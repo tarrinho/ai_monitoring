@@ -1,0 +1,40 @@
+# Dependabot — automated dependency update PRs.
+# Pairs with the CI secret-scan (TruffleHog + gitleaks) and Trivy scans:
+# Dependabot proposes the bump, CI gates it. Grouped to keep PR noise low.
+version: 2
+updates:
+  # Python deps — requirements.txt (runtime) + requirements-dev.txt (tooling)
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "deps"
+    groups:
+      python-deps:
+        patterns: ["*"]
+
+  # GitHub Actions — the pinned action versions in ci.yml / release.yml
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Docker — the base image in the Dockerfile
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "docker"
