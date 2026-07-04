@@ -47,7 +47,11 @@ def make_snap(ts):
                  "mem_used": int(mem / 100 * 128) * 2**30, "mem_total": 128 * 2**30,
                  "mem_avail": int((100 - mem) / 100 * 128) * 2**30,
                  "disk": {"pct": 61.4, "used": 880 * 2**30, "total": 1400 * 2**30},
-                 "load": [round(cpu / 8, 2), round(cpu / 9, 2), round(cpu / 11, 2)], "ncpu": 20},
+                 "load": [round(cpu / 8, 2), round(cpu / 9, 2), round(cpu / 11, 2)], "ncpu": 20,
+                 "info": {"kernel": "6.11.0-1004-nvidia", "arch": "aarch64",
+                          "hostname": "dgx-spark", "cpu_model": "NVIDIA Grace (Arm Neoverse)",
+                          "cpu_cores": 20, "cpu_threads": 20, "cpu_mhz": 3400,
+                          "swap_total": 8 * 2**30}},
         "procs": {"available": True, "ncpu": 20,
                   "top_cpu": [{"app": n, "cpu": round(c, 1), "pid": 1000 + i, "ram": r * 2**30}
                               for i, (n, c, r) in enumerate([
@@ -160,6 +164,12 @@ def _serve_with_theme(path, prefix=""):
         shim = ("<script>(function(){var p=new URLSearchParams(location.search)"
                 ".get('theme');if(p){localStorage.setItem('aimon-theme',p);"
                 "document.documentElement.setAttribute('data-theme',p);}})();</script>")
+        # ?pop=1 forces the Host hardware popover open (so it can be screenshot)
+        shim += ("<style id='_popforce'></style><script>(function(){"
+                 "if(new URLSearchParams(location.search).get('pop'))"
+                 "document.getElementById('_popforce').textContent="
+                 "'.hw-pop{display:block!important;position:static!important;box-shadow:none;margin-top:8px}';"
+                 "})();</script>")
         resp.text = html.replace("<head>", "<head>" + shim, 1)
     return resp
 

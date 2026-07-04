@@ -4,7 +4,37 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.0.6] — 2026-07-04
+
+### Added
+- **gitleaks in the CI secret-scan** — a second, independent secret scanner now
+  runs alongside TruffleHog in the `secret-scan` job, driven by a `.gitleaks.toml`
+  (built-in rule set + an allowlist for the synthetic values in `tests/` and
+  `.env.example`, which are the only non-real "secrets" committed). Fails the job
+  on any leak in the working tree or commit history.
+
+### Fixed
+- **ruff E702 in `collectors/host.py`** — the `cpu_cores` parse used a
+  `…; break` one-liner; split so `ruff check .` stays clean (source is strict;
+  E70x are only relaxed under `tests/`).
+
+### Docs
+- **`ARCHITECTURE.md` brought in line with the code** — documents the `containers`
+  collector, the **decoupled backend loops** (`_backend_loop` + `asyncio.wait_for`
+  → `_backend_latest`) that keep a wedged `nvidia-smi`/proxy from stalling the tick,
+  the `/api/stream` SSE channel + `/api/events` model timeline, the per-IP auth
+  brute-force lockout, and that the per-deployment LiteLLM `/health` probe was
+  removed (+ `spend_mode=lite` aggregates). Version bump cuts a clean release.
+
 ## [1.0.5] — 2026-07-04
+
+### Tests
+- **+7 QA tests** for the 1.0.5 changes: sidebar order (Overview→GPU→LiteLLM),
+  full-width "metrics over time" (regression), default 24h window on the LLM pages,
+  GPU name rendered in the header via `textContent` (security — no new HTML sink),
+  the window start→end date range wiring, the Apache-2.0 LICENSE + README + publish
+  allow-list, and the consolidated `ci.yml` (five control jobs + a badges job, old
+  split workflows removed, per-control README endpoint badges).
 
 ### Changed
 - **CI consolidated into one workflow with per-control badges** — the five split

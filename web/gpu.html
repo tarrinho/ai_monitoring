@@ -140,7 +140,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.0.5</div>
+      <div id="sidebar-brand-ver">v1.0.6</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -180,6 +180,12 @@
   <section class="card span-2" id="card-list">
     <h2>Per-GPU</h2>
     <div id="g-list"><div class="unavail">no data</div></div>
+  </section>
+
+  <section class="card span-full" id="card-appcpu">
+    <h2>CPU usage by app (stacked) — <span id="appcpu-win">1h</span>
+      <span class="info" title="Per-process CPU % of the top-10 apps over time, stacked. Per-app GPU usage is not exposed by nvidia-smi in this setup — the aggregate GPU util is charted above.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:280px"><canvas id="appcpu-chart"></canvas></div>
   </section>
 
   <section class="card span-full" id="card-charts">
@@ -250,6 +256,33 @@ function mkChart(canvas, cfg){
   }
 })();
 function fmtT(t){ return t?new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""; }
+
+// Stacked per-app CPU% over time (top-10 apps, one colour each).
+const PROC_COLORS=["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff","#ff7b72",
+  "#39c5cf","#ffa657","#7ee787","#d2a8ff"];
+const appCpuChart=new Chart(document.getElementById("appcpu-chart"),{
+  type:"line", data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    scales:{
+      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      y:{stacked:true,beginAtZero:true,grid:{color:"#30363d33"},
+         ticks:{color:"#8b949e",font:{size:9},callback:v=>v+"%"}}}}
+});
+async function loadAppCpu(){
+  document.getElementById("appcpu-win").textContent=WIN;
+  const d=await api("/api/procseries?kind=cpu&window="+WIN);
+  if(!d) return;
+  const pts=d.points||[], apps=d.apps||[];
+  appCpuChart.data.labels=pts.map(p=>fmtT(p.t));
+  appCpuChart.data.datasets=apps.map((a,i)=>({label:a,
+    data:pts.map(p=>p[a]==null?null:p[a]),
+    borderColor:PROC_COLORS[i%PROC_COLORS.length],
+    backgroundColor:PROC_COLORS[i%PROC_COLORS.length]+"66",
+    borderWidth:1,pointRadius:0,tension:.25,fill:true,spanGaps:true}));
+  appCpuChart.update("none");
+}
 function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(Math.round(v*100)/100)+(cfg.unit||"")); }
 function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
 
@@ -320,7 +353,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); }
+function rangedReload(){ loadSeries(); loadAppCpu(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -351,7 +384,7 @@ document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
     b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
-    document.getElementById("win-label").textContent=WIN; loadSeries();
+    document.getElementById("win-label").textContent=WIN; loadSeries(); loadAppCpu();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -368,6 +401,7 @@ async function tick(){
     document.getElementById("updated").textContent="updated "+t;
   }
   await loadSeries();
+  await loadAppCpu();
 }
 updateRangeUI();
 tick();

@@ -14,7 +14,7 @@
 # build-args (the default builder uses the host daemon, which can pull/pull).
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.5}"
+VERSION="${VERSION:-1.0.6}"
 IMAGE="${IMAGE:-ai-monitoring}"
 PROXY_ARGS=()
 [ -n "${http_proxy:-}" ] && PROXY_ARGS+=(--build-arg "http_proxy=$http_proxy"

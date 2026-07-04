@@ -19,17 +19,25 @@ permissions:
 
 jobs:
   secret-scan:
-    name: TruffleHog secret scan
+    name: secret scan (TruffleHog + gitleaks)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0          # full history so the scan sees past commits
+          fetch-depth: 0          # full history so both scanners see past commits
       - name: TruffleHog
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
           extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude
+      # Second, independent secret scanner. Reads .gitleaks.toml (built-in rules +
+      # allowlist for the synthetic values in tests/ + .env.example). Fails the job
+      # on any leak in the working tree or commit history.
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_CONFIG: .gitleaks.toml
 
   lint:
     name: lint + type (ruff / bandit / semgrep / mypy / vulture)

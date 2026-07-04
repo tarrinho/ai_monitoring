@@ -361,7 +361,7 @@ def insert_proc_series(ts: float, kind: str, items: list[dict],
 
 
 def proc_series(kind: str, window: str, max_points: int = 200,
-                top_n: int = 5, end: float | None = None) -> dict[str, Any]:
+                top_n: int = 10, end: float | None = None) -> dict[str, Any]:
     """Multi-series per-app values for the top-N apps of a metric in the window.
     Returns {"apps": [...], "points": [{t, <app>: v, ...}]}. `end` shifts back."""
     secs = WINDOWS.get(window, WINDOWS["1h"])

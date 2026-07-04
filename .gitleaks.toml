@@ -1,0 +1,16 @@
+# gitleaks config — extends the built-in rule set and allowlists the SYNTHETIC
+# secrets that live in tests/ and .env.example by design. Real secrets are never
+# committed (git-ignored `.env`, kept out of the publish allow-list), so those two
+# locations are the only source of false positives. Used by the CI `secret-scan`
+# job (.github/workflows/ci.yml) alongside TruffleHog.
+title = "AI-Monitoring"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic / example values are not real secrets"
+paths = [
+  '''tests/.*''',
+  '''\.env\.example''',
+]

@@ -1,7 +1,7 @@
 services:
   ai-monitoring:
     build: .
-    image: ai-monitoring:1.0.5
+    image: ai-monitoring:1.0.6
     container_name: ai-monitoring
     restart: unless-stopped
     # Secrets + endpoints come from .env (git-ignored). Never inline keys here.

@@ -45,7 +45,7 @@ def _read_rss(pid: int) -> int:
         return 0
 
 
-def sample(top_n: int = 5) -> dict:
+def sample(top_n: int = 10) -> dict:
     """Return top-N apps by CPU% and by RAM, aggregated by executable name."""
     global _prev, _prev_wall
     now_wall = 0.0

@@ -54,6 +54,73 @@ def _loadavg() -> list[float]:
         return [0.0, 0.0, 0.0]
 
 
+_hw: dict | None = None      # static hardware info — read once, then cached
+
+
+def _cpu_max_mhz() -> int | None:
+    # /sys cpufreq (kHz) works on ARM (Grace) + x86 when the host exposes it
+    try:
+        with open("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") as f:
+            return round(int(f.read().strip()) / 1000)
+    except Exception:
+        pass
+    try:  # x86 fallback: max "cpu MHz" in /proc/cpuinfo (absent on ARM)
+        with open(f"{_PROC}/cpuinfo") as f:
+            mhz = [float(ln.split(":")[1]) for ln in f if ln.lower().startswith("cpu mhz")]
+        return round(max(mhz)) if mhz else None
+    except Exception:
+        return None
+
+
+def _cpu_model() -> str | None:
+    try:
+        with open(f"{_PROC}/cpuinfo") as f:
+            txt = f.read()
+    except Exception:
+        txt = ""
+    for ln in txt.splitlines():                       # x86: "model name"
+        if ln.lower().startswith("model name"):
+            return ln.split(":", 1)[1].strip()
+    try:  # ARM (GB10): device-tree board/SoC model (no model name in cpuinfo)
+        with open("/sys/firmware/devicetree/base/model", "rb") as f:
+            m = f.read().decode(errors="ignore").strip("\x00 ").strip()
+            if m:
+                return m
+    except Exception:
+        pass
+    return None
+
+
+def _hw_info() -> dict:
+    """Static hardware facts for the Host tooltip — collected once and cached."""
+    global _hw
+    if _hw is not None:
+        return _hw
+    info: dict = {}
+    try:
+        u = os.uname()
+        info["kernel"], info["arch"], info["hostname"] = u.release, u.machine, u.nodename
+    except Exception:
+        pass
+    if (cm := _cpu_model()):
+        info["cpu_model"] = cm[:90]
+    if (mhz := _cpu_max_mhz()):
+        info["cpu_mhz"] = mhz
+    try:  # physical cores (x86 "cpu cores"); threads = logical
+        with open(f"{_PROC}/cpuinfo") as f:
+            for ln in f:
+                if ln.lower().startswith("cpu cores"):
+                    info["cpu_cores"] = int(ln.split(":")[1])
+                    break
+    except Exception:
+        pass
+    info["cpu_threads"] = os.cpu_count() or 0
+    if (sw := _read_meminfo().get("SwapTotal")):
+        info["swap_total"] = sw
+    _hw = info
+    return info
+
+
 def sample(disk_path: str = "/") -> dict:
     """Return a host snapshot. Never raises — degrades to partial data."""
     global _prev_cpu
@@ -82,4 +149,5 @@ def sample(disk_path: str = "/") -> dict:
         "mem_pct": round(mem_used / mem_total * 100, 1) if mem_total else 0.0,
         "disk": _disk(disk_path),
         "ncpu": os.cpu_count() or 0,
+        "info": _hw_info(),
     }

@@ -73,6 +73,19 @@
   .srv{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;
     padding:0 6px;margin-left:6px;vertical-align:middle}
   .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
+  /* hardware-detail popover on the Host card */
+  .hw-wrap{position:relative;display:inline-block}
+  .hw-pop{display:none;position:absolute;top:20px;left:0;z-index:100;width:340px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;
+    box-shadow:0 10px 30px #0009;font-size:12px;font-weight:400;text-transform:none;
+    letter-spacing:normal;color:var(--fg);white-space:normal}
+  .hw-wrap:hover .hw-pop{display:block}
+  .hw-pop h4{margin:9px 0 3px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--accent);font-weight:700}
+  .hw-pop h4:first-child{margin-top:0}
+  .hw-pop .row{display:flex;justify-content:space-between;gap:14px;padding:1px 0;line-height:1.45}
+  .hw-pop .row span:first-child{color:var(--muted);flex:0 0 auto}
+  .hw-pop .row span:last-child{color:var(--fg);text-align:right;font-variant-numeric:tabular-nums}
   .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
   .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
   .windows{display:flex;gap:4px;margin-left:16px}
@@ -177,7 +190,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.0.5</div>
+      <div id="sidebar-brand-ver">v1.0.6</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -214,7 +227,9 @@
   <div id="ram-banner" class="ram-banner"></div>
   <div class="grid">
   <section class="card" id="card-host">
-    <h2>Host <span id="host-badge" class="badge"></span></h2>
+    <h2>Host <span id="host-badge" class="badge"></span>
+      <span class="hw-wrap"><span class="info" title="Server hardware details">ⓘ</span>
+        <div id="host-detail" class="hw-pop"></div></span></h2>
     <div class="kpis" id="host-kpis"></div>
     <div class="host-spark"><canvas id="host-spark"></canvas></div>
   </section>
@@ -457,6 +472,57 @@ function lastNonNull(pts, key){
 }
 
 // ---- render (KPIs from latest snapshot) ------------------------------------
+// Curated reference specs for known GPUs (facts not exposed by nvidia-smi:
+// core counts, memory bandwidth, interconnect). Matched by name substring.
+const GPU_SPECS={
+  "GB10":{title:"NVIDIA GB10 Grace Blackwell Superchip",rows:[
+    ["Arm CPU","20-core (10× Cortex-X925 + 10× A725)"],
+    ["Blackwell GPU","6,144 CUDA cores"],
+    ["Tensor cores","192 (5th-gen)"],
+    ["RT cores","48 (4th-gen)"],
+    ["Unified memory","128 GB LPDDR5X · 256-bit"],
+    ["Memory bandwidth","273 GB/s @ 8,533 MT/s"],
+    ["AI performance","~1 PFLOP FP4 (sparse)"],
+    ["CPU↔GPU link","NVLink-C2C (coherent)"],
+    ["Scale-out","ConnectX-7 200G · 2 units ≈ 400B params"]]},
+};
+function gpuSpecFor(name){
+  const n=String(name||"").toUpperCase();
+  for(const k in GPU_SPECS){ if(n.includes(k)) return GPU_SPECS[k]; }
+  return null;
+}
+// Build the hardware-detail popover shown on the Host card ⓘ (measured facts
+// from /proc + nvidia-smi, plus curated reference specs for a recognised GPU).
+function renderHostDetail(h, g){
+  const el=document.getElementById("host-detail"); if(!el) return;
+  const info=(h&&h.info)||{}, gp=(g&&g.gpus&&g.gpus[0])||{};
+  const row=(k,v)=> (v||v===0)
+    ? `<div class="row"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>` : "";
+  let html="<h4>Server</h4>";
+  html+=row("Host", info.hostname);
+  html+=row("OS / arch", (info.arch||"")+(info.kernel?(" · "+info.kernel):""));
+  html+="<h4>CPU</h4>";
+  html+=row("Model", info.cpu_model);
+  html+=row("Cores / threads",
+    (info.cpu_cores?info.cpu_cores+" cores / ":"")+((info.cpu_threads||h.ncpu||"?")+" threads"));
+  if(info.cpu_mhz) html+=row("Max clock", (info.cpu_mhz/1000).toFixed(2)+" GHz");
+  html+="<h4>Memory</h4>";
+  html+=row("RAM", bytes(h.mem_total));
+  if(info.swap_total) html+=row("Swap", bytes(info.swap_total));
+  if(g&&g.available){
+    html+="<h4>GPU</h4>";
+    html+=row("Device", gp.name||g.vendor);
+    html+=row("VRAM", gp.vram_total?bytes(gp.vram_total):"unified (shared with RAM)");
+    if(gp.power!=null) html+=row("Power", gp.power+" W");
+    const spec=gpuSpecFor(gp.name);
+    if(spec){
+      html+="<h4>"+escapeHtml(spec.title)+"</h4>";
+      for(const r of spec.rows) html+=row(r[0], r[1]);
+    }
+  }
+  if(h.disk&&h.disk.total){ html+="<h4>Storage</h4>"+row("Disk total", bytes(h.disk.total)); }
+  setHtml(el, html);
+}
 function renderHost(h){
   const b=document.getElementById("host-badge");
   if(!h||!h.available){ badge(b,false);
@@ -853,6 +919,7 @@ function applySnapshot(d){
   const snap = d.latest||{}; const c = snap.collectors||{};
   renderStrip(c);
   renderHost(c.host); renderGpu(c.gpu); renderLitellm(c.litellm);
+  renderHostDetail(c.host, c.gpu);
   renderOllama(c.ollama); renderLlamacpp(c.llamacpp); renderProcs(c.procs, c.host);
   renderContainers(c.containers);
   // stale-clock: green(<15s) → amber(<60s) → red, so a frozen sampler is obvious

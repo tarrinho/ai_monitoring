@@ -218,8 +218,8 @@ def test_litellm_heavy_parse_runs_off_event_loop():
     assert "await" not in parser, "_parse_spend must be pure/synchronous"
 
 
-def test_version_is_1_0_5():
-    assert config.VERSION == "AI-Monitoring_1.0.5"
+def test_version_is_1_0_6():
+    assert config.VERSION == "AI-Monitoring_1.0.6"
 
 
 def test_ux_improvements_present():
@@ -621,3 +621,136 @@ def test_overview_ram_pressure_banner_wired():
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="ram-banner"' in html
     assert "h.mem_pct>=90" in html       # banner shows only under memory pressure
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Extra QA — 1.0.5 UI + packaging regressions
+# ══════════════════════════════════════════════════════════════════════════════
+_PAGES = ["index", "gpu", "litellm", "ollama", "llamacpp", "alerts"]
+_WINDOWED = ["index", "gpu", "litellm", "llamacpp", "ollama"]   # have the window nav
+_LLM_PAGES = ["litellm", "ollama", "llamacpp"]                  # default window = 24h
+
+
+def _page(name):
+    return (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+
+
+def test_sidebar_gpu_between_overview_and_litellm():
+    """regression: sidebar order is Overview → GPU → LiteLLM on every page."""
+    for name in _PAGES:
+        html = _page(name)
+        o = html.find('href="/">Overview')
+        g = html.find('href="/gpu">GPU')
+        ll = html.find('href="/litellm">LiteLLM')
+        assert o >= 0 and g >= 0 and ll >= 0, f"{name}: nav links missing"
+        assert o < g < ll, f"{name}: sidebar order must be Overview < GPU < LiteLLM"
+
+
+def test_metrics_over_time_is_full_width():
+    """regression: the charts card spans every grid column (was ~50% at span-2)."""
+    for name in ("gpu", "litellm"):
+        html = _page(name)
+        assert ".span-full{grid-column:1/-1}" in html, f"{name}: .span-full CSS missing"
+        assert 'class="card span-full" id="card-charts"' in html, \
+            f"{name}: charts card must use span-full, not span-2"
+
+
+def test_llm_pages_default_to_24h_window():
+    """regression: LiteLLM/Ollama/llama.cpp open on a 24h window by default."""
+    for name in _LLM_PAGES:
+        html = _page(name)
+        assert 'let WIN = "24h";' in html, f"{name}: default WIN must be 24h"
+        assert '<button data-w="24h" class="active">24h</button>' in html, \
+            f"{name}: the 24h button must be the active one"
+        assert '<button data-w="1h" class="active">' not in html, \
+            f"{name}: the 1h button must no longer be active"
+
+
+def test_gpu_name_in_header_via_textcontent():
+    """regression+security: the single-GPU name sits in the card header and is set
+    via textContent (never an innerHTML sink), and the old bottom caption is gone."""
+    html = _page("index")
+    assert 'id="gpu-name"' in html
+    assert "nameEl.textContent" in html            # written safely, no HTML sink
+    # the removed bottom caption must not come back
+    assert 'proc-total mut">${escapeHtml(g.gpus[0].name' not in html
+
+
+def test_window_date_range_wired_on_windowed_pages():
+    """regression+security: every windowed page shows an absolute start→end range,
+    updated via updateRangeUI, and rendered with textContent (not innerHTML)."""
+    for name in _WINDOWED:
+        html = _page(name)
+        assert 'id="range-dates"' in html, f"{name}: range-dates span missing"
+        assert "function fmtRange(" in html, f"{name}: fmtRange helper missing"
+        assert "_dt.textContent" in html, f"{name}: range dates must use textContent"
+
+
+def test_license_apache2_present_and_wired():
+    """packaging: Apache-2.0 LICENSE exists, is referenced in the README, and ships
+    via the publish allow-list."""
+    lic = (ROOT / "LICENSE").read_text(encoding="utf-8")
+    assert "Apache License" in lic and "Version 2.0" in lic
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "Apache License 2.0" in readme
+    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
+    assert "LICENSE" in pub, "LICENSE not in publish allow-list"
+
+
+def test_ci_consolidated_with_per_control_badges():
+    """functional: one ci.yml runs every control as a job (+ a badges job), the five
+    old split workflows are gone, and the README carries per-control endpoint badges."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    for job in ("secret-scan:", "lint:", "tests:", "trivy-fs:", "build-scan:", "badges:"):
+        assert job in ci, f"ci.yml missing job {job}"
+    assert "schemaVersion" in ci, "badges job must write shields endpoint JSON"
+    wf = ROOT / ".github" / "workflows"
+    for gone in ("lint.yml", "tests.yml", "trivy-fs.yml", "secret-scan.yml", "build-scan.yml"):
+        assert not (wf / gone).exists(), f"stale split workflow {gone} still present"
+    assert (wf / "release.yml").exists()
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for ctl in ("secret-scan", "lint", "tests", "trivy-fs", "build-scan"):
+        assert f"badges/{ctl}.json" in readme, f"README missing endpoint badge for {ctl}"
+
+
+def test_gpu_stacked_per_app_cpu_chart():
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert 'id="appcpu-chart"' in html and "loadAppCpu" in html
+    assert "stacked:true" in html                       # stacked area, not lines
+    assert 'fill:true' in html and "PROC_COLORS" in html  # filled, per-app colours
+    assert "/api/procseries?kind=cpu" in html
+
+
+def test_procs_reader_exposes_top10():
+    import db as _db
+    import inspect
+    assert "top_n: int = 10" in inspect.getsource(_db.proc_series)
+
+
+def test_overview_host_hardware_popover():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="host-detail"' in html and "renderHostDetail" in html
+    assert ".hw-pop" in html                      # styled popover, not a bare title
+    assert "GPU_SPECS" in html and '"GB10"' in html   # curated reference specs
+
+
+def test_host_collector_emits_static_info():
+    import inspect
+    from collectors import host
+    src = inspect.getsource(host)
+    assert "_hw_info" in src and '"info"' in src   # static HW facts in the snapshot
+    info = host.sample().get("info", {})
+    assert "arch" in info and "cpu_threads" in info
+
+
+def test_gitleaks_wired_in_secret_scan():
+    """security: gitleaks runs alongside TruffleHog in the secret-scan job, with a
+    .gitleaks.toml that allowlists the synthetic values in tests/ + .env.example."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "gitleaks/gitleaks-action" in ci, "gitleaks step missing from CI"
+    assert "trufflesecurity/trufflehog" in ci, "TruffleHog must still run too"
+    cfg = (ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
+    assert "useDefault = true" in cfg          # built-in rule set
+    assert "tests/" in cfg and ".env.example" in cfg   # synthetic-secret allowlist
+    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
+    assert ".gitleaks.toml" in pub, ".gitleaks.toml not in publish allow-list"
