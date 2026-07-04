@@ -159,8 +159,8 @@
   <div class="windows" id="windows">
     <button id="nav-left" title="shift earlier">◀</button>
     <button data-w="15m">15m</button>
-    <button data-w="1h" class="active">1h</button>
-    <button data-w="24h">24h</button>
+    <button data-w="1h">1h</button>
+    <button data-w="24h" class="active">24h</button>
     <button data-w="30d">30d</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
@@ -187,7 +187,7 @@
   </section>
 
   <section class="card" id="card-charts" style="grid-column:1/-1">
-    <h2>Ollama over time — <span id="win-label">1h</span>
+    <h2>Ollama over time — <span id="win-label">24h</span>
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>
     <div class="chart-grid" id="chart-grid"></div>
@@ -265,7 +265,7 @@ function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
-let WIN = "1h";
+let WIN = "24h";
 async function api(path){
   if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
     path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);

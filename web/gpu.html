@@ -50,6 +50,7 @@
     border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
   .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
   .span-2{grid-column:span 2}
+  .span-full{grid-column:1/-1}   /* span every column, whatever the count */
   @media(max-width:720px){.span-2{grid-column:span 1}}
   .chart-grid{display:grid;gap:12px;
     grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
@@ -181,7 +182,7 @@
     <div id="g-list"><div class="unavail">no data</div></div>
   </section>
 
-  <section class="card span-2" id="card-charts">
+  <section class="card span-full" id="card-charts">
     <h2>GPU metrics over time — <span id="win-label">1h</span>
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>

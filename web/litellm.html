@@ -51,6 +51,7 @@
     border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
   .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
   .span-2{grid-column:span 2}
+  .span-full{grid-column:1/-1}   /* span every column, whatever the count */
   @media(max-width:720px){.span-2{grid-column:span 1}}
   .chart-grid{display:grid;gap:16px;grid-template-columns:1fr}
   .mini{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
@@ -162,8 +163,8 @@
   <div class="windows" id="windows">
     <button id="nav-left" title="shift earlier">◀</button>
     <button data-w="15m">15m</button>
-    <button data-w="1h" class="active">1h</button>
-    <button data-w="24h">24h</button>
+    <button data-w="1h">1h</button>
+    <button data-w="24h" class="active">24h</button>
     <button data-w="30d">30d</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
@@ -200,35 +201,35 @@
   </section>
 
   <section class="card span-2" id="card-keytime">
-    <h2>Top 10 API keys over time — <span id="keytime-win">1h</span></h2>
+    <h2>Top 10 API keys over time — <span id="keytime-win">24h</span></h2>
     <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-corr">
-    <h2>Concurrency vs p95 latency — <span id="corr-win">1h</span></h2>
+    <h2>Concurrency vs p95 latency — <span id="corr-win">24h</span></h2>
     <div class="chart-wrap" style="height:170px"><canvas id="corr-chart"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-impact">
-    <h2>Load vs resource impact — <span id="impact-win">1h</span>
+    <h2>Load vs resource impact — <span id="impact-win">24h</span>
       <span class="info" title="Request rate vs GPU util, KV-cache, and the llama.cpp process CPU % and RAM % (RSS / host memory) — the per-execution cost signals for a GPU-served LLM. Dedicated CPU + RAM over-time charts are below.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:190px"><canvas id="impact-chart"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-svc-cpu">
-    <h2>LLM serving CPU over time — <span id="svc-cpu-win">1h</span>
+    <h2>LLM serving CPU over time — <span id="svc-cpu-win">24h</span>
       <span class="info" title="Per-process CPU % of the LLM serving processes (llama-server, ollama) over the window.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:170px"><canvas id="svc-cpu-chart"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-svc-ram">
-    <h2>LLM serving RAM over time — <span id="svc-ram-win">1h</span>
+    <h2>LLM serving RAM over time — <span id="svc-ram-win">24h</span>
       <span class="info" title="Resident memory (RSS) of the LLM serving processes over the window.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:170px"><canvas id="svc-ram-chart"></canvas></div>
   </section>
 
-  <section class="card span-2" id="card-charts">
-    <h2>LiteLLM metrics over time — <span id="win-label">1h</span>
+  <section class="card span-full" id="card-charts">
+    <h2>LiteLLM metrics over time — <span id="win-label">24h</span>
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>
     <div class="chart-grid" id="chart-grid"></div>
@@ -337,7 +338,7 @@ function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
-let WIN = "1h";
+let WIN = "24h";
 async function api(path){
   if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
     path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
