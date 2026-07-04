@@ -1,0 +1,9 @@
+# TruffleHog exclude-paths (regex, one per line). Used by CI (.github/workflows/ci.yml)
+# and deploy/scan-secrets.sh. .env files hold real secrets BY DESIGN and are
+# git-ignored; tarballs are built artifacts, not source.
+(^|/)\.env($|\.)
+(^|/)test-env/\.env
+\.tar\.gz$
+(^|/)data/
+(^|/)__pycache__/
+(^|/)\.venv/

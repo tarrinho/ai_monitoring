@@ -1,0 +1,87 @@
+<svg width="1200" height="520" viewBox="0 0 1200 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI-Monitoring architecture: collectors to sampling loop to SQLite to JSON API to dashboards">
+  <defs>
+    <linearGradient id="abg" x1="0" y1="0" x2="0" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0d1117"/><stop offset="1" stop-color="#12161d"/>
+    </linearGradient>
+    <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8b949e"/>
+    </marker>
+    <style>
+      text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;fill:#e6edf3}
+      .h{font-size:15px;font-weight:700}
+      .s{font-size:12.5px;fill:#8b949e}
+      .box{fill:#161b22;stroke:#30363d;rx:10}
+      .lane{fill:#8b949e;font-size:12px;font-weight:600;letter-spacing:.08em}
+      .flow{stroke:#8b949e;stroke-width:2;fill:none}
+    </style>
+  </defs>
+  <rect width="1200" height="520" rx="16" fill="url(#abg)"/>
+  <rect x="0" y="0" width="1200" height="5" rx="2.5" fill="#58a6ff"/>
+  <text x="40" y="46" font-size="24" font-weight="800">AI-Monitoring — data flow</text>
+  <text x="40" y="72" class="s">A single async loop samples every collector, persists tiered series to SQLite, evaluates alerts, and serves the dashboards.</text>
+
+  <!-- lane labels -->
+  <text x="40" y="120" class="lane">COLLECT</text>
+  <text x="360" y="120" class="lane">PROCESS</text>
+  <text x="620" y="120" class="lane">STORE</text>
+  <text x="870" y="120" class="lane">SERVE</text>
+
+  <!-- collectors column -->
+  <g>
+    <rect class="box" x="40" y="135" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="157" class="h">host · procs  <tspan class="s">/proc</tspan></text>
+    <rect class="box" x="40" y="177" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="199" class="h">gpu  <tspan class="s">nvidia-smi / ssh / http</tspan></text>
+    <rect class="box" x="40" y="219" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="241" class="h">ollama  <tspan class="s">/api/ps · tags</tspan></text>
+    <rect class="box" x="40" y="261" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="283" class="h">llama.cpp  <tspan class="s">/health · slots</tspan></text>
+    <rect class="box" x="40" y="303" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="325" class="h">litellm  <tspan class="s">/global/activity</tspan></text>
+    <rect class="box" x="40" y="345" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="367" class="h">containers  <tspan class="s">docker.sock</tspan></text>
+  </g>
+
+  <!-- sampling loop -->
+  <rect class="box" x="340" y="200" width="220" height="120" rx="12" fill="#1c2230" stroke="#3d4657"/>
+  <text x="360" y="228" class="h">sampling loop</text>
+  <text x="360" y="250" class="s">asyncio.gather()</text>
+  <text x="360" y="270" class="s">wait_for watchdog</text>
+  <text x="360" y="290" class="s">→ snapshot{collectors}</text>
+  <text x="360" y="310" class="s">→ _metrics_row()</text>
+
+  <!-- alerts/anomaly under loop -->
+  <rect class="box" x="340" y="335" width="220" height="46" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text x="360" y="355" class="h" style="fill:#f0883e">alerts · anomaly</text>
+  <text x="360" y="372" class="s">thresholds · spike/budget → webhook</text>
+
+  <!-- SQLite -->
+  <rect class="box" x="600" y="200" width="210" height="120" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="620" y="228" class="h" style="fill:#7ee787">SQLite</text>
+  <text x="620" y="250" class="s">metrics + _1m/_1h rollups</text>
+  <text x="620" y="270" class="s">key_series · proc_series</text>
+  <text x="620" y="290" class="s">events · alerts · uptime</text>
+  <text x="620" y="310" class="s">prune · retention (→ years)</text>
+
+  <!-- API -->
+  <rect class="box" x="850" y="200" width="180" height="120" rx="12" fill="#1c2230" stroke="#3d4657"/>
+  <text x="870" y="228" class="h" style="fill:#58a6ff">JSON API</text>
+  <text x="870" y="250" class="s">/api/data</text>
+  <text x="870" y="270" class="s">/api/series · keyseries</text>
+  <text x="870" y="290" class="s">/api/alerts · nav</text>
+  <text x="870" y="310" class="s">token gate · CSP</text>
+
+  <!-- dashboards -->
+  <rect class="box" x="1050" y="150" width="120" height="220" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="1066" y="176" class="h" style="fill:#bc8cff">6 dashboards</text>
+  <text x="1066" y="200" class="s">Overview</text>
+  <text x="1066" y="222" class="s">LiteLLM</text>
+  <text x="1066" y="244" class="s">GPU</text>
+  <text x="1066" y="266" class="s">Ollama</text>
+  <text x="1066" y="288" class="s">llama.cpp</text>
+  <text x="1066" y="310" class="s">Alerts</text>
+  <text x="1066" y="344" class="s" style="fill:#7ee787">poll every 5s</text>
+
+  <!-- flow arrows -->
+  <path class="flow" d="M285 260 C315 260 315 258 338 258" marker-end="url(#arw)"/>
+  <path class="flow" d="M285 236 C312 236 315 250 338 250" marker-end="url(#arw)"/>
+  <path class="flow" d="M285 320 C312 320 315 270 338 268" marker-end="url(#arw)"/>
+  <path class="flow" d="M562 260 C580 260 582 260 598 260" marker-end="url(#arw)"/>
+  <path class="flow" d="M812 260 C830 260 832 260 848 260" marker-end="url(#arw)"/>
+  <path class="flow" d="M1032 260 C1040 260 1042 260 1048 260" marker-end="url(#arw)"/>
+  <text x="470" y="470" class="s">config.py — env-driven, fail-fast   ·   Dockerfile — Alpine, non-root, in-image pytest gate   ·   arm64 / amd64 / armv7</text>
+</svg>

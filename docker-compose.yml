@@ -1,0 +1,38 @@
+services:
+  ai-monitoring:
+    build: .
+    image: ai-monitoring:1.0.3
+    container_name: ai-monitoring
+    restart: unless-stopped
+    # Secrets + endpoints come from .env (git-ignored). Never inline keys here.
+    env_file: .env
+    # See host processes (top apps by CPU/RAM) rather than only the container's
+    # PID namespace. Comment out to restrict to in-container processes.
+    pid: host
+    ports:
+      - "${MONITOR_PORT:-9925}:9925"
+    volumes:
+      - ai-monitoring-data:/data
+      # Container liveness/alive-time monitoring: mount the Docker socket read-only
+      # and set MONITOR_CONTAINERS in .env. Remove both if you don't use it.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Remote-GPU SSH mode: mount your private key read-only and set
+      # GPU_SSH_KEY=/keys/gpu_key in .env (uncomment to use).
+      # - ./gpu_key:/keys/gpu_key:ro
+    # Lets the non-root monitor read the Docker socket (set DOCKER_GID in .env to
+    # the host 'docker' group id: getent group docker | cut -d: -f3).
+    group_add:
+      - "${DOCKER_GID:-999}"
+    # host.docker.internal lets the container reach LLM backends on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9925/healthz',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ai-monitoring-data:

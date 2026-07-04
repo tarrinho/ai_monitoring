@@ -1,0 +1,16 @@
+# LiteLLM proxy config for the AI-Monitoring test environment.
+# Proxies a tiny Ollama model so the monitor sees real traffic/latency/spend.
+model_list:
+  - model_name: qwen2.5-0.5b
+    litellm_params:
+      model: ollama/qwen2.5:0.5b
+      api_base: http://ollama:11434
+
+general_settings:
+  # persist keys/spend in the Postgres DB (DATABASE_URL) so /spend/logs works
+  store_model_in_db: true
+
+litellm_settings:
+  # write a SpendLogs row per request → powers the monitor's wait/cost/tokens
+  drop_params: true
+  set_verbose: false

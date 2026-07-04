@@ -1,0 +1,595 @@
+# Static QA — source inspection, no network/runtime backends required.
+# Enforces the rules.md invariants that apply to this project: env-only
+# secrets, dashboard security (§17), version consistency (§0a), fail-fast
+# config, and container hardening.
+import re
+from pathlib import Path
+
+import config
+
+ROOT = Path(__file__).resolve().parent.parent
+WEB = ROOT / "web" / "index.html"
+
+
+# ------------------------------------------------------------- secrets --------
+def test_no_hardcoded_secrets_in_source():
+    pat = re.compile(
+        r'(sk-[A-Za-z0-9]{8})|'
+        r'(master_key\s*=\s*["\'][^"\'$]{6})|'
+        r'(password\s*=\s*["\'][^"\'$]{4})',
+        re.I,
+    )
+    for p in list(ROOT.glob("*.py")) + list((ROOT / "collectors").glob("*.py")):
+        txt = p.read_text(encoding="utf-8")
+        assert not pat.search(txt), f"possible hardcoded secret in {p.name}"
+
+
+def test_env_example_has_only_placeholders():
+    txt = (ROOT / ".env.example").read_text(encoding="utf-8")
+    # any *_KEY / MASTER_KEY line must be blank or a CHANGE_ME placeholder
+    for line in txt.splitlines():
+        if re.match(r'^[A-Z_]*(KEY|TOKEN)=', line):
+            val = line.split("=", 1)[1].strip()
+            assert val == "" or "CHANGE_ME" in val, f"real-looking secret: {line}"
+
+
+def test_gitignore_blocks_env_and_db():
+    txt = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert ".env" in txt
+    assert "*.db" in txt
+
+
+def test_redacted_summary_never_exposes_key_value(monkeypatch):
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-supersecretvalue")
+    s = config.redacted_summary()
+    assert s["litellm_key"] == "set"
+    assert "supersecret" not in repr(s)
+
+
+# ---------------------------------------------------- version consistency -----
+def test_single_version_constant():
+    assert config.VERSION.startswith("AI-Monitoring_")
+    # version string must not be duplicated as a literal elsewhere in source
+    for p in (ROOT / "app.py", ROOT / "db.py"):
+        assert config.VERSION not in p.read_text(encoding="utf-8"), \
+            f"version literal duplicated in {p.name}; reference config.VERSION"
+
+
+# --------------------------------------------------------- fail-fast cfg ------
+def test_validate_rejects_bad_port(monkeypatch):
+    monkeypatch.setattr(config, "MONITOR_PORT", 0)
+    assert any("MONITOR_PORT" in e for e in config.validate())
+
+
+def test_validate_rejects_fast_interval(monkeypatch):
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 0.1)
+    assert any("INTERVAL" in e for e in config.validate())
+
+
+def test_validate_requires_key_when_litellm_url_set(monkeypatch):
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://x:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", None)
+    assert any("MASTER_KEY" in e for e in config.validate())
+
+
+# --------------------------------------------------- dashboard security §17 ---
+def test_dashboard_has_single_escapehtml():
+    html = WEB.read_text(encoding="utf-8")
+    assert html.count("function escapeHtml") == 1
+
+
+def test_dashboard_innerHTML_only_via_sanitizer():
+    html = WEB.read_text(encoding="utf-8")
+    # the only `innerHTML =` assignment must be the DOMPurify-wrapped setHtml
+    assigns = re.findall(r'innerHTML\s*=', html)
+    assert len(assigns) == 1
+    assert "DOMPurify.sanitize" in html
+
+
+def test_dashboard_timers_tracked_and_cleared():
+    html = WEB.read_text(encoding="utf-8")
+    assert "_timers.push(setInterval" in html
+    assert "_timers.forEach(clearInterval)" in html
+    assert "beforeunload" in html
+
+
+def test_window_selector_and_series_wiring():
+    html = WEB.read_text(encoding="utf-8")
+    for w in ("15m", "1h", "24h", "30d"):
+        assert f'data-w="{w}"' in html, f"missing window button {w}"
+    assert "/api/series" in html and "loadSeries" in html
+
+
+def test_per_characteristic_charts_defined():
+    html = WEB.read_text(encoding="utf-8")
+    assert 'id="chart-grid"' in html and 'id="card-gpu"' in html
+    # one graph per characteristic, built from the CHARTS config
+    # NB: vram_used / vram_pct intentionally NOT charted here — unified-memory
+    # GPUs (GB10) report no separate VRAM, so those tiles were always empty.
+    for key in ('"cpu"', '"mem"', '"disk"', '"load1"', '"gpu"',
+                '"wait"', '"tok"', '"power"', '"gtemp"', '"slots"',
+                '"reqrate"', '"tok_in"', '"tok_out"', '"errrate"',
+                '"costrate"', '"kvcache"', '"tokwatt"', '"backlog"',
+                '"ttft"', '"cachehit"'):
+        assert key in html, f"missing chart for {key}"
+
+
+def test_windowed_pages_have_time_nav_arrows():
+    # every dashboard with a time-window selector also has ◀ / ▶ pan arrows
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'id="nav-left"' in html and 'id="nav-right"' in html, name
+        assert "TIMEEND" in html and 'end="+TIMEEND' in html, name   # panned query
+        assert 'id="range-lbl"' in html, name
+
+
+def test_overview_charts_grouped_collapsible():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert "chart-group" in html and "group-hd" in html
+    assert ".chart-group.collapsed" in html          # collapse CSS
+    assert 'aimon_g_' in html                         # per-group persistence
+    # charts tagged into Host / GPU / LLM groups
+    for g in ('g:"Host"', 'g:"GPU"', 'g:"LLM"'):
+        assert g in html, f"charts not grouped into {g}"
+
+
+def test_all_pages_have_alert_dot():
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert "has-alert" in html and "_alertDot" in html, name
+        assert "/api/alerts" in html, name           # polls active alerts
+
+
+def test_all_pages_have_collapsible_sidebar():
+    # lateral collapsible sidebar (AntiBot GW pattern) on every dashboard
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'id="sidebar-nav"' in html, f"{name}: no sidebar"
+        assert 'id="sidebar-toggle"' in html and 'id="sidebar-reopen"' in html, name
+        assert "sb-collapsed" in html and "aimon_sb" in html, name   # collapse + persist
+        # all six sections reachable from the sidebar
+        for href in ('href="/"', 'href="/litellm"', 'href="/gpu"',
+                     'href="/ollama"', 'href="/llamacpp"', 'href="/alerts"'):
+            assert href in html, f"{name}: sidebar missing {href}"
+
+
+def test_all_pages_have_theme_toggle():
+    # day/night toggle present on every dashboard + shared via localStorage
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'id="theme-btn"' in html, f"{name}: no theme button"
+        assert 'data-theme="light"' in html, f"{name}: no light palette"
+        assert "aimon-theme" in html, f"{name}: theme not persisted"
+        # nav links hidden for unconfigured backends — filter targets all three
+        assert "/api/nav" in html, f"{name}: no nav-link filter"
+        for be in ("litellm", "gpu", "ollama"):
+            assert f'"{be}"' in html, f"{name}: nav filter missing {be}"
+
+
+def test_dashboard_uptime_and_export_wired():
+    html = WEB.read_text(encoding="utf-8")
+    assert 'id="card-uptime"' in html and "loadUptime" in html
+    assert 'id="export-btn"' in html and "/api/export" in html
+
+
+def test_overview_top_apps_and_evolution():
+    html = WEB.read_text(encoding="utf-8")
+    # top-5 tables
+    assert 'id="card-topcpu"' in html and 'id="card-topram"' in html
+    assert "renderProcs" in html
+    # per-app evolution line charts + endpoint
+    assert 'id="cpuevo-chart"' in html and 'id="ramevo-chart"' in html
+    assert "loadProcEvo" in html and "/api/procseries" in html
+
+
+def test_overview_top_ram_shows_system_total():
+    """Top-5 RAM must show a system-wide used/total footer so the per-app rows
+    (which never sum to host RAM — huge pages / GPU / shmem live outside RSS) have
+    context. renderProcs must receive host mem for this."""
+    html = WEB.read_text(encoding="utf-8")
+    assert "proc-total" in html and "System RAM" in html
+    assert "renderProcs(c.procs, c.host)" in html   # host mem passed in
+
+
+def test_litellm_load_controls_present_and_documented():
+    """The busy-proxy load controls must exist in config + be documented, so a
+    slammed proxy can be throttled/disabled without code changes."""
+    import config
+    knobs = ("LITELLM_HEAVY_INTERVAL", "LITELLM_SPEND_ENABLED",
+             "LITELLM_SPEND_MAX_ROWS",
+             "LITELLM_SPEND_TIMEOUT", "LITELLM_CB_THRESHOLD",
+             "LITELLM_CB_COOLDOWN", "LITELLM_SPEND_MAX_BYTES")
+    for knob in knobs:
+        assert hasattr(config, knob), f"config missing {knob}"
+    env_ex = (ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for var in knobs:
+        assert var in env_ex, f".env.example missing {var}"
+        assert var in readme, f"README missing {var}"
+
+
+def test_litellm_heavy_parse_runs_off_event_loop():
+    """The /spend/logs aggregation must be dispatched to a thread (asyncio.to_thread)
+    so a big log pull never blocks the event loop (F2)."""
+    src = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    assert "asyncio.to_thread(" in src and "_parse_spend" in src
+    # the sync parser must not do any awaiting (it runs in a worker thread)
+    parser = src.split("def _parse_spend(", 1)[1].split("\ndef ", 1)[0]
+    assert "await" not in parser, "_parse_spend must be pure/synchronous"
+
+
+def test_version_is_1_0_3():
+    assert config.VERSION == "AI-Monitoring_1.0.3"
+
+
+def test_ux_improvements_present():
+    """v1.0.1 UX: status strip, metric tooltips, served-by tags, stale-clock
+    colouring, and the 'connecting…' state are all wired."""
+    html = WEB.read_text(encoding="utf-8")
+    assert 'id="status-strip"' in html and "function renderStrip" in html
+    assert "const HELP=" in html and "HELP[label]" in html
+    assert "function servedBy(" in html and 'class="srv"' in html
+    assert 'age>=60?"var(--bad)"' in html and "age>=15" in html
+    assert "function errText(" in html and "connecting…" in html
+    assert 'class="info"' in html and "unified memory" in html
+    assert "request throughput is on the LiteLLM page" in html
+    ll = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "function servedBy(" in ll and 'class="srv"' in ll
+
+
+def test_overview_metrics_full_width_layout():
+    """Metrics-over-time must be a full-width block row — not a grid item relying on
+    the unreliable auto-fit `grid-column:1/-1`. main is a flex column, small cards
+    live in a nested .grid, the wide charts stack full-width."""
+    html = WEB.read_text(encoding="utf-8")
+    assert "display:flex" in html and "flex-direction:column" in html   # main = stack
+    assert 'class="grid"' in html and 'class="grid-wide"' in html
+    assert "grid-column:1/-1" not in html               # the removed quirk-prone hack
+    m = re.search(r'<section class="([^"]*)" id="card-charts"', html)
+    assert m and "span-2" not in m.group(1), "card-charts must be a full-width block, not span-2"
+
+
+def test_gpu_vram_tiles_hide_on_unified_memory():
+    """When a GPU has no dedicated VRAM (unified memory → vram_total null), the
+    dashboard hides the VRAM KPI tile + the VRAM over-time chart tiles."""
+    html = WEB.read_text(encoding="utf-8")
+    assert "hasVram" in html                       # the guard
+    assert 'card.id = cfg.id + "-card"' in html     # chart tiles are addressable
+    assert '"c-vram-card","c-vpct-card"' in html    # VRAM charts toggled off
+
+
+def test_top_apps_is_top_10():
+    """Top-apps tables + over-time charts show 10 (not 5), with enough distinct
+    colors for 10 lines."""
+    html = WEB.read_text(encoding="utf-8")
+    assert "Top 10 apps · CPU" in html and "Top 10 apps · RAM" in html
+    assert "Top 5 apps" not in html
+    assert "procs.sample, 10" in (ROOT / "app.py").read_text(encoding="utf-8")
+    colors = re.search(r"PROC_COLORS=\[([^\]]*)\]", html, re.S)
+    assert colors and colors.group(1).count("#") >= 10, "need ≥10 colors for 10 lines"
+
+
+def test_container_card_shows_down_duration():
+    """A stopped/removed container must still render (as down) with how long it's
+    been down — the card can't silently drop containers."""
+    html = WEB.read_text(encoding="utf-8")
+    r = html.split("function renderContainers", 1)[1].split("\nfunction ", 1)[0]
+    assert "down_s" in r and "fmtDur(x.down_s" in r
+    assert 'dot down' in r                      # red dot for not-running
+    assert "uptime / down" in r                 # column header
+    # small show/hide-exited toggle, persisted
+    assert 'id="cont-toggle"' in r and "aimon_show_exited" in html
+    assert "exited (" in r and "_showExited" in html
+    # default = exited hidden (only running shown until the user opts in)
+    assert '(localStorage.getItem("aimon_show_exited") ?? "0") === "1"' in html
+
+
+def test_vram_charts_removed_on_unified_memory():
+    """VRAM used/% charts are gone — GB10 unified memory reports no separate VRAM,
+    so those tiles were permanently empty. (KPIs stay, guarded by vram_total.)"""
+    for name in ("index", "gpu"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        charts = html.split("const CHARTS", 1)[1].split("];", 1)[0]
+        assert 'key:"vram_used"' not in charts, f"{name}: VRAM used chart still present"
+        assert 'key:"vram_pct"' not in charts, f"{name}: VRAM % chart still present"
+
+
+def test_empty_charts_auto_hidden():
+    """Every charted dashboard hides a tile whose metric has no data in the window
+    (e.g. LiteLLM latency under spend_mode=lite) — self-healing when data returns."""
+    for name in ("index", "gpu", "litellm", "llamacpp"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'cfg.id+"-card"' in html, f"{name}: chart tiles have no -card id"
+        assert 'pts.some(p=>p[cfg.key]!=null)' in html, f"{name}: no all-null hide"
+
+
+def test_health_probe_fully_removed():
+    """The deployment-probing /health call must NOT exist anywhere — it can freeze
+    a unified-memory box. (Cheap /health/liveliness + /health/backlog stay.)"""
+    ll = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    assert "_do_health" not in ll
+    assert 'f"{base}/health"' not in ll and "/health," not in ll
+    assert "LITELLM_HEALTH_ENABLED" not in (ROOT / "config.py").read_text(encoding="utf-8")
+    for page in ("index.html", "litellm.html"):
+        html = (ROOT / "web" / page).read_text(encoding="utf-8")
+        assert 'kpi("Healthy"' not in html and 'kpi("Unhealthy"' not in html
+        assert "l.healthy" not in html and "l.unhealthy" not in html
+    # the cheap probes remain
+    assert "/health/liveliness" in ll and "/health/backlog" in ll
+
+
+def test_litellm_load_shed_wired():
+    """Load-shedding must gate both heavy calls and be fed the host load."""
+    import config
+    assert hasattr(config, "LITELLM_LOAD_SHED")
+    ll = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    assert "def _load_shed(" in ll and "def note_load(" in ll
+    assert ll.count("_load_shed()") >= 2        # gates /health AND /spend/logs
+    app = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "litellm.note_load(_load_per_core(snap))" in app
+
+
+def test_container_monitoring_wired():
+    """Container liveness/alive-time feature is fully wired: config knob, collector,
+    decoupled backend loop, snapshot inclusion, and the dashboard card + renderer."""
+    import config
+    assert hasattr(config, "MONITOR_CONTAINERS") and hasattr(config, "DOCKER_SOCKET")
+    assert (ROOT / "collectors" / "containers.py").exists()
+    appsrc = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "containers" in appsrc and '_backend_loop(\n            "containers"' in appsrc \
+        or '"containers"' in appsrc            # loop + snapshot
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="card-containers"' in html and "renderContainers(" in html
+    assert "fmtDur(" in html                   # alive-time formatting
+    env_ex = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "MONITOR_CONTAINERS" in env_ex
+
+
+def test_app_uses_typed_appkeys():
+    """App state uses typed web.AppKey (aiohttp-recommended), not deprecated string
+    keys — avoids NotAppKeyWarning + gives type safety."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "web.AppKey(" in src
+    for legacy in ('app["session"]', 'app["sampler"]', 'app["backends"]',
+                   'request.app["session"]'):
+        assert legacy not in src, f"legacy string app key still present: {legacy}"
+
+
+def test_db_connect_is_closing_context_manager():
+    """_connect() must be a commit-and-CLOSE context manager (sqlite's own
+    `with conn:` never closes → ResourceWarning leak)."""
+    src = (ROOT / "db.py").read_text(encoding="utf-8")
+    cm = src.split("def _connect(", 1)[1].split("\ndef ", 1)[0]
+    assert "@contextmanager" in src.split("def _connect(", 1)[0][-60:]
+    assert "conn.close()" in cm and "conn.commit()" in cm and "conn.rollback()" in cm
+
+
+def test_backends_decoupled_from_host_sampling():
+    """The main sampler must not await ANY blocking collector inline — HTTP
+    backends AND gpu (a subprocess that can wedge) run in their own loops, so
+    nothing can stall host/procs (the stale-data / wedged-loop bug)."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    body = src.split("async def _sample_once", 1)[1].split("\nasync def ", 1)[0]
+    for call in ("litellm.sample(", "ollama.sample(", "llamacpp.sample(",
+                 "gpu.sample("):
+        assert call not in body, f"_sample_once must not call {call} inline"
+    assert "_backend_loop(" in src and '"backends"' in src
+    # host/procs (pure /proc, non-blocking) are still sampled fresh every tick
+    assert "host.sample" in body and "procs.sample" in body
+
+
+def test_sampler_loops_are_wedge_proof():
+    """Every place a collector is awaited must be time-bounded so a hung call
+    (wedged nvidia-smi, slow proxy) can NEVER freeze the loop forever — the bug
+    that left host CPU/RAM frozen at the load-spike moment."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    # backend loops bound each sample with wait_for
+    bl = src.split("async def _backend_loop", 1)[1].split("\nasync def ", 1)[0]
+    assert "asyncio.wait_for(" in bl and "TimeoutError" in bl
+    # the main tick is itself watchdogged
+    loop = src.split("async def _sampling_loop", 1)[1].split("\nasync def ", 1)[0]
+    assert "asyncio.wait_for(_sample_once(" in loop
+    # gpu is sampled through the bounded backend machinery, not inline
+    assert "_gpu_sample" in src and '_backend_loop("gpu"' in src
+
+
+def test_litellm_heavy_calls_freeze_safe():
+    """Guard the anti-freeze properties so they can't silently regress: the heavy
+    /spend/logs call is behind a circuit breaker, with json.loads off the event
+    loop and a response size cap."""
+    src = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    # circuit breaker gates the heavy call
+    assert "_cb_open(" in src and "_cb_record(" in src
+    # json.loads happens inside the thread-run parser, never on the loop
+    assert "def _parse_spend_bytes(" in src
+    loop_side = src.split("async def _heavy_sample", 1)[1].split("def _parse_spend_bytes", 1)[0]
+    assert "json.loads(" not in loop_side, "json.loads() must run off the event loop"
+    # size cap enforced before deserialize
+    assert "LITELLM_SPEND_MAX_BYTES" in src and "too_big" in src
+
+
+def test_alerts_module_webhook_only():
+    src = (ROOT / "alerts.py").read_text(encoding="utf-8")
+    assert "ALERT_WEBHOOK_URL" in src
+    # other channels removed
+    for ch in ("TELEGRAM", "DISCORD", "SLACK", "SMTP", "_send_email"):
+        assert ch not in src, f"alerts.py still references removed channel {ch}"
+    # recovery + debounce behavior intact
+    assert "recovered" in src and "_due" in src
+
+
+def test_litellm_page_exists_and_secure():
+    page = ROOT / "web" / "litellm.html"
+    assert page.exists(), "second LiteLLM dashboard missing"
+    html = page.read_text(encoding="utf-8")
+    # dedicated LiteLLM time-series charts (Ollama lives on its own /ollama page)
+    for key in ('"wait"', '"reqrate"', '"tok_in"', '"tok_out"', '"errrate"',
+                '"costrate"', '"backlog"', '"p50"', '"p95"', '"p99"', '"conc"'):
+        assert key in html, f"litellm page missing chart {key}"
+    assert "SLO" in html   # SLO tile
+    # strict separation: no Ollama panels/charts on the LiteLLM page
+    assert "renderOllama" not in html and 'id="card-ollama"' not in html
+    assert '"orun"' not in html and '"ovram"' not in html
+    # top-10 API keys bar chart
+    assert 'id="keys-chart"' in html and "renderKeys" in html
+    # load-vs-impact correlation chart (req/s vs GPU/KV/llama-CPU) + loader
+    assert 'id="impact-chart"' in html and "loadImpact" in html
+    assert 'id="card-impact"' in html
+    # per-model resource cost columns sourced from the procs collector
+    assert "svcProc" in html and "svc CPU" in html and "svc RAM" in html
+    assert 'type:"bar"' in html
+    # top-10 keys OVER TIME — multi-line, one color per key
+    assert 'id="keytime-chart"' in html and "loadKeyTime" in html
+    assert "/api/keyseries" in html and "KEY_COLORS" in html
+    # per-key anomaly panel
+    assert 'id="card-anomalies"' in html and "loadAnomalies" in html
+    assert "/api/anomalies" in html
+    # failed-request viewer (#2) + concurrency-vs-latency (#1) + per-model SLO (#3)
+    assert 'id="card-failures"' in html and "renderFailures" in html
+    assert 'id="corr-chart"' in html and "loadCorr" in html
+    assert "p95" in html and "SLO" in html
+    # same §17 invariants as the main dashboard
+    assert html.count("function escapeHtml") == 1
+    assert len(re.findall(r'innerHTML\s*=', html)) == 1
+    assert "DOMPurify.sanitize" in html
+    assert "_timers.forEach(clearInterval)" in html
+    # cross-links between the two dashboards
+    assert '/litellm' in (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_alerts_module_covers_anomaly_channel():
+    # anomalies flow through the same notifier (extra_breaches path)
+    src = (ROOT / "alerts.py").read_text(encoding="utf-8")
+    assert "extra_breaches" in src
+    anom = (ROOT / "anomaly.py").read_text(encoding="utf-8")
+    assert "spike" in anom and "budget" in anom
+
+
+def test_alerts_page_exists_and_secure():
+    page = ROOT / "web" / "alerts.html"
+    assert page.exists(), "alerts dashboard missing"
+    html = page.read_text(encoding="utf-8")
+    assert "Send test alert" in html and "/api/alerts/test" in html
+    assert "/api/alerts" in html and "Channels" in html and "Alert history" in html
+    # §17 invariants
+    assert html.count("function escapeHtml") == 1
+    assert len(re.findall(r'innerHTML\s*=', html)) == 1
+    assert "DOMPurify.sanitize" in html
+    assert "_timers.forEach(clearInterval)" in html
+    assert '/alerts' in (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_gpu_page_exists_and_secure():
+    page = ROOT / "web" / "gpu.html"
+    assert page.exists(), "GPU dashboard missing"
+    html = page.read_text(encoding="utf-8")
+    # vram_pct / vram_used charts removed — unified-memory GPUs report no VRAM
+    for key in ('"gpu"', '"power"', '"gtemp"', '"tokwatt"'):
+        assert key in html, f"gpu page missing chart {key}"
+    assert html.count("function escapeHtml") == 1
+    assert len(re.findall(r'innerHTML\s*=', html)) == 1
+    assert "DOMPurify.sanitize" in html
+    assert "_timers.forEach(clearInterval)" in html
+    assert '/gpu' in (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_ollama_page_exists_and_secure():
+    page = ROOT / "web" / "ollama.html"
+    assert page.exists(), "Ollama dashboard missing"
+    html = page.read_text(encoding="utf-8")
+    for key in ('"orun"', '"oram"', '"ovram"'):
+        assert key in html, f"ollama page missing chart {key}"
+    assert "Active running models" in html   # the requested view
+    assert html.count("function escapeHtml") == 1
+    assert len(re.findall(r'innerHTML\s*=', html)) == 1
+    assert "DOMPurify.sanitize" in html
+    assert "_timers.forEach(clearInterval)" in html
+    assert '/ollama' in (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_deploy_helpers_present():
+    assert (ROOT / "deploy" / "tunnel.sh").exists()
+    assert (ROOT / "deploy" / "ai-monitoring.container.service").exists()
+    assert (ROOT / "deploy" / "build-multiarch.sh").exists()
+    assert (ROOT / "deploy" / "docker-compose.server.yml").exists()
+
+
+def test_docs_present_and_current():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    arch = (ROOT / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert len(readme) > 2000 and len(arch) > 1500, "docs too thin"
+    # README documents every dashboard route + the config sections
+    for k in ("/litellm", "/gpu", "/ollama", "/alerts", "Configuration",
+              "Retention", "Deployment", "Security"):
+        assert k in readme, f"README missing '{k}'"
+    # every .env-facing config var (from .env.example) is documented in README
+    env_vars = [ln.split("=", 1)[0] for ln in
+                (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+                if ln and not ln.startswith("#") and "=" in ln]
+    for var in ("MONITOR_DASHBOARD_TOKEN", "ROLLUP_HOUR_DAYS", "ANOMALY_FACTOR",
+                "ALERT_WEBHOOK_URL", "GPU_SSH", "SLO_LATENCY_MS"):
+        assert var in env_vars, f".env.example lost {var}"
+        assert var in readme, f"README missing config var {var}"
+
+
+def test_startup_selfcheck_clean():
+    # the per-run boot smoke check must pass in a healthy checkout
+    import app
+    assert app.startup_selfcheck() == []
+
+
+def test_dockerfile_gates_build_on_tests():
+    # QA must run on every build: a `test` stage runs pytest and the runtime
+    # stage depends on its marker, so a regression fails `docker build`.
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "AS test" in df and "pytest" in df
+    assert "COPY --from=test /qa-passed" in df
+
+
+def test_every_metric_column_charted_somewhere():
+    # regression guard: any new db metric column must appear as a chart key in
+    # at least one dashboard, else it silently never gets graphed.
+    import db
+    pages = "".join(p.read_text(encoding="utf-8")
+                    for p in (ROOT / "web").glob("*.html"))
+    # unified-memory GPUs (GB10) report no separate VRAM → these columns are
+    # still collected (ollama fallback / alerts) but intentionally uncharted.
+    for col in db._METRIC_COLS:
+        if col in ("vram_total", "vram_used", "vram_pct"):
+            continue
+        assert f'"{col}"' in pages, f"metric {col} has no chart on any dashboard"
+
+
+def test_llm_cards_hidden_by_default():
+    # rules: with no backend the LLM panels must not show — hidden until configured
+    html = WEB.read_text(encoding="utf-8")
+    for cid in ("card-litellm", "card-ollama", "card-llamacpp"):
+        m = re.search(rf'id="{cid}"[^>]*style="display:none"', html)
+        assert m, f"{cid} must default to display:none"
+    # and rendering is gated on isConfigured
+    assert html.count("isConfigured(") >= 3
+
+
+# ------------------------------------------------------ container hardening ---
+def test_dockerfile_nonroot_and_healthcheck():
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(r'^USER\s+monitor', df, re.M), "container must run non-root"
+    assert "HEALTHCHECK" in df
+    assert "/healthz" in df
+
+
+def test_dockerfile_alpine_multiarch_hardened():
+    # Alpine base (0 HIGH/CRITICAL vs 11 on Debian slim) + multi-arch build knobs
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "python:3.12-alpine" in df, "base must be Alpine (vuln-minimal)"
+    assert "ARG RUN_TESTS" in df, "cross-arch builds need a test-skip toggle"
+    assert "--upgrade pip" in df, "pip must be upgraded (clears pip CVEs)"
+    assert "adduser" in df and "USER monitor" in df   # non-root on BusyBox
+    assert (ROOT / "deploy" / "build-multiarch.sh").exists()
+
+
+def test_dockerfile_copies_every_top_level_module():
+    # guard: every top-level .py the app imports must be COPYed into the image
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    for mod in ("config.py", "db.py", "app.py", "alerts.py", "anomaly.py"):
+        assert mod in df, f"Dockerfile does not COPY {mod} — container will crash"

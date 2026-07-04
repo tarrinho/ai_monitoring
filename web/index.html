@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring</title>
+<link rel="icon" href="/assets/favicon.svg">
+<script src="/assets/chart.umd.min.js"></script>
+<script src="/assets/purify.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149;
+  }
+  html[data-theme="light"]{
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eaeef2; --line:#d0d7de;
+    --fg:#1f2328; --muted:#59636e; --accent:#0969da; --ok:#1a7f37;
+    --warn:#9a6700; --bad:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body,.card,#sidebar,header{transition:background-color .2s ease,border-color .2s ease,color .2s ease}
+  .card:hover{border-color:var(--muted)}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .ver{color:var(--muted);font-size:12px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);
+    display:inline-block;margin-right:5px}
+  .dot.up{background:var(--ok)} .dot.down{background:var(--bad)}
+  #updated{margin-left:auto;color:var(--muted);font-size:12px}
+  /* main is a vertical stack; small cards go in a nested .grid, the wide
+     over-time charts are full-width block rows (no auto-fit 1/-1 quirk). */
+  main{padding:18px;display:flex;flex-direction:column;gap:16px}
+  .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));align-items:start}
+  .grid-wide{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+  .ram-banner{display:none;background:#f8514922;border:1px solid var(--bad);border-radius:10px;
+    padding:10px 14px;font-size:13px;margin-bottom:4px;color:var(--fg)}
+  .ram-banner b{color:var(--bad)}
+  .host-spark{height:132px;margin-top:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px}
+  .card h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;
+    letter-spacing:.05em;color:var(--muted);display:flex;align-items:center;
+    justify-content:space-between}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px}
+  .kpi{background:var(--panel2);border-radius:8px;padding:10px 12px}
+  .kpi .v{font-size:22px;font-weight:600}
+  .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
+  .kpi .v.warn{color:var(--warn)} .kpi .v.bad{color:var(--bad)}
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+  th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .chart-wrap{height:180px;margin-top:6px}
+  .unavail{color:var(--muted);font-style:italic;padding:6px 0}
+  .proc-total{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);
+    font-size:12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .mut{color:var(--muted)}
+  .cont-foot{margin-top:8px;text-align:right}
+  .mini-btn{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer}
+  .mini-btn:hover{color:var(--fg);border-color:var(--accent)}
+  /* at-a-glance status strip (one dot per backend + key live numbers) */
+  .strip{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:9px 14px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;font-size:12px}
+  .strip .s{display:flex;align-items:center;gap:5px;color:var(--muted);white-space:nowrap}
+  .strip .s b{color:var(--fg);font-weight:600}
+  .strip .sep{width:1px;align-self:stretch;background:var(--line)}
+  /* served-by tag on model names */
+  .srv{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;
+    padding:0 6px;margin-left:6px;vertical-align:middle}
+  .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
+  .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
+  .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
+  .windows{display:flex;gap:4px;margin-left:16px}
+  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
+  .span-2{grid-column:span 2}
+  @media(max-width:720px){.span-2{grid-column:span 1}}
+  .chart-grid{display:grid;gap:12px;
+    grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  /* collapsible chart groups (Host / GPU / LLM) */
+  #chart-grid{display:block}
+  .chart-group{margin-bottom:14px}
+  .group-hd{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;
+    padding:6px 2px 8px;color:var(--fg);font-size:12px;font-weight:700;
+    text-transform:uppercase;letter-spacing:.05em}
+  .group-hd:hover{color:var(--accent)}
+  .group-hd .caret{font-size:10px;color:var(--muted);width:10px;transition:color .15s}
+  .group-hd:hover .caret{color:var(--accent)}
+  .chart-group.collapsed .chart-grid{display:none}
+  .mini{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+  .mini h3{margin:0 0 4px;font-size:12px;color:var(--muted);font-weight:500;
+    display:flex;justify-content:space-between}
+  .mini h3 .cur{color:var(--fg);font-variant-numeric:tabular-nums}
+  .mini .chart-wrap{height:140px;margin:0}
+
+  /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:600px){
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
+</style>
+<script>
+/* day/night — applied on every page; choice shared via localStorage */
+(function(){var KEY="aimon-theme";
+  var t=localStorage.getItem(KEY)||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){var b=document.getElementById("theme-btn");
+    if(b)b.textContent=document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  document.addEventListener("DOMContentLoaded",function(){
+    var b=document.getElementById("theme-btn"); if(!b)return; icon();
+    b.addEventListener("click",function(){
+      var cur=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+      document.documentElement.setAttribute("data-theme",cur);
+      localStorage.setItem(KEY,cur); icon();});
+    /* hide dashboard links for unconfigured backends */
+    try{
+      var tok=new URLSearchParams(location.search).get("token");
+      fetch("/api/nav"+(tok?("?token="+encodeURIComponent(tok)):""),
+        {headers:tok?{Authorization:"Bearer "+tok}:{}})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(n){ if(!n)return;
+          [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+            if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
+              .forEach(function(a){a.style.display="none";});
+          });
+        }).catch(function(){});
+      // live alert indicator on the sidebar "Alerts" item (from any page)
+      function _alertDot(){
+        var tk=new URLSearchParams(location.search).get("token");
+        fetch("/api/alerts"+(tk?("?token="+encodeURIComponent(tk)):""),
+          {headers:tk?{Authorization:"Bearer "+tk}:{}})
+          .then(function(r){return r.ok?r.json():null;})
+          .then(function(d){ if(!d)return;
+            var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+            if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
+          }).catch(function(){});
+      }
+      _alertDot(); setInterval(_alertDot, 10000);
+    }catch(e){}
+  });
+})();
+</script>
+</head>
+<body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.0.3</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/gpu">GPU</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
+<header>
+  <h1>Overview</h1>
+  <span class="ver" id="ver"></span>
+  <div class="windows" id="windows">
+    <button id="nav-left" title="shift earlier">◀</button>
+    <button data-w="15m">15m</button>
+    <button data-w="1h" class="active">1h</button>
+    <button data-w="24h">24h</button>
+    <button data-w="30d">30d</button>
+    <button id="nav-right" title="shift later" disabled>▶</button>
+    <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
+  </div>
+  <span id="updated">connecting…</span>
+  <button id="theme-btn" class="badge" title="toggle day / night"
+    style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
+</header>
+<main>
+  <div id="status-strip" class="strip"><span class="mut">connecting…</span></div>
+  <div id="ram-banner" class="ram-banner"></div>
+  <div class="grid">
+  <section class="card" id="card-host">
+    <h2>Host <span id="host-badge" class="badge"></span></h2>
+    <div class="kpis" id="host-kpis"></div>
+    <div class="host-spark"><canvas id="host-spark"></canvas></div>
+  </section>
+
+  <section class="card" id="card-gpu" style="display:none">
+    <h2>GPU <span id="gpu-badge" class="badge"></span></h2>
+    <div class="kpis" id="gpu-kpis"></div>
+    <div id="gpu-list"></div>
+  </section>
+
+  <section class="card" id="card-uptime">
+    <h2>Uptime <span class="badge" id="uptime-win">24h</span></h2>
+    <div id="uptime-body"><div class="unavail">no backend history yet</div></div>
+  </section>
+
+  <section class="card" id="card-containers" style="display:none">
+    <h2>Containers <span class="badge" id="containers-badge"></span></h2>
+    <div id="containers-body"><div class="unavail">sampling…</div></div>
+  </section>
+
+  <section class="card" id="card-topcpu">
+    <h2>Top 10 apps · CPU <span class="badge" id="topcpu-badge"></span></h2>
+    <div id="topcpu-body"><div class="unavail">sampling…</div></div>
+  </section>
+
+  <section class="card" id="card-topram">
+    <h2>Top 10 apps · RAM</h2>
+    <div id="topram-body"><div class="unavail">sampling…</div></div>
+  </section>
+  </div><!-- /.grid -->
+
+  <div class="grid-wide">
+  <section class="card" id="card-cpuevo">
+    <h2>Top-CPU apps over time — <span id="cpuevo-win">1h</span></h2>
+    <div class="chart-wrap" style="height:240px"><canvas id="cpuevo-chart"></canvas></div>
+  </section>
+
+  <section class="card" id="card-ramevo">
+    <h2>Top-RAM apps over time — <span id="ramevo-win">1h</span></h2>
+    <div class="chart-wrap" style="height:240px"><canvas id="ramevo-chart"></canvas></div>
+  </section>
+  </div><!-- /.grid-wide -->
+
+  <section class="card" id="card-charts">
+    <h2>Metrics over time — <span id="win-label">1h</span>
+      <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
+    </h2>
+    <div class="chart-grid" id="chart-grid"></div>
+  </section>
+
+  <section class="card" id="card-litellm" style="display:none">
+    <h2>LiteLLM <span id="litellm-badge" class="badge"></span></h2>
+    <div class="kpis" id="litellm-kpis"></div>
+    <div id="litellm-models"></div>
+  </section>
+
+  <section class="card" id="card-ollama" style="display:none">
+    <h2>Ollama <span id="ollama-badge" class="badge"></span></h2>
+    <div class="mut" style="font-size:11px;margin:-4px 0 6px">loaded-model memory — request throughput is on the LiteLLM page</div>
+    <div class="kpis" id="ollama-kpis"></div>
+    <div id="ollama-models"></div>
+  </section>
+
+  <section class="card" id="card-llamacpp" style="display:none">
+    <h2>llama.cpp <span id="llamacpp-badge" class="badge"></span></h2>
+    <div class="kpis" id="llamacpp-kpis"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// ---- security helpers (rules.md §17) --------------------------------------
+function escapeHtml(s){
+  if(s===null||s===undefined) return "";
+  return String(s).replace(/[&<>"']/g,c=>(
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function setHtml(el, html){ el.innerHTML = DOMPurify.sanitize(html); }
+const _timers = [];               // every interval tracked + cleared on unload
+window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
+
+// ---- formatting ------------------------------------------------------------
+function bytes(n){
+  if(!n) return "0 B";
+  const u=["B","KB","MB","GB","TB"]; let i=0; n=Number(n);
+  while(n>=1024&&i<u.length-1){n/=1024;i++;}
+  return n.toFixed(i?1:0)+" "+u[i];
+}
+function fmtDur(s){
+  if(s==null) return "—";
+  s=Math.floor(s); const d=Math.floor(s/86400); s%=86400;
+  const h=Math.floor(s/3600); s%=3600; const m=Math.floor(s/60);
+  if(d>0) return d+"d "+h+"h";
+  if(h>0) return h+"h "+m+"m";
+  if(m>0) return m+"m";
+  return Math.floor(s)+"s";
+}
+// hover help so jargon KPIs explain themselves (title= tooltips)
+const HELP={
+  "CPU":"Host CPU utilisation across all cores","Memory":"Host RAM used ÷ total",
+  "Mem used":"Host RAM in use","Disk":"Root filesystem usage",
+  "Load 1m":"1-minute load average (runnable + uninterruptible tasks)","CPUs":"Logical core count",
+  "GPU util":"GPU compute utilisation","VRAM used":"GPU memory in use / total",
+  "Power":"GPU power draw","Temp":"Hottest GPU sensor","Throttled":"GPU clock-throttling (thermal/power)","GPUs":"Number of GPUs",
+  "Backlog":"LiteLLM in-flight requests waiting to dispatch",
+  "Wait avg":"Avg LLM response time (from spend logs)","Wait max":"Slowest response in the window",
+  "Reqs (win)":"Requests in the rolling window",
+  "Slots active":"llama.cpp inference slots in use / total","Tokens/s":"llama.cpp generation throughput","Ctx":"llama.cpp context window size",
+  "Running":"Ollama models currently loaded in memory","Installed":"Ollama models available to load",
+  "RAM":"Loaded-model RAM (not request throughput)","VRAM":"Loaded-model VRAM",
+};
+function kpi(label,val,cls){
+  const t=HELP[label]?` title="${escapeHtml(HELP[label])}"`:"";
+  return `<div class="kpi"${t}><div class="v ${cls||""}">${escapeHtml(val)}</div>`
+       + `<div class="l">${escapeHtml(label)}</div></div>`;
+}
+// which backend serves a LiteLLM model id, from its prefix
+function servedBy(model){
+  const m=String(model||"").toLowerCase();
+  if(m.startsWith("ollama/")) return "ollama";
+  if(m.startsWith("llama-cpp/")||m.startsWith("llamacpp/")||m.startsWith("llama_cpp/")) return "llama.cpp";
+  if(m.includes("/")) return m.split("/")[0];
+  return "";
+}
+// friendly collector error text ("starting" -> "connecting…")
+function errText(e){ return e==="starting" ? "connecting…" : (e||"unconfigured"); }
+function badge(el, up, textUp, textDown){
+  el.className = "badge " + (up?"ok":"bad");
+  el.textContent = up ? (textUp||"up") : (textDown||"down");
+}
+// A backend panel is shown only when that backend is configured. An
+// unconfigured backend (no URL/key) is hidden entirely; a configured-but-down
+// backend stays visible with a red badge so failures are not silently hidden.
+function showCard(id, visible){
+  const el = document.getElementById(id);
+  if(el) el.style.display = visible ? "" : "none";
+}
+function isConfigured(obj){
+  return !!obj && !(obj.available===false && obj.error==="unconfigured");
+}
+
+// ---- charts: one graph per characteristic (series-driven, windowed) --------
+// Each characteristic gets its own line chart, all sharing the window selector.
+const CHARTS = [
+  {g:"Host", id:"c-cpu",  key:"cpu",       label:"CPU %",        color:"#58a6ff", max:100, unit:"%"},
+  {g:"Host", id:"c-mem",  key:"mem",       label:"Memory %",     color:"#3fb950", max:100, unit:"%"},
+  {g:"Host", id:"c-disk", key:"disk",      label:"Disk %",       color:"#56d4dd", max:100, unit:"%"},
+  {g:"Host", id:"c-load", key:"load1",     label:"Load (1m)",    color:"#e3b341"},
+  {g:"GPU",  id:"c-gpu",  key:"gpu",       label:"GPU %",        color:"#bc8cff", max:100, unit:"%"},
+  {g:"GPU",  id:"c-pow",  key:"power",     label:"GPU power (W)",color:"#ffa657", unit:" W"},
+  {g:"GPU",  id:"c-gtemp",key:"gtemp",     label:"GPU temp (°C)",color:"#ff7b72", unit:"°"},
+  {g:"LLM",  id:"c-slots",key:"slots",     label:"Busy slots",   color:"#79c0ff"},
+  {g:"LLM",  id:"c-conc", key:"conc",      label:"Concurrent work",color:"#a371f7"},
+  {g:"LLM",  id:"c-wait", key:"wait",      label:"LLM wait (ms)",color:"#d29922", unit:" ms"},
+  {g:"LLM",  id:"c-ttft", key:"ttft",      label:"TTFT (ms)",    color:"#ffab70", unit:" ms"},
+  {g:"LLM",  id:"c-tok",  key:"tok",       label:"Tokens/s",     color:"#7ee787"},
+  {g:"LLM",  id:"c-req",  key:"reqrate",   label:"Requests/s",   color:"#a5d6ff"},
+  {g:"LLM",  id:"c-tin",  key:"tok_in",    label:"Prompt tok/s", color:"#39c5cf"},
+  {g:"LLM",  id:"c-tout", key:"tok_out",   label:"Completion tok/s",color:"#26a641"},
+  {g:"LLM",  id:"c-err",  key:"errrate",   label:"Error rate %", color:"#f85149", unit:"%", max:100},
+  {g:"LLM",  id:"c-cost", key:"costrate",  label:"Cost $/h",     color:"#e3b341", unit:" $"},
+  {g:"LLM",  id:"c-kv",   key:"kvcache",   label:"KV-cache %",   color:"#cea5fb", unit:"%", max:100},
+  {g:"LLM",  id:"c-tw",   key:"tokwatt",   label:"Tokens/watt",  color:"#7ee787"},
+  {g:"LLM",  id:"c-bklog",key:"backlog",   label:"LLM Backlog Reqs",color:"#ff9bce"},
+  {g:"LLM",  id:"c-chit", key:"cachehit",  label:"Cache hit %",  color:"#6cb6ff", unit:"%", max:100},
+];
+const _charts = {};
+
+function mkChart(canvas, cfg){
+  const yTick = cfg.bytes
+    ? {color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
+    : {color:"#8b949e",font:{size:9}};
+  return new Chart(canvas, {
+    type:"line",
+    data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
+      backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,
+      tension:.25,fill:true,spanGaps:true}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{intersect:false,mode:"index"},
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+        y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
+  });
+}
+// Build chart cards grouped into collapsible sections (Host / GPU / LLM).
+// DOM API (not innerHTML) keeps the single-sanitized-innerHTML §17 invariant.
+(function buildCharts(){
+  const container = document.getElementById("chart-grid");
+  const GROUPS = ["Host", "GPU", "LLM"];
+  for(const gname of GROUPS){
+    const items = CHARTS.filter(c => c.g === gname);
+    if(!items.length) continue;
+    const sec = document.createElement("div"); sec.className = "chart-group";
+    const hd = document.createElement("div"); hd.className = "group-hd";
+    const caret = document.createElement("span"); caret.className = "caret"; caret.textContent = "▾";
+    const t = document.createElement("span"); t.textContent = gname + " · " + items.length;
+    hd.append(caret, t);
+    const grid = document.createElement("div"); grid.className = "chart-grid";
+    for(const cfg of items){
+      const card = document.createElement("div"); card.className = "mini";
+      card.id = cfg.id + "-card";     // so a chart tile can be hidden (e.g. VRAM on unified-memory GPUs)
+      const h = document.createElement("h3");
+      const nm = document.createElement("span"); nm.textContent = cfg.label;
+      const cur = document.createElement("span"); cur.className = "cur";
+      cur.id = cfg.id + "-cur"; cur.textContent = "—";
+      h.append(nm, cur);
+      const wrap = document.createElement("div"); wrap.className = "chart-wrap";
+      const cv = document.createElement("canvas"); cv.id = cfg.id;
+      wrap.appendChild(cv);
+      card.append(h, wrap);
+      grid.appendChild(card);
+      _charts[cfg.id] = mkChart(cv, cfg);
+    }
+    sec.append(hd, grid);
+    container.appendChild(sec);
+    const KEY = "aimon_g_" + gname;
+    function apply(c){ sec.classList.toggle("collapsed", c); caret.textContent = c ? "▸" : "▾"; }
+    hd.addEventListener("click", function(){
+      const c = !sec.classList.contains("collapsed");
+      apply(c); try{ localStorage.setItem(KEY, c ? "1" : "0"); }catch(e){}
+    });
+    try{ if(localStorage.getItem(KEY) === "1") apply(true); }catch(e){}
+  }
+})();
+
+function fmtT(t){
+  return t ? new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "";
+}
+function fmtCur(cfg, v){
+  if(v==null) return "—";
+  return cfg.bytes ? bytes(v) : (Math.round(v*10)/10) + (cfg.unit||"");
+}
+function lastNonNull(pts, key){
+  for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; }
+  return null;
+}
+
+// ---- render (KPIs from latest snapshot) ------------------------------------
+function renderHost(h){
+  const b=document.getElementById("host-badge");
+  if(!h||!h.available){ badge(b,false);
+    setHtml(document.getElementById("host-kpis"),
+      `<div class="unavail">${escapeHtml((h&&h.error)||"unavailable")}</div>`); return; }
+  badge(b,true,"live");
+  const cpuCls=h.cpu_pct>=90?"bad":h.cpu_pct>=75?"warn":"";
+  const memCls=h.mem_pct>=90?"bad":h.mem_pct>=75?"warn":"";
+  const disk=h.disk||{};
+  setHtml(document.getElementById("host-kpis"),
+    kpi("CPU",h.cpu_pct+"%",cpuCls)+kpi("Memory",h.mem_pct+"%",memCls)
+    +kpi("Mem used",bytes(h.mem_used))+kpi("Disk",(disk.pct||0).toFixed(0)+"%")
+    +kpi("Load 1m",(h.load&&h.load[0]||0).toFixed(2))+kpi("CPUs",h.ncpu));
+  // host RAM-pressure banner (real host state, not a UI glitch)
+  const rb=document.getElementById("ram-banner");
+  if(rb){
+    if(h.mem_pct>=90){
+      rb.style.display="";
+      setHtml(rb,`<b>Host memory ${h.mem_pct}%</b> (${bytes(h.mem_used)} of `
+        +`${bytes(h.mem_total)}) — near capacity. Stop unused containers or reduce `
+        +`model/context size to avoid OOM / CPU-spill.`);
+    } else rb.style.display="none";
+  }
+}
+
+// ---- top apps (processes) by CPU / RAM -------------------------------------
+function renderProcs(p, h){
+  const badge=document.getElementById("topcpu-badge");
+  if(!p||!p.available){
+    badge.className="badge bad"; badge.textContent="n/a";
+    const m=`<div class="unavail">${escapeHtml((p&&p.error)||"unavailable")}</div>`;
+    setHtml(document.getElementById("topcpu-body"),m);
+    setHtml(document.getElementById("topram-body"),m); return;
+  }
+  badge.className="badge ok"; badge.textContent=(p.ncpu||1)+" cpu";
+  const cpu=(p.top_cpu||[]).map(x=>`<tr><td>${escapeHtml(x.app)}</td>`
+    +`<td class="num">${x.cpu}%</td></tr>`).join("");
+  setHtml(document.getElementById("topcpu-body"),
+    cpu?`<table><tr><th>App</th><th class="num">CPU</th></tr>${cpu}</table>`
+       :`<div class="unavail">no CPU activity yet</div>`);
+  const ram=(p.top_ram||[]).map(x=>`<tr><td>${escapeHtml(x.app)}</td>`
+    +`<td class="num">${bytes(x.ram)}</td></tr>`).join("");
+  // system-wide RAM totals give the per-app rows context (top-5 ≠ whole system)
+  const mt=h&&h.mem_total, mu=h&&h.mem_used;
+  const mp=h&&(h.mem_pct!=null?h.mem_pct:(mt?mu/mt*100:0));
+  const memCls=mp>=90?"bad":mp>=75?"warn":"ok";
+  const total=mt?`<div class="proc-total">System RAM `
+      +`<span class="badge ${memCls}">${bytes(mu)} / ${bytes(mt)}</span> `
+      +`<span class="mut">used (${(+mp).toFixed(0)}%)</span>`
+      +`<span class="info" title="Top-5 apps rarely sum to system RAM: huge pages, GPU-pinned / unified memory (e.g. GB10), tmpfs and kernel use aren't per-process RSS.">ⓘ</span></div>`:"";
+  setHtml(document.getElementById("topram-body"),
+    (ram?`<table><tr><th>App</th><th class="num">RAM</th></tr>${ram}</table>`
+        :`<div class="unavail">no data</div>`)+total);
+}
+
+// ---- monitored containers: liveness + alive-time (Docker API) --------------
+let _showExited = (localStorage.getItem("aimon_show_exited") ?? "0") === "1";
+function renderContainers(c){
+  const card=document.getElementById("card-containers");
+  if(!c || !c.available || !(c.containers||[]).length){ card.style.display="none"; return; }
+  card.style.display="";
+  const all=c.containers;
+  const up=all.filter(x=>x.running).length;
+  const exited=all.length-up;
+  const badge=document.getElementById("containers-badge");
+  badge.className="badge "+(up===all.length?"ok":up?"warn":"bad");
+  badge.textContent=up+"/"+all.length+" up";
+  const list = _showExited ? all : all.filter(x=>x.running);
+  const rows=list.map(x=>{
+    const dot=x.running?'<span class="dot up"></span>':'<span class="dot down"></span>';
+    const state=x.running?"up":escapeHtml(x.status||"down");
+    // running -> uptime; stopped/removed -> how long it's been down (last seen)
+    const timec=x.running?fmtDur(x.uptime_s)
+      :(x.down_s!=null?'<span class="mut">down '+fmtDur(x.down_s)+'</span>':"—");
+    return `<tr><td>${dot}${escapeHtml(x.name)}</td>`
+      +`<td class="num ${x.running?"":"mut"}">${state}</td>`
+      +`<td class="num">${timec}</td></tr>`;
+  }).join("");
+  // small show/hide toggle for exited containers (only when there are any)
+  const foot = exited>0
+    ? `<div class="cont-foot"><button id="cont-toggle" class="mini-btn">`
+      +`${_showExited?"hide":"show"} exited (${exited})</button></div>`
+    : "";
+  setHtml(document.getElementById("containers-body"),
+    `<table><tr><th>Container</th><th class="num">state</th>`
+    +`<th class="num">uptime / down</th></tr>${rows}</table>`+foot);
+  const btn=document.getElementById("cont-toggle");
+  if(btn) btn.addEventListener("click",function(){
+    _showExited=!_showExited;
+    try{localStorage.setItem("aimon_show_exited",_showExited?"1":"0");}catch(e){}
+    renderContainers(c);
+  });
+}
+
+// per-app evolution: one colored line per top app (CPU% and RAM bytes)
+const PROC_COLORS=["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff","#ff7b72",
+  "#39c5cf","#ffa657","#7ee787","#d2a8ff"];
+function mkEvo(id, isBytes){
+  const yTick=isBytes?{color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
+                     :{color:"#8b949e",font:{size:9}};
+  return new Chart(document.getElementById(id),{type:"line",
+    data:{labels:[],datasets:[]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{intersect:false,mode:"index"},
+      plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+              y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true}}}});
+}
+const cpuEvo=mkEvo("cpuevo-chart",false), ramEvo=mkEvo("ramevo-chart",true);
+function fillEvo(chart, d, unit){
+  const pts=d.points||[], apps=d.apps||[];
+  chart.data.labels=pts.map(p=>fmtT(p.t));
+  chart.data.datasets=apps.map((a,i)=>({label:a+(unit||""),
+    data:pts.map(p=>p[a]==null?null:p[a]),
+    borderColor:PROC_COLORS[i%PROC_COLORS.length],
+    backgroundColor:PROC_COLORS[i%PROC_COLORS.length]+"22",
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
+  chart.update("none");
+}
+async function loadProcEvo(){
+  document.getElementById("cpuevo-win").textContent=WIN;
+  document.getElementById("ramevo-win").textContent=WIN;
+  const dc=await api("/api/procseries?kind=cpu&window="+WIN);
+  if(dc) fillEvo(cpuEvo, dc, "");
+  const dr=await api("/api/procseries?kind=ram&window="+WIN);
+  if(dr) fillEvo(ramEvo, dr, "");
+}
+function renderGpu(g){
+  const avail=!!(g&&g.available);
+  showCard("card-gpu", avail);   // no GPU CLI => hide (like a missing backend)
+  if(!avail) return;
+  badge(document.getElementById("gpu-badge"),true,(g.mode||"")+" "+(g.vendor||""));
+  const thr = g.throttled ? "bad" : "";
+  // hide the VRAM tile + over-time VRAM charts when the GPU has no dedicated VRAM
+  // (e.g. GB10 unified memory reports [N/A]).
+  const hasVram = g.vram_total!=null && g.vram_total>0;
+  ["c-vram-card","c-vpct-card"].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.style.display = hasVram ? "" : "none";
+  });
+  const vramKpi = hasVram ? kpi("VRAM used",bytes(g.vram_used)+" / "+bytes(g.vram_total)) : "";
+  setHtml(document.getElementById("gpu-kpis"),
+    kpi("GPU util",g.util+"%")+vramKpi
+    +kpi("Power",g.power!=null?g.power+" W":"—")
+    +kpi("Temp",g.temp_max!=null?g.temp_max+"°":"—")
+    +kpi("Throttled",g.throttled?"YES":"no",thr)+kpi("GPUs",g.count));
+  if(g.gpus&&g.gpus.length>1){
+    // per-GPU table only for multi-GPU hosts; a single GPU is already fully
+    // described by the KPI tiles above (name kept as a subtle caption).
+    let rows=g.gpus.map(x=>`<tr><td>${escapeHtml(x.name)}</td>`
+      +`<td class="num">${x.util}%</td>`
+      +`<td class="num">${x.vram_total!=null?bytes(x.vram_used)+" / "+bytes(x.vram_total):"unified"}</td>`
+      +`<td class="num">${x.power!=null?x.power+"W":"—"}</td>`
+      +`<td class="num">${x.temp!=null?x.temp+"°":"—"}</td></tr>`).join("");
+    setHtml(document.getElementById("gpu-list"),
+      `<table><tr><th>GPU</th><th class="num">util</th>`
+      +`<th class="num">VRAM</th><th class="num">pwr</th>`
+      +`<th class="num">temp</th></tr>${rows}</table>`);
+  } else if(g.gpus&&g.gpus.length===1){
+    setHtml(document.getElementById("gpu-list"),
+      `<div class="proc-total mut">${escapeHtml(g.gpus[0].name||"GPU")}`
+      +`${g.gpus[0].vram_total==null?" · unified memory":""}</div>`);
+  } else setHtml(document.getElementById("gpu-list"),"");
+}
+function renderLitellm(l){
+  showCard("card-litellm", isConfigured(l));
+  if(!isConfigured(l)) return;
+  const b=document.getElementById("litellm-badge");
+  if(!l||!l.available){ badge(b,false);
+    setHtml(document.getElementById("litellm-kpis"),
+      `<div class="unavail">${escapeHtml((l&&l.error)||"unconfigured")}</div>`);
+    setHtml(document.getElementById("litellm-models"),""); return; }
+  badge(b,true,"live");
+  setHtml(document.getElementById("litellm-kpis"),
+    kpi("Wait avg", l.wait_avg_ms!=null?l.wait_avg_ms+" ms":"—")
+    +kpi("Wait max", l.wait_max_ms!=null?l.wait_max_ms+" ms":"—")
+    +kpi("Reqs (win)", l.requests_window||0)
+    +kpi("Backlog", l.backlog!=null?l.backlog:"—",(l.backlog>0?"warn":"")));
+  if(l.per_model&&l.per_model.length){
+    let rows=l.per_model.map(m=>{const sb=servedBy(m.model);return `<tr><td>${escapeHtml(m.model)}`
+      +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")+`</td>`
+      +`<td class="num">${m.reqs}</td>`
+      +`<td class="num">${m.wait_avg_ms!=null?m.wait_avg_ms+" ms":"—"}</td>`
+      +`<td class="num">${m.tokens}</td>`
+      +`<td class="num">${m.cost!=null?"$"+m.cost:"—"}</td></tr>`;}).join("");
+    setHtml(document.getElementById("litellm-models"),
+      `<table><tr><th>Model</th><th class="num">reqs</th>`
+      +`<th class="num">wait</th><th class="num">tok</th>`
+      +`<th class="num">cost</th></tr>${rows}</table>`);
+  } else if(l.models&&l.models.length){
+    let rows=l.models.map(m=>{const sb=servedBy(m);return `<tr><td>${escapeHtml(m)}`
+      +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")+`</td></tr>`;}).join("");
+    setHtml(document.getElementById("litellm-models"),
+      `<table><tr><th>Served model</th></tr>${rows}</table>`);
+  } else setHtml(document.getElementById("litellm-models"),"");
+}
+function renderOllama(o){
+  showCard("card-ollama", isConfigured(o));
+  if(!isConfigured(o)) return;
+  const b=document.getElementById("ollama-badge");
+  if(!o||!o.available){ badge(b,false);
+    setHtml(document.getElementById("ollama-kpis"),
+      `<div class="unavail">${escapeHtml((o&&o.error)||"unconfigured")}</div>`);
+    setHtml(document.getElementById("ollama-models"),""); return; }
+  badge(b,true,"live");
+  setHtml(document.getElementById("ollama-kpis"),
+    kpi("Running",o.models_running)+kpi("Installed",o.models_installed)
+    +kpi("RAM",bytes(o.ram_used))+kpi("VRAM",bytes(o.vram_used)));
+  if(o.models&&o.models.length){
+    let rows=o.models.map(m=>`<tr><td>${escapeHtml(m.name)}</td>`
+      +`<td class="num">${bytes(m.size)}</td>`
+      +`<td class="num">${bytes(m.size_vram)}</td></tr>`).join("");
+    setHtml(document.getElementById("ollama-models"),
+      `<table><tr><th>Model</th><th class="num">RAM</th>`
+      +`<th class="num">VRAM</th></tr>${rows}</table>`);
+  } else setHtml(document.getElementById("ollama-models"),
+      `<div class="unavail">no models loaded</div>`);
+}
+function renderLlamacpp(c){
+  showCard("card-llamacpp", isConfigured(c));
+  if(!isConfigured(c)) return;
+  const b=document.getElementById("llamacpp-badge");
+  if(!c||!c.available){ badge(b,false);
+    setHtml(document.getElementById("llamacpp-kpis"),
+      `<div class="unavail">${escapeHtml((c&&c.error)||"unconfigured")}</div>`); return; }
+  badge(b,true,c.status||"live");
+  setHtml(document.getElementById("llamacpp-kpis"),
+    kpi("Slots active",(c.slots_active||0)+" / "+(c.n_slots!=null?c.n_slots:"—"))
+    +kpi("Tokens/s", c.predicted_per_second!=null?c.predicted_per_second:"—")
+    +kpi("Ctx", c.ctx_size!=null?c.ctx_size:"—")
+    +kpi("Status", c.status||"—"));
+}
+
+// ---- poll ------------------------------------------------------------------
+const AUTH = new URLSearchParams(location.search).get("token");
+let TIMEEND=null;
+const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
+let WIN = "1h";
+
+async function api(path){
+  if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
+    path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
+  try{
+    const sep = path.includes("?") ? "&" : "?";
+    const url = path + (AUTH ? (sep+"token="+encodeURIComponent(AUTH)) : "");
+    const r = await fetch(url, {headers: AUTH?{Authorization:"Bearer "+AUTH}:{}});
+    if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
+    return await r.json();
+  }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
+}
+
+function setWinLabels(){
+  const el=document.getElementById("win-label"); if(el) el.textContent=WIN;
+  const uw=document.getElementById("uptime-win"); if(uw) uw.textContent=WIN;
+}
+let _hostSpark=null;
+async function loadSeries(){
+  const d = await api("/api/series?window="+WIN);
+  if(!d) return;
+  const pts = d.points || [];
+  const labels = pts.map(p=>fmtT(p.t));
+  for(const cfg of CHARTS){
+    const ch = _charts[cfg.id];
+    ch.data.labels = labels;
+    ch.data.datasets[0].data = pts.map(p=> (p[cfg.key]==null?null:p[cfg.key]));
+    ch.update("none");
+    const cur = document.getElementById(cfg.id+"-cur");
+    if(cur) cur.textContent = fmtCur(cfg, lastNonNull(pts, cfg.key));
+    // Hide a chart tile that has no data at all in this window (e.g. LiteLLM
+    // latency/rate metrics under spend_mode=lite). Self-healing: it reappears
+    // as soon as the metric produces a value.
+    const card = document.getElementById(cfg.id+"-card");
+    if(card) card.style.display = pts.some(p=>p[cfg.key]!=null) ? "" : "none";
+  }
+  // host CPU/Mem sparkline — fills the Host card so it matches its row's height
+  const hs=document.getElementById("host-spark");
+  if(hs){
+    if(!_hostSpark){
+      _hostSpark=new Chart(hs,{type:"line",
+        data:{labels:[],datasets:[
+          {label:"CPU %",data:[],borderColor:"#58a6ff",backgroundColor:"#58a6ff18",
+           borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true},
+          {label:"Mem %",data:[],borderColor:"#3fb950",backgroundColor:"#3fb95018",
+           borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
+        options:{responsive:true,maintainAspectRatio:false,animation:false,
+          interaction:{intersect:false,mode:"index"},
+          plugins:{legend:{display:true,labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+          scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:5,font:{size:9}},grid:{color:"#30363d33"}},
+                  y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true,max:100}}}});
+    }
+    _hostSpark.data.labels=labels;
+    _hostSpark.data.datasets[0].data=pts.map(p=>p.cpu==null?null:p.cpu);
+    _hostSpark.data.datasets[1].data=pts.map(p=>p.mem==null?null:p.mem);
+    _hostSpark.update("none");
+  }
+  _syncGroupCounts();
+}
+// keep each collapsible group header count in sync with its VISIBLE tiles
+function _syncGroupCounts(){
+  document.querySelectorAll("#chart-grid .chart-group").forEach(function(sec){
+    const total = sec.querySelectorAll(".mini").length;
+    const shown = sec.querySelectorAll(".mini:not([style*='display: none'])").length;
+    const t = sec.querySelector(".group-hd span:last-child");
+    if(t){ const base = t.textContent.split(" · ")[0]; t.textContent = base + " · " + shown; }
+    // a group with every tile hidden collapses out of view entirely
+    sec.style.display = shown ? "" : "none";
+  });
+}
+async function loadUptime(){
+  const d = await api("/api/uptime?window="+WIN);
+  const body = document.getElementById("uptime-body");
+  if(!d || !d.uptime || !Object.keys(d.uptime).length){
+    setHtml(body, `<div class="unavail">no backend history yet</div>`); return; }
+  let rows = Object.entries(d.uptime).map(([b,u])=>{
+    const cls = u.uptime_pct>=99?"":u.uptime_pct>=95?"warn":"bad";
+    return `<tr><td>${escapeHtml(b)}</td>`
+      +`<td class="num v ${cls}">${u.uptime_pct}%</td>`
+      +`<td class="num">${u.outages}</td></tr>`;
+  }).join("");
+  setHtml(body, `<table><tr><th>Backend</th><th class="num">uptime</th>`
+    +`<th class="num">outages</th></tr>${rows}</table>`);
+}
+
+function rangedReload(){ loadSeries(); loadUptime(); loadProcEvo(); }
+function updateRangeUI(){
+  const now=Date.now()/1000;
+  document.getElementById("nav-right").disabled = !TIMEEND;
+  const lbl=document.getElementById("range-lbl");
+  if(!TIMEEND){ lbl.textContent="live"; return; }
+  const m=Math.round((now-TIMEEND)/60);
+  lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
+}
+document.getElementById("nav-left").addEventListener("click",()=>{
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-WSECS[WIN];
+  updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-right").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
+  if(TIMEEND>=Date.now()/1000) TIMEEND=null;
+  updateRangeUI(); rangedReload();
+});
+document.querySelectorAll("#windows button[data-w]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI(); setWinLabels();
+    loadSeries(); loadUptime(); loadProcEvo();
+  });
+});
+document.getElementById("export-btn").addEventListener("click",()=>{
+  const q = "/api/export?window="+WIN+"&format=csv"
+    + (AUTH?("&token="+encodeURIComponent(AUTH)):"");
+  window.open(q, "_blank");
+});
+
+// compact top strip: one dot per backend + the key live numbers
+function renderStrip(c, now){
+  function dot(name, coll, extra){
+    const avail = coll && coll.available;
+    const starting = coll && coll.error==="starting";
+    const cls = avail?"up":(starting?"":"down");
+    const col = avail?"var(--ok)":(starting?"var(--muted)":"var(--bad)");
+    return `<span class="s" title="${escapeHtml(name+": "+(avail?"ok":errText(coll&&coll.error)))}">`
+      +`<span class="dot ${cls}" style="background:${col}"></span>${escapeHtml(name)}${extra||""}</span>`;
+  }
+  const g=c.gpu||{}, ll=c.litellm||{}, lc=c.llamacpp||{};
+  const gpuTxt = g.available&&g.util!=null ? ` <b>${g.util}%</b>` : "";
+  const blTxt = ll.available&&ll.backlog!=null ? ` <b>${ll.backlog}</b>` : "";
+  const slTxt = lc.available&&lc.slots_active!=null ? ` <b>${lc.slots_active}/${lc.n_slots!=null?lc.n_slots:"—"}</b>` : "";
+  setHtml(document.getElementById("status-strip"),
+    dot("host",c.host)+`<span class="sep"></span>`
+    +dot("GPU",c.gpu,gpuTxt)+dot("LiteLLM",c.litellm,blTxt)
+    +dot("Ollama",c.ollama)+dot("llama.cpp",c.llamacpp,slTxt)
+    +dot("containers",c.containers)+`<span class="sep"></span>`
+    +`<span class="s mut">GPU util · LiteLLM backlog · llama.cpp slots</span>`);
+}
+let _sseOk=false, _ver="";
+// render everything that comes from a live snapshot (shared by SSE + poll)
+function applySnapshot(d){
+  if(d.version){ _ver=d.version; }
+  document.getElementById("ver").textContent = _ver||"";
+  const snap = d.latest||{}; const c = snap.collectors||{};
+  renderStrip(c);
+  renderHost(c.host); renderGpu(c.gpu); renderLitellm(c.litellm);
+  renderOllama(c.ollama); renderLlamacpp(c.llamacpp); renderProcs(c.procs, c.host);
+  renderContainers(c.containers);
+  // stale-clock: green(<15s) → amber(<60s) → red, so a frozen sampler is obvious
+  const up=document.getElementById("updated");
+  if(snap.ts){
+    const age=Math.max(0,(d.now||Date.now()/1000)-snap.ts);
+    up.textContent = "updated "+new Date(snap.ts*1000).toLocaleTimeString()
+      +(age>=15?" ("+Math.round(age)+"s ago)":"");
+    up.style.color = age>=60?"var(--bad)":age>=15?"var(--warn)":"var(--muted)";
+  } else { up.textContent="—"; }
+}
+async function tick(){
+  // when SSE is delivering, skip the snapshot poll (SSE covers it); always
+  // refresh the windowed series (not carried over the stream)
+  if(!_sseOk){
+    const d = await api("/api/data?history=1");
+    if(d) applySnapshot(d);
+  }
+  await loadSeries();
+  await loadUptime();
+  await loadProcEvo();
+}
+// live push: one connection replaces the 5s snapshot poll; self-healing — on any
+// SSE error we flip back to polling and the browser auto-reconnects EventSource.
+function startSSE(){
+  if(typeof EventSource==="undefined") return;
+  const url="/api/stream"+(AUTH?("?token="+encodeURIComponent(AUTH)):"");
+  let es; try{ es=new EventSource(url); }catch(e){ return; }
+  es.onmessage=function(ev){
+    try{ applySnapshot({version:_ver, latest:JSON.parse(ev.data), now:Date.now()/1000}); _sseOk=true; }
+    catch(e){}
+  };
+  es.onerror=function(){ _sseOk=false; };
+  window.addEventListener("beforeunload", function(){ try{ es.close(); }catch(e){} });
+}
+setWinLabels();
+tick();
+startSSE();
+_timers.push(setInterval(tick, 5000));
+</script>
+</div>
+<script>
+/* collapsible lateral sidebar — state persisted, active link by path */
+(function(){var KEY="aimon_sb";
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if(a.getAttribute("href")===p)a.classList.add("active");});
+  });
+})();
+</script>
+</body>
+</html>

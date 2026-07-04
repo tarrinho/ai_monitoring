@@ -1,0 +1,200 @@
+# config.py — AI-Monitoring configuration (env-driven, fail-fast).
+#
+# ALL secrets and endpoints come from the environment. Nothing sensitive is
+# hard-coded, logged, or persisted. Missing *required* values fail fast at
+# boot with a clear message (never a silent default).
+from __future__ import annotations
+
+import os
+
+VERSION = "AI-Monitoring_1.0.3"
+
+# --- optional local .env support (dev convenience; no-op if absent) ----------
+try:
+    from dotenv import load_dotenv  # python-dotenv, optional
+    load_dotenv()
+except Exception:
+    pass
+
+
+def _str(name: str, default: str | None = None) -> str | None:
+    v = os.environ.get(name, default)
+    return v.strip() if isinstance(v, str) else v
+
+
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# --- listen / storage --------------------------------------------------------
+MONITOR_HOST = _str("MONITOR_HOST", "0.0.0.0")
+MONITOR_PORT = _int("MONITOR_PORT", 9925)
+DB_PATH      = _str("MONITOR_DB_PATH", "/data/ai-monitoring.db")
+
+# --- sampling / retention ----------------------------------------------------
+SAMPLE_INTERVAL   = _float("MONITOR_SAMPLE_INTERVAL", 5.0)     # seconds
+RETENTION_SAMPLES = _int("MONITOR_RETENTION_SAMPLES", 8640)    # in-mem ring
+DB_RETENTION_HOURS = _int("MONITOR_DB_RETENTION_HOURS", 720)   # on-disk prune
+HTTP_TIMEOUT      = _float("MONITOR_HTTP_TIMEOUT", 4.0)        # per collector call
+
+# --- optional dashboard auth (token gate) ------------------------------------
+# If set, dashboard + data endpoints require  Authorization: Bearer <token>
+# or  ?token=<token>. If unset, dashboard is open (loopback/behind-proxy use).
+DASHBOARD_TOKEN = _str("MONITOR_DASHBOARD_TOKEN")  # optional
+# Brute-force protection on the dashboard token: after AUTH_MAX_FAILS bad tokens
+# from one client IP within AUTH_WINDOW_S seconds, that IP is locked out (429)
+# for AUTH_LOCKOUT_S. Behind a reverse proxy, set AUTH_TRUSTED_PROXY=1 to read the
+# real client IP from X-Forwarded-For (leave 0 if directly exposed, or an attacker
+# can spoof the header to dodge the lockout).
+AUTH_MAX_FAILS   = _int("MONITOR_AUTH_MAX_FAILS", 10)
+AUTH_WINDOW_S    = _float("MONITOR_AUTH_WINDOW_S", 300.0)
+AUTH_LOCKOUT_S   = _float("MONITOR_AUTH_LOCKOUT_S", 900.0)
+AUTH_TRUSTED_PROXY = (_str("MONITOR_AUTH_TRUSTED_PROXY", "0") or "0").lower() in ("1", "true", "yes", "on")
+# Log each collector's availability + error to stderr (docker logs) on startup
+# and whenever it changes — so you can see WHY a panel is missing (e.g. GPU).
+MONITOR_DEBUG = (_str("MONITOR_DEBUG", "0") or "0").lower() in ("1", "true", "yes", "on")
+
+# --- backends (all optional; a missing backend is reported "unconfigured") ---
+# LiteLLM (JSON endpoints only — NO prometheus).
+LITELLM_BASE_URL   = _str("LITELLM_BASE_URL")           # e.g. http://host:4000
+LITELLM_MASTER_KEY = _str("LITELLM_MASTER_KEY")         # Bearer for /spend,/health
+LITELLM_SPEND_WINDOW_MIN = _int("LITELLM_SPEND_WINDOW_MIN", 15)  # latency window
+SLO_LATENCY_MS      = _float("SLO_LATENCY_MS", 2000.0)  # SLO target; % under this
+# Verbose per-call logging for the LiteLLM collector (diagnose empty dashboards).
+LITELLM_DEBUG = (_str("LITELLM_DEBUG", "0") or "0").lower() in ("1", "true", "yes", "on")
+# The two heavy LiteLLM calls — /health (forces a probe of every deployment) and
+# /spend/logs (returns the whole day's request logs) — poll on THIS slower cadence
+# instead of every SAMPLE_INTERVAL, so a busy proxy isn't hammered. Cheap signals
+# (liveliness, backlog, /v1/models) still refresh every sample.
+LITELLM_HEAVY_INTERVAL = _float("LITELLM_HEAVY_INTERVAL", 60.0)  # seconds
+# Escape hatches for a very busy proxy:
+#   *_SPEND_ENABLED=0  -> stop pulling /spend/logs entirely (drops the whole-day
+#                         query + transfer; loses latency/cost/key panels, keeps
+#                         backlog/health/up-down which are cheap).
+#   *_HEALTH_ENABLED=0 -> stop calling /health (no per-deployment probing).
+#   *_SPEND_MAX_ROWS   -> hard cap on rows parsed per poll; only the most recent
+#                         are kept (the window drops older ones anyway). Bounds
+#                         CPU/memory when a day accumulates huge log volume.
+LITELLM_SPEND_ENABLED = (_str("LITELLM_SPEND_ENABLED", "1") or "1").lower() in ("1", "true", "yes", "on")
+# How to gather spend/usage:
+#   full = raw /spend/logs (whole-day pull; gives latency percentiles but heavy)
+#   lite = server-side aggregates (/global/activity[/model], /global/spend/keys) —
+#          tiny payloads, ~0 CPU; gives requests/tokens/cost/per-model/top-keys but
+#          NO latency. Best for a busy proxy. (SPEND_ENABLED=0 overrides to off.)
+LITELLM_SPEND_MODE = (_str("LITELLM_SPEND_MODE", "full") or "full").lower()
+# Adaptive load-shedding: when the host's 1-min load average PER CORE reaches this,
+# the monitor automatically STOPS the heavy /spend/logs pull (full mode) and
+# resumes when load drops. 0 = disabled. ~4 = "load is 4x the core count"
+# (saturated). Cheap calls (backlog, liveliness, models, lite aggregates) keep
+# running. (The deployment-probing /health call is not used at all — removed.)
+LITELLM_LOAD_SHED = _float("LITELLM_LOAD_SHED", 0.0)  # load-per-core threshold
+LITELLM_SPEND_MAX_ROWS = _int("LITELLM_SPEND_MAX_ROWS", 20000)
+# Heavy calls (/health, /spend/logs) get a longer timeout than the 4s default —
+# on a busy proxy the whole-day /spend/logs query easily exceeds 4s, and a 4s
+# timeout there means it ALWAYS times out and the latency/cost/key panels stay
+# blank. Bounded by the sampling cadence (these calls run at most once per
+# LITELLM_HEAVY_INTERVAL).
+LITELLM_SPEND_TIMEOUT = _float("LITELLM_SPEND_TIMEOUT", 20.0)  # seconds
+# Circuit breaker: if a heavy call (/health or /spend/logs) fails this many times
+# in a row, stop calling it for the cooldown, then probe once — so the monitor
+# never keeps hammering a struggling/frozen proxy. Auto-recovers on success.
+LITELLM_CB_THRESHOLD = _int("LITELLM_CB_THRESHOLD", 3)
+LITELLM_CB_COOLDOWN = _float("LITELLM_CB_COOLDOWN", 300.0)  # seconds
+# Hard cap on the /spend/logs response size. A huge day of logs is refused before
+# it's deserialized — protects the monitor's own memory + event loop.
+LITELLM_SPEND_MAX_BYTES = _int("LITELLM_SPEND_MAX_BYTES", 67108864)  # 64 MiB
+
+# Ollama.
+OLLAMA_BASE_URL = _str("OLLAMA_BASE_URL")               # e.g. http://host:11434
+
+# llama.cpp server (native JSON: /slots /props /health — no --metrics needed).
+LLAMACPP_BASE_URL = _str("LLAMACPP_BASE_URL")           # e.g. http://host:8080
+LLAMACPP_API_KEY  = _str("LLAMACPP_API_KEY")            # optional Bearer
+
+# Container liveness / alive-time via the Docker Engine API. Comma-separated
+# container names to watch; empty = feature off. Requires the Docker socket
+# mounted into the monitor (see docker-compose.yml) + membership in its group.
+MONITOR_CONTAINERS = [c.strip() for c in (_str("MONITOR_CONTAINERS", "") or "").split(",") if c.strip()]
+DOCKER_SOCKET = _str("MONITOR_DOCKER_SOCKET", "/var/run/docker.sock")
+
+# GPU — the GPU box may be a DIFFERENT host. Three modes, in precedence order:
+#   1. SSH (agentless): run nvidia-smi on the remote box over SSH.
+#   2. HTTP agent: GET GPU JSON from a small endpoint on the GPU box.
+#   3. local: nvidia-smi / rocm-smi on this host.
+GPU_SSH          = _str("GPU_SSH")            # "user@gpuhost" -> remote nvidia-smi
+GPU_SSH_PORT     = _int("GPU_SSH_PORT", 22)
+GPU_SSH_KEY      = _str("GPU_SSH_KEY")        # path to private key (mount into container)
+GPU_METRICS_URL  = _str("GPU_METRICS_URL")    # http agent returning GPU JSON
+# Safest for a LOCAL host GPU + a musl/Alpine container: the host writes
+# `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` to a file on a timer,
+# and the monitor reads it (bind-mounted read-only). No SSH, no network, no shell.
+GPU_METRICS_FILE = _str("GPU_METRICS_FILE")   # path to the nvidia-smi CSV file
+GPU_FILE_MAX_AGE = _float("GPU_FILE_MAX_AGE", 60.0)  # stale-if-older-than (seconds)
+
+# --- alert thresholds (0/empty disables each) --------------------------------
+ALERT_CPU_PCT       = _float("ALERT_CPU_PCT", 0.0)
+ALERT_MEM_PCT       = _float("ALERT_MEM_PCT", 0.0)
+ALERT_DISK_PCT      = _float("ALERT_DISK_PCT", 0.0)
+ALERT_GPU_PCT       = _float("ALERT_GPU_PCT", 0.0)
+ALERT_VRAM_PCT      = _float("ALERT_VRAM_PCT", 0.0)     # vram_used/vram_total
+ALERT_LLM_WAIT_MS   = _float("ALERT_LLM_WAIT_MS", 0.0)  # LiteLLM avg wait
+ALERT_BACKLOG       = _float("ALERT_BACKLOG", 0.0)      # LiteLLM queue depth
+ALERT_ON_BACKEND_DOWN = _str("ALERT_ON_BACKEND_DOWN", "1") not in ("0", "false", "")
+ALERT_REPEAT_MIN    = _float("ALERT_REPEAT_MIN", 30.0)  # re-notify cooldown
+
+# --- per-key anomaly / abuse detection (0 disables each) ---------------------
+# Spike: a key's recent request rate >= FACTOR × its own hourly baseline.
+ANOMALY_FACTOR      = _float("ANOMALY_FACTOR", 4.0)     # 0 disables spike detect
+ANOMALY_MIN_REQS    = _float("ANOMALY_MIN_REQS", 20.0)  # floor to ignore tiny keys
+# Budget: a key's spend rate over this $/hour fires an alert.
+ANOMALY_KEY_BUDGET_HR = _float("ANOMALY_KEY_BUDGET_HR", 0.0)
+
+# --- alert channel (webhook only) --------------------------------------------
+ALERT_WEBHOOK_URL     = _str("ALERT_WEBHOOK_URL")          # generic JSON POST
+
+# --- retention rollups (Tier 4) ----------------------------------------------
+ROLLUP_RAW_HOURS   = _int("ROLLUP_RAW_HOURS", 24)      # keep raw samples
+ROLLUP_MIN_DAYS    = _int("ROLLUP_MIN_DAYS", 30)       # 1-min rollup retention
+ROLLUP_HOUR_DAYS   = _int("ROLLUP_HOUR_DAYS", 365)     # 1-hour rollup retention
+
+
+def redacted_summary() -> dict:
+    """Boot banner — endpoints shown, secrets shown only as present/absent."""
+    return {
+        "version": VERSION,
+        "listen": f"{MONITOR_HOST}:{MONITOR_PORT}",
+        "db_path": DB_PATH,
+        "sample_interval_s": SAMPLE_INTERVAL,
+        "litellm": LITELLM_BASE_URL or "(unconfigured)",
+        "litellm_key": "set" if LITELLM_MASTER_KEY else "absent",
+        "ollama": OLLAMA_BASE_URL or "(unconfigured)",
+        "llamacpp": LLAMACPP_BASE_URL or "(unconfigured)",
+        "gpu_mode": ("ssh:" + GPU_SSH) if GPU_SSH else (
+            "http" if GPU_METRICS_URL else "local"),
+        "dashboard_auth": "token" if DASHBOARD_TOKEN else "open",
+    }
+
+
+def validate() -> list[str]:
+    """Return list of fatal config errors (empty = OK). Fail-fast at boot."""
+    errs: list[str] = []
+    if not (1 <= MONITOR_PORT <= 65535):
+        errs.append(f"MONITOR_PORT out of range: {MONITOR_PORT}")
+    if SAMPLE_INTERVAL < 1.0:
+        errs.append("MONITOR_SAMPLE_INTERVAL must be >= 1.0s")
+    # At least one LLM backend should be configured to be useful, but this is a
+    # warning, not fatal — host metrics still work standalone.
+    if LITELLM_BASE_URL and not LITELLM_MASTER_KEY:
+        errs.append("LITELLM_BASE_URL set but LITELLM_MASTER_KEY missing "
+                    "(/spend and /health need the master key)")
+    return errs

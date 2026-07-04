@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · LiteLLM</title>
+<link rel="icon" href="/assets/favicon.svg">
+<script src="/assets/chart.umd.min.js"></script>
+<script src="/assets/purify.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149;
+  }
+  html[data-theme="light"]{
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eaeef2; --line:#d0d7de;
+    --fg:#1f2328; --muted:#59636e; --accent:#0969da; --ok:#1a7f37;
+    --warn:#9a6700; --bad:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body,.card,#sidebar,header{transition:background-color .2s ease,border-color .2s ease,color .2s ease}
+  .card:hover{border-color:var(--muted)}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .ver{color:var(--muted);font-size:12px}
+  #updated{margin-left:auto;color:var(--muted);font-size:12px}
+  main{padding:18px;display:grid;gap:16px;
+    grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px}
+  .card h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;
+    letter-spacing:.05em;color:var(--muted);display:flex;align-items:center;
+    justify-content:space-between}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px}
+  .kpi{background:var(--panel2);border-radius:8px;padding:10px 12px}
+  .kpi .v{font-size:22px;font-weight:600}
+  .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
+  .kpi .v.warn{color:var(--warn)} .kpi .v.bad{color:var(--bad)}
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+  th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
+  .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
+  .windows{display:flex;gap:4px;margin-left:8px}
+  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
+  .span-2{grid-column:span 2}
+  @media(max-width:720px){.span-2{grid-column:span 1}}
+  .chart-grid{display:grid;gap:16px;grid-template-columns:1fr}
+  .mini{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+  .mini h3{margin:0 0 4px;font-size:12px;color:var(--muted);font-weight:500;
+    display:flex;justify-content:space-between}
+  .mini h3 .cur{color:var(--fg);font-variant-numeric:tabular-nums}
+  .mini .chart-wrap{height:320px;margin:0}
+  .unavail{color:var(--muted);font-style:italic;padding:6px 0}
+  .fire{color:var(--bad)} .recover{color:var(--ok)}
+  .srv{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;
+    padding:0 6px;margin-left:6px;vertical-align:middle}
+  a{color:var(--accent)}
+
+  /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:600px){
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
+</style>
+<script>
+/* day/night — applied on every page; choice shared via localStorage */
+(function(){var KEY="aimon-theme";
+  var t=localStorage.getItem(KEY)||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){var b=document.getElementById("theme-btn");
+    if(b)b.textContent=document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  document.addEventListener("DOMContentLoaded",function(){
+    var b=document.getElementById("theme-btn"); if(!b)return; icon();
+    b.addEventListener("click",function(){
+      var cur=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+      document.documentElement.setAttribute("data-theme",cur);
+      localStorage.setItem(KEY,cur); icon();});
+    /* hide dashboard links for unconfigured backends */
+    try{
+      var tok=new URLSearchParams(location.search).get("token");
+      fetch("/api/nav"+(tok?("?token="+encodeURIComponent(tok)):""),
+        {headers:tok?{Authorization:"Bearer "+tok}:{}})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(n){ if(!n)return;
+          [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+            if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
+              .forEach(function(a){a.style.display="none";});
+          });
+        }).catch(function(){});
+      // live alert indicator on the sidebar "Alerts" item (from any page)
+      function _alertDot(){
+        var tk=new URLSearchParams(location.search).get("token");
+        fetch("/api/alerts"+(tk?("?token="+encodeURIComponent(tk)):""),
+          {headers:tk?{Authorization:"Bearer "+tk}:{}})
+          .then(function(r){return r.ok?r.json():null;})
+          .then(function(d){ if(!d)return;
+            var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+            if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
+          }).catch(function(){});
+      }
+      _alertDot(); setInterval(_alertDot, 10000);
+    }catch(e){}
+  });
+})();
+</script>
+</head>
+<body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.0.3</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/gpu">GPU</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
+<header>
+  <h1>LiteLLM</h1>
+  <div class="windows" id="windows">
+    <button id="nav-left" title="shift earlier">◀</button>
+    <button data-w="15m">15m</button>
+    <button data-w="1h" class="active">1h</button>
+    <button data-w="24h">24h</button>
+    <button data-w="30d">30d</button>
+    <button id="nav-right" title="shift later" disabled>▶</button>
+    <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
+  </div>
+  <span id="updated">connecting…</span>
+  <button id="theme-btn" class="badge" title="toggle day / night"
+    style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
+</header>
+<main>
+  <section class="card span-2" id="card-kpi">
+    <h2>Live <span class="badge" id="ll-badge"></span></h2>
+    <div class="kpis" id="ll-kpis"></div>
+  </section>
+
+  <section class="card span-2" id="card-models">
+    <h2>Per-model (rolling window)</h2>
+    <div id="ll-models"><div class="unavail">no data</div></div>
+  </section>
+
+  <section class="card span-2" id="card-failures">
+    <h2>Recent failed requests <span class="badge" id="fail-badge"></span></h2>
+    <div id="fail-body"><div class="unavail">none</div></div>
+  </section>
+
+  <section class="card span-2" id="card-anomalies">
+    <h2>Key anomalies <span class="badge" id="anom-badge"></span></h2>
+    <div id="anom-body"><div class="unavail">none</div></div>
+  </section>
+
+  <section class="card span-2" id="card-keys">
+    <h2>Top 10 API keys by requests <span class="badge" id="keys-win"></span></h2>
+    <div class="chart-wrap" style="height:240px"><canvas id="keys-chart"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-keytime">
+    <h2>Top 10 API keys over time — <span id="keytime-win">1h</span></h2>
+    <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-corr">
+    <h2>Concurrency vs p95 latency — <span id="corr-win">1h</span></h2>
+    <div class="chart-wrap" style="height:170px"><canvas id="corr-chart"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-impact">
+    <h2>Load vs resource impact — <span id="impact-win">1h</span>
+      <span class="info" title="Request rate vs GPU util, KV-cache and the llama.cpp process CPU — the per-execution cost signals for a GPU-served LLM (host RAM is static; KV-cache is the per-request memory).">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:190px"><canvas id="impact-chart"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-charts">
+    <h2>LiteLLM metrics over time — <span id="win-label">1h</span>
+      <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
+    </h2>
+    <div class="chart-grid" id="chart-grid"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+function escapeHtml(s){
+  if(s===null||s===undefined) return "";
+  return String(s).replace(/[&<>"']/g,c=>(
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function setHtml(el, html){ el.innerHTML = DOMPurify.sanitize(html); }
+function servedBy(model){
+  const m=String(model||"").toLowerCase();
+  if(m.startsWith("ollama/")) return "ollama";
+  if(m.startsWith("llama-cpp/")||m.startsWith("llamacpp/")||m.startsWith("llama_cpp/")) return "llama.cpp";
+  if(m.includes("/")) return m.split("/")[0];
+  return "";
+}
+// latest procs snapshot (set each tick) → map a model's backend to its serving
+// process' current CPU% + RSS. Reuses the procs collector — no new sampling.
+let _procs = null;
+function svcProc(backend){
+  const p=_procs||{}, cpu=p.top_cpu||[], ram=p.top_ram||[];
+  const names = backend==="llama.cpp" ? ["llama-server","llama-cpp","llama_cpp"]
+              : backend==="ollama" ? ["ollama"] : [];
+  if(!names.length) return {cpu:null, ram:null};
+  const hit=x=>names.some(n=>String(x.app||"").toLowerCase().includes(n));
+  const c=cpu.find(hit), r=ram.find(hit);
+  return {cpu: c?c.cpu:null, ram: (r?r.ram:(c?c.ram:null))};
+}
+const _timers = [];
+window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
+
+function bytes(n){
+  if(!n) return "0 B";
+  const u=["B","KB","MB","GB","TB"]; let i=0; n=Number(n);
+  while(n>=1024&&i<u.length-1){n/=1024;i++;}
+  return n.toFixed(i?1:0)+" "+u[i];
+}
+function expiresIn(iso){
+  if(!iso) return "—";
+  const t=new Date(iso).getTime(); if(isNaN(t)) return "—";
+  const s=Math.round((t-Date.now())/1000);
+  if(s<=0) return "now"; if(s<60) return s+"s";
+  if(s<3600) return Math.round(s/60)+"m"; return Math.round(s/3600)+"h";
+}
+function kpi(label,val,cls){
+  return `<div class="kpi"><div class="v ${cls||""}">${escapeHtml(val)}</div>`
+       + `<div class="l">${escapeHtml(label)}</div></div>`;
+}
+function badge(el, up, txt){ el.className="badge "+(up?"ok":"bad"); el.textContent=up?(txt||"live"):"down"; }
+
+// LiteLLM-only time series (keys come straight from /api/series).
+const CHARTS = [
+  {id:"c-wait", key:"wait",     label:"Wait avg (ms)",   color:"#d29922", unit:" ms"},
+  {id:"c-p50",  key:"p50",      label:"p50 latency (ms)",color:"#3fb950", unit:" ms"},
+  {id:"c-p95",  key:"p95",      label:"p95 latency (ms)",color:"#e3b341", unit:" ms"},
+  {id:"c-p99",  key:"p99",      label:"p99 latency (ms)",color:"#f85149", unit:" ms"},
+  {id:"c-req",  key:"reqrate",  label:"Requests/s",      color:"#a5d6ff"},
+  {id:"c-tin",  key:"tok_in",   label:"Prompt tok/s",    color:"#39c5cf"},
+  {id:"c-tout", key:"tok_out",  label:"Completion tok/s",color:"#26a641"},
+  {id:"c-err",  key:"errrate",  label:"Error rate %",    color:"#f85149", unit:"%", max:100},
+  {id:"c-cost", key:"costrate", label:"Cost $/h",        color:"#e3b341", unit:" $"},
+  {id:"c-bklog",key:"backlog",  label:"LLM Backlog Reqs",color:"#ff9bce"},
+  {id:"c-conc", key:"conc",     label:"Concurrent LLM work",color:"#a371f7"},
+  {id:"c-ttft", key:"ttft",     label:"TTFT (ms)",       color:"#ffab70", unit:" ms"},
+  {id:"c-chit", key:"cachehit", label:"Cache hit %",     color:"#6cb6ff", unit:"%", max:100},
+];
+const _charts = {};
+function mkChart(canvas, cfg){
+  const yTick = cfg.bytes
+    ? {color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
+    : {color:"#8b949e",font:{size:9}};
+  return new Chart(canvas, {
+    type:"line",
+    data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
+      backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+              y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
+  });
+}
+(function build(){
+  const grid=document.getElementById("chart-grid");
+  for(const cfg of CHARTS){
+    const card=document.createElement("div");card.className="mini";card.id=cfg.id+"-card";
+    const h=document.createElement("h3");
+    const nm=document.createElement("span");nm.textContent=cfg.label;
+    const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
+    h.append(nm,cur);
+    const wrap=document.createElement("div");wrap.className="chart-wrap";
+    const cv=document.createElement("canvas");cv.id=cfg.id;wrap.appendChild(cv);
+    card.append(h,wrap);grid.appendChild(card);
+    _charts[cfg.id]=mkChart(cv,cfg);
+  }
+})();
+function fmtT(t){ return t?new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""; }
+function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(cfg.unit?(Math.round(v*100)/100)+cfg.unit:Math.round(v*100)/100)); }
+function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
+
+const AUTH = new URLSearchParams(location.search).get("token");
+let TIMEEND=null;
+const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
+let WIN = "1h";
+async function api(path){
+  if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
+    path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
+  try{
+    const sep=path.includes("?")?"&":"?";
+    const url=path+(AUTH?(sep+"token="+encodeURIComponent(AUTH)):"");
+    const r=await fetch(url,{headers:AUTH?{Authorization:"Bearer "+AUTH}:{}});
+    if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
+    return await r.json();
+  }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
+}
+
+function renderKpis(l){
+  const b=document.getElementById("ll-badge");
+  if(!l || l.available===false){
+    badge(b,false);
+    setHtml(document.getElementById("ll-kpis"),
+      `<div class="unavail">${escapeHtml((l&&l.error)||"unconfigured")}</div>`);
+    setHtml(document.getElementById("ll-models"),`<div class="unavail">no data</div>`);
+    return;
+  }
+  const lite = l.spend_mode==="lite";
+  badge(b,true, lite?"live · lite":"live");
+  const sloCls = l.slo_pct==null?"":(l.slo_pct>=99?"":(l.slo_pct>=95?"warn":"bad"));
+  const compact = n => n==null?null:(Math.abs(n)>=1e6?(n/1e6).toFixed(1)+"M"
+    :Math.abs(n)>=1e3?(n/1e3).toFixed(1)+"k":String(n));
+  // Always-present signals (available in both lite and full modes).
+  const t = [
+    kpi("Reqs (win)", l.requests_window||0),
+    kpi("Backlog", l.backlog!=null?l.backlog:"—",(l.backlog>0?"warn":"")),
+    kpi("Tokens today", compact(l.tokens_today)||"—"),
+  ];
+  // Latency / rate tiles — only rendered when they have a value (null in lite
+  // mode). Avoids a wall of "—"; they reappear automatically under spend_mode=full.
+  const add = (lab,v,suf,cls) => { if(v!=null) t.push(kpi(lab, v+(suf||""), cls||"")); };
+  add("p50", l.p50_ms, " ms");
+  add("p95", l.p95_ms, " ms");
+  add("p99", l.p99_ms, " ms", (l.p99_ms>l.slo_target_ms?"bad":""));
+  if(l.slo_pct!=null) t.push(kpi(l.slo_target_ms?("SLO <"+l.slo_target_ms+"ms"):"SLO", l.slo_pct+"%", sloCls));
+  add("Wait avg", l.wait_avg_ms, " ms");
+  add("Wait max", l.wait_max_ms, " ms");
+  add("Error %", l.error_pct, "%", (l.error_pct>0?"bad":""));
+  add("Cost/h", l.cost_rate_hr!=null?("$"+l.cost_rate_hr):null, "");
+  add("Req/s", l.req_rate, "");
+  add("TTFT", l.ttft_avg_ms, " ms");
+  add("Cache hit", l.cache_hit_pct, "%");
+  add("Cache saved", l.cache_saved!=null?("$"+l.cache_saved):null, "");
+  setHtml(document.getElementById("ll-kpis"), t.join(""));
+  // lite mode uses server-side aggregates (near-zero CPU) but has no latency data
+  const liteNote = l.spend_mode==="lite"
+    ? `<div class="unavail">Lite mode — latency (p50/p95/p99, TTFT, SLO), rates `
+      +`(req/s, error %, cost/h) and cache stats are unavailable; server-side `
+      +`aggregates keep CPU near zero. Set LITELLM_SPEND_MODE=full for the full set.</div>`
+    : "";
+  if(l.per_model&&l.per_model.length){
+    // full-only columns (latency + cost) are dropped in lite mode — no "—" wall
+    let rows=l.per_model.map(m=>{
+      const slo=m.slo_pct;
+      const sloCls=slo==null?"":(slo>=99?"recover":(slo>=95?"":"fire"));
+      const sb=servedBy(m.model);
+      const svc=svcProc(sb);   // serving process CPU% + RSS (from procs collector)
+      return `<tr><td>${escapeHtml(m.model||"(unnamed)")}`
+      +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")+`</td>`
+      +`<td class="num">${m.reqs}</td>`
+      +`<td class="num">${svc.cpu!=null?svc.cpu+'%':'—'}</td>`
+      +`<td class="num">${svc.ram!=null?bytes(svc.ram):'—'}</td>`
+      +(lite?"":`<td class="num">${m.wait_avg_ms!=null?m.wait_avg_ms+' ms':'—'}</td>`
+        +`<td class="num">${m.p95_ms!=null?m.p95_ms+' ms':'—'}</td>`
+        +`<td class="num ${sloCls}">${slo!=null?slo+'%':'—'}</td>`)
+      +`<td class="num">${m.tokens}</td>`
+      +(lite?"":`<td class="num">${m.cost!=null?'$'+m.cost:'—'}</td>`)+`</tr>`;}).join("");
+    setHtml(document.getElementById("ll-models"), liteNote
+      +`<table><tr><th>Model</th><th class="num">reqs</th>`
+      +`<th class="num">svc CPU</th><th class="num">svc RAM</th>`
+      +(lite?"":`<th class="num">wait avg</th><th class="num">p95</th><th class="num">SLO</th>`)
+      +`<th class="num">tok</th>`+(lite?"":`<th class="num">cost</th>`)
+      +`</tr>${rows}</table>`);
+  } else setHtml(document.getElementById("ll-models"),
+      liteNote+`<div class="unavail">no requests in window</div>`);
+}
+
+// Top-10 API keys — horizontal bar chart (categorical, updates each tick).
+const keysChart = new Chart(document.getElementById("keys-chart"), {
+  type:"bar",
+  data:{labels:[],datasets:[{label:"requests",data:[],
+    backgroundColor:"#58a6ff88",borderColor:"#58a6ff",borderWidth:1}]},
+  options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
+    plugins:{legend:{display:false}},
+    scales:{x:{beginAtZero:true,ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:"#e6edf3",font:{size:10}},grid:{display:false}}}}
+});
+function keyLabel(k){
+  if(k.alias) return k.alias;
+  const s = String(k.key||"?");
+  return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s;
+}
+function renderKeys(l){
+  const win=document.getElementById("keys-win");
+  if(win) win.textContent = l&&l.spend_window_min?("last "+l.spend_window_min+"m"):"";
+  const keys=(l&&l.top_keys)||[];
+  keysChart.data.labels=keys.map(keyLabel);
+  // lite mode ranks keys by spend (no per-key request counts) -> fall back to cost
+  keysChart.data.datasets[0].data=keys.map(k=>k.reqs!=null?k.reqs:(k.cost||0));
+  keysChart.update("none");
+}
+
+// Top-10 keys OVER TIME — one colored line per key.
+const KEY_COLORS = ["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff",
+                    "#ff7b72","#39c5cf","#f0883e","#7ee787","#db61a2"];
+const keyTimeChart = new Chart(document.getElementById("keytime-chart"), {
+  type:"line",
+  data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+});
+function keyDisp(label){
+  const s=String(label||"?");
+  return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s;
+}
+async function loadAnomalies(){
+  const d=await api("/api/anomalies");
+  const body=document.getElementById("anom-body");
+  const badge=document.getElementById("anom-badge");
+  if(!d){ return; }
+  const active=d.active||[];
+  if(active.length){
+    badge.className="badge bad"; badge.textContent=active.length+" active";
+    let rows=active.map(a=>`<tr><td>⚠</td><td>${escapeHtml(a.message)}</td></tr>`).join("");
+    setHtml(body,`<table>${rows}</table>`);
+  } else {
+    badge.className="badge ok"; badge.textContent="clear";
+    const hist=(d.history||[]).slice(0,5);
+    if(hist.length){
+      let rows=hist.map(h=>`<tr><td>${escapeHtml(new Date(h.ts*1000).toLocaleTimeString())}</td>`
+        +`<td>${escapeHtml(h.kind)}</td><td>${escapeHtml(h.detail)}</td></tr>`).join("");
+      setHtml(body,`<div class="unavail">no active anomalies · recent:</div>`
+        +`<table><tr><th>time</th><th>kind</th><th>detail</th></tr>${rows}</table>`);
+    } else setHtml(body,`<div class="unavail">none</div>`);
+  }
+}
+
+// Concurrency vs p95 latency — dual y-axis: does latency climb with load?
+const corrChart = new Chart(document.getElementById("corr-chart"), {
+  type:"line",
+  data:{labels:[],datasets:[
+    {label:"concurrency",data:[],borderColor:"#a371f7",backgroundColor:"#a371f722",
+     borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true,yAxisID:"yc"},
+    {label:"p95 latency (ms)",data:[],borderColor:"#e3b341",
+     borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yl"}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    scales:{
+      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      yc:{position:"left",beginAtZero:true,ticks:{color:"#a371f7",font:{size:9}},
+          grid:{color:"#30363d33"},title:{display:true,text:"concurrency",color:"#a371f7"}},
+      yl:{position:"right",beginAtZero:true,ticks:{color:"#e3b341",font:{size:9}},
+          grid:{display:false},title:{display:true,text:"p95 ms",color:"#e3b341"}}}}
+});
+// Load-vs-impact: req/s (left) against GPU util / KV-cache / llama.cpp CPU (right %).
+const impactChart = new Chart(document.getElementById("impact-chart"), {
+  type:"line",
+  data:{labels:[],datasets:[
+    {label:"req/s",data:[],borderColor:"#58a6ff",backgroundColor:"#58a6ff22",
+     borderWidth:1.6,pointRadius:0,tension:.25,fill:true,spanGaps:true,yAxisID:"yr"},
+    {label:"GPU %",data:[],borderColor:"#bc8cff",
+     borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"},
+    {label:"KV-cache %",data:[],borderColor:"#f778ba",
+     borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"},
+    {label:"llama.cpp CPU %",data:[],borderColor:"#7ee787",
+     borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    scales:{
+      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      yr:{position:"left",beginAtZero:true,ticks:{color:"#58a6ff",font:{size:9}},
+          grid:{color:"#30363d33"},title:{display:true,text:"req/s",color:"#58a6ff"}},
+      yp:{position:"right",beginAtZero:true,max:100,ticks:{color:"#8b949e",font:{size:9}},
+          grid:{display:false},title:{display:true,text:"impact %",color:"#8b949e"}}}}
+});
+async function loadImpact(){
+  document.getElementById("impact-win").textContent=WIN;
+  const s=await api("/api/series?window="+WIN);
+  const pc=await api("/api/procseries?kind=cpu&window="+WIN);
+  if(!s) return;
+  const pts=s.points||[];
+  impactChart.data.labels=pts.map(p=>fmtT(p.t));
+  impactChart.data.datasets[0].data=pts.map(p=>p.reqrate==null?null:p.reqrate);
+  impactChart.data.datasets[1].data=pts.map(p=>p.gpu==null?null:p.gpu);
+  impactChart.data.datasets[2].data=pts.map(p=>p.kvcache==null?null:p.kvcache);
+  // llama.cpp process CPU from procseries, matched by nearest timestamp
+  let cpuData=pts.map(()=>null);
+  if(pc && pc.points && pc.apps){
+    const app=(pc.apps||[]).find(a=>/llama/i.test(a));
+    if(app){
+      const byT={}; pc.points.forEach(p=>{ byT[Math.round(p.t)]=p[app]; });
+      cpuData=pts.map(p=>{ const v=byT[Math.round(p.t)]; return v==null?null:v; });
+    }
+  }
+  impactChart.data.datasets[3].data=cpuData;
+  impactChart.update("none");
+}
+async function loadCorr(){
+  const d=await api("/api/series?window="+WIN);
+  document.getElementById("corr-win").textContent=WIN;
+  if(!d) return;
+  const pts=d.points||[];
+  corrChart.data.labels=pts.map(p=>fmtT(p.t));
+  corrChart.data.datasets[0].data=pts.map(p=>p.conc==null?null:p.conc);
+  corrChart.data.datasets[1].data=pts.map(p=>p.p95==null?null:p.p95);
+  corrChart.update("none");
+}
+
+async function loadKeyTime(){
+  const d=await api("/api/keyseries?window="+WIN);
+  document.getElementById("keytime-win").textContent=WIN;
+  if(!d){ return; }
+  const pts=d.points||[]; const labels=d.labels||[];
+  keyTimeChart.data.labels=pts.map(p=>fmtT(p.t));
+  keyTimeChart.data.datasets=labels.map((lab,i)=>({
+    label:keyDisp(lab),
+    data:pts.map(p=>p[lab]==null?null:p[lab]),
+    borderColor:KEY_COLORS[i%KEY_COLORS.length],
+    backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
+  keyTimeChart.update("none");
+}
+
+function renderFailures(l){
+  const b=document.getElementById("fail-badge");
+  const body=document.getElementById("fail-body");
+  const f=(l&&l.recent_failures)||[];
+  if(!f.length){ b.className="badge ok"; b.textContent="0";
+    setHtml(body,`<div class="unavail">no failed requests in window</div>`); return; }
+  b.className="badge bad"; b.textContent=f.length;
+  let rows=f.map(x=>`<tr><td>${escapeHtml(new Date(x.t*1000).toLocaleTimeString())}</td>`
+    +`<td>${escapeHtml(x.model)}</td><td>${escapeHtml(x.key)}</td>`
+    +`<td class="fire">${escapeHtml(x.error)}</td></tr>`).join("");
+  setHtml(body,`<table><tr><th>time</th><th>model</th><th>key</th>`
+    +`<th>error</th></tr>${rows}</table>`);
+}
+
+async function loadSeries(){
+  const d=await api("/api/series?window="+WIN);
+  if(!d) return;
+  const pts=d.points||[]; const labels=pts.map(p=>fmtT(p.t));
+  for(const cfg of CHARTS){
+    const ch=_charts[cfg.id];
+    ch.data.labels=labels;
+    ch.data.datasets[0].data=pts.map(p=>(p[cfg.key]==null?null:p[cfg.key]));
+    ch.update("none");
+    const cur=document.getElementById(cfg.id+"-cur");
+    if(cur) cur.textContent=fmtCur(cfg,lastNonNull(pts,cfg.key));
+    const card=document.getElementById(cfg.id+"-card");
+    if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
+  }
+}
+function rangedReload(){ loadSeries(); loadKeyTime(); loadCorr(); loadImpact(); }
+function updateRangeUI(){
+  const now=Date.now()/1000;
+  document.getElementById("nav-right").disabled = !TIMEEND;
+  const lbl=document.getElementById("range-lbl");
+  if(!TIMEEND){ lbl.textContent="live"; return; }
+  const m=Math.round((now-TIMEEND)/60);
+  lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
+}
+document.getElementById("nav-left").addEventListener("click",()=>{
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-WSECS[WIN];
+  updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-right").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
+  if(TIMEEND>=Date.now()/1000) TIMEEND=null;
+  updateRangeUI(); rangedReload();
+});
+document.querySelectorAll("#windows button[data-w]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
+    document.getElementById("win-label").textContent=WIN;
+    loadSeries(); loadKeyTime(); loadCorr(); loadImpact();
+  });
+});
+document.getElementById("export-btn").addEventListener("click",()=>{
+  window.open("/api/export?window="+WIN+"&format=csv"
+    +(AUTH?("&token="+encodeURIComponent(AUTH)):""),"_blank");
+});
+
+async function tick(){
+  const d=await api("/api/data?history=1");
+  if(d){
+    const c=(d.latest||{}).collectors||{};
+    _procs = c.procs || null;
+    renderKpis(c.litellm);
+    renderKeys(c.litellm);
+    renderFailures(c.litellm);
+    const t=(d.latest||{}).ts?new Date(d.latest.ts*1000).toLocaleTimeString():"—";
+    document.getElementById("updated").textContent="updated "+t;
+  }
+  await loadSeries();
+  await loadKeyTime();
+  await loadCorr();
+  await loadImpact();
+  await loadAnomalies();
+}
+tick();
+_timers.push(setInterval(tick,5000));
+</script>
+</div>
+<script>
+/* collapsible lateral sidebar — state persisted, active link by path */
+(function(){var KEY="aimon_sb";
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if(a.getAttribute("href")===p)a.classList.add("active");});
+  });
+})();
+</script>
+</body>
+</html>

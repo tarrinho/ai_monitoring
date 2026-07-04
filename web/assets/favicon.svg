@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e3a5f;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#0f1f3a;stop-opacity:1"/>
+    </linearGradient>
+    <linearGradient id="shieldEdge" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:0.6"/>
+      <stop offset="100%" style="stop-color:#1d4ed8;stop-opacity:0.2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Shield body -->
+  <path d="M128 14 L224 52 L224 144 Q220 210 128 242 Q36 210 32 144 L32 52 Z"
+        fill="url(#shieldGrad)" stroke="url(#shieldEdge)" stroke-width="3"/>
+
+  <!-- Shield inner highlight line -->
+  <path d="M128 26 L210 59 L210 144 Q207 198 128 226 Q49 198 46 144 L46 59 Z"
+        fill="none" stroke="#3b82f6" stroke-width="1" opacity="0.3"/>
+
+  <!-- Robot head (rounded rectangle) -->
+  <rect x="72" y="72" width="112" height="88" rx="16" ry="16"
+        fill="#1e293b" stroke="#475569" stroke-width="2"/>
+
+  <!-- Robot antenna base -->
+  <rect x="120" y="58" width="16" height="16" rx="4" fill="#334155"/>
+  <!-- Robot antenna line -->
+  <rect x="126" y="38" width="4" height="24" fill="#475569"/>
+  <!-- Robot antenna tip -->
+  <circle cx="128" cy="36" r="8" fill="#f97316" opacity="0.9"/>
+  <circle cx="128" cy="36" r="4" fill="#fed7aa"/>
+
+  <!-- Robot eye left — glowing -->
+  <rect x="84" y="92" width="36" height="30" rx="6" fill="#0c0c1a"/>
+  <rect x="88" y="96" width="28" height="22" rx="4" fill="#0ea5e9" opacity="0.9"/>
+  <rect x="92" y="100" width="8" height="8" rx="2" fill="white" opacity="0.6"/>
+
+  <!-- Robot eye right — glowing -->
+  <rect x="136" y="92" width="36" height="30" rx="6" fill="#0c0c1a"/>
+  <rect x="140" y="96" width="28" height="22" rx="4" fill="#0ea5e9" opacity="0.9"/>
+  <rect x="144" y="100" width="8" height="8" rx="2" fill="white" opacity="0.6"/>
+
+  <!-- Robot mouth grille -->
+  <rect x="84" y="136" width="88" height="14" rx="4" fill="#0c0c1a"/>
+  <rect x="90" y="140" width="10" height="6" rx="2" fill="#334155"/>
+  <rect x="107" y="140" width="10" height="6" rx="2" fill="#334155"/>
+  <rect x="124" y="140" width="10" height="6" rx="2" fill="#334155"/>
+  <rect x="141" y="140" width="10" height="6" rx="2" fill="#334155"/>
+  <rect x="158" y="140" width="10" height="6" rx="2" fill="#334155"/>
+
+  <!-- Prohibition badge (bottom-right, overlapping shield) -->
+  <circle cx="186" cy="186" r="52" fill="#dc2626"/>
+  <circle cx="186" cy="186" r="48" fill="#b91c1c"/>
+  <!-- Inner circle ring -->
+  <circle cx="186" cy="186" r="44" fill="none" stroke="#fca5a5" stroke-width="3" opacity="0.4"/>
+  <!-- Diagonal bar -->
+  <line x1="151" y1="151" x2="221" y2="221"
+        stroke="white" stroke-width="14" stroke-linecap="round"/>
+</svg>

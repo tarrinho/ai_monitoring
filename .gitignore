@@ -1,0 +1,21 @@
+# secrets / env
+.env
+*.env
+!.env.example
+# data / db
+*.db
+*.db-wal
+*.db-shm
+data/
+# build artefacts
+*.tar.gz
+*.log
+validation/
+# python caches
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

@@ -1,0 +1,28 @@
+# Server-side compose for a pre-built image (no build context needed).
+# Use on the armv7 (or any) target after `docker load`-ing the image.
+#   docker compose -f docker-compose.server.yml up -d
+services:
+  ai-monitoring:
+    image: ai-monitoring:1.0.3        # the loaded image tag
+    container_name: ai-monitoring
+    restart: unless-stopped
+    env_file: .env                    # copy .env.example → .env and fill in
+    ports:
+      - "${MONITOR_PORT:-9925}:9925"
+    volumes:
+      - ai-monitoring-data:/data      # metrics DB — survives restarts
+    # see host processes (top apps by CPU/RAM); comment out to restrict to container
+    pid: host
+    # reach LLM backends running on the host:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9925/healthz',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ai-monitoring-data:

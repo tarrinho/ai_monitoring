@@ -1,0 +1,119 @@
+name: CI
+
+# Runs the rules.md controls on every push / PR to GitHub:
+#   secret-scan (TruffleHog) · lint+type (ruff/bandit/semgrep/mypy/vulture) ·
+#   pytest (static+dynamic) · Trivy filesystem scan · build-gate + Trivy image scan.
+# All jobs run in parallel; a red job blocks the merge.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:        # allow manual runs from the Actions tab
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. Secrets ────────────────────────────────────────────────────────────
+  secret-scan:
+    name: TruffleHog secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so the scan sees past commits
+      # Official TruffleHog action — working tree + commit range, verified +
+      # unknown results, non-zero exit on a hit.
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude
+
+  # ── 2. Lint + type (rules.md §9) ──────────────────────────────────────────
+  lint:
+    name: lint + type (ruff / bandit / semgrep / mypy / vulture)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: |
+          pip install -r requirements.txt
+          pip install ruff bandit semgrep mypy vulture
+
+      - name: ruff (lint)
+        run: ruff check .
+
+      - name: bandit (High severity only → 0 allowed)
+        # Medium findings (B104 bind-all, B608 known-column SQL, B108 demo /tmp)
+        # are accepted per rules.md; -lll reports/fails on High only.
+        run: bandit -r . -x ./tests -lll
+
+      - name: semgrep (OSS registry rules — NO auto / NO token)
+        run: semgrep --config p/python --config p/security-audit --error .
+
+      - name: mypy (typed source)
+        run: mypy --ignore-missing-imports app.py config.py collectors/ db.py
+
+      - name: vulture (dead code — informational)
+        # Heuristic; reported but does not block the build.
+        continue-on-error: true
+        run: vulture app.py config.py collectors db.py --min-confidence 80
+
+  # ── 3. Tests (rules.md §1 + §2) ───────────────────────────────────────────
+  tests:
+    name: pytest (static + dynamic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # test-env integration auto-skips when the stack isn't up (see rules.md §3)
+      - run: python -m pytest tests/test_static_qa.py tests/test_dynamic_qa.py -q
+
+  # ── 4. Trivy filesystem scan (deps + config + secrets) ────────────────────
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy fs (HIGH/CRITICAL → fail)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ── 5. Build gate + Trivy image scan (rules.md §14 + §10) ─────────────────
+  build-and-scan:
+    name: build (test gate) + Trivy image scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # RUN_TESTS=1 runs the full pytest suite INSIDE the image; a failure here
+      # means no image is produced — the release gate. Runner is amd64.
+      - name: Build image (in-image test gate)
+        run: docker build --build-arg RUN_TESTS=1 -t ai-monitoring:ci .
+
+      - name: Trivy image (HIGH/CRITICAL → fail)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: ai-monitoring:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Alerts</title>
+<link rel="icon" href="/assets/favicon.svg">
+<script src="/assets/purify.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149;
+  }
+  html[data-theme="light"]{
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eaeef2; --line:#d0d7de;
+    --fg:#1f2328; --muted:#59636e; --accent:#0969da; --ok:#1a7f37;
+    --warn:#9a6700; --bad:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body,.card,#sidebar,header{transition:background-color .2s ease,border-color .2s ease,color .2s ease}
+  .card:hover{border-color:var(--muted)}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  #updated{margin-left:auto;color:var(--muted);font-size:12px}
+  main{padding:18px;display:grid;gap:16px;
+    grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;
+    color:var(--muted);display:flex;align-items:center;justify-content:space-between}
+  table{width:100%;border-collapse:collapse;margin-top:4px;font-size:12px}
+  th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
+  .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)} .badge.off{color:var(--muted)}
+  .unavail{color:var(--muted);font-style:italic;padding:6px 0}
+  .span-2{grid-column:span 2}
+  @media(max-width:720px){.span-2{grid-column:span 1}}
+  button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:8px 14px;
+    font-size:13px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  a{color:var(--accent)}
+  .fire{color:var(--bad)} .recover{color:var(--ok)}
+  .chip{display:inline-block;padding:2px 8px;border-radius:12px;margin:2px;font-size:12px;
+    background:var(--panel2)}
+  .chip.on{color:var(--ok);border:1px solid #3fb95044} .chip.off{color:var(--muted)}
+
+  /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:600px){
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
+</style>
+<script>
+/* day/night — applied on every page; choice shared via localStorage */
+(function(){var KEY="aimon-theme";
+  var t=localStorage.getItem(KEY)||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){var b=document.getElementById("theme-btn");
+    if(b)b.textContent=document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  document.addEventListener("DOMContentLoaded",function(){
+    var b=document.getElementById("theme-btn"); if(!b)return; icon();
+    b.addEventListener("click",function(){
+      var cur=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+      document.documentElement.setAttribute("data-theme",cur);
+      localStorage.setItem(KEY,cur); icon();});
+    /* hide dashboard links for unconfigured backends */
+    try{
+      var tok=new URLSearchParams(location.search).get("token");
+      fetch("/api/nav"+(tok?("?token="+encodeURIComponent(tok)):""),
+        {headers:tok?{Authorization:"Bearer "+tok}:{}})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(n){ if(!n)return;
+          [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+            if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
+              .forEach(function(a){a.style.display="none";});
+          });
+        }).catch(function(){});
+      // live alert indicator on the sidebar "Alerts" item (from any page)
+      function _alertDot(){
+        var tk=new URLSearchParams(location.search).get("token");
+        fetch("/api/alerts"+(tk?("?token="+encodeURIComponent(tk)):""),
+          {headers:tk?{Authorization:"Bearer "+tk}:{}})
+          .then(function(r){return r.ok?r.json():null;})
+          .then(function(d){ if(!d)return;
+            var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+            if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
+          }).catch(function(){});
+      }
+      _alertDot(); setInterval(_alertDot, 10000);
+    }catch(e){}
+  });
+})();
+</script>
+</head>
+<body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.0.3</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/gpu">GPU</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
+<header>
+  <h1>Alerts</h1>
+  <span id="updated">connecting…</span>
+  <button id="theme-btn" class="badge" title="toggle day / night"
+    style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
+</header>
+<main>
+  <section class="card" id="card-channels">
+    <h2>Channels</h2>
+    <div id="chans"></div>
+    <div style="margin-top:12px">
+      <button id="test-btn">Send test alert</button>
+      <span id="test-result" style="margin-left:10px;font-size:12px;color:var(--muted)"></span>
+    </div>
+    <div id="test-detail" style="margin-top:8px"></div>
+  </section>
+
+  <section class="card" id="card-active">
+    <h2>Active breaches <span class="badge" id="active-badge"></span></h2>
+    <div id="active-body"><div class="unavail">none</div></div>
+  </section>
+
+  <section class="card" id="card-thresholds">
+    <h2>Thresholds</h2>
+    <div id="thresh"></div>
+  </section>
+
+  <section class="card span-2" id="card-history">
+    <h2>Alert history</h2>
+    <div id="history-body"><div class="unavail">no alerts yet</div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+function escapeHtml(s){
+  if(s===null||s===undefined) return "";
+  return String(s).replace(/[&<>"']/g,c=>(
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function setHtml(el,html){ el.innerHTML = DOMPurify.sanitize(html); }
+const _timers = [];
+window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
+
+const AUTH = new URLSearchParams(location.search).get("token");
+async function api(path, opts){
+  try{
+    const sep=path.includes("?")?"&":"?";
+    const url=path+(AUTH?(sep+"token="+encodeURIComponent(AUTH)):"");
+    const o=Object.assign({headers:AUTH?{Authorization:"Bearer "+AUTH}:{}}, opts||{});
+    const r=await fetch(url,o);
+    if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
+    return await r.json();
+  }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
+}
+function ago(ts){
+  const s=Math.round(Date.now()/1000 - ts);
+  if(s<60) return s+"s ago"; if(s<3600) return Math.round(s/60)+"m ago";
+  if(s<86400) return Math.round(s/3600)+"h ago"; return Math.round(s/86400)+"d ago";
+}
+
+function render(d){
+  // channels
+  setHtml(document.getElementById("chans"),
+    (d.channels||[]).map(c=>`<span class="chip ${c.on?'on':'off'}">`
+      +`${escapeHtml(c.name)} ${c.on?'●':'○'}</span>`).join(""));
+  // active
+  const ab=document.getElementById("active-badge");
+  const active=d.active||[];
+  if(active.length){ ab.className="badge bad"; ab.textContent=active.length; }
+  else { ab.className="badge ok"; ab.textContent="clear"; }
+  setHtml(document.getElementById("active-body"),
+    active.length ? `<table>${active.map(k=>`<tr><td class="fire">⚠ ${escapeHtml(k)}</td></tr>`).join("")}</table>`
+                  : `<div class="unavail">no active breaches</div>`);
+  // thresholds
+  const t=d.thresholds||{};
+  const rows=[["CPU %",t.cpu_pct],["MEM %",t.mem_pct],["Disk %",t.disk_pct],
+    ["GPU %",t.gpu_pct],["VRAM %",t.vram_pct],["LLM wait ms",t.llm_wait_ms],
+    ["Backlog",t.backlog],["Anomaly ×",t.anomaly_factor],["Key $/h",t.key_budget_hr]]
+    .map(([k,v])=>`<tr><td>${escapeHtml(k)}</td><td class="num">`
+      +`${(!v||v==0)?'<span class="badge off">off</span>':escapeHtml(v)}</td></tr>`).join("");
+  setHtml(document.getElementById("thresh"),
+    `<table><tr><th>Signal</th><th class="num">threshold</th></tr>${rows}</table>`
+    +`<div class="unavail">backend-down: ${t.backend_down?'on':'off'} · re-notify every ${escapeHtml(t.repeat_min)}m</div>`);
+  // history
+  const h=d.history||[];
+  setHtml(document.getElementById("history-body"),
+    h.length ? `<table><tr><th>when</th><th>type</th><th>detail</th></tr>`
+      +h.map(a=>`<tr><td>${escapeHtml(ago(a.ts))}</td>`
+        +`<td class="${a.kind==='fire'?'fire':'recover'}">${escapeHtml(a.kind)}</td>`
+        +`<td>${escapeHtml(a.msg)}</td></tr>`).join("")+`</table>`
+      : `<div class="unavail">no alerts yet — thresholds not breached</div>`);
+}
+
+async function tick(){
+  const d=await api("/api/alerts");
+  if(d){ render(d); document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString(); }
+}
+
+document.getElementById("test-btn").addEventListener("click", async ()=>{
+  const btn=document.getElementById("test-btn");
+  const res=document.getElementById("test-result");
+  btn.disabled=true; res.textContent="sending…";
+  const d=await api("/api/alerts/test", {method:"POST"});
+  btn.disabled=false;
+  if(!d){ res.textContent="failed"; return; }
+  const r=d.results||{};
+  const ok=Object.values(r).filter(v=>v==="ok").length;
+  res.textContent = ok+" channel(s) delivered";
+  setHtml(document.getElementById("test-detail"),
+    `<table><tr><th>channel</th><th>result</th></tr>`
+    +Object.entries(r).map(([c,v])=>`<tr><td>${escapeHtml(c)}</td>`
+      +`<td class="${v==='ok'?'recover':(v==='not configured'?'':'fire')}">${escapeHtml(v)}</td></tr>`).join("")
+    +`</table>`);
+});
+
+tick();
+_timers.push(setInterval(tick, 5000));
+</script>
+</div>
+<script>
+/* collapsible lateral sidebar — state persisted, active link by path */
+(function(){var KEY="aimon_sb";
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if(a.getAttribute("href")===p)a.classList.add("active");});
+  });
+})();
+</script>
+</body>
+</html>

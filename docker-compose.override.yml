@@ -1,0 +1,14 @@
+# LOCAL DEV ONLY — auto-merged by `docker compose` on this machine.
+# Attaches the monitor to the test-env network so it can reach the loopback-
+# bound Ollama/LiteLLM by DNS name (litellm:4000, ollama:11434).
+# Do NOT copy this file to a server — plain `docker-compose.yml` is portable.
+services:
+  ai-monitoring:
+    networks:
+      - default
+      - testenv
+
+networks:
+  testenv:
+    external: true
+    name: aimon-testenv

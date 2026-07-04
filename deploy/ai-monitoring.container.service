@@ -1,0 +1,27 @@
+# systemd --user unit to auto-start the AI-Monitoring container on boot.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/ai-monitoring.container.service ~/.config/systemd/user/ai-monitoring.service
+#   # edit WorkingDirectory below to the repo path
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ai-monitoring
+#   loginctl enable-linger "$USER"     # start at boot without an active login
+#
+# Uses docker compose; swap for `podman compose` if you use podman.
+[Unit]
+Description=AI-Monitoring dashboard (docker compose)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AI-Monitoring
+ExecStartPre=/usr/bin/docker compose up -d --build
+ExecStart=/usr/bin/docker compose logs -f
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

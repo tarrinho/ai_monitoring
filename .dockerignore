@@ -1,0 +1,20 @@
+.env
+*.env
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+validation/
+# NOTE: README.md is NOT ignored — the test stage's QA gate
+# (test_docs_present_and_current) reads it. The runtime stage copies app files
+# explicitly (config.py db.py app.py … web/), so README never ships anyway.
+# NOTE: tests/, pytest.ini, requirements-dev.txt are intentionally NOT ignored —
+# the Docker "test" stage runs the full QA suite on every build (build fails on
+# regression). The runtime stage copies only app files, so the final image stays
+# clean and never ships the tests.

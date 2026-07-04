@@ -1,0 +1,36 @@
+# deploy/gpu-metrics.service — write nvidia-smi metrics to a file for AI-Monitoring.
+#
+# The SAFE way to expose a LOCAL host GPU to the (Alpine) monitor container: this
+# host-side service writes nvidia-smi CSV to a file every few seconds; the monitor
+# bind-mounts that file READ-ONLY (no SSH, no network, no shell access to the host).
+#
+# Install on the GPU host:
+#   sudo mkdir -p /var/lib/aimon-gpu && sudo chmod 755 /var/lib/aimon-gpu
+#   sudo cp deploy/gpu-metrics.service /etc/systemd/system/
+#   sudo systemctl enable --now gpu-metrics.service
+# The non-root monitor (uid 10001) must be able to traverse the dir (755 above)
+# and read the file — `umask 022` below makes each written file world-readable.
+#   # then in the monitor's docker-compose.yml, mount the dir read-only:
+#   #   volumes:
+#   #     - /var/lib/aimon-gpu:/gpu:ro
+#   # and in .env:  GPU_METRICS_FILE=/gpu/gpu.csv
+#
+# Writes atomically (tmp + mv) so the container never reads a half-written file.
+[Unit]
+Description=Write nvidia-smi metrics to a file for AI-Monitoring
+After=multi-user.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+# The query columns MUST match what the collector expects (name, util, mem.used,
+# mem.total, temp, power.draw, power.limit, throttle).
+ExecStart=/bin/sh -c 'while true; do \
+  nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.hw_slowdown \
+  --format=csv,noheader,nounits > /var/lib/aimon-gpu/gpu.csv.tmp 2>/dev/null \
+  && mv -f /var/lib/aimon-gpu/gpu.csv.tmp /var/lib/aimon-gpu/gpu.csv; \
+  sleep 5; done'
+
+[Install]
+WantedBy=multi-user.target

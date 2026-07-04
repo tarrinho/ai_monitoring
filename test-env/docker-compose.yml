@@ -1,0 +1,99 @@
+# AI-Monitoring test environment — real LLM backends for the monitor to read.
+#   ollama    : serves a tiny model (qwen2.5:0.5b) on :11434
+#   db        : Postgres for LiteLLM spend/keys (so /spend/logs works)
+#   litellm   : proxy on :4000 in front of ollama, master key auth
+#
+# Bring up:  docker compose -f test-env/docker-compose.yml up -d
+# Pull model: docker exec aimon-ollama ollama pull qwen2.5:0.5b
+# The AI-Monitoring container reaches these via host.docker.internal:<port>.
+name: aimon-testenv
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aimon-ollama
+    restart: unless-stopped
+    # loopback-only: Ollama has no auth — never expose it on 0.0.0.0. The
+    # monitor reaches it over the shared network via DNS name `ollama`.
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  db:
+    image: postgres:16-alpine
+    container_name: aimon-litellm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set in test-env/.env}"
+      POSTGRES_DB: litellm
+    volumes:
+      - litellm-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: aimon-litellm
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    # loopback-only host binding; the monitor uses the network DNS name `litellm`
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?set in test-env/.env}"
+      LITELLM_SALT_KEY: "${LITELLM_SALT_KEY:?set in test-env/.env}"
+      DATABASE_URL: "postgresql://litellm:${POSTGRES_PASSWORD}@db:5432/litellm"
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+
+  # continuous traffic so the monitor's LLM graphs keep moving (demo/soak).
+  # Disable with:  docker compose -f test-env/docker-compose.yml stop traffic
+  traffic:
+    image: curlimages/curl:latest
+    container_name: aimon-traffic
+    restart: unless-stopped
+    depends_on:
+      litellm:
+        condition: service_started
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?set in test-env/.env}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        i=0
+        while true; do
+          i=$$((i + 1))
+          m=$$((8 + i % 24))
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $$LITELLM_MASTER_KEY" \
+            -H "Content-Type: application/json" \
+            -X POST http://litellm:4000/v1/chat/completions \
+            -d "{\"model\":\"qwen2.5-0.5b\",\"messages\":[{\"role\":\"user\",\"content\":\"traffic ping $$i\"}],\"max_tokens\":$$m}"
+          sleep 3
+        done
+
+volumes:
+  ollama-data:
+  litellm-db:
+
+# Named network so the AI-Monitoring container can join it and reach the
+# backends by DNS name (litellm:4000, ollama:11434) instead of host ports.
+networks:
+  default:
+    name: aimon-testenv

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Ollama</title>
+<link rel="icon" href="/assets/favicon.svg">
+<script src="/assets/chart.umd.min.js"></script>
+<script src="/assets/purify.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149;
+  }
+  html[data-theme="light"]{
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eaeef2; --line:#d0d7de;
+    --fg:#1f2328; --muted:#59636e; --accent:#0969da; --ok:#1a7f37;
+    --warn:#9a6700; --bad:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body,.card,#sidebar,header{transition:background-color .2s ease,border-color .2s ease,color .2s ease}
+  .card:hover{border-color:var(--muted)}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  #updated{margin-left:auto;color:var(--muted);font-size:12px}
+  main{padding:18px;display:grid;gap:16px;
+    grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px}
+  .card h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;
+    letter-spacing:.05em;color:var(--muted);display:flex;align-items:center;
+    justify-content:space-between}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px}
+  .kpi{background:var(--panel2);border-radius:8px;padding:10px 12px}
+  .kpi .v{font-size:22px;font-weight:600}
+  .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+  th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
+  .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
+  .windows{display:flex;gap:4px;margin-left:8px}
+  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
+  .span-2{grid-column:span 2}
+  @media(max-width:720px){.span-2{grid-column:span 1}}
+  .chart-grid{display:grid;gap:16px;grid-template-columns:1fr}
+  .mini{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+  .mini h3{margin:0 0 4px;font-size:12px;color:var(--muted);font-weight:500;
+    display:flex;justify-content:space-between}
+  .mini h3 .cur{color:var(--fg);font-variant-numeric:tabular-nums}
+  .mini .chart-wrap{height:320px;margin:0}
+  .unavail{color:var(--muted);font-style:italic;padding:6px 0}
+  a{color:var(--accent)}
+  .pill{font-size:10px;padding:1px 6px;border-radius:10px;background:var(--panel);color:var(--muted)}
+
+  /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:600px){
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
+</style>
+<script>
+/* day/night — applied on every page; choice shared via localStorage */
+(function(){var KEY="aimon-theme";
+  var t=localStorage.getItem(KEY)||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){var b=document.getElementById("theme-btn");
+    if(b)b.textContent=document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  document.addEventListener("DOMContentLoaded",function(){
+    var b=document.getElementById("theme-btn"); if(!b)return; icon();
+    b.addEventListener("click",function(){
+      var cur=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+      document.documentElement.setAttribute("data-theme",cur);
+      localStorage.setItem(KEY,cur); icon();});
+    /* hide dashboard links for unconfigured backends */
+    try{
+      var tok=new URLSearchParams(location.search).get("token");
+      fetch("/api/nav"+(tok?("?token="+encodeURIComponent(tok)):""),
+        {headers:tok?{Authorization:"Bearer "+tok}:{}})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(n){ if(!n)return;
+          [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+            if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
+              .forEach(function(a){a.style.display="none";});
+          });
+        }).catch(function(){});
+      // live alert indicator on the sidebar "Alerts" item (from any page)
+      function _alertDot(){
+        var tk=new URLSearchParams(location.search).get("token");
+        fetch("/api/alerts"+(tk?("?token="+encodeURIComponent(tk)):""),
+          {headers:tk?{Authorization:"Bearer "+tk}:{}})
+          .then(function(r){return r.ok?r.json():null;})
+          .then(function(d){ if(!d)return;
+            var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+            if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
+          }).catch(function(){});
+      }
+      _alertDot(); setInterval(_alertDot, 10000);
+    }catch(e){}
+  });
+})();
+</script>
+</head>
+<body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.0.3</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/gpu">GPU</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
+<header>
+  <h1>Ollama</h1>
+  <span class="badge" id="o-ver"></span>
+  <div class="windows" id="windows">
+    <button id="nav-left" title="shift earlier">◀</button>
+    <button data-w="15m">15m</button>
+    <button data-w="1h" class="active">1h</button>
+    <button data-w="24h">24h</button>
+    <button data-w="30d">30d</button>
+    <button id="nav-right" title="shift later" disabled>▶</button>
+    <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
+  </div>
+  <span id="updated">connecting…</span>
+  <button id="theme-btn" class="badge" title="toggle day / night"
+    style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
+</header>
+<main>
+  <section class="card span-2" id="card-kpi">
+    <h2>Live <span class="badge" id="o-badge"></span></h2>
+    <div class="kpis" id="o-kpis"></div>
+  </section>
+
+  <section class="card span-2" id="card-running">
+    <h2>Active running models</h2>
+    <div id="o-running"><div class="unavail">no data</div></div>
+  </section>
+
+  <section class="card span-2" id="card-modelevents">
+    <h2>Model activity <span class="badge" style="background:var(--panel2)">load / unload</span></h2>
+    <div id="o-modelevents"><div class="unavail">no model events yet</div></div>
+  </section>
+
+  <section class="card" id="card-charts" style="grid-column:1/-1">
+    <h2>Ollama over time — <span id="win-label">1h</span>
+      <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
+    </h2>
+    <div class="chart-grid" id="chart-grid"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+function escapeHtml(s){
+  if(s===null||s===undefined) return "";
+  return String(s).replace(/[&<>"']/g,c=>(
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function setHtml(el, html){ el.innerHTML = DOMPurify.sanitize(html); }
+const _timers = [];
+window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
+
+function bytes(n){
+  if(!n) return "0 B";
+  const u=["B","KB","MB","GB","TB"]; let i=0; n=Number(n);
+  while(n>=1024&&i<u.length-1){n/=1024;i++;}
+  return n.toFixed(i?1:0)+" "+u[i];
+}
+function kpi(label,val){
+  return `<div class="kpi"><div class="v">${escapeHtml(val)}</div>`
+       + `<div class="l">${escapeHtml(label)}</div></div>`;
+}
+function badge(el, up, txt){ el.className="badge "+(up?"ok":"bad"); el.textContent=up?(txt||"live"):"down"; }
+function expiresIn(iso){
+  if(!iso) return "—";
+  const t=new Date(iso).getTime(); if(isNaN(t)) return "—";
+  const s=Math.round((t-Date.now())/1000);
+  if(s<=0) return "now";
+  if(s<60) return s+"s"; if(s<3600) return Math.round(s/60)+"m"; return Math.round(s/3600)+"h";
+}
+
+const CHARTS = [
+  {id:"c-run",  key:"orun",  label:"Running models", color:"#7ee787"},
+  {id:"c-ram",  key:"oram",  label:"Model RAM",      color:"#f0883e", bytes:true},
+  {id:"c-vram", key:"ovram", label:"Model VRAM",     color:"#f778ba", bytes:true},
+];
+const _charts = {};
+function mkChart(canvas, cfg){
+  const yTick = cfg.bytes
+    ? {color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
+    : {color:"#8b949e",font:{size:9}};
+  return new Chart(canvas, {
+    type:"line",
+    data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
+      backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+              y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
+  });
+}
+(function build(){
+  const grid=document.getElementById("chart-grid");
+  for(const cfg of CHARTS){
+    const card=document.createElement("div");card.className="mini";
+    const h=document.createElement("h3");
+    const nm=document.createElement("span");nm.textContent=cfg.label;
+    const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
+    h.append(nm,cur);
+    const wrap=document.createElement("div");wrap.className="chart-wrap";
+    const cv=document.createElement("canvas");cv.id=cfg.id;wrap.appendChild(cv);
+    card.append(h,wrap);grid.appendChild(card);
+    _charts[cfg.id]=mkChart(cv,cfg);
+  }
+})();
+function fmtT(t){ return t?new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""; }
+function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(Math.round(v*100)/100)); }
+function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
+
+const AUTH = new URLSearchParams(location.search).get("token");
+let TIMEEND=null;
+const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
+let WIN = "1h";
+async function api(path){
+  if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
+    path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
+  try{
+    const sep=path.includes("?")?"&":"?";
+    const url=path+(AUTH?(sep+"token="+encodeURIComponent(AUTH)):"");
+    const r=await fetch(url,{headers:AUTH?{Authorization:"Bearer "+AUTH}:{}});
+    if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
+    return await r.json();
+  }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
+}
+
+function renderKpis(o){
+  const b=document.getElementById("o-badge");
+  document.getElementById("o-ver").textContent = (o&&o.version)?("v"+o.version):"";
+  if(!o || o.available===false){
+    badge(b,false);
+    setHtml(document.getElementById("o-kpis"),
+      `<div class="unavail">${escapeHtml((o&&o.error)||"unconfigured")}</div>`);
+    setHtml(document.getElementById("o-running"),
+      `<div class="unavail">Set OLLAMA_BASE_URL (e.g. http://host:11434) to see running models.</div>`);
+    return;
+  }
+  badge(b,true,"live");
+  setHtml(document.getElementById("o-kpis"),
+    kpi("Running", o.models_running)
+    +kpi("Installed", o.models_installed)
+    +kpi("Model RAM", bytes(o.ram_used))
+    +kpi("Model VRAM", bytes(o.vram_used))
+    +kpi("On GPU", (o.gpu_pct!=null?o.gpu_pct:0)+"%")
+    +kpi("Version", o.version||"—"));
+  if(o.models&&o.models.length){
+    let rows=o.models.map(m=>`<tr><td>${escapeHtml(m.name)}</td>`
+      +`<td>${escapeHtml(m.params||"—")} <span class="pill">${escapeHtml(m.quant||"")}</span></td>`
+      +`<td class="num">${bytes(m.size)}</td>`
+      +`<td class="num">${bytes(m.size_vram)}</td>`
+      +`<td class="num">${m.gpu_pct!=null?m.gpu_pct+"%":"—"}</td>`
+      +`<td class="num">${escapeHtml(expiresIn(m.expires_at))}</td></tr>`).join("");
+    setHtml(document.getElementById("o-running"),
+      `<table><tr><th>Model</th><th>params</th><th class="num">size</th>`
+      +`<th class="num">VRAM</th><th class="num">on GPU</th>`
+      +`<th class="num">unloads in</th></tr>${rows}</table>`);
+  } else setHtml(document.getElementById("o-running"),
+      `<div class="unavail">no models currently loaded</div>`);
+}
+
+async function loadSeries(){
+  const d=await api("/api/series?window="+WIN);
+  if(!d) return;
+  const pts=d.points||[]; const labels=pts.map(p=>fmtT(p.t));
+  for(const cfg of CHARTS){
+    const ch=_charts[cfg.id];
+    ch.data.labels=labels;
+    ch.data.datasets[0].data=pts.map(p=>(p[cfg.key]==null?null:p[cfg.key]));
+    ch.update("none");
+    const cur=document.getElementById(cfg.id+"-cur");
+    if(cur) cur.textContent=fmtCur(cfg,lastNonNull(pts,cfg.key));
+  }
+}
+function rangedReload(){ loadSeries(); }
+function updateRangeUI(){
+  const now=Date.now()/1000;
+  document.getElementById("nav-right").disabled = !TIMEEND;
+  const lbl=document.getElementById("range-lbl");
+  if(!TIMEEND){ lbl.textContent="live"; return; }
+  const m=Math.round((now-TIMEEND)/60);
+  lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
+}
+document.getElementById("nav-left").addEventListener("click",()=>{
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-WSECS[WIN];
+  updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-right").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
+  if(TIMEEND>=Date.now()/1000) TIMEEND=null;
+  updateRangeUI(); rangedReload();
+});
+document.querySelectorAll("#windows button[data-w]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
+    document.getElementById("win-label").textContent=WIN; loadSeries();
+  });
+});
+document.getElementById("export-btn").addEventListener("click",()=>{
+  window.open("/api/export?window="+WIN+"&format=csv"
+    +(AUTH?("&token="+encodeURIComponent(AUTH)):""),"_blank");
+});
+
+async function loadModelEvents(){
+  const d=await api("/api/events?kind=model&limit=30");
+  const evs=(d&&d.events)||[];
+  const el=document.getElementById("o-modelevents");
+  if(!el) return;
+  if(!evs.length){ setHtml(el,`<div class="unavail">no model events yet</div>`); return; }
+  const rows=evs.map(e=>{
+    const load=e.up;
+    const glyph=`<span style="color:${load?'var(--ok)':'var(--bad)'}">${load?'▲':'▼'}</span>`;
+    const model=escapeHtml((e.detail||"").replace(/^(un)?loaded\s+/,""));
+    return `<tr><td>${glyph} ${escapeHtml(e.backend)}</td>`
+      +`<td>${load?'loaded':'unloaded'}</td><td>${model}</td>`
+      +`<td class="num" style="color:var(--muted)">${escapeHtml(fmtT(e.ts))}</td></tr>`;
+  }).join("");
+  setHtml(el,`<table><tr><th>Backend</th><th>Event</th><th>Model</th>`
+    +`<th class="num">time</th></tr>${rows}</table>`);
+}
+async function tick(){
+  const d=await api("/api/data?history=1");
+  if(d){
+    const c=(d.latest||{}).collectors||{};
+    renderKpis(c.ollama);
+    const t=(d.latest||{}).ts?new Date(d.latest.ts*1000).toLocaleTimeString():"—";
+    document.getElementById("updated").textContent="updated "+t;
+  }
+  await loadModelEvents();
+  await loadSeries();
+}
+tick();
+_timers.push(setInterval(tick,5000));
+</script>
+</div>
+<script>
+/* collapsible lateral sidebar — state persisted, active link by path */
+(function(){var KEY="aimon_sb";
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if(a.getAttribute("href")===p)a.classList.add("active");});
+  });
+})();
+</script>
+</body>
+</html>
