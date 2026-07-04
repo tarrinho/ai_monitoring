@@ -687,14 +687,20 @@ def test_window_date_range_wired_on_windowed_pages():
 
 
 def test_license_apache2_present_and_wired():
-    """packaging: Apache-2.0 LICENSE exists, is referenced in the README, and ships
-    via the publish allow-list."""
+    """packaging: Apache-2.0 LICENSE exists and is referenced in the README. The
+    publish allow-list check runs only where the publisher is checked out (dev tree
+    on the Mac); the public repo intentionally excludes deploy/publish-github.sh —
+    it embeds the private git-personal SSH alias and lives in a separate private
+    scripts repo — so CI skips that assertion cleanly."""
     lic = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Apache License" in lic and "Version 2.0" in lic
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "Apache License 2.0" in readme
-    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
-    assert "LICENSE" in pub, "LICENSE not in publish allow-list"
+    pub_path = ROOT / "deploy" / "publish-github.sh"
+    if not pub_path.exists():
+        return   # public checkout: publisher lives in ai_monitoring_scripts, not here
+    assert "LICENSE" in pub_path.read_text(encoding="utf-8"), \
+        "LICENSE not in publish allow-list"
 
 
 def test_ci_consolidated_with_per_control_badges():
@@ -717,7 +723,13 @@ def test_gpu_stacked_per_app_cpu_chart():
     html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
     assert 'id="appcpu-chart"' in html and "loadAppCpu" in html
     assert "stacked:true" in html                       # stacked area, not lines
-    assert 'fill:true' in html and "PROC_COLORS" in html  # filled, per-app colours
+    assert "PROC_COLORS" in html                          # per-app colour palette
+    # Stacked-area fill MUST go to the previous dataset, not to zero. fill:true fills
+    # to origin, stacking translucent layers so each band blends with the ones below
+    # (green→olive, pink→mauve) and no longer matches its legend swatch. The appcpu
+    # datasets must fill to the previous line (i?"-1":"origin").
+    assert re.search(r'fill:\s*i\s*\?\s*["\']-1["\']\s*:\s*["\']origin["\']', html), \
+        "appcpu stacked chart must fill to previous dataset, not to zero"
     assert "/api/procseries?kind=cpu" in html
 
 
@@ -752,5 +764,10 @@ def test_gitleaks_wired_in_secret_scan():
     cfg = (ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
     assert "useDefault = true" in cfg          # built-in rule set
     assert "tests/" in cfg and ".env.example" in cfg   # synthetic-secret allowlist
-    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
-    assert ".gitleaks.toml" in pub, ".gitleaks.toml not in publish allow-list"
+    # publisher lives in a private scripts repo, not published here (see
+    # test_license_apache2_present_and_wired for rationale). Skip cleanly in CI.
+    pub_path = ROOT / "deploy" / "publish-github.sh"
+    if not pub_path.exists():
+        return
+    assert ".gitleaks.toml" in pub_path.read_text(encoding="utf-8"), \
+        ".gitleaks.toml not in publish allow-list"
