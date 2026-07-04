@@ -4,6 +4,16 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.0.5] — 2026-07-04
+
+### Changed
+- **Full-width "metrics over time"** — the charts card on the GPU and LiteLLM
+  dashboards now spans every grid column (`grid-column: 1 / -1`) instead of two,
+  so on wide screens it uses the whole width instead of ~50%.
+- **Default time window is now 24h** on the LiteLLM, Ollama, and llama.cpp
+  dashboards (was 1h) — their charts open on a full day by default; the 15m / 1h /
+  30d buttons and history pan are unchanged.
+
 ## [1.0.4] — 2026-07-04
 
 ### Added

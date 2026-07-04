@@ -28,8 +28,10 @@
   header h1{font-size:16px;margin:0;font-weight:600}
   .ver{color:var(--muted);font-size:12px}
   #updated{margin-left:auto;color:var(--muted);font-size:12px}
-  main{padding:18px;display:grid;gap:16px;
-    grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  /* LiteLLM is a stacked, full-width dashboard — one column so every card spans
+     100%. (auto-fit created 3-4 columns on wide screens, leaving span-2 cards at
+     50-66% width.) minmax(0,1fr) lets wide tables/charts scroll instead of overflow. */
+  main{padding:18px;display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
     padding:14px 16px}
   .card h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;
@@ -50,9 +52,10 @@
   .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
     border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
   .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
-  .span-2{grid-column:span 2}
-  .span-full{grid-column:1/-1}   /* span every column, whatever the count */
-  @media(max-width:720px){.span-2{grid-column:span 1}}
+  /* single-column grid → every card fills the row (no implicit extra column from
+     `span 2`, which is what left cards at partial width on wide screens) */
+  .span-2{grid-column:1/-1}
+  .span-full{grid-column:1/-1}
   .chart-grid{display:grid;gap:16px;grid-template-columns:1fr}
   .mini{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
   .mini h3{margin:0 0 4px;font-size:12px;color:var(--muted);font-weight:500;
@@ -143,7 +146,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.0.4</div>
+      <div id="sidebar-brand-ver">v1.0.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
