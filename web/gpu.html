@@ -280,7 +280,10 @@ async function loadAppCpu(){
     data:pts.map(p=>p[a]==null?null:p[a]),
     borderColor:PROC_COLORS[i%PROC_COLORS.length],
     backgroundColor:PROC_COLORS[i%PROC_COLORS.length]+"66",
-    borderWidth:1,pointRadius:0,tension:.25,fill:true,spanGaps:true}));
+    // stacked area: fill to the previous dataset (not to zero) so each band shows
+    // its own pure colour — fill:true fills to origin, stacking translucent layers
+    // and blending every band with the ones below (green→olive, pink→mauve).
+    borderWidth:1,pointRadius:0,tension:.25,fill:i?"-1":"origin",spanGaps:true}));
   appCpuChart.update("none");
 }
 function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(Math.round(v*100)/100)+(cfg.unit||"")); }
