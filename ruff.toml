@@ -1,0 +1,6 @@
+# Ruff config. Production code is strict (default rules); test files may use the
+# compact fixture style — semicolon one-liners and grouped imports — that ruff's
+# E702/E401/E701 flag. Keep those relaxed in tests only, so `ruff check .` (as CI
+# runs it, rules.md §9) stays green without loosening the app code.
+[lint.per-file-ignores]
+"tests/**" = ["E701", "E702", "E401", "E402"]

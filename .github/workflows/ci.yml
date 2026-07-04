@@ -88,7 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Trivy fs (HIGH/CRITICAL → fail)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           scan-type: fs
           scan-ref: .
@@ -109,7 +109,7 @@ jobs:
         run: docker build --build-arg RUN_TESTS=1 -t ai-monitoring:ci .
 
       - name: Trivy image (HIGH/CRITICAL → fail)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           scan-type: image
           image-ref: ai-monitoring:ci

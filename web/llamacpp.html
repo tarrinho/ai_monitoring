@@ -165,6 +165,7 @@
     <button data-w="30d">30d</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
+    <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
   <span id="updated">connecting…</span>
   <button id="theme-btn" class="badge" title="toggle day / night"
@@ -308,10 +309,19 @@ async function loadSeries(){
   }
 }
 function rangedReload(){ loadSeries(); }
+function fmtRange(ts){
+  const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
+  return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
+}
 function updateRangeUI(){
   const now=Date.now()/1000;
   document.getElementById("nav-right").disabled = !TIMEEND;
   const lbl=document.getElementById("range-lbl");
+  // absolute window bounds shown at the top — start → end, refreshed on every
+  // pan (◀ ▶) and window change.
+  const _end=TIMEEND||now, _start=_end-WSECS[WIN];
+  const _dt=document.getElementById("range-dates");
+  if(_dt) _dt.textContent = fmtRange(_start)+"  →  "+fmtRange(_end);
   if(!TIMEEND){ lbl.textContent="live"; return; }
   const m=Math.round((now-TIMEEND)/60);
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
@@ -347,6 +357,7 @@ async function tick(){
   }
   await loadSeries();
 }
+updateRangeUI();
 tick();
 _timers.push(setInterval(tick,5000));
 </script>

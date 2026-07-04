@@ -18,6 +18,14 @@ Versioning: [SemVer](https://semver.org/).
   its served-by backend (llama.cpp → `llama-server`, ollama → `ollama`) from the
   existing procs collector — no new sampling, no observer-effect.
 
+### Fixed
+- **CI (GitHub Actions)** — pinned `aquasecurity/trivy-action` to an existing
+  release (`@0.35.0`; `@0.24.0` no longer resolves) in both the filesystem and
+  image scans, and added a `ruff.toml` so `ruff check .` passes: test fixtures may
+  use compact semicolon one-liners / grouped imports (E701/E702/E401/E402 relaxed
+  in `tests/**` only — app code stays strict). Overview: Uptime card stacked under
+  the GPU card; the GPU card badge shows `live` instead of the `file nvidia` mode.
+
 ### Docs
 - **README GPU-setup section** — consolidated step-by-step for the three GPU
   feed modes (local file via `deploy/gpu-metrics.service`, remote SSH, remote
