@@ -8,7 +8,7 @@ server** that serves dashboards + a JSON API reading from that same store.
                     ┌──────────────────────── app.py (aiohttp) ────────────────────────┐
                     │                                                                   │
   every 5s   ┌──────▼─────── sampling loop ───────┐        HTTP ┌── dashboards (web/) ──┐
-  ───────────►  gather() all collectors           │        ◄────►  poll JSON API every 5s│
+  ───────────►  host+procs → _latest              │        ◄────►  SSE push + 5s poll     │
              │  → snapshot {collectors:{…}}        │             └───────────────────────┘
              │  → _metrics_row() flatten to cols   │                        ▲
              │  → db.insert / insert_metrics       │                        │
@@ -21,18 +21,23 @@ server** that serves dashboards + a JSON API reading from that same store.
                     │                                                    │
                     ▼                        SQLite (/data) ◄────────────┘
         collectors/ (host, procs, gpu,     metrics(+_1m,_1h) key_series(+rollups)
-        litellm, ollama, llamacpp)         proc_series(+rollups) events anomalies
-                                           alert_log samples
+        litellm, ollama, llamacpp,         proc_series(+rollups) events anomalies
+        containers)                        alert_log samples
 ```
 
 ## Sampling loop (`app.py:_sampling_loop`)
 
 Each tick (`MONITOR_SAMPLE_INTERVAL`, default 5s):
 
-1. **Collect** — `asyncio.gather` runs all collectors concurrently. Host/GPU/
-   procs are sync (`asyncio.to_thread`, they read `/proc` / run `nvidia-smi`);
-   LiteLLM/Ollama/llama.cpp are async HTTP. Every collector returns a dict with
-   an `available` bool and never raises — one dead backend can't stall the loop.
+1. **Collect (decoupled — the anti-freeze guarantee)** — the tick only `await`s
+   the two cheap, always-fast collectors: `host` and `procs` (sync `/proc` reads
+   via `asyncio.to_thread`). Every heavier backend — `gpu` (subprocess
+   `nvidia-smi`), `litellm`, `ollama`, `llamacpp`, `containers` (HTTP / socket) —
+   runs in its **own `_backend_loop`** on its own cadence, each call HARD-bounded
+   by `asyncio.wait_for`, writing its latest result into `_backend_latest`. The
+   tick reads that cache, so a wedged `nvidia-smi` (D-state) or a hung proxy can
+   never stall sampling. Every collector returns `{available, …}` and never
+   raises. The main tick is itself `wait_for`-bounded as a final backstop.
 2. **Flatten** — `_metrics_row(snap)` maps the nested snapshot into ~24 flat
    numeric columns (`cpu`, `mem`, `gpu`, `wait`, `p95`, `reqrate`, `conc`, …),
    deriving VRAM% / tokens-per-watt / concurrency, with fallbacks (VRAM from
@@ -55,7 +60,7 @@ Each tick (`MONITOR_SAMPLE_INTERVAL`, default 5s):
 | `key_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/keyseries` |
 | `proc_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/procseries` |
 | `samples` | every tick | `MONITOR_DB_RETENTION_HOURS` | boot warm-load |
-| `events` | on transition | `ROLLUP_HOUR_DAYS` | `/api/uptime` |
+| `events` (`kind` state/model) | on transition / model swap | `ROLLUP_HOUR_DAYS` | `/api/uptime` (state) · `/api/events` (model) |
 | `anomalies` / `alert_log` | on fire | `ROLLUP_HOUR_DAYS` | `/api/anomalies` / `/api/alerts` |
 
 **Windowed reads** (`series`, `key_series`, `proc_series`) pick the table by
@@ -69,9 +74,16 @@ volume makes everything survive restarts.
 ## HTTP layer (`app.py`)
 
 Middlewares (outer→inner): `_sechdr_mw` (security headers on every response) →
-`_auth_mw` (token gate on `/` + `/api/*`, constant-time). Dashboard pages set an
-HttpOnly cookie from `?token=` then 302 to a clean URL. Handlers read the
-in-memory ring (`_latest`, `_ring`) for "now" and SQLite for history. An
+`_auth_mw` (token gate on `/` + `/api/*`, constant-time compare, HttpOnly-cookie
+session). `_auth_mw` also does **per-IP brute-force lockout**: after
+`AUTH_MAX_FAILS` bad tokens in `AUTH_WINDOW_S` an IP gets `429 + Retry-After` for
+`AUTH_LOCKOUT_S` (client IP from `X-Forwarded-For` only when
+`AUTH_TRUSTED_PROXY` is set, so the header can't be spoofed to dodge it).
+Dashboard pages set the cookie from `?token=` then 302 to a clean URL. Handlers
+read the in-memory ring (`_latest`, `_ring`) for "now" and SQLite for history.
+`GET /api/stream` is a **Server-Sent Events** channel that pushes each new
+snapshot over one connection (the Overview uses it and falls back to polling on
+error); `/api/events?kind=model` serves the model load/unload timeline. An
 in-process `startup_selfcheck()` verifies dashboards/assets/metrics/routes at
 boot and logs the result.
 
@@ -86,12 +98,19 @@ Each exposes `sample()` returning `{available, …}` and degrades to
   by CPU% (delta) and RSS. `pid: host` to see host processes.
 - `gpu` — `nvidia-smi`/`rocm-smi` locally, **or remote** via SSH (`GPU_SSH`) or
   an HTTP agent (`GPU_METRICS_URL`); util/VRAM/power/temp/throttle.
-- `litellm` — `/health/liveliness`, `/v1/models`, `/health`, `/health/backlog`
-  (in-flight), `/spend/logs` → latency (avg/p50/p95/p99/SLO), rates, tokens,
-  cost, cache, TTFT, per-model + per-key aggregation, recent failures.
+- `litellm` — `/health/liveliness`, `/v1/models`, `/health/backlog` (in-flight),
+  and `/spend/logs` → latency (avg/p50/p95/p99/SLO), rates, tokens, cost, cache,
+  TTFT, per-model + per-key aggregation, recent failures. `spend_mode=lite` swaps
+  the heavy whole-day log pull for server-side aggregates (`/global/activity`,
+  `/global/spend/keys`). The per-deployment `/health` probe was removed — it
+  exhausted unified-memory GPUs (see §6 load-safety).
 - `ollama` — `/api/ps` (running + RAM/VRAM + params/quant), `/api/tags`,
   `/api/version`.
 - `llamacpp` — `/health`, `/props`, `/slots` (active slots, tokens/s, kv-cache).
+- `containers` — Docker Engine API over the mounted `docker.sock` (read-only
+  GETs): liveness + uptime / down-duration per container; auto-discovers all host
+  containers when `MONITOR_CONTAINERS` is empty. Per-container inspects run
+  concurrently so the sample can't overrun its loop's `wait_for` bound.
 
 ## Extension points
 
@@ -107,5 +126,8 @@ Each exposes `sample()` returning `{available, …}` and degrades to
 
 Each is a self-contained HTML page (inline CSS/JS, vendored Chart.js + DOMPurify
 — no CDN). Shared conventions applied uniformly: theme head-script (day/night +
-nav-visibility + alert-dot), collapsible sidebar, window + pan controls, one
-DOMPurify-sanitised `innerHTML` sink (§17). They poll the JSON API every 5s.
+nav-visibility + alert-dot), collapsible sidebar, window + pan controls (default
+window 24h on the LiteLLM/Ollama/llama.cpp pages), one DOMPurify-sanitised
+`innerHTML` sink (§17). The Overview takes live snapshots over the `/api/stream`
+SSE channel and falls back to a 5s poll on any stream error; the windowed
+time-series are always fetched on demand.

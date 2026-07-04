@@ -231,13 +231,19 @@ def series(window: str, max_points: int = 300,
 
 
 def insert_key_series(ts: float, top_keys: list[dict[str, Any]]) -> None:
-    """Store this tick's per-key request counts (one row per key)."""
+    """Store this tick's per-key ranking value (one row per key). In full mode
+    that's request count; in **lite** mode LiteLLM gives no per-key requests (only
+    spend), so fall back to spend/cost — the same metric the top-keys bar shows —
+    instead of storing zeros that leave the over-time chart empty."""
     if not top_keys:
         return
     rows = []
     for k in top_keys:
         label = k.get("alias") or k.get("key") or "?"
-        rows.append((ts, str(label)[:80], float(k.get("reqs", 0) or 0)))
+        val = k.get("reqs")
+        if val is None:      # lite: rank by spend (cost / total_spend / spend)
+            val = k.get("cost") or k.get("total_spend") or k.get("spend") or 0
+        rows.append((ts, str(label)[:80], float(val or 0)))
     try:
         with _connect() as conn:
             conn.executemany(

@@ -2355,3 +2355,22 @@ def test_metrics_row_is_pure_and_fast():
         row = a._metrics_row(snap)
     assert (_t.time() - t) < 2.0            # 500 pure builds well under 2s (no I/O)
     assert all(k in row for k in ("cpu", "gpu", "slots", "backlog"))
+
+
+def test_key_series_falls_back_to_spend_in_lite(tmp_path, monkeypatch):
+    # lite mode: top_keys carry spend but no reqs → key_series must store spend,
+    # not zeros (else the "Top 10 keys over time" chart is empty). Regression.
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "k.db"))
+    db.init()
+    now = 1_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    # full-mode key (reqs) and lite-mode key (reqs=None, cost)
+    db.insert_key_series(now, [{"alias": "full-key", "reqs": 42},
+                               {"alias": "lite-key", "reqs": None, "cost": 3.5}])
+    ks = db.key_series("15m")
+    pts = ks.get("points", [])
+    assert pts, "no key_series points"
+    last = pts[-1]
+    assert last.get("full-key") == 42        # requests preserved in full mode
+    assert last.get("lite-key") == 3.5        # spend used when reqs is None

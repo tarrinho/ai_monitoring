@@ -204,7 +204,7 @@
   </section>
 
   <section class="card span-2" id="card-keytime">
-    <h2>Top 10 API keys over time — <span id="keytime-win">24h</span></h2>
+    <h2>Top 10 API keys over time <span id="keytime-metric" class="badge">by requests</span> — <span id="keytime-win">24h</span></h2>
     <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart"></canvas></div>
   </section>
 
@@ -258,6 +258,7 @@ function servedBy(model){
 // process' current CPU% + RSS. Reuses the procs collector — no new sampling.
 let _procs = null;
 let _hostMemTotal = 0;   // host total RAM (bytes) → serving-process RSS as a %
+let _spendMode = "full"; // lite mode has no per-key requests → key charts show spend
 function svcProc(backend){
   const p=_procs||{}, cpu=p.top_cpu||[], ram=p.top_ram||[];
   const names = backend==="llama.cpp" ? ["llama-server","llama-cpp","llama_cpp"]
@@ -600,6 +601,9 @@ async function loadCorr(){
 async function loadKeyTime(){
   const d=await api("/api/keyseries?window="+WIN);
   document.getElementById("keytime-win").textContent=WIN;
+  // lite mode ranks keys by spend (no per-key request counts) → label accordingly
+  const km=document.getElementById("keytime-metric");
+  if(km) km.textContent = _spendMode==="lite" ? "by spend ($)" : "by requests";
   if(!d){ return; }
   const pts=d.points||[]; const labels=d.labels||[];
   keyTimeChart.data.labels=pts.map(p=>fmtT(p.t));
@@ -687,6 +691,7 @@ async function tick(){
     const c=(d.latest||{}).collectors||{};
     _procs = c.procs || null;
     _hostMemTotal = (c.host && c.host.mem_total) || 0;
+    _spendMode = (c.litellm && c.litellm.spend_mode) || "full";
     renderKpis(c.litellm);
     renderKeys(c.litellm);
     renderFailures(c.litellm);

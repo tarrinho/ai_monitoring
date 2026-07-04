@@ -7,6 +7,16 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.0.5] — 2026-07-04
 
 ### Changed
+- **CI consolidated into one workflow with per-control badges** — the five split
+  workflows were merged back into a single `ci.yml` (secret-scan / lint / tests /
+  trivy-fs / build-scan run as jobs), so the Actions page shows **one aggregated
+  run per push**. A final `badges` job writes each control's status as a shields
+  "endpoint" JSON to an orphan `badges` branch, so the README keeps **individual
+  per-control badges** (plus one overall CI badge). No third-party services.
+- **Publish auto-tags the release** — after a successful `publish-github.sh` push,
+  it pushes an annotated `v<version>` tag (unless it already exists, or
+  `SKIP_TAG=yes`), which triggers the release workflow. Commit subjects are
+  version+timestamp stamped so each push is distinct.
 - **Full-width "metrics over time"** — the charts card on the GPU and LiteLLM
   dashboards now spans every grid column (`grid-column: 1 / -1`) instead of two,
   so on wide screens it uses the whole width instead of ~50%.

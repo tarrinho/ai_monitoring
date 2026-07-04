@@ -6,11 +6,13 @@
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-ai__monitoring-2496ED?logo=github&logoColor=white)](https://github.com/tarrinho/ai_monitoring/pkgs/container/ai_monitoring)
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-[![secret-scan](https://github.com/tarrinho/ai_monitoring/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/secret-scan.yml)
-[![lint](https://github.com/tarrinho/ai_monitoring/actions/workflows/lint.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/lint.yml)
-[![tests](https://github.com/tarrinho/ai_monitoring/actions/workflows/tests.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/tests.yml)
-[![trivy-fs](https://github.com/tarrinho/ai_monitoring/actions/workflows/trivy-fs.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/trivy-fs.yml)
-[![build-scan](https://github.com/tarrinho/ai_monitoring/actions/workflows/build-scan.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/build-scan.yml)
+<!-- Per-control status from the single CI workflow, published to the `badges` branch. -->
+[![CI](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![secret-scan](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/secret-scan.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![lint](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/lint.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/tests.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![trivy-fs](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/trivy-fs.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![build-scan](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/build-scan.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 
 Single-binary observability for a self-hosted LLM stack — **LiteLLM**, **Ollama**,
 **llama.cpp**, **GPU**, and **host** — in one aiohttp app. Collectors poll each

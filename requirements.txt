@@ -1,2 +1,4 @@
-aiohttp>=3.9,<4
-python-dotenv>=1.0,<2
+# Pinned to exact versions so Trivy's filesystem scan can resolve them and flag
+# CVEs — it cannot vuln-scan version RANGES like `>=3.9,<4`. Bump on a Trivy hit.
+aiohttp==3.14.1
+python-dotenv==1.2.2
