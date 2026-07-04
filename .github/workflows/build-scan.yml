@@ -1,4 +1,6 @@
 name: build-scan
+# Title each run by the job (not the generic publish commit message).
+run-name: build gate + trivy image
 
 # rules.md §14 + §10 (image) — build with the in-image pytest gate, then Trivy
 # scans the resulting image for HIGH/CRITICAL CVEs.

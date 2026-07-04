@@ -7,16 +7,26 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.0.4] — 2026-07-04
 
 ### Added
+- **Release workflow** (`.github/workflows/release.yml`) — pushing a `vX.Y.Z` tag
+  now publishes a **GitHub Release** (notes pulled from this CHANGELOG) and pushes
+  the **multi-arch container image** (amd64 / arm64 / armv7) to GitHub Packages
+  (`ghcr.io/tarrinho/ai_monitoring`), using the built-in `GITHUB_TOKEN` — no extra
+  secrets. Each publish commit is now titled with the version + a UTC timestamp so
+  successive pushes have distinct descriptions.
 - **Per-control CI badges** — the single `ci.yml` workflow was split into five
   independent workflows (`secret-scan`, `lint`, `tests`, `trivy-fs`, `build-scan`),
   each surfacing its own GitHub Actions status badge in the README so a failure is
   attributable to a specific control at a glance.
 - **LiteLLM "Load vs resource impact" chart** — a dual-axis correlation chart on
   the LiteLLM dashboard plotting request rate (req/s) against the per-execution
-  cost signals of a GPU-served LLM: GPU util %, KV-cache %, and the llama.cpp
-  process CPU %. (Exact per-request CPU/RAM isn't measurable with interval
-  sampling and is mostly noise for a GPU-bound model — this shows the honest
-  correlation. Host RAM is static; KV-cache is the real per-request memory.)
+  cost signals of a GPU-served LLM: GPU util %, KV-cache %, the llama.cpp process
+  **CPU %** and **RAM %** (RSS / host memory). (Exact per-request CPU/RAM isn't
+  measurable with interval sampling and is mostly noise for a GPU-bound model —
+  this shows the honest correlation. Host RAM is static; KV-cache is the real
+  per-request memory.)
+- **Dedicated CPU + RAM over-time charts** on the LiteLLM dashboard — one line per
+  LLM serving process (`llama-server`, `ollama`): CPU % over time, and RSS (RAM)
+  over time. Fed from the procs collector (`/api/procseries`) — no new sampling.
 - **Per-model resource columns** — the LiteLLM per-model table gained **svc CPU**
   and **svc RAM** columns: each model's serving-process CPU % and RSS, mapped via
   its served-by backend (llama.cpp → `llama-server`, ollama → `ollama`) from the

@@ -1,4 +1,6 @@
 name: trivy-fs
+# Title each run by the job (not the generic publish commit message).
+run-name: trivy filesystem scan
 
 # rules.md §10 (filesystem) — Trivy scan of deps / config / secrets in the tree.
 on:

@@ -1,4 +1,6 @@
 name: tests
+# Title each run by the job (not the generic publish commit message).
+run-name: qa tests
 
 # rules.md §1 + §2 — static + dynamic pytest suites.
 on:

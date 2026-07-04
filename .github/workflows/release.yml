@@ -1,0 +1,83 @@
+name: release
+run-name: release ${{ github.event.inputs.tag || github.ref_name }}
+
+# On a version tag (v1.2.3) this fills the two things a fresh repo is missing:
+#   • Packages — builds the multi-arch image and pushes it to GitHub Container
+#     Registry (ghcr.io/<owner>/<repo>), using the built-in GITHUB_TOKEN.
+#   • Releases — creates a GitHub Release whose notes are the matching CHANGELOG
+#     section.
+# The per-commit test gate already ran in the `tests` + `build-scan` workflows on
+# the same commit, so the release build itself uses RUN_TESTS=0 to avoid a slow
+# emulated pytest run on the arm targets.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to (re)release, e.g. v1.0.4"
+        required: true
+
+permissions:
+  contents: write   # create the GitHub Release
+  packages: write   # push the image to ghcr.io
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve tag + lowercase image name
+        id: meta
+        run: |
+          echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # ── Packages: multi-arch image → GHCR ─────────────────────────────────
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push image (amd64 / arm64 / armv7)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: RUN_TESTS=0
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+
+      # ── Releases: GitHub Release with CHANGELOG notes ─────────────────────
+      - name: Extract CHANGELOG section for this tag
+        run: |
+          v="${{ steps.meta.outputs.tag }}"; v="${v#v}"
+          awk -v ver="$v" '
+            $0 ~ "^## \\[" ver "\\]" {p=1; next}
+            p && /^## \[/ {exit}
+            p {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Release ${{ steps.meta.outputs.tag }}." > RELEASE_NOTES.md
+          fi
+          {
+            echo ""
+            echo "---"
+            echo "**Container image:** \`docker pull ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`  (amd64 · arm64 · armv7)"
+          } >> RELEASE_NOTES.md
+      - name: Create (or update) the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "AI-Monitoring $tag" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$tag" --title "AI-Monitoring $tag" --notes-file RELEASE_NOTES.md
+          fi

@@ -432,9 +432,13 @@ def test_litellm_page_exists_and_secure():
     assert '"orun"' not in html and '"ovram"' not in html
     # top-10 API keys bar chart
     assert 'id="keys-chart"' in html and "renderKeys" in html
-    # load-vs-impact correlation chart (req/s vs GPU/KV/llama-CPU) + loader
+    # load-vs-impact correlation chart (req/s vs GPU/KV/llama-CPU+RAM) + loader
     assert 'id="impact-chart"' in html and "loadImpact" in html
     assert 'id="card-impact"' in html
+    assert '"llama.cpp CPU %"' in html and '"llama.cpp RAM %"' in html
+    # dedicated over-time charts: one CPU, one RAM (per serving process)
+    assert 'id="svc-cpu-chart"' in html and 'id="svc-ram-chart"' in html
+    assert "svcCpuChart" in html and "svcRamChart" in html
     # per-model resource cost columns sourced from the procs collector
     assert "svcProc" in html and "svc CPU" in html and "svc RAM" in html
     assert 'type:"bar"' in html

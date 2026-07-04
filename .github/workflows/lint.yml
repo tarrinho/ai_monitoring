@@ -1,4 +1,6 @@
 name: lint
+# Title each run by the job (not the generic publish commit message).
+run-name: lint + type
 
 # rules.md §9 — static hardening: ruff / bandit / semgrep / mypy / vulture.
 on:
