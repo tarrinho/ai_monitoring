@@ -1,0 +1,47 @@
+name: lint
+
+# rules.md §9 — static hardening: ruff / bandit / semgrep / mypy / vulture.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint + type (ruff / bandit / semgrep / mypy / vulture)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: |
+          pip install -r requirements.txt
+          pip install ruff bandit semgrep mypy vulture
+
+      - name: ruff (lint)
+        run: ruff check .
+
+      - name: bandit (High severity only → 0 allowed)
+        # Medium findings (B104 bind-all, B608 known-column SQL, B108 demo /tmp)
+        # are accepted per rules.md; -lll reports/fails on High only.
+        run: bandit -r . -x ./tests -lll
+
+      - name: semgrep (OSS registry rules — NO auto / NO token)
+        run: semgrep --config p/python --config p/security-audit --error .
+
+      - name: mypy (typed source)
+        run: mypy --ignore-missing-imports app.py config.py collectors/ db.py
+
+      - name: vulture (dead code — informational)
+        # Heuristic; reported but does not block the build.
+        continue-on-error: true
+        run: vulture app.py config.py collectors db.py --min-confidence 80

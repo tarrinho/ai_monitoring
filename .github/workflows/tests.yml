@@ -1,0 +1,27 @@
+name: tests
+
+# rules.md §1 + §2 — static + dynamic pytest suites.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: pytest (static + dynamic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # test-env integration auto-skips when the stack isn't up (see rules.md §3)
+      - run: python -m pytest tests/test_static_qa.py tests/test_dynamic_qa.py -q

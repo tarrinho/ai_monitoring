@@ -7,6 +7,10 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.0.4] — 2026-07-04
 
 ### Added
+- **Per-control CI badges** — the single `ci.yml` workflow was split into five
+  independent workflows (`secret-scan`, `lint`, `tests`, `trivy-fs`, `build-scan`),
+  each surfacing its own GitHub Actions status badge in the README so a failure is
+  attributable to a specific control at a glance.
 - **LiteLLM "Load vs resource impact" chart** — a dual-axis correlation chart on
   the LiteLLM dashboard plotting request rate (req/s) against the per-execution
   cost signals of a GPU-served LLM: GPU util %, KV-cache %, and the llama.cpp

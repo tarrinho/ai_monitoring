@@ -2,7 +2,11 @@
 
 ![AI-Monitoring](docs/img/banner.svg)
 
-[![CI](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![secret-scan](https://github.com/tarrinho/ai_monitoring/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/secret-scan.yml)
+[![lint](https://github.com/tarrinho/ai_monitoring/actions/workflows/lint.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/lint.yml)
+[![tests](https://github.com/tarrinho/ai_monitoring/actions/workflows/tests.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/tests.yml)
+[![trivy-fs](https://github.com/tarrinho/ai_monitoring/actions/workflows/trivy-fs.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/trivy-fs.yml)
+[![build-scan](https://github.com/tarrinho/ai_monitoring/actions/workflows/build-scan.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/build-scan.yml)
 
 Single-binary observability for a self-hosted LLM stack — **LiteLLM**, **Ollama**,
 **llama.cpp**, **GPU**, and **host** — in one aiohttp app. Collectors poll each

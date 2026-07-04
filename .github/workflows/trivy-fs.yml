@@ -1,0 +1,31 @@
+name: trivy-fs
+
+# rules.md §10 (filesystem) — Trivy scan of deps / config / secrets in the tree.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: trivy-fs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Trivy fs (HIGH/CRITICAL → fail)
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache: "false"   # skip trivy-action's internal actions/cache (node20 dep)

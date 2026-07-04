@@ -1,0 +1,37 @@
+name: build-scan
+
+# rules.md §14 + §10 (image) — build with the in-image pytest gate, then Trivy
+# scans the resulting image for HIGH/CRITICAL CVEs.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-scan:
+    name: build (test gate) + Trivy image scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # RUN_TESTS=1 runs the full pytest suite INSIDE the image; a failure here
+      # means no image is produced — the release gate. Runner is amd64.
+      - name: Build image (in-image test gate)
+        run: docker build --build-arg RUN_TESTS=1 -t ai-monitoring:ci .
+
+      - name: Trivy image (HIGH/CRITICAL → fail)
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: image
+          image-ref: ai-monitoring:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache: "false"   # skip trivy-action's internal actions/cache (node20 dep)

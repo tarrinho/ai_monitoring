@@ -498,6 +498,8 @@ const impactChart = new Chart(document.getElementById("impact-chart"), {
     {label:"KV-cache %",data:[],borderColor:"#f778ba",
      borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"},
     {label:"llama.cpp CPU %",data:[],borderColor:"#7ee787",
+     borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"},
+    {label:"llama.cpp RAM %",data:[],borderColor:"#f0883e",
      borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"}]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
@@ -513,22 +515,25 @@ async function loadImpact(){
   document.getElementById("impact-win").textContent=WIN;
   const s=await api("/api/series?window="+WIN);
   const pc=await api("/api/procseries?kind=cpu&window="+WIN);
+  const pr=await api("/api/procseries?kind=ram&window="+WIN);
   if(!s) return;
   const pts=s.points||[];
   impactChart.data.labels=pts.map(p=>fmtT(p.t));
   impactChart.data.datasets[0].data=pts.map(p=>p.reqrate==null?null:p.reqrate);
   impactChart.data.datasets[1].data=pts.map(p=>p.gpu==null?null:p.gpu);
   impactChart.data.datasets[2].data=pts.map(p=>p.kvcache==null?null:p.kvcache);
-  // llama.cpp process CPU from procseries, matched by nearest timestamp
-  let cpuData=pts.map(()=>null);
-  if(pc && pc.points && pc.apps){
-    const app=(pc.apps||[]).find(a=>/llama/i.test(a));
-    if(app){
-      const byT={}; pc.points.forEach(p=>{ byT[Math.round(p.t)]=p[app]; });
-      cpuData=pts.map(p=>{ const v=byT[Math.round(p.t)]; return v==null?null:v; });
-    }
-  }
-  impactChart.data.datasets[3].data=cpuData;
+  // serving-process CPU % (procseries/cpu) + RAM as % of host total (procseries/ram),
+  // matched to the series timestamps by nearest second.
+  const align=(feed,conv)=>{
+    if(!(feed && feed.points && feed.apps)) return pts.map(()=>null);
+    const app=(feed.apps||[]).find(a=>/llama/i.test(a));
+    if(!app) return pts.map(()=>null);
+    const byT={}; feed.points.forEach(p=>{ byT[Math.round(p.t)]=p[app]; });
+    return pts.map(p=>{ const v=byT[Math.round(p.t)]; return v==null?null:conv(v); });
+  };
+  impactChart.data.datasets[3].data=align(pc, v=>v);
+  impactChart.data.datasets[4].data=_hostMemTotal>0
+    ? align(pr, v=>Math.round(v/_hostMemTotal*1000)/10) : pts.map(()=>null);
   impactChart.update("none");
 }
 async function loadCorr(){
