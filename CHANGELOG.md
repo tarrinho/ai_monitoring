@@ -32,6 +32,15 @@ Versioning: [SemVer](https://semver.org/).
   its served-by backend (llama.cpp → `llama-server`, ollama → `ollama`) from the
   existing procs collector — no new sampling, no observer-effect.
 
+### Tests
+- **Expanded QA coverage (+13)** across categories: **security** (CSP
+  script/object-src lock-down, HttpOnly+SameSite=Strict session cookie, GPU HTTP-
+  agent SSRF scheme guard), **functional** (`/api/export` CSV+JSON shapes, robust
+  `/api/series` bounds), **unit** (`config.validate` clean, redacted-summary key
+  hiding, `_parse_spend_bytes` junk tolerance), **regression** (LiteLLM down-on-5xx
+  liveliness; Overview GPU-badge `live`, Uptime-under-GPU, RAM-banner threshold),
+  and **performance** (`_metrics_row` 500× pure builds < 2 s). Suite: 176 passing.
+
 ### Fixed
 - **CI (GitHub Actions)** — pinned `aquasecurity/trivy-action` to an existing
   release (`@0.35.0`; `@0.24.0` no longer resolves) in both the filesystem and
@@ -44,6 +53,10 @@ Versioning: [SemVer](https://semver.org/).
   card badge shows `live` instead of the `file nvidia` mode.
 
 ### Docs
+- **Apache-2.0 license** — added a `LICENSE` file (Apache License 2.0, © 2026
+  Pedro Tarrinho) plus a README "License" section and license badge, matching the
+  other projects. README badges: added `release` + `ghcr.io`; the image-size badge
+  was dropped rather than depend on a small third-party badge service for GHCR.
 - **README GPU-setup section** — consolidated step-by-step for the three GPU
   feed modes (local file via `deploy/gpu-metrics.service`, remote SSH, remote
   HTTP agent) plus the unified-memory GB10 caveat (VRAM reads N/A by design).

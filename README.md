@@ -2,6 +2,10 @@
 
 ![AI-Monitoring](docs/img/banner.svg)
 
+[![release](https://img.shields.io/github/v/release/tarrinho/ai_monitoring?sort=semver&label=release&color=3fb950)](https://github.com/tarrinho/ai_monitoring/releases/latest)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-ai__monitoring-2496ED?logo=github&logoColor=white)](https://github.com/tarrinho/ai_monitoring/pkgs/container/ai_monitoring)
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 [![secret-scan](https://github.com/tarrinho/ai_monitoring/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/secret-scan.yml)
 [![lint](https://github.com/tarrinho/ai_monitoring/actions/workflows/lint.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/lint.yml)
 [![tests](https://github.com/tarrinho/ai_monitoring/actions/workflows/tests.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/tests.yml)
@@ -317,3 +321,12 @@ as a gate** — a failing test aborts `docker build` before an image exists.
 ```bash
 pip install -r requirements-dev.txt && pytest
 ```
+
+## License
+
+This project is licensed under the Apache License 2.0.
+
+You are free to use, modify, and distribute this software, including for
+commercial purposes, under the terms of the license.
+
+See the [LICENSE](LICENSE) file for full details.

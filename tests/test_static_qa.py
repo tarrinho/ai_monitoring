@@ -597,3 +597,27 @@ def test_dockerfile_copies_every_top_level_module():
     df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     for mod in ("config.py", "db.py", "app.py", "alerts.py", "anomaly.py"):
         assert mod in df, f"Dockerfile does not COPY {mod} — container will crash"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Extra QA — Overview layout regressions (1.0.4)
+# ══════════════════════════════════════════════════════════════════════════════
+def test_overview_gpu_badge_is_live_not_mode():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'gpu-badge"),true,"live"' in html
+    # the old "file nvidia" (mode + vendor) badge text must be gone
+    assert 'g.mode||"")+" "+(g.vendor' not in html
+
+
+def test_overview_uptime_stacked_under_gpu():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    i = html.find("flex-direction:column")
+    g = html.find('id="card-gpu"', i)
+    u = html.find('id="card-uptime"', i)
+    assert i >= 0 and 0 < g < u          # gpu card sits above uptime in the column
+
+
+def test_overview_ram_pressure_banner_wired():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="ram-banner"' in html
+    assert "h.mem_pct>=90" in html       # banner shows only under memory pressure

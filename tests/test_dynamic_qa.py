@@ -2224,3 +2224,134 @@ async def test_containers_sample_concurrent_under_loop_bound(monkeypatch):
     assert len(out["containers"]) == N
     # sequential would be N*0.3 = 3.6s; concurrent must be well under 1s.
     assert elapsed < 1.5, f"inspects not concurrent: {elapsed:.2f}s for {N} containers"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Extra QA — security · functional · unit · regression · performance
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── security ──────────────────────────────────────────────────────────────────
+async def test_csp_locks_down_script_and_object_src():
+    c = await _client()
+    try:
+        csp = (await c.get("/healthz")).headers.get("Content-Security-Policy", "")
+        assert "default-src 'self'" in csp
+        assert "object-src 'none'" in csp
+        assert "base-uri" in csp
+    finally:
+        await c.close()
+
+
+async def test_session_cookie_is_httponly_and_strict(monkeypatch):
+    import app as a
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "supersecrettoken1234")
+    a._auth_fails.clear(); a._auth_locked_until.clear()
+    c = await _client()
+    try:
+        r = await c.get("/?token=supersecrettoken1234", allow_redirects=False)
+        assert r.status == 302
+        sc = r.headers.get("Set-Cookie", "")
+        assert "HttpOnly" in sc and "SameSite=Strict" in sc
+    finally:
+        a._auth_fails.clear(); a._auth_locked_until.clear()
+        await c.close()
+
+
+def test_gpu_http_agent_rejects_non_http_scheme(monkeypatch):
+    # SSRF guard: a file:// or gopher:// GPU-agent URL must never be fetched
+    monkeypatch.setattr(config, "GPU_METRICS_URL", "file:///etc/passwd")
+    assert gpu._http() is None
+    monkeypatch.setattr(config, "GPU_METRICS_URL", "gopher://evil/")
+    assert gpu._http() is None
+
+
+# ── functional ────────────────────────────────────────────────────────────────
+async def test_export_csv_and_json_shapes():
+    c = await _client()
+    try:
+        rc = await c.get("/api/export?window=1h&format=csv")
+        assert rc.status == 200
+        assert (await rc.text()).splitlines()[0].startswith("t,")   # header row
+        d = await (await c.get("/api/export?window=1h&format=json")).json()
+        assert "window" in d and "points" in d
+    finally:
+        await c.close()
+
+
+async def test_series_extreme_points_is_robust():
+    c = await _client()
+    try:
+        assert (await c.get("/api/series?window=1h&points=999999")).status == 200
+        assert (await c.get("/api/series?window=1h&points=1")).status == 200
+        assert (await c.get("/api/series?window=bogus")).status == 200
+    finally:
+        await c.close()
+
+
+# ── unit ──────────────────────────────────────────────────────────────────────
+def test_config_validate_clean(monkeypatch):
+    monkeypatch.setattr(config, "MONITOR_PORT", 9925)
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    assert config.validate() == []
+
+
+def test_redacted_summary_hides_key(monkeypatch):
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-supersecretvalue")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sometoken1234567")
+    s = config.redacted_summary()
+    assert isinstance(s, dict)
+    assert "supersecret" not in repr(s)
+    assert "sometoken" not in repr(s)
+
+
+def test_parse_spend_bytes_tolerates_junk_and_shapes():
+    import json as _j
+    rows = [{"model": "m1", "total_tokens": 10, "spend": 0.1,
+             "startTime": "2026-07-04T00:00:00"}]
+    d, *_ = litellm._parse_spend_bytes(_j.dumps(rows).encode(), 0.0, 1000)
+    assert isinstance(d, dict)
+    # {"data":[...]} envelope is also accepted
+    d2, *_ = litellm._parse_spend_bytes(_j.dumps({"data": rows}).encode(), 0.0, 1000)
+    assert isinstance(d2, dict)
+    # malformed bytes must never raise → empty result
+    d3, *_ = litellm._parse_spend_bytes(b"<<not json>>", 0.0, 1000)
+    assert d3 == {}
+
+
+# ── regression ────────────────────────────────────────────────────────────────
+async def test_litellm_down_on_liveliness_5xx(monkeypatch):
+    # a 5xx/timeout on /health/liveliness = DOWN (else the heavy /spend call would
+    # hammer an already-struggling proxy). Regression for the 1.0.2 fix.
+    async def liveliness(_):
+        return web.Response(status=503, text="overloaded")
+    app = web.Application()
+    app.router.add_get("/health/liveliness", liveliness)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LITELLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        async with aiohttp.ClientSession() as s:
+            out = await litellm.sample(s)
+        assert out["available"] is False
+    finally:
+        await srv.close()
+
+
+# ── performance ───────────────────────────────────────────────────────────────
+def test_metrics_row_is_pure_and_fast():
+    import time as _t
+    import app as a
+    snap = {"ts": 0, "collectors": {
+        "host": {"available": True, "cpu_pct": 50, "mem_pct": 60,
+                 "disk": {"pct": 40}, "load": [1, 1, 1]},
+        "litellm": {"available": True, "backlog": 5,
+                    "top_keys": [{"alias": f"k{i}", "reqs": i} for i in range(1000)]},
+        "llamacpp": {"available": True, "slots_active": 2},
+        "gpu": {"available": True, "util": 90}, "ollama": {"available": False}}}
+    t = _t.time()
+    row = {}
+    for _ in range(500):
+        row = a._metrics_row(snap)
+    assert (_t.time() - t) < 2.0            # 500 pure builds well under 2s (no I/O)
+    assert all(k in row for k in ("cpu", "gpu", "slots", "backlog"))
