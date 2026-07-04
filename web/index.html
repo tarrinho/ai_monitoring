@@ -183,8 +183,8 @@
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">Overview</a>
-    <a href="/litellm">LiteLLM</a>
     <a href="/gpu">GPU</a>
+    <a href="/litellm">LiteLLM</a>
     <a href="/ollama">Ollama</a>
     <a href="/llamacpp">llama.cpp</a>
     <a href="/alerts">Alerts</a>
@@ -218,16 +218,18 @@
     <div class="host-spark"><canvas id="host-spark"></canvas></div>
   </section>
 
-  <section class="card" id="card-gpu" style="display:none">
-    <h2>GPU <span id="gpu-badge" class="badge"></span></h2>
-    <div class="kpis" id="gpu-kpis"></div>
-    <div id="gpu-list"></div>
-  </section>
+  <div style="display:flex;flex-direction:column;gap:16px">
+    <section class="card" id="card-gpu" style="display:none">
+      <h2>GPU <span id="gpu-badge" class="badge"></span></h2>
+      <div class="kpis" id="gpu-kpis"></div>
+      <div id="gpu-list"></div>
+    </section>
 
-  <section class="card" id="card-uptime">
-    <h2>Uptime <span class="badge" id="uptime-win">24h</span></h2>
-    <div id="uptime-body"><div class="unavail">no backend history yet</div></div>
-  </section>
+    <section class="card" id="card-uptime">
+      <h2>Uptime <span class="badge" id="uptime-win">24h</span></h2>
+      <div id="uptime-body"><div class="unavail">no backend history yet</div></div>
+    </section>
+  </div>
 
   <section class="card" id="card-containers" style="display:none">
     <h2>Containers <span class="badge" id="containers-badge"></span></h2>
@@ -584,7 +586,7 @@ function renderGpu(g){
   const avail=!!(g&&g.available);
   showCard("card-gpu", avail);   // no GPU CLI => hide (like a missing backend)
   if(!avail) return;
-  badge(document.getElementById("gpu-badge"),true,(g.mode||"")+" "+(g.vendor||""));
+  badge(document.getElementById("gpu-badge"),true,"live");
   const thr = g.throttled ? "bad" : "";
   // hide the VRAM tile + over-time VRAM charts when the GPU has no dedicated VRAM
   // (e.g. GB10 unified memory reports [N/A]).
