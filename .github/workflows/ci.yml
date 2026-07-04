@@ -31,13 +31,23 @@ jobs:
           path: ./
           extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude
       # Second, independent secret scanner. Reads .gitleaks.toml (built-in rules +
-      # allowlist for the synthetic values in tests/ + .env.example). Fails the job
-      # on any leak in the working tree or commit history.
+      # allowlist for the synthetic values in tests/ + .env.example). Scans full
+      # commit history (fetch-depth:0 above) and fails on any leak. We run the
+      # gitleaks binary directly instead of the marketplace Node action — that
+      # action bundles a deprecated Node 20 runtime; the binary has no Node
+      # dependency and stays green as runners drop Node 20.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          GITLEAKS_CONFIG: .gitleaks.toml
+        run: |
+          set -euo pipefail
+          ver=$(curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
+            | grep -oP '"tag_name":\s*"v\K[^"]+')
+          echo "gitleaks v${ver}"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks git . --config .gitleaks.toml --redact -v
 
   lint:
     name: lint + type (ruff / bandit / semgrep / mypy / vulture)

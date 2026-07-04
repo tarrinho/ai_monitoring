@@ -759,7 +759,10 @@ def test_gitleaks_wired_in_secret_scan():
     """security: gitleaks runs alongside TruffleHog in the secret-scan job, with a
     .gitleaks.toml that allowlists the synthetic values in tests/ + .env.example."""
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "gitleaks/gitleaks-action" in ci, "gitleaks step missing from CI"
+    # gitleaks runs as the binary (no deprecated Node 20 action); it scans git
+    # history with the repo config.
+    assert "gitleaks git . --config .gitleaks.toml" in ci, "gitleaks step missing from CI"
+    assert "gitleaks/gitleaks-action" not in ci, "drop the Node 20 marketplace action"
     assert "trufflesecurity/trufflehog" in ci, "TruffleHog must still run too"
     cfg = (ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
     assert "useDefault = true" in cfg          # built-in rule set
