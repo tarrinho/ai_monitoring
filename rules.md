@@ -14,6 +14,24 @@ Run stages in order. A stage that is not run is reported `⏭️ SKIP` with a re
 never silently omitted (see §18). The build gate is **in the Dockerfile**:
 `--build-arg RUN_TESTS=1` runs `pytest tests/` inside the image; no pass → no image.
 
+> **Global convention — documentation is English-only.** Everything committed to
+> the repo (`README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, `rules.md`,
+> `validation/*`, every `.env.example` / source comment + docstring, commit
+> messages, and code identifiers) **must be written in English — no exceptions.**
+> Interactive/chat replies may be in the operator's language, but nothing in the
+> repo is. This is enforced at §15; a doc or PR that ships non-English prose is
+> rejected.
+
+> **Global constraint — never run the monitored backends on this host.** LiteLLM,
+> Ollama, and llama.cpp must **not** be installed, started, or bundled on the
+> machine that runs AI-Monitoring — they are heavy (GPU/CPU/RAM) and would compete
+> with, and degrade, the very server this monitor is meant to watch. AI-Monitoring
+> is a **read-only observer of REMOTE backends**: it only reaches them over the
+> network via their `*_BASE_URL` (and reads the GPU via a file/SSH/HTTP feed).
+> Never add them to a compose file, Dockerfile, install script, or `test-env/` that
+> is deployed alongside the monitor. The local `test-env/` stack is for **isolated
+> QA only** (§3) and must never run on a production monitor host.
+
 Project facts:
 - Version string: `config.VERSION` (e.g. `AI-Monitoring_1.0.0`); UI copy in each
   `web/*.html` `#sidebar-brand-ver`.

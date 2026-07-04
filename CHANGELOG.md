@@ -4,6 +4,31 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.0.4] — 2026-07-04
+
+### Added
+- **LiteLLM "Load vs resource impact" chart** — a dual-axis correlation chart on
+  the LiteLLM dashboard plotting request rate (req/s) against the per-execution
+  cost signals of a GPU-served LLM: GPU util %, KV-cache %, and the llama.cpp
+  process CPU %. (Exact per-request CPU/RAM isn't measurable with interval
+  sampling and is mostly noise for a GPU-bound model — this shows the honest
+  correlation. Host RAM is static; KV-cache is the real per-request memory.)
+- **Per-model resource columns** — the LiteLLM per-model table gained **svc CPU**
+  and **svc RAM** columns: each model's serving-process CPU % and RSS, mapped via
+  its served-by backend (llama.cpp → `llama-server`, ollama → `ollama`) from the
+  existing procs collector — no new sampling, no observer-effect.
+
+### Docs
+- **README GPU-setup section** — consolidated step-by-step for the three GPU
+  feed modes (local file via `deploy/gpu-metrics.service`, remote SSH, remote
+  HTTP agent) plus the unified-memory GB10 caveat (VRAM reads N/A by design).
+- **`rules.md`: documentation is English-only** — a global convention (enforced at
+  §15) that everything committed to the repo is written in English.
+- **`rules.md`: never run the monitored backends on the monitor host** — a global
+  constraint that LiteLLM / Ollama / llama.cpp must not be installed or run
+  alongside AI-Monitoring (they would compete for GPU/CPU/RAM with the server it
+  watches); the monitor only reaches REMOTE backends over the network.
+
 ## [1.0.3] — 2026-07-04
 
 ### Added
@@ -173,6 +198,7 @@ overloading the systems it watches.
   Trivy, dashboard-security, black-box dynamic check, multi-arch gate, status
   report). Validation records under `validation/<version>.md`.
 
+[1.0.4]: https://github.com/tarrinho/ai_monitoring/releases/tag/v1.0.4
 [1.0.3]: https://github.com/tarrinho/ai_monitoring/releases/tag/v1.0.3
 [1.0.2]: https://github.com/tarrinho/ai_monitoring/releases/tag/v1.0.2
 [1.0.0]: https://github.com/tarrinho/ai_monitoring/releases/tag/v1.0.0

@@ -218,8 +218,8 @@ def test_litellm_heavy_parse_runs_off_event_loop():
     assert "await" not in parser, "_parse_spend must be pure/synchronous"
 
 
-def test_version_is_1_0_3():
-    assert config.VERSION == "AI-Monitoring_1.0.3"
+def test_version_is_1_0_4():
+    assert config.VERSION == "AI-Monitoring_1.0.4"
 
 
 def test_ux_improvements_present():
