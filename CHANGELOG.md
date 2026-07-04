@@ -23,8 +23,11 @@ Versioning: [SemVer](https://semver.org/).
   release (`@0.35.0`; `@0.24.0` no longer resolves) in both the filesystem and
   image scans, and added a `ruff.toml` so `ruff check .` passes: test fixtures may
   use compact semicolon one-liners / grouped imports (E701/E702/E401/E402 relaxed
-  in `tests/**` only — app code stays strict). Overview: Uptime card stacked under
-  the GPU card; the GPU card badge shows `live` instead of the `file nvidia` mode.
+  in `tests/**` only — app code stays strict). Cleared the Node.js-20 deprecation
+  warnings: `actions/checkout@v4`→`v5`, `actions/setup-python@v5`→`v6` (both now
+  node24), and `cache: "false"` on the Trivy steps to skip trivy-action's internal
+  node20 `actions/cache`. Overview: Uptime card stacked under the GPU card; the GPU
+  card badge shows `live` instead of the `file nvidia` mode.
 
 ### Docs
 - **README GPU-setup section** — consolidated step-by-step for the three GPU

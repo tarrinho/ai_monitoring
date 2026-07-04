@@ -24,7 +24,7 @@ jobs:
     name: TruffleHog secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0          # full history so the scan sees past commits
       # Official TruffleHog action — working tree + commit range, verified +
@@ -40,8 +40,8 @@ jobs:
     name: lint + type (ruff / bandit / semgrep / mypy / vulture)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install tools
@@ -73,8 +73,8 @@ jobs:
     name: pytest (static + dynamic)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt -r requirements-dev.txt
@@ -86,7 +86,7 @@ jobs:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Trivy fs (HIGH/CRITICAL → fail)
         uses: aquasecurity/trivy-action@0.35.0
         with:
@@ -96,13 +96,14 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+          cache: "false"   # skip trivy-action's internal actions/cache (node20 dep)
 
   # ── 5. Build gate + Trivy image scan (rules.md §14 + §10) ─────────────────
   build-and-scan:
     name: build (test gate) + Trivy image scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # RUN_TESTS=1 runs the full pytest suite INSIDE the image; a failure here
       # means no image is produced — the release gate. Runner is amd64.
       - name: Build image (in-image test gate)
@@ -117,3 +118,4 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+          cache: "false"   # skip trivy-action's internal actions/cache (node20 dep)
