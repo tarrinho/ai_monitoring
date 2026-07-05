@@ -190,6 +190,15 @@ def init() -> None:
                 conn.execute("ALTER TABLE events ADD COLUMN kind TEXT DEFAULT 'state'")
             except Exception:
                 pass
+        # per-user alert webhook (1.2.2): each user can set their own webhook URL.
+        _ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        for col, ddl in (("webhook_url", "TEXT"),
+                         ("webhook_enabled", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in _ucols:
+                try:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+                except Exception:
+                    pass
 
 
 def insert(ts: float, payload: dict[str, Any]) -> None:
@@ -717,6 +726,45 @@ def user_delete(name: str) -> bool:
         return (cur.rowcount or 0) > 0
     except Exception:
         return False
+
+
+def user_get_webhook(name: str) -> dict[str, Any] | None:
+    """A user's alert-webhook config: {url, enabled}. None if the user is absent."""
+    try:
+        with _connect() as conn:
+            r = conn.execute(
+                "SELECT webhook_url, webhook_enabled FROM users WHERE name = ?",
+                (name,)).fetchone()
+        if not r:
+            return None
+        return {"url": r[0] or "", "enabled": bool(r[1])}
+    except Exception:
+        return None
+
+
+def user_set_webhook(name: str, url: str, enabled: bool) -> bool:
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                "UPDATE users SET webhook_url = ?, webhook_enabled = ? WHERE name = ?",
+                (url or None, 1 if enabled else 0, name))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def user_webhooks_enabled() -> list[dict[str, Any]]:
+    """Every enabled, non-empty webhook for a NON-disabled user — the alert fan-out
+    recipient list. Disabled users never receive alerts."""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT name, webhook_url FROM users WHERE webhook_enabled = 1 "
+                "AND webhook_url IS NOT NULL AND webhook_url <> '' "
+                "AND disabled = 0 ORDER BY name").fetchall()
+        return [{"user": r[0], "url": r[1]} for r in rows]
+    except Exception:
+        return []
 
 
 def user_touch_login(name: str, ts: float) -> None:

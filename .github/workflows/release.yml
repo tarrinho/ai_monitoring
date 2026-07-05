@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing version tag to (re)release, e.g. v1.2.1"
+        description: "Existing version tag to (re)release, e.g. v1.2.2"
         required: true
 
 permissions:

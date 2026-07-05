@@ -219,7 +219,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.2.1"
+    assert config.VERSION == "AI-Monitoring_1.2.2"
 
 
 def test_ux_improvements_present():
@@ -923,4 +923,12 @@ def test_account_page_change_password_form():
     assert 'name="current"' in html and 'name="new"' in html      # requires current pw
     assert "/api/account/password" in html and "/api/me" in html
     assert "X-CSRF-Token" in html and "innerHTML" not in html      # CSRF + DOM-safe
+    assert not re.search(r'<[^>]+\son(click|submit|change)=', html)  # no inline handlers
+
+
+def test_account_page_has_webhook_section():
+    html = (ROOT / "web" / "account.html").read_text(encoding="utf-8")
+    assert 'id="wh-form"' in html and 'id="whurl"' in html and 'id="wh-test"' in html
+    assert "/api/account/webhook" in html
+    assert "innerHTML" not in html                       # DOM-API only
     assert not re.search(r'<[^>]+\son(click|submit|change)=', html)  # no inline handlers

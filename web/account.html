@@ -59,6 +59,20 @@
         <div class="msg" id="msg"></div>
       </form>
     </section>
+    <section class="card">
+      <h2>Alert webhook</h2>
+      <div class="sub">Get AI-Monitoring alerts at your own webhook (Slack / Discord / generic JSON POST). Must be a public http(s) URL — private / internal addresses are refused.</div>
+      <form id="wh-form" autocomplete="off">
+        <label for="whurl">Webhook URL</label>
+        <input id="whurl" name="url" type="url" placeholder="https://hooks.example.com/services/...">
+        <label style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+          <input id="whon" name="enabled" type="checkbox" style="width:auto"> Enabled
+        </label>
+        <button type="submit">Save webhook</button>
+        <button type="button" id="wh-test" style="margin-top:10px;background:var(--panel2);color:var(--fg);border:1px solid var(--line)">Send test</button>
+        <div class="msg" id="wh-msg"></div>
+      </form>
+    </section>
   </main>
 <script>
 (function(){
@@ -90,6 +104,36 @@
         if(!res.ok){setMsg(res.j.error||"Update failed.",false);}
         else{setMsg("Password updated. Other sessions were signed out.",true);f.reset();}
       }).catch(function(){setMsg("Update failed.",false);});
+  });
+
+  // ── alert webhook ──
+  function whMsg(txt,good){var m=document.getElementById("wh-msg");m.textContent=txt||"";
+    m.className="msg"+(txt?(good?" ok":" bad"):"");}
+  function whUrl(){return document.getElementById("whurl").value.trim();}
+  fetch("/api/account/webhook").then(function(r){return r.ok?r.json():null;}).then(function(d){
+    if(d){document.getElementById("whurl").value=d.url||"";
+      document.getElementById("whon").checked=!!d.enabled;}
+  }).catch(function(){});
+  document.getElementById("wh-form").addEventListener("submit",function(ev){
+    ev.preventDefault();
+    var body=new URLSearchParams({url:whUrl(),
+      enabled:document.getElementById("whon").checked?"1":"0"}).toString();
+    fetch("/api/account/webhook",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},body:body})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+      .then(function(res){whMsg(res.ok?"Webhook saved.":(res.j.error||"Save failed."),res.ok);})
+      .catch(function(){whMsg("Save failed.",false);});
+  });
+  document.getElementById("wh-test").addEventListener("click",function(){
+    whMsg("Sending test…",true);
+    var body=new URLSearchParams({url:whUrl()}).toString();
+    fetch("/api/account/webhook/test",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},body:body})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+      .then(function(res){
+        if(res.ok&&res.j.ok){whMsg("Test sent — check your webhook.",true);}
+        else{whMsg(res.j.error||("Test failed: "+(res.j.result||"error")),false);}
+      }).catch(function(){whMsg("Test failed.",false);});
   });
 })();
 </script>

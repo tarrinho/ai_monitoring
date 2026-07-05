@@ -127,7 +127,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.2.1</div>
+      <div id="sidebar-brand-ver">v1.2.2</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -187,11 +187,14 @@ const _timers = [];
 window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
 
 const AUTH = new URLSearchParams(location.search).get("token");
+let CSRF = "";     // per-session CSRF token (from /api/me) for state-changing POSTs
 async function api(path, opts){
   try{
     const sep=path.includes("?")?"&":"?";
     const url=path+(AUTH?(sep+"token="+encodeURIComponent(AUTH)):"");
-    const o=Object.assign({headers:AUTH?{Authorization:"Bearer "+AUTH}:{}}, opts||{});
+    const o=Object.assign({}, opts||{});
+    // merge headers so Authorization (token auth) and any per-call header coexist
+    o.headers=Object.assign(AUTH?{Authorization:"Bearer "+AUTH}:{}, (opts&&opts.headers)||{});
     const r=await fetch(url,o);
     if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
     return await r.json();
@@ -245,7 +248,7 @@ document.getElementById("test-btn").addEventListener("click", async ()=>{
   const btn=document.getElementById("test-btn");
   const res=document.getElementById("test-result");
   btn.disabled=true; res.textContent="sending…";
-  const d=await api("/api/alerts/test", {method:"POST"});
+  const d=await api("/api/alerts/test", {method:"POST", headers:{"X-CSRF-Token":CSRF}});
   btn.disabled=false;
   if(!d){ res.textContent="failed"; return; }
   const r=d.results||{};
@@ -257,6 +260,15 @@ document.getElementById("test-btn").addEventListener("click", async ()=>{
       +`<td class="${v==='ok'?'recover':(v==='not configured'?'':'fire')}">${escapeHtml(v)}</td></tr>`).join("")
     +`</table>`);
 });
+
+// Identity + CSRF token; hide the admin-only "test" button for viewers.
+(async ()=>{ try{
+  const d = await api("/api/me");
+  if(d){ CSRF = d.csrf || "";
+    if(d.user && d.role !== "admin"){
+      const b=document.getElementById("test-btn"); if(b) b.style.display="none"; }
+  }
+}catch(e){} })();
 
 tick();
 _timers.push(setInterval(tick, 5000));

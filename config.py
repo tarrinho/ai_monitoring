@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.2.1"
+VERSION = "AI-Monitoring_1.2.2"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -46,6 +46,10 @@ SAMPLE_INTERVAL   = _float("MONITOR_SAMPLE_INTERVAL", 5.0)     # seconds
 RETENTION_SAMPLES = _int("MONITOR_RETENTION_SAMPLES", 8640)    # in-mem ring
 DB_RETENTION_HOURS = _int("MONITOR_DB_RETENTION_HOURS", 720)   # on-disk prune
 HTTP_TIMEOUT      = _float("MONITOR_HTTP_TIMEOUT", 4.0)        # per collector call
+# Hard cap on a single collector response body (defends against a compromised /
+# MITM'd backend returning a multi-GB body and OOM-ing the monitor). Generous —
+# real backend JSON is tiny; /spend/logs uses its own dedicated byte cap.
+HTTP_MAX_BYTES    = _int("MONITOR_HTTP_MAX_BYTES", 16 * 1024 * 1024)   # 16 MiB
 
 # --- optional dashboard auth (token gate) ------------------------------------
 # If set, dashboard + data endpoints require  Authorization: Bearer <token>
@@ -71,6 +75,9 @@ ADMIN_PASSWORD = _str("MONITOR_ADMIN_PASSWORD")
 ADMIN_EMAIL    = _str("MONITOR_ADMIN_EMAIL")
 # How long a login session stays valid before re-auth (seconds; default 7 days).
 SESSION_TTL_S  = _float("MONITOR_SESSION_TTL_S", 7 * 24 * 3600.0)
+# Hard ceiling on concurrent server-side sessions (login + legacy-token), so the
+# in-memory session stores can't grow without bound. Oldest-expiring are evicted.
+SESSION_MAX    = _int("MONITOR_SESSION_MAX", 2000)
 # How long the access/admin audit trail is kept (days; admins review it in the UI).
 AUDIT_RETENTION_DAYS = _int("MONITOR_AUDIT_RETENTION_DAYS", 90)
 # Brute-force protection on the dashboard token: after AUTH_MAX_FAILS bad tokens
@@ -188,8 +195,22 @@ ANOMALY_MIN_REQS    = _float("ANOMALY_MIN_REQS", 20.0)  # floor to ignore tiny k
 # Budget: a key's spend rate over this $/hour fires an alert.
 ANOMALY_KEY_BUDGET_HR = _float("ANOMALY_KEY_BUDGET_HR", 0.0)
 
-# --- alert channel (webhook only) --------------------------------------------
-ALERT_WEBHOOK_URL     = _str("ALERT_WEBHOOK_URL")          # generic JSON POST
+# --- alert channel (webhook) -------------------------------------------------
+ALERT_WEBHOOK_URL     = _str("ALERT_WEBHOOK_URL")          # operator-set global (trusted)
+# Per-user webhooks (each user configures their own at /account) are USER-supplied,
+# so they are SSRF-validated: by default a URL that resolves to a private/loopback/
+# link-local/metadata address is refused (both when saved and before each send —
+# DNS-rebinding aware). Set WEBHOOK_ALLOW_PRIVATE=1 only for trusted LANs.
+WEBHOOK_ALLOW_PRIVATE = (_str("MONITOR_WEBHOOK_ALLOW_PRIVATE", "0") or "0").lower() in ("1", "true", "yes", "on")
+# Require https for user webhooks (recommended when the monitor is internet-facing).
+WEBHOOK_HTTPS_ONLY    = (_str("MONITOR_WEBHOOK_HTTPS_ONLY", "0") or "0").lower() in ("1", "true", "yes", "on")
+# Optional comma-separated host allowlist for user webhooks (empty = any public
+# host). e.g. hooks.slack.com,discord.com — a subdomain of an entry is allowed too.
+WEBHOOK_ALLOW_HOSTS   = _str("MONITOR_WEBHOOK_ALLOW_HOSTS", "") or ""
+# Cap on how many per-user webhooks the notifier resolves + posts to per alert
+# tick, so a large user base (or a user with a slow-resolving host) can't make the
+# fan-out unbounded. Validation + delivery are also run concurrently + time-bounded.
+WEBHOOK_MAX_RECIPIENTS = _int("MONITOR_WEBHOOK_MAX_RECIPIENTS", 50)
 
 # --- retention rollups (Tier 4) ----------------------------------------------
 ROLLUP_RAW_HOURS   = _int("ROLLUP_RAW_HOURS", 24)      # keep raw samples
@@ -228,6 +249,11 @@ def validate(user_count: int = 0) -> list[str]:
     if LITELLM_BASE_URL and not LITELLM_MASTER_KEY:
         errs.append("LITELLM_BASE_URL set but LITELLM_MASTER_KEY missing "
                     "(/spend and /health need the master key)")
+    # A too-short shared token is brute-forceable; refuse to boot with one so it
+    # can't silently protect the dashboard with ~nothing. Use a long random token.
+    if DASHBOARD_TOKEN and len(DASHBOARD_TOKEN) < 16:
+        errs.append("MONITOR_DASHBOARD_TOKEN too short (<16 chars) — use a long, "
+                    "random token (e.g. `openssl rand -base64 24`)")
     # F2: refuse to boot fully open unless the operator opted in explicitly.
     # Auth is "configured" when a legacy token is set OR at least one user account
     # exists (username+password login). Neither → fatal unless MONITOR_ALLOW_OPEN=1.

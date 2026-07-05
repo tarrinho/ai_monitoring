@@ -1307,7 +1307,7 @@ async def test_notifier_debounce_and_recovery(monkeypatch):
     monkeypatch.setattr(config, "ALERT_REPEAT_MIN", 9999)  # never repeat
     sent_log = []
 
-    async def fake_fanout(self, session, text):
+    async def fake_fanout(self, session, text, recipients=None):
         sent_log.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", fake_fanout)
 
@@ -2366,7 +2366,9 @@ def test_config_validate_clean(monkeypatch):
     monkeypatch.setattr(config, "MONITOR_PORT", 9925)
     monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
-    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok")   # F2: a token is valid config
+    # F2: a token is valid config — but it must be long enough (>=16 chars), else
+    # validate() now rejects it as brute-forceable (weak-token gate).
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok1234567890abcd")
     assert config.validate() == []
 
 
@@ -3213,3 +3215,281 @@ async def test_change_password_is_audited(monkeypatch):
     finally:
         await c.close()
     assert "account.password" in {r["action"] for r in db.audit_list(50)}
+
+
+# ============================================================================
+# Security-fix regression — one guard per finding from the code review, so a
+# future edit can't silently reopen it. All values are synthetic placeholders.
+# ============================================================================
+def test_sec_open_redirect_backslash_blocked():
+    # `/\evil.com` is normalised by browsers to `//evil.com` (protocol-relative)
+    # → off-site redirect. _safe_path must reject backslash, not just `//`.
+    import app as a
+    assert a._safe_path("/\\evil.com") == "/"
+    assert a._safe_path("//evil.com") == "/"
+    assert a._safe_path("/dashboard") == "/dashboard"      # legit local path kept
+
+
+def test_sec_weak_token_rejected_by_validate(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "short")
+    assert any("too short" in e for e in config.validate())
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "a" * 16)   # >=16 ok
+    assert not any("too short" in e for e in config.validate())
+
+
+def test_sec_ssh_prefix_rejects_dash_and_uses_separator(monkeypatch):
+    from collectors import gpu
+    # a '-'-prefixed host would be parsed by ssh as an option (arg injection)
+    monkeypatch.setattr(config, "GPU_SSH", "-oProxyCommand=touch /tmp/x")
+    monkeypatch.setattr(config, "GPU_SSH_KEY", "")
+    monkeypatch.setattr(config, "GPU_SSH_PORT", 22)
+    assert gpu._ssh_prefix() is None
+    monkeypatch.setattr(config, "GPU_SSH", "user@gpuhost")
+    pre = gpu._ssh_prefix()
+    assert pre is not None and pre[-2:] == ["--", "user@gpuhost"]   # '--' guards host
+
+
+async def test_sec_legacy_token_cookie_is_opaque(monkeypatch):
+    # the aimon_session cookie must be an opaque session id, NOT the raw token.
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "longenoughtoken1234")
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    c = await _client()
+    try:
+        r = await c.get("/?token=longenoughtoken1234", allow_redirects=False)
+        assert r.status == 302
+        sc = r.headers.get("Set-Cookie", "")
+        assert "aimon_session=" in sc
+        assert "aimon_session=longenoughtoken1234" not in sc     # raw token NOT stored
+        assert (await c.get("/api/data")).status == 200          # opaque cookie auths
+    finally:
+        await c.close()
+
+
+async def test_sec_alerts_test_requires_admin(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("vic", "vic@x.io", auth.hash_password("vicpw1234"), "viewer",
+                   time.time())
+    c = await _client()
+    try:
+        r = await c.post("/login", data={"username": "vic", "password": "vicpw1234"},
+                         allow_redirects=False)
+        assert r.status == 302
+        assert (await c.post("/api/alerts/test")).status == 403   # viewer forbidden
+    finally:
+        await c.close()
+
+
+async def test_sec_fetch_json_caps_oversized_body(monkeypatch):
+    import collectors
+    monkeypatch.setattr(config, "HTTP_MAX_BYTES", 1024)
+
+    async def big(_request):
+        return web.Response(body=b'{"x":"' + b"A" * 5000 + b'"}',
+                            content_type="application/json")
+
+    app = web.Application()
+    app.router.add_get("/big", big)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        async with aiohttp.ClientSession() as s:
+            data, err = await collectors.fetch_json(s, str(srv.make_url("/big")))
+        assert data is None and err and "too large" in err
+    finally:
+        await srv.close()
+
+
+# ── per-user alert webhook (1.2.2) ────────────────────────────────────────────
+def test_webhook_db_crud():
+    db.user_create("wu", "w@x.io", auth.hash_password("wupw1234"), "viewer", time.time())
+    assert db.user_get_webhook("wu") == {"url": "", "enabled": False}
+    assert db.user_set_webhook("wu", "https://hooks.example.com/x", True)
+    assert db.user_get_webhook("wu") == {"url": "https://hooks.example.com/x", "enabled": True}
+    assert [r["user"] for r in db.user_webhooks_enabled()] == ["wu"]
+    # disabling the account removes it from the fan-out recipient list
+    db.user_set_disabled("wu", True)
+    assert db.user_webhooks_enabled() == []
+
+
+async def test_webhook_ssrf_validation(monkeypatch):
+    # No test relies on real DNS (the in-image gate has no network): private targets
+    # are IP LITERALS (getaddrinfo returns them verbatim), and the "public passes"
+    # cases use ALLOW_PRIVATE=True which skips the resolve step.
+    monkeypatch.setattr(config, "WEBHOOK_HTTPS_ONLY", False)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "")
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", False)
+    for bad in ("http://169.254.169.254/latest/meta", "http://127.0.0.1:9000/x",
+                "http://10.1.2.3/hook", "http://[::1]/x", "ftp://host/x", "notaurl"):
+        assert await alerts.validate_webhook_url(bad) is not None, bad
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)   # skip DNS/IP check
+    assert await alerts.validate_webhook_url("https://hooks.slack.com/services/x") is None
+    monkeypatch.setattr(config, "WEBHOOK_HTTPS_ONLY", True)      # rejects http
+    assert await alerts.validate_webhook_url("http://hooks.slack.com/x") is not None
+    monkeypatch.setattr(config, "WEBHOOK_HTTPS_ONLY", False)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "hooks.slack.com,discord.com")
+    assert await alerts.validate_webhook_url("https://evil.example.com/x") is not None
+    assert await alerts.validate_webhook_url("https://team.discord.com/x") is None   # subdomain ok
+
+
+async def test_account_webhook_get_set(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)      # allow test host
+    db.user_create("wv", "v@x.io", auth.hash_password("wvpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        csrf = await _login_get_csrf(c, "wv", "wvpw1234")
+        assert (await (await c.get("/api/account/webhook")).json())["url"] == ""
+        r = await c.post("/api/account/webhook",
+                         data={"url": "https://hooks.example.test/mine", "enabled": "1"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        d = await (await c.get("/api/account/webhook")).json()
+        assert d["url"] == "https://hooks.example.test/mine" and d["enabled"] is True
+    finally:
+        await c.close()
+
+
+async def test_account_webhook_rejects_ssrf_and_needs_csrf(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", False)
+    db.user_create("ws", "s@x.io", auth.hash_password("wspw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        csrf = await _login_get_csrf(c, "ws", "wspw1234")
+        # private/loopback URL is refused
+        r = await c.post("/api/account/webhook",
+                         data={"url": "http://127.0.0.1:8080/x", "enabled": "1"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400
+        # missing CSRF -> 403
+        r = await c.post("/api/account/webhook",
+                         data={"url": "https://hooks.slack.com/x", "enabled": "1"})
+        assert r.status == 403
+    finally:
+        await c.close()
+
+
+async def test_notifier_fans_out_to_user_webhooks(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
+    monkeypatch.setattr(config, "ALERT_CPU_PCT", 50.0)
+    monkeypatch.setattr(config, "ALERT_REPEAT_MIN", 9999)
+    db.user_create("wf", "f@x.io", auth.hash_password("wfpw1234"), "viewer", time.time())
+    db.user_set_webhook("wf", "https://hooks.example.test/mine", True)
+    posted = []
+
+    async def fake_post(self, session, url, payload):
+        posted.append(url)
+    monkeypatch.setattr(alerts.Notifier, "_post_json", fake_post)
+    n = alerts.Notifier()
+    hot = {"ts": 0, "collectors": {"host": {"available": True, "cpu_pct": 90,
+                                            "mem_pct": 1, "disk": {"pct": 1}}}}
+    async with aiohttp.ClientSession() as s:
+        await n.process(s, hot, 1000)
+    assert "https://hooks.example.test/mine" in posted
+    # a disabled webhook is not a recipient
+    db.user_set_webhook("wf", "https://hooks.example.test/mine", False)
+    assert "https://hooks.example.test/mine" not in await alerts.Notifier()._recipients()
+
+
+async def test_webhook_set_is_audited(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
+    db.user_create("wa", "a@x.io", auth.hash_password("wapw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        csrf = await _login_get_csrf(c, "wa", "wapw1234")
+        await c.post("/api/account/webhook",
+                     data={"url": "https://hooks.example.test/x", "enabled": "1"},
+                     headers={"X-CSRF-Token": csrf})
+    finally:
+        await c.close()
+    assert "webhook.set" in {r["action"] for r in db.audit_list(50)}
+
+
+# ── webhook SSRF hardening (manual-review findings M1 + L1) ───────────────────
+def test_sec_webhook_ip_blocked_covers_cgnat_and_mapped():
+    import alerts
+    # L1: RFC 6598 CGNAT / shared space must be blocked (is_private misses it <3.13)
+    assert alerts._ip_blocked("100.64.0.1")
+    assert alerts._ip_blocked("100.127.255.254")
+    # IPv4-mapped IPv6 collapses to v4 → internal targets can't hide in v6
+    assert alerts._ip_blocked("::ffff:169.254.169.254")
+    assert alerts._ip_blocked("::ffff:100.64.0.1")
+    # public still allowed
+    assert not alerts._ip_blocked("8.8.8.8")
+    assert not alerts._ip_blocked("1.1.1.1")
+
+
+async def test_sec_webhook_resolver_pins_validated_ip(monkeypatch):
+    # M1: the SSRF resolver must REFUSE to hand aiohttp a blocked address, even if
+    # the hostname (re)resolves to one at connect time (DNS-rebinding TOCTOU).
+    import alerts
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", False)
+    r = alerts._SSRFResolver()
+
+    def _info(ip):
+        async def _f(*a, **k):
+            return [{"hostname": "h", "host": ip, "port": 0,
+                     "family": 2, "proto": 0, "flags": 0}]
+        return _f
+    try:
+        monkeypatch.setattr(r._base, "resolve", _info("127.0.0.1"))
+        with pytest.raises(OSError):
+            await r.resolve("rebind.evil.test")            # rebound to loopback → refused
+        monkeypatch.setattr(r._base, "resolve", _info("169.254.169.254"))
+        with pytest.raises(OSError):
+            await r.resolve("metadata.evil.test")          # metadata IP → refused
+        monkeypatch.setattr(r._base, "resolve", _info("8.8.8.8"))
+        out = await r.resolve("good.test")                 # public → passes through
+        assert out and out[0]["host"] == "8.8.8.8"
+    finally:
+        await r.close()
+
+
+async def test_sec_webhook_resolver_respects_allow_private(monkeypatch):
+    # the operator opt-in must still reach a LAN host (resolver mustn't over-block)
+    import alerts
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
+    r = alerts._SSRFResolver()
+
+    async def _priv(*a, **k):
+        return [{"hostname": "h", "host": "10.0.0.5", "port": 0,
+                 "family": 2, "proto": 0, "flags": 0}]
+    try:
+        monkeypatch.setattr(r._base, "resolve", _priv)
+        out = await r.resolve("lan.internal")
+        assert out and out[0]["host"] == "10.0.0.5"        # allowed with opt-in
+    finally:
+        await r.close()
+
+
+async def test_sec_webhook_recipients_timeboxed(monkeypatch):
+    # §6: a slow-resolving user webhook must NOT hang the alert tick (which would
+    # wedge the sampling loop) — it is dropped within HTTP_TIMEOUT, not awaited fully.
+    import alerts
+    monkeypatch.setattr(config, "HTTP_TIMEOUT", 0.2)
+
+    async def _hang(url):
+        await asyncio.sleep(5)
+        return None
+    monkeypatch.setattr(alerts, "validate_webhook_url", _hang)
+    monkeypatch.setattr(alerts.db, "user_webhooks_enabled",
+                        lambda: [{"name": "u", "url": "http://slow.test/"}])
+    t0 = time.perf_counter()
+    out = await alerts.Notifier()._recipients()
+    assert out == [] and (time.perf_counter() - t0) < 2.0   # bounded, not 5s
+
+
+async def test_sec_webhook_recipients_capped(monkeypatch):
+    # a large user base can't make the fan-out unbounded — capped per tick.
+    import alerts
+    monkeypatch.setattr(config, "WEBHOOK_MAX_RECIPIENTS", 3)
+
+    async def _ok(url):
+        return None                                        # every URL "valid"
+    monkeypatch.setattr(alerts, "validate_webhook_url", _ok)
+    monkeypatch.setattr(alerts.db, "user_webhooks_enabled",
+                        lambda: [{"name": f"u{i}", "url": f"http://h{i}.test/"}
+                                 for i in range(10)])
+    out = await alerts.Notifier()._recipients()
+    assert len(out) == 3                                    # capped at MAX_RECIPIENTS

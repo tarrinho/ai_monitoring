@@ -19,6 +19,13 @@ import config
 
 _MiB = 1024 * 1024
 
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that refuses to follow 3xx — returning None makes urllib
+    raise the HTTPError instead of chasing the Location (SSRF guard for _http)."""
+    def redirect_request(self, *args, **kwargs):   # noqa: D102
+        return None
+
 _NVIDIA_QUERY = [
     "nvidia-smi",
     "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,"
@@ -40,13 +47,19 @@ def _run(cmd: list[str], timeout: float = 6.0) -> str | None:
 def _ssh_prefix() -> list[str] | None:
     if not config.GPU_SSH:
         return None
+    # Reject a host or key path that begins with '-': although _run uses an argv
+    # list (no shell → no command injection), ssh would parse a '-'-prefixed value
+    # as an OPTION (e.g. GPU_SSH="-oProxyCommand=…" → local command execution).
+    if config.GPU_SSH.startswith("-") or \
+            (config.GPU_SSH_KEY and config.GPU_SSH_KEY.startswith("-")):
+        return None
     pre = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
            "-o", "StrictHostKeyChecking=accept-new"]
     if config.GPU_SSH_KEY:
         pre += ["-i", config.GPU_SSH_KEY]
     if config.GPU_SSH_PORT and config.GPU_SSH_PORT != 22:
         pre += ["-p", str(config.GPU_SSH_PORT)]
-    pre.append(config.GPU_SSH)
+    pre += ["--", config.GPU_SSH]      # '--' ends option parsing before the host
     return pre
 
 
@@ -151,8 +164,11 @@ def _http() -> dict | None:
         return None
     try:
         # bypass any http_proxy/https_proxy env — the GPU agent is a local/LAN
-        # endpoint and must not be routed through a corporate proxy.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # endpoint and must not be routed through a corporate proxy. Redirects are
+        # NOT followed (_NoRedirect): a 3xx to file://-via-http or an internal
+        # metadata IP would otherwise turn this into an SSRF/exfil primitive.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect())
         with opener.open(url, timeout=4) as r:  # noqa: S310 (scheme-checked)
             data = json.loads(r.read().decode())
     except Exception:

@@ -320,8 +320,15 @@ async def _sampling_loop(app: web.Application) -> None:
             _track_events(snap)
             _track_model_events(snap)
             anoms = _detect_anomalies(snap)
-            await _notifier.process(session, snap, snap["ts"],
-                                    extra_breaches=anoms)
+            # Bound the notifier like _sample_once: a user webhook with a slow-
+            # resolving/blackholed host must never wedge the sampling loop (§6).
+            try:
+                await asyncio.wait_for(
+                    _notifier.process(session, snap, snap["ts"],
+                                      extra_breaches=anoms), 15)
+            except asyncio.TimeoutError:
+                print("[alert] notifier exceeded 15s — skipped this tick",
+                      file=sys.stderr)
             if snap["ts"] - last_rollup > 60:
                 db.rollup()
                 last_rollup = snap["ts"]
@@ -378,8 +385,34 @@ async def _sechdr_mw(request: web.Request, handler):
 
 
 # ------------------------------------------------------------------- auth -----
-_COOKIE = "aimon_session"       # legacy shared-token session cookie
+_COOKIE = "aimon_session"       # legacy shared-token session cookie (opaque id)
 _USER_COOKIE = "aimon_user"     # per-user login session id (auth.py sessions)
+
+# Opaque server-side sessions for legacy-token logins: the aimon_session cookie
+# now holds a random id (not the master token itself), so cookie theft / a
+# mis-logged Set-Cookie never leaks the actual shared secret. sid -> expiry epoch.
+# In-memory like the user sessions; a restart just asks for ?token= again.
+_token_sessions: dict[str, float] = {}
+
+
+def _token_session_new(now: float) -> str:
+    """Mint an opaque legacy-token session id (bounded, expired ones pruned)."""
+    for sid in [s for s, exp in _token_sessions.items() if exp <= now]:
+        _token_sessions.pop(sid, None)
+    over = len(_token_sessions) - config.SESSION_MAX
+    if over > 0:
+        for sid, _e in sorted(_token_sessions.items(), key=lambda kv: kv[1])[:over]:
+            _token_sessions.pop(sid, None)
+    sid = secrets.token_urlsafe(32)
+    _token_sessions[sid] = now + 7 * 24 * 3600.0
+    return sid
+
+
+def _token_cookie_valid(request: web.Request) -> bool:
+    """True if the aimon_session cookie is a live opaque token-session id."""
+    sid = request.cookies.get(_COOKIE)
+    exp = _token_sessions.get(sid) if sid else None
+    return exp is not None and exp > time.time()
 
 
 def _is_https(request: web.Request) -> bool:
@@ -394,11 +427,13 @@ def _token_ok(tok: str | None) -> bool:
 
 
 def _request_token(request: web.Request) -> str | None:
-    """Token from Authorization header, then ?token=, then session cookie."""
+    """Raw token from the Authorization header, then ?token=. The aimon_session
+    COOKIE is intentionally NOT read here — it carries an opaque session id, not
+    the token, and is validated separately via _token_cookie_valid()."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:]
-    return request.query.get("token") or request.cookies.get(_COOKIE)
+    return request.query.get("token")
 
 
 def _session_from_req(request: web.Request) -> dict | None:
@@ -442,7 +477,7 @@ def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
         if u and not u["disabled"]:
             return True, u["role"], sess
         auth.session_drop(request.cookies.get(_USER_COOKIE))   # user gone/disabled
-    if _token_ok(_request_token(request)):
+    if _token_ok(_request_token(request)) or _token_cookie_valid(request):
         return True, "admin", None
     return False, None, None
 
@@ -461,6 +496,21 @@ _ADMIN_API_PREFIX = "/api/admin/"
 _auth_fails: dict[str, collections.deque] = collections.defaultdict(
     lambda: collections.deque(maxlen=128))
 _auth_locked_until: dict[str, float] = {}
+
+
+def _prune_auth_state(now: float) -> None:
+    """Bound the per-IP brute-force maps so a flood of distinct source IPs can't
+    grow them without limit (memory DoS). Only runs a full scan once the maps get
+    large; drops expired lockouts and stale/empty fail windows. Cheap and safe —
+    an active lockout (locked_until > now) is never removed early."""
+    if len(_auth_locked_until) + len(_auth_fails) < 4096:
+        return
+    for ip in [i for i, u in _auth_locked_until.items() if u <= now]:
+        _auth_locked_until.pop(ip, None)
+    win = config.AUTH_WINDOW_S
+    for ip in [i for i, d in _auth_fails.items()
+               if not d or now - d[-1] > win]:
+        _auth_fails.pop(ip, None)
 
 
 def _client_ip(request: web.Request) -> str:
@@ -492,7 +542,7 @@ def _login_dest(request: web.Request, nxt: str) -> str:
     """Location for redirecting an unauthenticated page request to the login form,
     preserving where they were headed via a validated ?next=."""
     base = _fwd_prefix(request) + "/login"
-    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+    if nxt and nxt.startswith("/") and not nxt.startswith("//") and "\\" not in nxt:
         return base + "?next=" + quote(nxt, safe="")
     return base
 
@@ -515,6 +565,7 @@ async def _auth_mw(request: web.Request, handler):
 
     ip = _client_ip(request)
     now = time.time()
+    _prune_auth_state(now)
     locked = _auth_locked_until.get(ip, 0.0)
     if locked > now:
         return web.json_response(
@@ -525,8 +576,12 @@ async def _auth_mw(request: web.Request, handler):
     if not authed:
         # Count a lockout strike only when a credential was actually PRESENTED and
         # rejected (real brute-force) — not for a browser that simply isn't logged
-        # in yet (that just gets bounced to /login).
-        presented = bool(_request_token(request)) or bool(request.cookies.get(_USER_COOKIE))
+        # in yet (that just gets bounced to /login). Only a presented BEARER/query
+        # TOKEN counts: it's the one guessable shared secret. A session cookie
+        # (aimon_user / aimon_session) is a 256-bit opaque id — un-brute-forceable,
+        # and an EXPIRED one on an auto-polling dashboard would otherwise lock the
+        # operator's own IP out. Password brute-force is counted in login_submit.
+        presented = bool(_request_token(request))
         if presented:
             fails = _auth_fails[ip]
             while fails and now - fails[0] > config.AUTH_WINDOW_S:
@@ -582,14 +637,16 @@ def _maybe_cookie_redirect(request: web.Request, dest: str) -> None:
     """If authed via ?token=, move it into an HttpOnly cookie and redirect to a
     clean URL — keeps the secret out of history, access logs, Referer, and the
     tunnel's request inspector after the very first hit."""
-    if config.DASHBOARD_TOKEN and request.query.get("token") and \
+    if config.DASHBOARD_TOKEN and _token_ok(request.query.get("token")) and \
             not request.cookies.get(_COOKIE):
         resp = web.HTTPFound((_fwd_prefix(request) + dest) or dest)
-        # F3: the cookie value is the bearer token, so mark it Secure by default
-        # (assume TLS in front). Only fall back to conditional when the operator
-        # opts into plain-HTTP testing — never ship the token over cleartext silently.
+        # The cookie holds an OPAQUE session id (not the master token) so the raw
+        # secret never lands in a browser cookie / a mis-logged Set-Cookie. F3:
+        # Secure by default (assume TLS); only conditional when the operator opts
+        # into plain-HTTP testing — never ship the cookie over cleartext silently.
         secure = _is_https(request) if config.COOKIE_ALLOW_INSECURE else True
-        resp.set_cookie(_COOKIE, config.DASHBOARD_TOKEN, max_age=86400 * 7,
+        sid = _token_session_new(time.time())
+        resp.set_cookie(_COOKIE, sid, max_age=86400 * 7,
                         httponly=True, samesite="Strict",
                         secure=secure, path="/")
         raise resp
@@ -672,6 +729,11 @@ def _cookie_secure(request: web.Request) -> bool:
     return _is_https(request) if config.COOKIE_ALLOW_INSECURE else True
 
 
+# Fixed decoy hash: scrypt-verify against it for unknown users so a failed login
+# takes the same time whether or not the username exists (anti-enumeration).
+_DECOY_HASH = auth.hash_password(secrets.token_urlsafe(16))
+
+
 def _set_user_cookie(resp, sid: str, request: web.Request) -> None:
     resp.set_cookie(_USER_COOKIE, sid, max_age=int(config.SESSION_TTL_S),
                     httponly=True, samesite="Strict",
@@ -679,8 +741,10 @@ def _set_user_cookie(resp, sid: str, request: web.Request) -> None:
 
 
 def _safe_path(nxt: str | None) -> str:
-    """A validated local redirect target (no open-redirect off-site)."""
-    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+    """A validated local redirect target (no open-redirect off-site). Rejects `//`
+    AND `\\` — browsers normalise a backslash to `/`, so `/\\evil.com` would resolve
+    as the protocol-relative `//evil.com` and redirect off-site."""
+    if nxt and nxt.startswith("/") and not nxt.startswith("//") and "\\" not in nxt:
         return nxt
     return "/"
 
@@ -703,7 +767,14 @@ async def login_submit_handler(request: web.Request) -> web.Response:
     pw = str(data.get("password") or "")
     nxt = _safe_path(str(data.get("next") or "/"))
     u = db.user_get(name)
-    ok = u is not None and not u["disabled"] and auth.verify_password(pw, u["pw_hash"])
+    if u is not None and not u["disabled"]:
+        ok = auth.verify_password(pw, u["pw_hash"])
+    else:
+        # Run the (deliberately slow) scrypt against a fixed decoy hash for an
+        # unknown/disabled user too, so login latency can't be used to enumerate
+        # which usernames exist (timing side-channel).
+        auth.verify_password(pw, _DECOY_HASH)
+        ok = False
     if not ok:
         fails = _auth_fails[ip]
         while fails and now - fails[0] > config.AUTH_WINDOW_S:
@@ -733,8 +804,10 @@ async def logout_handler(request: web.Request) -> web.Response:
     if sess:
         _audit(request, sess["user"], "logout")
     auth.session_drop(request.cookies.get(_USER_COOKIE))
+    _token_sessions.pop(request.cookies.get(_COOKIE) or "", None)  # legacy-token sid
     resp = web.HTTPFound(_fwd_prefix(request) + "/login")
     resp.del_cookie(_USER_COOKIE, path="/")
+    resp.del_cookie(_COOKIE, path="/")
     raise resp
 
 
@@ -780,6 +853,53 @@ async def api_account_password(request: web.Request) -> web.Response:
     auth.sessions_drop_user_except(sess["user"], request.cookies.get(_USER_COOKIE))
     _audit(request, sess["user"], "account.password")
     return web.json_response({"ok": True})
+
+
+# ── per-user alert webhook (self-service) ─────────────────────────────────────
+async def api_account_webhook_get(request: web.Request) -> web.Response:
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in"}, status=401)
+    wh = db.user_get_webhook(sess["user"]) or {"url": "", "enabled": False}
+    return web.json_response(wh)
+
+
+async def api_account_webhook_set(request: web.Request) -> web.Response:
+    """Save YOUR OWN alert webhook. User-supplied → SSRF-validated before storing."""
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in"}, status=401)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    url = str(data.get("url") or "").strip()
+    enabled = str(data.get("enabled") or "").lower() in ("1", "true", "on", "yes")
+    if url:
+        if (err := await alerts.validate_webhook_url(url)):
+            return web.json_response({"error": err}, status=400)
+    elif enabled:
+        return web.json_response({"error": "enabling a webhook needs a URL"}, status=400)
+    db.user_set_webhook(sess["user"], url, enabled and bool(url))
+    _audit(request, sess["user"], "webhook.set",
+           detail="on" if (enabled and url) else "off")
+    return web.json_response({"ok": True})
+
+
+async def api_account_webhook_test(request: web.Request) -> web.Response:
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in"}, status=401)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    url = str(data.get("url") or "").strip()
+    if not url:
+        url = (db.user_get_webhook(sess["user"]) or {}).get("url") or ""
+    if not url:
+        return web.json_response({"error": "no webhook URL set"}, status=400)
+    res = await alerts.send_test_url(request.app[_SESSION], url)
+    _audit(request, sess["user"], "webhook.test", detail="ok" if res.get("ok") else "fail")
+    return web.json_response(res)
 
 
 # ───────────────────────────── admin: user mgmt ──────────────────────────────
@@ -979,6 +1099,14 @@ async def alerts_handler(request: web.Request) -> web.Response:
 
 
 async def alerts_test_handler(request: web.Request) -> web.Response:
+    # Firing test notifications is an admin action (it hits the operator's real
+    # webhook/channels): require the admin role and a CSRF token for a session
+    # login. Token-authed automation is CSRF-exempt; open mode (no auth) allows it.
+    _, role, sess = _auth_ctx(request)
+    if _auth_enabled() and role != "admin":
+        return web.json_response({"error": "forbidden"}, status=403)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
     session: aiohttp.ClientSession = request.app[_SESSION]
     results = await alerts.send_test(session)
     return web.json_response({"results": results})
@@ -1107,6 +1235,8 @@ async def _on_cleanup(app: web.Application) -> None:
         await sess.close()
     # the containers collector holds its own unix-socket session — close it too
     await containers.close()
+    # the per-user webhook sender holds its own SSRF-pinned session — close it too
+    await alerts.close_webhook_session()
 
 
 def build_app() -> web.Application:
@@ -1124,6 +1254,9 @@ def build_app() -> web.Application:
     app.router.add_get("/account", account_page_handler)
     app.router.add_get("/api/me", me_handler)
     app.router.add_post("/api/account/password", api_account_password)
+    app.router.add_get("/api/account/webhook", api_account_webhook_get)
+    app.router.add_post("/api/account/webhook", api_account_webhook_set)
+    app.router.add_post("/api/account/webhook/test", api_account_webhook_test)
     app.router.add_get("/admin/users", admin_users_page_handler)
     app.router.add_get("/api/admin/users", api_admin_users_list)
     app.router.add_post("/api/admin/users", api_admin_users_create)

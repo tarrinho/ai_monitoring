@@ -4,6 +4,71 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.2.2] — 2026-07-05
+
+### Added
+- **Per-user alert webhooks.** Each user configures **their own** webhook at
+  `/account` (Slack / Discord / generic JSON POST) with an enable toggle and a
+  *Send test* button. When an alert fires, the notifier fans out to every enabled
+  webhook (of non-disabled users) **plus** the operator-set global
+  `ALERT_WEBHOOK_URL` (backward compatible); recipients are resolved + validated
+  once per tick. Backed by `GET/POST /api/account/webhook` and
+  `POST /api/account/webhook/test` (session-only, CSRF-protected); set/test are
+  audited (`webhook.set`, `webhook.test`).
+
+### Security
+Per-user webhooks are user-supplied, so they are **SSRF-guarded**: a URL is refused
+(on save **and** re-checked before each send — DNS-rebinding aware) when it resolves
+to a private / loopback / link-local / reserved / metadata address; only `http(s)`
+schemes are allowed and redirects are not followed. Opt-in hardening:
+`MONITOR_WEBHOOK_HTTPS_ONLY=1`, host allowlist `MONITOR_WEBHOOK_ALLOW_HOSTS`, and
+`MONITOR_WEBHOOK_ALLOW_PRIVATE=1` to relax the block on a trusted LAN. The
+operator-set global `ALERT_WEBHOOK_URL` is trusted and unchecked.
+
+Plus hardening from a full secure code review (no Critical/High found; these close
+the Medium/Low findings). No functional change — all existing auth/cookie/stream/login
+flows are unchanged and regression-tested (`test_sec_*`).
+- **Opaque legacy-token cookie.** The `aimon_session` cookie now holds a random
+  server-side session id instead of the master token itself, so cookie theft or a
+  mis-logged `Set-Cookie` can no longer leak the raw shared secret.
+- **Collector response size cap.** `fetch_json` caps a backend body at
+  `MONITOR_HTTP_MAX_BYTES` (16 MiB) *before* deserialising, so a compromised/MITM'd
+  backend can't stream a huge body and OOM the monitor. Outbound calls also stop
+  following redirects (`allow_redirects=False`; urllib `_NoRedirect` for the GPU
+  HTTP feed) — an SSRF-to-metadata guard.
+- **Open-redirect fixed.** `_safe_path`/`_login_dest` now reject a backslash, so
+  `?next=/\evil.com` (which browsers normalise to `//evil.com`) can't bounce a user
+  off-site.
+- **Alerts test is admin-only + CSRF.** `POST /api/alerts/test` now requires the
+  admin role and a CSRF token (was reachable by any logged-in viewer); the *test*
+  button is hidden for non-admins.
+- **Login timing equalised.** An unknown username now runs a decoy scrypt verify,
+  removing the response-time side-channel that revealed which usernames exist.
+- **Weak shared token refused at boot.** `validate()` now rejects a
+  `MONITOR_DASHBOARD_TOKEN` shorter than 16 chars (was only a skippable warning).
+- **Bounded auth/session state.** Server-side sessions are hard-capped
+  (`MONITOR_SESSION_MAX`, default 2000, oldest-expiring evicted) and the per-IP
+  brute-force maps are pruned, so neither can grow without bound.
+- **SSH argument-injection hardening.** The GPU-over-SSH command refuses a host or
+  key path beginning with `-` and inserts `--` before the host, so a config value
+  like `-oProxyCommand=…` can't be parsed by `ssh` as an option.
+- **Webhook SSRF: DNS-rebinding closed + CGNAT blocked.** Per-user webhooks now send
+  over a dedicated session whose resolver re-checks the IP aiohttp actually connects
+  to (`ttl_dns_cache=0`), so a low-TTL rebind after validation can't reach an internal
+  host; the checked IP is the connected IP. `_ip_blocked` also rejects RFC 6598 CGNAT
+  (`100.64.0.0/10`) and collapses IPv4-mapped IPv6. The `WEBHOOK_ALLOW_PRIVATE` opt-in
+  is still honoured for trusted-LAN targets.
+- **Webhook fan-out can't wedge the sampling loop (§6).** Per-user webhook resolution
+  + delivery is now capped (`MONITOR_WEBHOOK_MAX_RECIPIENTS`, default 50), run
+  concurrently, and time-boxed (`HTTP_TIMEOUT` per validate); the notifier tick is
+  wrapped in a 15 s `wait_for`. A user pointing their webhook at a slow/blackholed
+  host can no longer stall monitoring for everyone. The webhook POST is also released
+  via `async with` (was leaking connections).
+- **Auth lockout no longer self-locks the operator.** An expired opaque session
+  cookie on an auto-polling dashboard is no longer counted as a brute-force strike —
+  only a presented (guessable) bearer/query token is. A 256-bit session cookie can't
+  be brute-forced, and counting an expired one locked the operator's own IP out.
+
 ## [1.2.1] — 2026-07-05
 
 ### Added

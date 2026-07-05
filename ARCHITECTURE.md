@@ -78,8 +78,12 @@ Middlewares (outer→inner): `_sechdr_mw` (security headers on every response) �
 session). `_auth_mw` also does **per-IP brute-force lockout**: after
 `AUTH_MAX_FAILS` bad tokens in `AUTH_WINDOW_S` an IP gets `429 + Retry-After` for
 `AUTH_LOCKOUT_S` (client IP from `X-Forwarded-For` only when
-`AUTH_TRUSTED_PROXY` is set, so the header can't be spoofed to dodge it).
-Dashboard pages set the cookie from `?token=` then 302 to a clean URL. Handlers
+`AUTH_TRUSTED_PROXY` is set, so the header can't be spoofed to dodge it); the
+per-IP maps are pruned so they can't grow without bound, and server-side sessions
+are hard-capped (`SESSION_MAX`). Dashboard pages set the cookie from `?token=`
+then 302 to a clean URL — the cookie holds an **opaque session id, not the raw
+token**, so the shared secret never lands in a browser cookie. A too-short
+`MONITOR_DASHBOARD_TOKEN` (<16 chars) is refused at boot by `validate()`. Handlers
 read the in-memory ring (`_latest`, `_ring`) for "now" and SQLite for history.
 `GET /api/stream` is a **Server-Sent Events** channel that pushes each new
 snapshot over one connection (the Overview uses it and falls back to polling on

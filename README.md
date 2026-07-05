@@ -119,6 +119,13 @@ Every logged-in user (admin or viewer) can change **their own** password from th
 identity, and signs out their other sessions on success. Admins reset *other*
 users' passwords from `/admin/users`.
 
+Each user can also set **their own alert webhook** on `/account` (Slack / Discord /
+generic JSON POST) — when an alert fires it is delivered to every enabled user
+webhook plus the operator-set global `ALERT_WEBHOOK_URL`. User URLs are SSRF-guarded
+(private / loopback / metadata addresses are refused); see
+`MONITOR_WEBHOOK_HTTPS_ONLY` / `MONITOR_WEBHOOK_ALLOW_HOSTS` /
+`MONITOR_WEBHOOK_ALLOW_PRIVATE`.
+
 Seed the first admin via `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` /
 `MONITOR_ADMIN_EMAIL`, then manage everyone else from `/admin/users`. Passwords are
 scrypt-hashed in SQLite; sessions are HttpOnly + SameSite=Strict + Secure. The

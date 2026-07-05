@@ -76,8 +76,15 @@ _sessions: dict[str, dict] = {}
 
 
 def _sweep(now: float) -> None:
-    if len(_sessions) > 32:   # cheap opportunistic GC of expired sessions
-        for sid in [s for s, v in _sessions.items() if v["expiry"] <= now]:
+    # Always drop expired sessions (cheap dict pass). Then enforce a HARD ceiling:
+    # if still above config.SESSION_MAX, evict the soonest-to-expire until under it,
+    # so the in-memory store can't grow without bound even under many live logins.
+    for sid in [s for s, v in _sessions.items() if v["expiry"] <= now]:
+        _sessions.pop(sid, None)
+    over = len(_sessions) - config.SESSION_MAX
+    if over > 0:
+        for sid, _v in sorted(_sessions.items(),
+                              key=lambda kv: kv[1]["expiry"])[:over]:
             _sessions.pop(sid, None)
 
 
