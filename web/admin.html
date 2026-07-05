@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Users</title>
+<link rel="icon" href="/assets/favicon.svg">
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#30363d;
+    --fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  html[data-theme="light"]{--bg:#f6f8fa;--panel:#fff;--panel2:#eaeef2;--line:#d0d7de;
+    --fg:#1f2328;--muted:#59636e;--accent:#0969da;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{font-size:16px;margin:0}
+  header .sp{margin-left:auto;display:flex;gap:12px;align-items:center}
+  a{color:var(--accent);text-decoration:none}
+  main{padding:20px;max-width:1000px;margin:0 auto;display:grid;gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase}
+  .pill{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--panel2)}
+  .pill.admin{color:var(--accent)} .pill.viewer{color:var(--muted)}
+  .pill.ok{color:var(--ok)} .pill.off{color:var(--bad)}
+  .row-form{display:grid;grid-template-columns:1fr 1.4fr 1fr auto auto;gap:10px;align-items:end}
+  @media(max-width:720px){.row-form{grid-template-columns:1fr 1fr}}
+  label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+  input,select{width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--fg);font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  button{padding:8px 12px;border:0;border-radius:6px;background:var(--accent);color:#fff;
+    font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+  button:hover{filter:brightness(1.08)}
+  button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}
+  button.danger{background:transparent;color:var(--bad);border:1px solid var(--bad)}
+  .actions{display:flex;gap:6px;flex-wrap:wrap}
+  .msg{margin-top:10px;font-size:13px;min-height:18px}
+  .msg.bad{color:var(--bad)} .msg.ok{color:var(--ok)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+  <header>
+    <h1>User management</h1>
+    <div class="sp">
+      <span class="muted" id="whoami"></span>
+      <a href="/">← Dashboards</a>
+      <a href="/logout">Logout</a>
+      <button class="ghost" id="theme-btn" type="button" title="Toggle theme">🌙</button>
+    </div>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Add user</h2>
+      <form id="create-form" autocomplete="off">
+        <div class="row-form">
+          <div><label for="cu">Username</label><input id="cu" name="username" required></div>
+          <div><label for="ce">Email</label><input id="ce" name="email" type="email" required></div>
+          <div><label for="cp">Password</label><input id="cp" name="password" type="password" required></div>
+          <div><label for="cr">Role</label>
+            <select id="cr" name="role"><option value="viewer">viewer</option><option value="admin">admin</option></select></div>
+          <div><button type="submit">Create</button></div>
+        </div>
+        <div class="msg" id="create-msg"></div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>Users</h2>
+      <table>
+        <thead><tr><th>User</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="msg" id="list-msg"></div>
+    </section>
+    <section class="card">
+      <h2>Activity log
+        <select id="audit-filter" style="width:auto;margin-left:10px;display:inline-block">
+          <option value="">all events</option>
+          <option value="login">logins</option>
+          <option value="user">user changes</option>
+        </select>
+      </h2>
+      <table>
+        <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th></tr></thead>
+        <tbody id="audit-rows"></tbody>
+      </table>
+      <div class="msg" id="audit-msg"></div>
+    </section>
+  </main>
+<script>
+(function(){
+  var t=localStorage.getItem("aimon-theme")||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){document.getElementById("theme-btn").textContent=
+    document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  icon();
+  document.getElementById("theme-btn").addEventListener("click",function(){
+    var c=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+    document.documentElement.setAttribute("data-theme",c);localStorage.setItem("aimon-theme",c);icon();});
+
+  var CSRF="", ME=null;
+  function fmtTime(s){ if(!s) return "—"; try{return new Date(s*1000).toLocaleString();}catch(e){return "—";} }
+  function post(url,obj){
+    var body=new URLSearchParams(obj).toString();
+    return fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},body:body})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
+  }
+  function setMsg(el,text,good){el.textContent=text||"";el.className="msg"+(text?(good?" ok":" bad"):"");}
+
+  function actionBtn(label,cls,fn){var b=document.createElement("button");b.type="button";
+    b.className=cls;b.textContent=label;b.addEventListener("click",fn);return b;}
+
+  function render(users){
+    var tb=document.getElementById("rows"); tb.textContent="";
+    users.forEach(function(u){
+      var tr=document.createElement("tr");
+      function cell(txt,cls){var td=document.createElement("td");if(cls){var s=document.createElement("span");
+        s.className=cls;s.textContent=txt;td.appendChild(s);}else{td.textContent=txt;}return td;}
+      tr.appendChild(cell(u.name + (u.name===ME?" (you)":"")));
+      tr.appendChild(cell(u.email||"—"));
+      tr.appendChild(cell(u.role,"pill "+(u.role==="admin"?"admin":"viewer")));
+      tr.appendChild(cell(u.disabled?"disabled":"active","pill "+(u.disabled?"off":"ok")));
+      tr.appendChild(cell(fmtTime(u.last_login)));
+      var td=document.createElement("td"); var wrap=document.createElement("div"); wrap.className="actions";
+      wrap.appendChild(actionBtn(u.disabled?"Enable":"Disable","ghost",function(){
+        act({username:u.name,action:u.disabled?"enable":"disable"});}));
+      wrap.appendChild(actionBtn("Reset pw","ghost",function(){
+        var np=prompt("New password for "+u.name+" (min 8 chars):"); if(np) act({username:u.name,action:"reset",password:np});}));
+      wrap.appendChild(actionBtn("Delete","danger",function(){
+        if(confirm("Delete user "+u.name+"? This cannot be undone.")) act({username:u.name,action:"delete"});}));
+      td.appendChild(wrap); tr.appendChild(td); tb.appendChild(tr);
+    });
+  }
+  function load(){
+    fetch("/api/admin/users").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      if(!d){setMsg(document.getElementById("list-msg"),"Failed to load users.",false);return;}
+      CSRF=d.csrf||""; ME=d.me||null;
+      document.getElementById("whoami").textContent=ME?("Signed in as "+ME):"";
+      render(d.users||[]); setMsg(document.getElementById("list-msg"),"",true);
+    }).catch(function(){setMsg(document.getElementById("list-msg"),"Failed to load users.",false);});
+  }
+  function act(obj){
+    post("/api/admin/users/action",obj).then(function(res){
+      if(!res.ok){setMsg(document.getElementById("list-msg"),res.j.error||"Action failed.",false);}
+      else{ load(); loadAudit(); }
+    });
+  }
+  var ACT_LABEL={ "login.ok":"signed in", "login.fail":"failed login",
+    "login.lockout":"locked out", "logout":"signed out",
+    "user.create":"created user", "user.disable":"disabled user",
+    "user.enable":"enabled user", "user.delete":"deleted user",
+    "user.reset":"reset password" };
+  function loadAudit(){
+    var f=document.getElementById("audit-filter").value;
+    fetch("/api/admin/audit?limit=200"+(f?("&action="+encodeURIComponent(f)):""))
+      .then(function(r){return r.ok?r.json():null;}).then(function(d){
+        var tb=document.getElementById("audit-rows"); tb.textContent="";
+        if(!d){setMsg(document.getElementById("audit-msg"),"Failed to load activity.",false);return;}
+        setMsg(document.getElementById("audit-msg"),"",true);
+        (d.events||[]).forEach(function(e){
+          var tr=document.createElement("tr");
+          function c(x){var td=document.createElement("td");td.textContent=(x==null||x==="")?"—":x;return td;}
+          tr.appendChild(c(fmtTime(e.ts)));
+          tr.appendChild(c(e.actor));
+          tr.appendChild(c(ACT_LABEL[e.action]||e.action));
+          tr.appendChild(c(e.target));
+          tr.appendChild(c(e.ip));
+          tb.appendChild(tr);
+        });
+      }).catch(function(){setMsg(document.getElementById("audit-msg"),"Failed to load activity.",false);});
+  }
+  document.getElementById("audit-filter").addEventListener("change",loadAudit);
+  document.getElementById("create-form").addEventListener("submit",function(ev){
+    ev.preventDefault();
+    var f=ev.target, m=document.getElementById("create-msg");
+    post("/api/admin/users",{username:f.username.value.trim(),email:f.email.value.trim(),
+      password:f.password.value,role:f.role.value}).then(function(res){
+      if(!res.ok){setMsg(m,res.j.error||"Create failed.",false);}
+      else{setMsg(m,"User '"+res.j.user+"' created.",true);f.reset();load();loadAudit();}
+    });
+  });
+  load();
+  loadAudit();
+})();
+</script>
+</body>
+</html>

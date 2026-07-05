@@ -30,3 +30,27 @@ def _reset_litellm_heavy_cache():
     _litellm._HEAVY_TS = 0.0
     _litellm._CB = {}
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_state():
+    """Isolate the multi-user auth state between tests: the test DB is shared, so a
+    user created by one test would otherwise make `_any_users()` True and flip auth
+    on for every later test. Clear the users table + in-memory sessions/lockouts +
+    the user-presence cache before each test, so the default is 'no users → open'."""
+    import app as _app
+    import auth as _auth
+    import db as _db
+    try:
+        _db.init()
+        with _db._connect() as conn:
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM audit_log")
+    except Exception:
+        pass
+    _app._users_seen["checked"] = 0.0
+    _app._users_seen["any"] = False
+    _auth._sessions.clear()
+    _app._auth_fails.clear()
+    _app._auth_locked_until.clear()
+    yield

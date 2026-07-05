@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.0.6"
+VERSION = "AI-Monitoring_1.2.1"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -51,6 +51,28 @@ HTTP_TIMEOUT      = _float("MONITOR_HTTP_TIMEOUT", 4.0)        # per collector c
 # If set, dashboard + data endpoints require  Authorization: Bearer <token>
 # or  ?token=<token>. If unset, dashboard is open (loopback/behind-proxy use).
 DASHBOARD_TOKEN = _str("MONITOR_DASHBOARD_TOKEN")  # optional
+# Security F2: running WITHOUT a token serves every page + the data API open. That
+# is only safe on loopback / behind an authenticating proxy, so it must be an
+# explicit choice — validate() turns a missing token into a FATAL boot error unless
+# MONITOR_ALLOW_OPEN=1 is set. Prevents a forgotten token silently exposing metrics.
+ALLOW_OPEN = (_str("MONITOR_ALLOW_OPEN", "0") or "0").lower() in ("1", "true", "yes", "on")
+# Security F3: the session cookie carries the bearer token, so it must be marked
+# Secure (HTTPS-only) by default. Set MONITOR_COOKIE_ALLOW_INSECURE=1 ONLY for local
+# plain-HTTP testing, where the browser would otherwise drop a Secure cookie.
+COOKIE_ALLOW_INSECURE = (_str("MONITOR_COOKIE_ALLOW_INSECURE", "0") or "0").lower() in ("1", "true", "yes", "on")
+
+# --- multi-user access (username + password, SQLite-backed; see auth.py) -------
+# Each user has an email, a role ('admin' can manage users, 'viewer' is read-only),
+# and a scrypt password hash. The legacy single MONITOR_DASHBOARD_TOKEN keeps
+# working alongside user sessions (automation / bootstrap). The first admin is
+# seeded from these on an empty users table (idempotent — ignored once users exist).
+ADMIN_USER     = _str("MONITOR_ADMIN_USER")
+ADMIN_PASSWORD = _str("MONITOR_ADMIN_PASSWORD")
+ADMIN_EMAIL    = _str("MONITOR_ADMIN_EMAIL")
+# How long a login session stays valid before re-auth (seconds; default 7 days).
+SESSION_TTL_S  = _float("MONITOR_SESSION_TTL_S", 7 * 24 * 3600.0)
+# How long the access/admin audit trail is kept (days; admins review it in the UI).
+AUDIT_RETENTION_DAYS = _int("MONITOR_AUDIT_RETENTION_DAYS", 90)
 # Brute-force protection on the dashboard token: after AUTH_MAX_FAILS bad tokens
 # from one client IP within AUTH_WINDOW_S seconds, that IP is locked out (429)
 # for AUTH_LOCKOUT_S. Behind a reverse proxy, set AUTH_TRUSTED_PROXY=1 to read the
@@ -126,6 +148,13 @@ LLAMACPP_API_KEY  = _str("LLAMACPP_API_KEY")            # optional Bearer
 # mounted into the monitor (see docker-compose.yml) + membership in its group.
 MONITOR_CONTAINERS = [c.strip() for c in (_str("MONITOR_CONTAINERS", "") or "").split(",") if c.strip()]
 DOCKER_SOCKET = _str("MONITOR_DOCKER_SOCKET", "/var/run/docker.sock")
+# Security F1: talking straight to the Docker socket grants effective host root
+# (a :ro mount does NOT make the API read-only). Prefer a read-only socket proxy
+# (e.g. tecnativa/docker-socket-proxy with CONTAINERS=1, everything else 0) and
+# point MONITOR_DOCKER_API_URL at it (http://docker-socket-proxy:2375). When set,
+# the collector uses this TCP endpoint and the raw socket is NOT mounted into the
+# monitor. Unset → legacy direct-socket mode (backward compatible).
+DOCKER_API_URL = _str("MONITOR_DOCKER_API_URL")
 
 # GPU — the GPU box may be a DIFFERENT host. Three modes, in precedence order:
 #   1. SSH (agentless): run nvidia-smi on the remote box over SSH.
@@ -185,8 +214,10 @@ def redacted_summary() -> dict:
     }
 
 
-def validate() -> list[str]:
-    """Return list of fatal config errors (empty = OK). Fail-fast at boot."""
+def validate(user_count: int = 0) -> list[str]:
+    """Return list of fatal config errors (empty = OK). Fail-fast at boot.
+    `user_count` is the number of dashboard user accounts — passed in by main()
+    after db.init(), so F2 treats a populated users table as configured auth."""
     errs: list[str] = []
     if not (1 <= MONITOR_PORT <= 65535):
         errs.append(f"MONITOR_PORT out of range: {MONITOR_PORT}")
@@ -197,4 +228,13 @@ def validate() -> list[str]:
     if LITELLM_BASE_URL and not LITELLM_MASTER_KEY:
         errs.append("LITELLM_BASE_URL set but LITELLM_MASTER_KEY missing "
                     "(/spend and /health need the master key)")
+    # F2: refuse to boot fully open unless the operator opted in explicitly.
+    # Auth is "configured" when a legacy token is set OR at least one user account
+    # exists (username+password login). Neither → fatal unless MONITOR_ALLOW_OPEN=1.
+    if not DASHBOARD_TOKEN and user_count == 0 and not ALLOW_OPEN:
+        errs.append("no auth configured — no MONITOR_DASHBOARD_TOKEN and no user "
+                    "accounts, so the dashboard + API would be fully open. Set a "
+                    "token, create a user (MONITOR_ADMIN_USER/PASSWORD/EMAIL), or "
+                    "MONITOR_ALLOW_OPEN=1 to run open on purpose (loopback / behind "
+                    "an authenticating proxy only).")
     return errs

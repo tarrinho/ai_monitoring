@@ -1,17 +1,19 @@
 # collectors/containers.py — per-container liveness + alive-time via the Docker
-# Engine API over the unix socket (read-only GETs). For each configured container
-# name it reports whether it's running and, if so, how long it's been alive
-# (now - State.StartedAt). No docker CLI needed; pure aiohttp over the socket.
+# Engine API (read-only GETs). For each configured container name it reports
+# whether it's running and, if so, how long it's been alive (now - State.StartedAt).
+# No docker CLI needed; pure aiohttp.
 #
-# Requires the Docker socket mounted into the monitor and the process to be in the
-# socket's group (see docker-compose.yml). Missing socket / perms → available:False
-# with an error string; it never raises (like every collector).
+# Two transports (see config F1): preferred is a read-only socket PROXY over TCP
+# (MONITOR_DOCKER_API_URL) so the monitor never touches the host-root raw socket;
+# the legacy fallback is the unix socket mounted into the monitor. Missing
+# socket/proxy or perms → available:False with an error string; it never raises.
 from __future__ import annotations
 
 import asyncio
 import re
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import aiohttp
 
@@ -40,11 +42,24 @@ def _parse_started(s: str | None) -> float | None:
         return None
 
 
+def _base() -> str:
+    """Base URL for the Docker Engine API. With a socket proxy (F1) this is a real
+    TCP URL; over the raw unix socket aiohttp needs a dummy host ('http://docker')."""
+    if config.DOCKER_API_URL:
+        return config.DOCKER_API_URL.rstrip("/")
+    return "http://docker"
+
+
 async def _sess() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession(
-            connector=aiohttp.UnixConnector(path=config.DOCKER_SOCKET or "/var/run/docker.sock"))
+        if config.DOCKER_API_URL:
+            # F1: talk to a read-only socket proxy over TCP — no raw socket mount,
+            # so a monitor compromise can't reach the full host-root Docker API.
+            _session = aiohttp.ClientSession()
+        else:
+            _session = aiohttp.ClientSession(
+                connector=aiohttp.UnixConnector(path=config.DOCKER_SOCKET or "/var/run/docker.sock"))
     return _session
 
 
@@ -70,7 +85,7 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
     if not names:
         # discover every container on the host (running + stopped)
         try:
-            async with s.get("http://docker/containers/json?all=1",
+            async with s.get(f"{_base()}/containers/json?all=1",
                              timeout=aiohttp.ClientTimeout(total=4)) as r:
                 if r.status != 200:
                     return {"available": False, "error": f"list HTTP {r.status}"}
@@ -85,7 +100,7 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
         entry = {"name": name, "running": False, "status": None,
                  "uptime_s": None, "down_s": None}
         try:
-            async with s.get(f"http://docker/containers/{name}/json",
+            async with s.get(f"{_base()}/containers/{quote(name, safe='')}/json",
                              timeout=aiohttp.ClientTimeout(total=4)) as r:
                 if r.status == 404:
                     # removed from Docker entirely — fall back to when WE last saw it

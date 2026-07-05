@@ -74,6 +74,32 @@ CREATE TABLE IF NOT EXISTS proc_series_1m (bucket REAL, kind TEXT, app TEXT, val
 CREATE TABLE IF NOT EXISTS proc_series_1h (bucket REAL, kind TEXT, app TEXT, val REAL,
     PRIMARY KEY(bucket,kind,app));
 
+-- Dashboard user accounts (username + scrypt password hash). role: 'admin' can
+-- manage users; 'viewer' can only read the dashboards. Passwords are NEVER stored
+-- in plaintext; pw_hash is a self-describing scrypt string (see auth.hash_password).
+CREATE TABLE IF NOT EXISTS users (
+    name       TEXT PRIMARY KEY,
+    email      TEXT NOT NULL DEFAULT '',
+    pw_hash    TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT 'viewer',
+    created    REAL NOT NULL,
+    last_login REAL,
+    disabled   INTEGER NOT NULL DEFAULT 0
+);
+
+-- Access + admin-action audit trail (admins review it in /admin/users). action is
+-- a dotted key (login.ok, login.fail, login.lockout, logout, user.create, ...);
+-- actor = who did it, target = the affected user (for user.* actions).
+CREATE TABLE IF NOT EXISTS audit_log (
+    ts     REAL NOT NULL,
+    actor  TEXT,
+    action TEXT NOT NULL,
+    target TEXT,
+    ip     TEXT,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+
 -- Fired alerts (threshold + anomaly) for the alerts UI history/timeline.
 CREATE TABLE IF NOT EXISTS alert_log (
     ts    REAL NOT NULL,
@@ -601,6 +627,149 @@ def prune() -> int:
     try:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+            return cur.rowcount or 0
+    except Exception:
+        return 0
+
+
+# ─────────────────────────────── user accounts ───────────────────────────────
+# CRUD for the dashboard `users` table. pw_hash is opaque here (auth.py owns the
+# hashing); db.py only stores/reads it. Every function degrades safely.
+def user_create(name: str, email: str, pw_hash: str, role: str,
+                created: float) -> bool:
+    """Insert a new user. Returns False if the name already exists (or on error)."""
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO users(name, email, pw_hash, role, created, disabled) "
+                "VALUES (?,?,?,?,?,0)", (name, email, pw_hash, role, created))
+        return True
+    except Exception:
+        return False
+
+
+def user_get(name: str) -> dict[str, Any] | None:
+    """Full row incl. pw_hash (for login verification). None if absent."""
+    try:
+        with _connect() as conn:
+            r = conn.execute(
+                "SELECT name, email, pw_hash, role, created, last_login, disabled "
+                "FROM users WHERE name = ?", (name,)).fetchone()
+        if not r:
+            return None
+        return {"name": r[0], "email": r[1], "pw_hash": r[2], "role": r[3],
+                "created": r[4], "last_login": r[5], "disabled": bool(r[6])}
+    except Exception:
+        return None
+
+
+def user_list() -> list[dict[str, Any]]:
+    """All users WITHOUT pw_hash — safe to serialise to the admin UI."""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT name, email, role, created, last_login, disabled "
+                "FROM users ORDER BY name").fetchall()
+        return [{"name": r[0], "email": r[1], "role": r[2], "created": r[3],
+                 "last_login": r[4], "disabled": bool(r[5])} for r in rows]
+    except Exception:
+        return []
+
+
+def user_count(role: str | None = None) -> int:
+    """Total users, or users of a given role when `role` is set."""
+    try:
+        with _connect() as conn:
+            if role:
+                r = conn.execute("SELECT COUNT(*) FROM users WHERE role = ?",
+                                 (role,)).fetchone()
+            else:
+                r = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        return int(r[0]) if r else 0
+    except Exception:
+        return 0
+
+
+def user_set_disabled(name: str, disabled: bool) -> bool:
+    try:
+        with _connect() as conn:
+            cur = conn.execute("UPDATE users SET disabled = ? WHERE name = ?",
+                               (1 if disabled else 0, name))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def user_set_password(name: str, pw_hash: str) -> bool:
+    try:
+        with _connect() as conn:
+            cur = conn.execute("UPDATE users SET pw_hash = ? WHERE name = ?",
+                               (pw_hash, name))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def user_delete(name: str) -> bool:
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM users WHERE name = ?", (name,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def user_touch_login(name: str, ts: float) -> None:
+    try:
+        with _connect() as conn:
+            conn.execute("UPDATE users SET last_login = ? WHERE name = ?",
+                         (ts, name))
+    except Exception:
+        pass
+
+
+# ─────────────────────────────── audit trail ─────────────────────────────────
+# Append-only access/admin log. audit_add never raises (like every writer);
+# audit_list feeds the admin UI. Old rows are pruned by age with the metrics.
+def audit_add(ts: float, actor: str | None, action: str,
+              target: str | None = None, ip: str | None = None,
+              detail: str | None = None) -> None:
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO audit_log(ts, actor, action, target, ip, detail) "
+                "VALUES (?,?,?,?,?,?)", (ts, actor, action, target, ip, detail))
+    except Exception:
+        pass
+
+
+def audit_list(limit: int = 200, action_prefix: str | None = None
+               ) -> list[dict[str, Any]]:
+    """Most-recent-first audit rows (capped). Optional action_prefix filter
+    ('login', 'user', …) — matched as a `prefix.%` LIKE on a fixed, non-user string."""
+    limit = max(1, min(int(limit), 1000))
+    try:
+        with _connect() as conn:
+            if action_prefix:
+                rows = conn.execute(
+                    "SELECT ts, actor, action, target, ip, detail FROM audit_log "
+                    "WHERE action LIKE ? ORDER BY ts DESC LIMIT ?",
+                    (action_prefix + ".%", limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ts, actor, action, target, ip, detail FROM audit_log "
+                    "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return [{"ts": r[0], "actor": r[1], "action": r[2], "target": r[3],
+                 "ip": r[4], "detail": r[5]} for r in rows]
+    except Exception:
+        return []
+
+
+def audit_prune(cutoff: float) -> int:
+    """Delete audit rows older than `cutoff` (epoch). Returns rows removed."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM audit_log WHERE ts < ?", (cutoff,))
             return cur.rowcount or 0
     except Exception:
         return 0

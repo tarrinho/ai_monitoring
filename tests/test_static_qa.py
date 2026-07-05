@@ -218,8 +218,8 @@ def test_litellm_heavy_parse_runs_off_event_loop():
     assert "await" not in parser, "_parse_spend must be pure/synchronous"
 
 
-def test_version_is_1_0_6():
-    assert config.VERSION == "AI-Monitoring_1.0.6"
+def test_version_is_current():
+    assert config.VERSION == "AI-Monitoring_1.2.1"
 
 
 def test_ux_improvements_present():
@@ -774,3 +774,153 @@ def test_gitleaks_wired_in_secret_scan():
         return
     assert ".gitleaks.toml" in pub_path.read_text(encoding="utf-8"), \
         ".gitleaks.toml not in publish allow-list"
+
+
+# ── multi-user login + admin pages (1.1.0) ────────────────────────────────────
+def test_login_and_admin_pages_exist():
+    for f in ("login.html", "admin.html"):
+        assert (ROOT / "web" / f).exists(), f"missing {f}"
+
+
+def test_auth_pages_are_csp_safe():
+    # nonce-based CSP forbids inline event handlers; both new pages must use
+    # addEventListener only (no on*="..." attributes), like the dashboards.
+    for f in ("login.html", "admin.html"):
+        html = (ROOT / "web" / f).read_text(encoding="utf-8")
+        assert not re.search(r'<[^>]+\son(click|input|change|submit|load|mouse\w+)=',
+                             html), f"{f} has an inline event handler"
+
+
+def test_admin_page_builds_dom_without_innerhtml():
+    # the admin user table is built from JSON; it must use DOM APIs (textContent),
+    # never innerHTML, so untrusted user fields (name/email) can't inject markup.
+    html = (ROOT / "web" / "admin.html").read_text(encoding="utf-8")
+    assert "innerHTML" not in html
+    assert "createElement" in html and "textContent" in html
+    assert "X-CSRF-Token" in html            # CSRF header on writes
+
+
+def test_login_form_posts_to_login():
+    html = (ROOT / "web" / "login.html").read_text(encoding="utf-8")
+    assert 'action="/login"' in html
+    assert 'method="post"' in html.lower()
+    assert 'name="username"' in html and 'name="password"' in html
+
+
+def test_admin_page_has_audit_log_section():
+    html = (ROOT / "web" / "admin.html").read_text(encoding="utf-8")
+    assert 'id="audit-rows"' in html and "loadAudit" in html
+    assert "/api/admin/audit" in html
+    assert "innerHTML" not in html          # still DOM-API only (XSS-safe)
+
+
+# ============================================================================
+# Leak / publish regression — encodes the manual sensitive-data sweep so a future
+# edit can't silently push internal infra or a real secret to the public repo.
+# Skips cleanly where the publisher isn't checked out (public tree / in-image gate).
+# ============================================================================
+# Markers of internal infrastructure that must never reach the public GitHub repo.
+# The real values live in tests/_internal_markers.py, which is NOT in the publish
+# ALLOW-list — so the names themselves never ship. Public checkout → import fails
+# → the guard test skips (there is nothing to leak there anyway).
+try:
+    from _internal_markers import MARKERS as _INTERNAL_MARKERS
+except ImportError:
+    _INTERNAL_MARKERS = None
+
+
+def _publish_allow_list():
+    """Parse the ALLOW=(...) array from deploy/publish-github.sh — the exact set of
+    files that ship to the public repo. Returns None when the publisher isn't in
+    this checkout (the public repo / Docker test stage exclude it)."""
+    pub = ROOT / "deploy" / "publish-github.sh"
+    if not pub.exists():
+        return None
+    m = re.search(r'\nALLOW=\((.*?)\n\)', pub.read_text(encoding="utf-8"), re.S)
+    assert m, "ALLOW=(...) array not found in publish-github.sh"
+    return [t for t in m.group(1).split() if t and not t.startswith("#")]
+
+
+def test_regression_env_and_publisher_excluded_from_public_repo():
+    """.env (live secrets) is gitignored and never allow-listed; the publisher and
+    the internal rules.md are declared PRIVATE_FILES, not published."""
+    gi = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert ".env" in gi
+    allow = _publish_allow_list()
+    if allow is None:
+        return
+    assert ".env" not in allow
+    assert "deploy/publish-github.sh" not in allow
+    assert "rules.md" not in allow
+    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
+    pm = re.search(r'PRIVATE_FILES=\((.*?)\n\)', pub, re.S)
+    assert pm and "publish-github.sh" in pm.group(1) and "rules.md" in pm.group(1)
+
+
+def test_regression_no_internal_markers_in_published_files():
+    """Every ALLOW-listed source/doc file is scanned for internal infra markers
+    (private SSH alias, internal-domain hosts, engagement domains, RFC1918 lab IPs).
+    tests/ are excluded (fixtures legitimately reference these; .gitleaks.toml
+    allowlists them too), as are binaries and vendored JS assets."""
+    allow = _publish_allow_list()
+    if allow is None or _INTERNAL_MARKERS is None:
+        return                       # public checkout: nothing to scan for / with
+    skip_ext = (".png", ".svg", ".ico", ".js")
+    for rel in allow:
+        if rel.startswith("tests/"):
+            continue
+        p = ROOT / rel
+        if not p.exists() or p.suffix.lower() in skip_ext:
+            continue
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        for mark in _INTERNAL_MARKERS:
+            assert mark not in txt, \
+                f"internal marker {mark!r} leaked into published file {rel}"
+
+
+def test_regression_no_real_secret_values_in_published_files():
+    """No real-looking sk- key in any ALLOW-listed source file — only the known
+    placeholders (CHANGE_ME / demo / supersecret / sk-... / proj-) are allowed."""
+    allow = _publish_allow_list()
+    if allow is None:
+        return
+    real_sk = re.compile(r'sk-[A-Za-z0-9]{16,}')
+    placeholder = re.compile(r'sk-(CHANGE_ME|demo|supersecret|\.\.\.|proj-)')
+    for rel in allow:
+        if rel.startswith("tests/"):
+            continue
+        p = ROOT / rel
+        if not p.exists() or p.suffix.lower() in (".png", ".svg", ".ico"):
+            continue
+        for hit in real_sk.findall(p.read_text(encoding="utf-8", errors="ignore")):
+            assert placeholder.match(hit), \
+                f"real-looking key {hit!r} in published file {rel}"
+
+
+def test_regression_demo_seed_uses_synthetic_keys_only():
+    """The committed dashboard screenshots are generated by scripts/demo_seed.py;
+    its LiteLLM key values must be synthetic (sk-... / sk-demo), so a PNG can never
+    bake in a real key."""
+    seed = (ROOT / "scripts" / "demo_seed.py").read_text(encoding="utf-8")
+    placeholder = re.compile(r'sk-(demo|\.\.\.|CHANGE_ME)')
+    for hit in re.findall(r'sk-[A-Za-z0-9]{16,}', seed):
+        assert placeholder.match(hit), f"demo_seed embeds a real-looking key: {hit!r}"
+    assert "langgraph-agent" in seed        # synthetic aliases seen in the screenshots
+
+
+def test_regression_gitleaks_runs_as_binary_not_node_action():
+    """Regression for the Node 20 deprecation fix: gitleaks runs from the release
+    binary (marketplace Node action removed), still alongside TruffleHog, still
+    reading the repo .gitleaks.toml over full history."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "gitleaks/gitleaks-action" not in ci            # Node 20 action gone
+    assert "gitleaks git . --config .gitleaks.toml" in ci  # binary invocation
+    assert "trufflesecurity/trufflehog" in ci              # both scanners retained
+
+
+def test_account_page_change_password_form():
+    html = (ROOT / "web" / "account.html").read_text(encoding="utf-8")
+    assert 'name="current"' in html and 'name="new"' in html      # requires current pw
+    assert "/api/account/password" in html and "/api/me" in html
+    assert "X-CSRF-Token" in html and "innerHTML" not in html      # CSRF + DOM-safe
+    assert not re.search(r'<[^>]+\son(click|submit|change)=', html)  # no inline handlers

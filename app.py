@@ -12,15 +12,19 @@ import collections
 import hmac
 import json
 import re
+import secrets
 import sys
 import time
+from html import escape as _html_escape
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
 
 import config
 import db
+import auth
 import alerts
 import anomaly
 from collectors import host, litellm, ollama, llamacpp, gpu, procs, containers
@@ -325,6 +329,7 @@ async def _sampling_loop(app: web.Application) -> None:
                 db.prune()
                 db.prune_metrics()
                 db.prune_key_series()
+                db.audit_prune(snap["ts"] - config.AUDIT_RETENTION_DAYS * 86400)
                 last_prune = snap["ts"]
         except asyncio.CancelledError:
             raise
@@ -334,20 +339,30 @@ async def _sampling_loop(app: web.Application) -> None:
 
 
 # -------------------------------------------------------- security headers ----
-# CSP keeps 'unsafe-inline' because the dashboard ships one inline <script>/
-# <style>; frame-ancestors 'none' still blocks clickjacking regardless. The
-# Server header is overwritten to avoid version fingerprinting.
-_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-        "connect-src 'self'; object-src 'none'; base-uri 'none'; "
-        "frame-ancestors 'none'")
+# F5: script-src uses a per-response nonce instead of 'unsafe-inline', so an
+# injected inline <script> without the nonce won't execute (the dashboards carry
+# no inline on*= handlers, so this loses nothing). style-src keeps 'unsafe-inline'
+# because benign inline style="..." attributes are pervasive. frame-ancestors
+# 'none' blocks clickjacking; the Server header is overwritten to avoid
+# version fingerprinting. Pages stamp the nonce via a throwaway X-CSP-Nonce header
+# that _apply_sec_headers consumes; other responses (JSON API) execute no script.
+_NONCE_HDR = "X-CSP-Nonce"
+
+
+def _csp(nonce: str | None = None) -> str:
+    script_src = f"'self' 'nonce-{nonce}'" if nonce else "'self'"
+    return (f"default-src 'self'; script-src {script_src}; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'")
 
 
 def _apply_sec_headers(resp) -> None:
+    nonce = resp.headers.pop(_NONCE_HDR, None)   # set by _serve_page for HTML pages
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = _CSP
+    resp.headers["Content-Security-Policy"] = _csp(nonce)
     resp.headers["Server"] = "AI-Monitoring"
 
 
@@ -363,7 +378,8 @@ async def _sechdr_mw(request: web.Request, handler):
 
 
 # ------------------------------------------------------------------- auth -----
-_COOKIE = "aimon_session"
+_COOKIE = "aimon_session"       # legacy shared-token session cookie
+_USER_COOKIE = "aimon_user"     # per-user login session id (auth.py sessions)
 
 
 def _is_https(request: web.Request) -> bool:
@@ -385,8 +401,60 @@ def _request_token(request: web.Request) -> str | None:
     return request.query.get("token") or request.cookies.get(_COOKIE)
 
 
-# HTML pages that require auth (static assets + /healthz stay open).
-_PAGES = ("/", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts")
+def _session_from_req(request: web.Request) -> dict | None:
+    """The live per-user login session for this request, or None."""
+    return auth.session_get(request.cookies.get(_USER_COOKIE))
+
+
+_users_seen = {"any": False, "checked": 0.0}
+
+
+def _any_users() -> bool:
+    """Cached 'at least one user account exists' (15 s TTL, busted on change) so the
+    auth middleware doesn't COUNT the users table on every request."""
+    now = time.time()
+    if now - _users_seen["checked"] > 15:
+        _users_seen["any"] = db.user_count() > 0
+        _users_seen["checked"] = now
+    return bool(_users_seen["any"])
+
+
+def _mark_users_changed() -> None:
+    _users_seen["checked"] = 0.0        # force a refresh on the next check
+
+
+def _auth_enabled() -> bool:
+    """Auth is enforced unless explicitly opened. Active when a legacy token is set
+    OR any user account exists; with neither (and not opened) the app is open —
+    boot-time validate() already refuses that case unless MONITOR_ALLOW_OPEN=1."""
+    if config.ALLOW_OPEN:
+        return False
+    return bool(config.DASHBOARD_TOKEN) or _any_users()
+
+
+def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
+    """(authenticated, role, session). A valid user session confirms its DB user is
+    still present + enabled; the legacy master token counts as full 'admin' access
+    (it is the operator's shared secret). Returns role=None when unauthenticated."""
+    sess = _session_from_req(request)
+    if sess:
+        u = db.user_get(sess["user"])
+        if u and not u["disabled"]:
+            return True, u["role"], sess
+        auth.session_drop(request.cookies.get(_USER_COOKIE))   # user gone/disabled
+    if _token_ok(_request_token(request)):
+        return True, "admin", None
+    return False, None, None
+
+
+# HTML pages that require auth (static assets + /healthz + /login stay open).
+_PAGES = ("/", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
+          "/admin/users", "/account")
+# Reachable without a session: the login page/handlers and public assets.
+_OPEN = ("/healthz", "/login", "/logout")
+# Admin-only surfaces (role must be 'admin' or the legacy master token).
+_ADMIN_PAGES = ("/admin/users",)
+_ADMIN_API_PREFIX = "/api/admin/"
 
 # Brute-force protection: per-IP failed-token counters + lockouts (in-memory;
 # single-instance app, resets on restart — fine for this purpose).
@@ -397,11 +465,14 @@ _auth_locked_until: dict[str, float] = {}
 
 def _client_ip(request: web.Request) -> str:
     """Client IP for rate-limiting. Reads X-Forwarded-For ONLY when a trusted
-    proxy is declared — otherwise an attacker spoofs the header to dodge lockout."""
+    proxy is declared — otherwise an attacker spoofs the header to dodge lockout.
+    F4: take the RIGHTMOST entry — that one is appended by our own trusted proxy,
+    so a client can't inject a fake leftmost value to evade lockout or to frame a
+    victim IP into being locked out. The proxy must APPEND (not replace) XFF."""
     if config.AUTH_TRUSTED_PROXY:
         xff = request.headers.get("X-Forwarded-For", "")
         if xff:
-            return xff.split(",")[0].strip()
+            return xff.split(",")[-1].strip()
     return request.remote or "?"
 
 
@@ -411,35 +482,69 @@ def _record_auth_attack(ip: str) -> None:
           file=sys.stderr)
 
 
+def _audit(request: web.Request, actor: str | None, action: str,
+           target: str | None = None, detail: str | None = None) -> None:
+    """Append an access/admin-action row to the audit trail (best-effort)."""
+    db.audit_add(time.time(), actor, action, target, _client_ip(request), detail)
+
+
+def _login_dest(request: web.Request, nxt: str) -> str:
+    """Location for redirecting an unauthenticated page request to the login form,
+    preserving where they were headed via a validated ?next=."""
+    base = _fwd_prefix(request) + "/login"
+    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+        return base + "?next=" + quote(nxt, safe="")
+    return base
+
+
 @web.middleware
 async def _auth_mw(request: web.Request, handler):
-    # Only dashboard pages and the data API are gated. Static assets
-    # (/assets/*) and the container probe (/healthz) stay open, otherwise the
-    # browser — which loads assets without the token — gets 401 and the page
-    # renders blank.
-    if config.DASHBOARD_TOKEN:
-        p = request.path
-        needs_auth = p in _PAGES or p.startswith("/api/")
-        if needs_auth:
-            ip = _client_ip(request)
-            now = time.time()
-            locked = _auth_locked_until.get(ip, 0.0)
-            if locked > now:
-                return web.json_response(
-                    {"error": "too many attempts"}, status=429,
-                    headers={"Retry-After": str(int(locked - now))})
+    # Auth is enforced unless the operator explicitly opted the dashboard open
+    # (MONITOR_ALLOW_OPEN=1; validate() guarantees a token or a user exists first).
+    # Access = a valid per-user login session OR the legacy master token. Static
+    # assets, /healthz and the login endpoints stay open so the form can render.
+    if not _auth_enabled():
+        return await handler(request)
+    p = request.path
+    if p in _OPEN or p.startswith("/assets/"):
+        return await handler(request)
+    is_admin_path = p in _ADMIN_PAGES or p.startswith(_ADMIN_API_PREFIX)
+    needs_auth = is_admin_path or p in _PAGES or p.startswith("/api/")
+    if not needs_auth:
+        return await handler(request)
+
+    ip = _client_ip(request)
+    now = time.time()
+    locked = _auth_locked_until.get(ip, 0.0)
+    if locked > now:
+        return web.json_response(
+            {"error": "too many attempts"}, status=429,
+            headers={"Retry-After": str(int(locked - now))})
+
+    authed, role, _sess = _auth_ctx(request)
+    if not authed:
+        # Count a lockout strike only when a credential was actually PRESENTED and
+        # rejected (real brute-force) — not for a browser that simply isn't logged
+        # in yet (that just gets bounced to /login).
+        presented = bool(_request_token(request)) or bool(request.cookies.get(_USER_COOKIE))
+        if presented:
             fails = _auth_fails[ip]
             while fails and now - fails[0] > config.AUTH_WINDOW_S:
                 fails.popleft()
-            if not _token_ok(_request_token(request)):
-                fails.append(now)
-                if len(fails) >= config.AUTH_MAX_FAILS:
-                    _auth_locked_until[ip] = now + config.AUTH_LOCKOUT_S
-                    _record_auth_attack(ip)
-                    fails.clear()
-                return web.json_response({"error": "unauthorized"}, status=401)
-            fails.clear()
-            _auth_locked_until.pop(ip, None)
+            fails.append(now)
+            if len(fails) >= config.AUTH_MAX_FAILS:
+                _auth_locked_until[ip] = now + config.AUTH_LOCKOUT_S
+                _record_auth_attack(ip)
+                fails.clear()
+        if p.startswith("/api/"):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        raise web.HTTPFound(_login_dest(request, p))
+    _auth_fails.pop(ip, None)
+    _auth_locked_until.pop(ip, None)
+    if is_admin_path and role != "admin":
+        if p.startswith("/api/"):
+            return web.json_response({"error": "forbidden"}, status=403)
+        return web.Response(text="403 — admin access required", status=403)
     return await handler(request)
 
 
@@ -480,50 +585,302 @@ def _maybe_cookie_redirect(request: web.Request, dest: str) -> None:
     if config.DASHBOARD_TOKEN and request.query.get("token") and \
             not request.cookies.get(_COOKIE):
         resp = web.HTTPFound((_fwd_prefix(request) + dest) or dest)
+        # F3: the cookie value is the bearer token, so mark it Secure by default
+        # (assume TLS in front). Only fall back to conditional when the operator
+        # opts into plain-HTTP testing — never ship the token over cleartext silently.
+        secure = _is_https(request) if config.COOKIE_ALLOW_INSECURE else True
         resp.set_cookie(_COOKIE, config.DASHBOARD_TOKEN, max_age=86400 * 7,
                         httponly=True, samesite="Strict",
-                        secure=_is_https(request), path="/")
+                        secure=secure, path="/")
         raise resp
 
 
-def _serve_page(path: Path, prefix: str = "") -> web.Response:
+_SCRIPT_OPEN = re.compile(r"<script(?=[\s>])")
+
+
+def _sidebar_extra(user: str | None, role: str | None, prefix: str) -> str:
+    """Sidebar links injected server-side for a logged-in user: a Users link for
+    admins, and a logout link showing the username. Empty for token-only auth."""
+    if not user:
+        return ""
+    safe = _html_escape(user)
+    links = ""
+    if role == "admin":
+        links += f'<a href="{prefix}/admin/users">&#128101; Users</a>'
+    links += f'<a href="{prefix}/account">&#128273; Account</a>'
+    links += (f'<a href="{prefix}/logout" title="Log out">&#9099; Logout '
+              f'<span style="opacity:.6">({safe})</span></a>')
+    return links
+
+
+def _serve_page(path: Path, prefix: str = "", user: str | None = None,
+                role: str | None = None) -> web.Response:
     try:
         html = path.read_text(encoding="utf-8")
     except Exception:
         return web.Response(text="dashboard missing", status=500)
     if prefix:
         html = _apply_prefix(html, prefix)
-    return web.Response(text=html, content_type="text/html")
+    extra = _sidebar_extra(user, role, prefix)
+    if extra:                       # inject the user/admin links before </nav>
+        html = html.replace("</nav>", extra + "</nav>", 1)
+    # F5: stamp every <script> tag with a fresh nonce and hand it to the header
+    # layer (via _NONCE_HDR) so the CSP allows exactly these scripts and nothing
+    # injected. token_urlsafe is base64url — no ", ' or > to break the attribute.
+    nonce = secrets.token_urlsafe(16)
+    html = _SCRIPT_OPEN.sub(f'<script nonce="{nonce}"', html)
+    resp = web.Response(text=html, content_type="text/html")
+    resp.headers[_NONCE_HDR] = nonce
+    return resp
+
+
+def _page(request: web.Request, path: Path, dest: str) -> web.Response:
+    """Serve a dashboard page: move ?token= into a cookie, then render with the
+    current user's sidebar links (Users/logout) stamped in server-side."""
+    _maybe_cookie_redirect(request, dest)
+    _, role, sess = _auth_ctx(request)
+    user = sess["user"] if sess else None
+    return _serve_page(path, _fwd_prefix(request), user=user, role=role)
 
 
 async def index_handler(request: web.Request) -> web.Response:
-    _maybe_cookie_redirect(request, "/")
-    return _serve_page(_INDEX, _fwd_prefix(request))
+    return _page(request, _INDEX, "/")
 
 
 async def litellm_page_handler(request: web.Request) -> web.Response:
-    _maybe_cookie_redirect(request, "/litellm")
-    return _serve_page(_WEB / "litellm.html", _fwd_prefix(request))
+    return _page(request, _WEB / "litellm.html", "/litellm")
 
 
 async def gpu_page_handler(request: web.Request) -> web.Response:
-    _maybe_cookie_redirect(request, "/gpu")
-    return _serve_page(_WEB / "gpu.html", _fwd_prefix(request))
+    return _page(request, _WEB / "gpu.html", "/gpu")
 
 
 async def ollama_page_handler(request: web.Request) -> web.Response:
-    _maybe_cookie_redirect(request, "/ollama")
-    return _serve_page(_WEB / "ollama.html", _fwd_prefix(request))
+    return _page(request, _WEB / "ollama.html", "/ollama")
 
 
 async def llamacpp_page_handler(request: web.Request) -> web.Response:
-    _maybe_cookie_redirect(request, "/llamacpp")
-    return _serve_page(_WEB / "llamacpp.html", _fwd_prefix(request))
+    return _page(request, _WEB / "llamacpp.html", "/llamacpp")
 
 
 async def alerts_page_handler(request: web.Request) -> web.Response:
-    _maybe_cookie_redirect(request, "/alerts")
-    return _serve_page(_WEB / "alerts.html", _fwd_prefix(request))
+    return _page(request, _WEB / "alerts.html", "/alerts")
+
+
+# ───────────────────────────── login / logout ────────────────────────────────
+def _cookie_secure(request: web.Request) -> bool:
+    return _is_https(request) if config.COOKIE_ALLOW_INSECURE else True
+
+
+def _set_user_cookie(resp, sid: str, request: web.Request) -> None:
+    resp.set_cookie(_USER_COOKIE, sid, max_age=int(config.SESSION_TTL_S),
+                    httponly=True, samesite="Strict",
+                    secure=_cookie_secure(request), path="/")
+
+
+def _safe_path(nxt: str | None) -> str:
+    """A validated local redirect target (no open-redirect off-site)."""
+    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+        return nxt
+    return "/"
+
+
+async def login_page_handler(request: web.Request) -> web.Response:
+    authed, _role, _sess = _auth_ctx(request)
+    if authed:
+        raise web.HTTPFound(_fwd_prefix(request) + _safe_path(request.query.get("next")))
+    return _serve_page(_WEB / "login.html", _fwd_prefix(request))
+
+
+async def login_submit_handler(request: web.Request) -> web.Response:
+    ip = _client_ip(request)
+    now = time.time()
+    locked = _auth_locked_until.get(ip, 0.0)
+    if locked > now:
+        raise web.HTTPFound(_fwd_prefix(request) + "/login?e=locked")
+    data = await request.post()
+    name = str(data.get("username") or "").strip()
+    pw = str(data.get("password") or "")
+    nxt = _safe_path(str(data.get("next") or "/"))
+    u = db.user_get(name)
+    ok = u is not None and not u["disabled"] and auth.verify_password(pw, u["pw_hash"])
+    if not ok:
+        fails = _auth_fails[ip]
+        while fails and now - fails[0] > config.AUTH_WINDOW_S:
+            fails.popleft()
+        fails.append(now)
+        locked = len(fails) >= config.AUTH_MAX_FAILS
+        if locked:
+            _auth_locked_until[ip] = now + config.AUTH_LOCKOUT_S
+            _record_auth_attack(ip)
+            fails.clear()
+        _audit(request, name or "?", "login.lockout" if locked else "login.fail")
+        q = "?e=1" + ("&next=" + quote(nxt, safe="") if nxt != "/" else "")
+        raise web.HTTPFound(_fwd_prefix(request) + "/login" + q)
+    _auth_fails.pop(ip, None)
+    _auth_locked_until.pop(ip, None)
+    assert u is not None
+    sid, _csrf = auth.session_new(u["name"], u["role"])
+    db.user_touch_login(u["name"], now)
+    _audit(request, u["name"], "login.ok", detail=u["role"])
+    resp = web.HTTPFound(_fwd_prefix(request) + nxt)
+    _set_user_cookie(resp, sid, request)
+    raise resp
+
+
+async def logout_handler(request: web.Request) -> web.Response:
+    sess = _session_from_req(request)
+    if sess:
+        _audit(request, sess["user"], "logout")
+    auth.session_drop(request.cookies.get(_USER_COOKIE))
+    resp = web.HTTPFound(_fwd_prefix(request) + "/login")
+    resp.del_cookie(_USER_COOKIE, path="/")
+    raise resp
+
+
+# ───────────────────────────── self-service account ──────────────────────────
+async def me_handler(request: web.Request) -> web.Response:
+    """The current identity + per-session CSRF token (for any logged-in user, so a
+    viewer can obtain a CSRF token for their own account writes)."""
+    sess = _session_from_req(request)
+    if sess:
+        return web.json_response({"user": sess["user"], "role": sess["role"],
+                                  "csrf": sess["csrf"]})
+    _, role, _ = _auth_ctx(request)               # token-authed: no session/csrf
+    return web.json_response({"user": None, "role": role, "csrf": ""})
+
+
+async def account_page_handler(request: web.Request) -> web.Response:
+    _, role, sess = _auth_ctx(request)
+    user = sess["user"] if sess else None
+    return _serve_page(_WEB / "account.html", _fwd_prefix(request), user=user, role=role)
+
+
+async def api_account_password(request: web.Request) -> web.Response:
+    """Change YOUR OWN password. Requires the current password (proves it's really
+    you) + a policy-valid new one. Only for session-authed users (a token is not a
+    person). Other sessions of this user are invalidated; the current one stays."""
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in to change your password"}, status=401)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    current = str(data.get("current") or "")
+    new = str(data.get("new") or "")
+    u = db.user_get(sess["user"])
+    if not u or not auth.verify_password(current, u["pw_hash"]):
+        _audit(request, sess["user"], "account.password.fail")
+        return web.json_response({"error": "current password is incorrect"}, status=400)
+    if (pe := auth.password_error(new)):
+        return web.json_response({"error": pe}, status=400)
+    if auth.verify_password(new, u["pw_hash"]):
+        return web.json_response({"error": "new password must differ from the current one"}, status=400)
+    db.user_set_password(sess["user"], auth.hash_password(new))
+    auth.sessions_drop_user_except(sess["user"], request.cookies.get(_USER_COOKIE))
+    _audit(request, sess["user"], "account.password")
+    return web.json_response({"ok": True})
+
+
+# ───────────────────────────── admin: user mgmt ──────────────────────────────
+def _require_csrf(request: web.Request, sess: dict | None) -> bool:
+    """Session-authed writes need a matching CSRF token; token-authed automation
+    (bearer, not a browser-auto-sent cookie) is exempt."""
+    if sess is None:
+        return True
+    return hmac.compare_digest(
+        request.headers.get("X-CSRF-Token", "") or "", sess.get("csrf", "") or "")
+
+
+async def admin_users_page_handler(request: web.Request) -> web.Response:
+    _, role, sess = _auth_ctx(request)
+    user = sess["user"] if sess else None
+    return _serve_page(_WEB / "admin.html", _fwd_prefix(request), user=user, role=role)
+
+
+async def api_admin_users_list(request: web.Request) -> web.Response:
+    _, _role, sess = _auth_ctx(request)
+    return web.json_response({
+        "users": db.user_list(),
+        "csrf": (sess or {}).get("csrf", ""),
+        "me": (sess or {}).get("user"),
+    })
+
+
+async def api_admin_users_create(request: web.Request) -> web.Response:
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    name = str(data.get("username") or "").strip()
+    email = str(data.get("email") or "").strip()
+    pw = str(data.get("password") or "")
+    role = str(data.get("role") or "viewer").strip()
+    if role not in auth.ROLES:
+        return web.json_response({"error": "role must be admin or viewer"}, status=400)
+    if not auth.valid_username(name):
+        return web.json_response({"error": "invalid username (use A-Z a-z 0-9 . _ -, ≤32)"}, status=400)
+    if not auth.valid_email(email):
+        return web.json_response({"error": "invalid email"}, status=400)
+    if (pe := auth.password_error(pw)):
+        return web.json_response({"error": pe}, status=400)
+    if db.user_get(name):
+        return web.json_response({"error": "user already exists"}, status=409)
+    if not db.user_create(name, email, auth.hash_password(pw), role, time.time()):
+        return web.json_response({"error": "create failed"}, status=500)
+    _mark_users_changed()
+    _audit(request, actor, "user.create", target=name, detail=role)
+    return web.json_response({"ok": True, "user": name})
+
+
+async def api_admin_users_action(request: web.Request) -> web.Response:
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    name = str(data.get("username") or "").strip()
+    action = str(data.get("action") or "").strip()
+    target = db.user_get(name)
+    if not target:
+        return web.json_response({"error": "no such user"}, status=404)
+    # never remove/disable/lock out the last remaining admin
+    last_admin = target["role"] == "admin" and db.user_count("admin") <= 1
+    if action in ("disable", "delete") and last_admin:
+        return web.json_response({"error": "cannot disable/delete the last admin"}, status=400)
+    if action == "disable":
+        db.user_set_disabled(name, True)
+        auth.sessions_drop_user(name)
+    elif action == "enable":
+        db.user_set_disabled(name, False)
+    elif action == "delete":
+        db.user_delete(name)
+        auth.sessions_drop_user(name)
+        _mark_users_changed()
+    elif action == "reset":
+        pw = str(data.get("password") or "")
+        if (pe := auth.password_error(pw)):
+            return web.json_response({"error": pe}, status=400)
+        db.user_set_password(name, auth.hash_password(pw))
+        auth.sessions_drop_user(name)     # force re-login with the new password
+    else:
+        return web.json_response({"error": "unknown action"}, status=400)
+    _audit(request, actor, "user." + action, target=name)
+    return web.json_response({"ok": True})
+
+
+async def api_admin_audit(request: web.Request) -> web.Response:
+    """Recent audit-trail rows for the admin UI (admin-gated by the /api/admin/*
+    middleware rule). Optional ?limit= (≤1000) and ?action= prefix filter."""
+    try:
+        limit = int(request.query.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    prefix = request.query.get("action") or None
+    if prefix not in (None, "login", "logout", "user"):
+        prefix = None
+    return web.json_response({"events": db.audit_list(limit, prefix)})
 
 
 async def data_handler(request: web.Request) -> web.Response:
@@ -760,6 +1117,18 @@ def build_app() -> web.Application:
     app.router.add_get("/ollama", ollama_page_handler)
     app.router.add_get("/llamacpp", llamacpp_page_handler)
     app.router.add_get("/alerts", alerts_page_handler)
+    # multi-user login + admin user management
+    app.router.add_get("/login", login_page_handler)
+    app.router.add_post("/login", login_submit_handler)
+    app.router.add_get("/logout", logout_handler)
+    app.router.add_get("/account", account_page_handler)
+    app.router.add_get("/api/me", me_handler)
+    app.router.add_post("/api/account/password", api_account_password)
+    app.router.add_get("/admin/users", admin_users_page_handler)
+    app.router.add_get("/api/admin/users", api_admin_users_list)
+    app.router.add_post("/api/admin/users", api_admin_users_create)
+    app.router.add_post("/api/admin/users/action", api_admin_users_action)
+    app.router.add_get("/api/admin/audit", api_admin_audit)
     app.router.add_get("/api/data", data_handler)
     app.router.add_get("/api/series", series_handler)
     app.router.add_get("/api/uptime", uptime_handler)
@@ -818,13 +1187,17 @@ def startup_selfcheck() -> list[str]:
 
 
 def main() -> int:
-    errs = config.validate()
+    db.init()
+    created = auth.bootstrap_admin()
+    if created:
+        print(f"[auth] bootstrapped initial admin user '{created}' from env",
+              file=sys.stderr)
+    errs = config.validate(db.user_count())
     if errs:
         print("FATAL config errors:", file=sys.stderr)
         for e in errs:
             print(f"  - {e}", file=sys.stderr)
         return 2
-    db.init()
     sc = startup_selfcheck()
     if sc:
         print("[selfcheck] PROBLEMS DETECTED:", file=sys.stderr)

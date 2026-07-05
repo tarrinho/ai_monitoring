@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Account</title>
+<link rel="icon" href="/assets/favicon.svg">
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#30363d;
+    --fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--bad:#f85149}
+  html[data-theme="light"]{--bg:#f6f8fa;--panel:#fff;--panel2:#eaeef2;--line:#d0d7de;
+    --fg:#1f2328;--muted:#59636e;--accent:#0969da;--ok:#1a7f37;--bad:#cf222e}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:16px;margin:0}
+  header .sp{margin-left:auto;display:flex;gap:12px;align-items:center}
+  a{color:var(--accent);text-decoration:none}
+  main{padding:22px;max-width:440px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px 22px}
+  .card h2{margin:0 0 4px;font-size:14px}
+  .sub{color:var(--muted);font-size:12px;margin:0 0 16px}
+  label{display:block;font-size:12px;color:var(--muted);margin:14px 0 4px}
+  input{width:100%;padding:9px 11px;border-radius:7px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--fg);font-size:14px}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{width:100%;margin-top:20px;padding:10px;border:0;border-radius:7px;
+    background:var(--accent);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{filter:brightness(1.08)}
+  .msg{margin-top:14px;font-size:13px;min-height:18px}
+  .msg.bad{color:var(--bad)} .msg.ok{color:var(--ok)}
+  .muted{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+  <header>
+    <h1>Account</h1>
+    <div class="sp">
+      <span class="muted" id="whoami"></span>
+      <a href="/">← Dashboards</a>
+      <a href="/logout">Logout</a>
+      <button id="theme-btn" type="button" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 9px;cursor:pointer" title="Toggle theme">🌙</button>
+    </div>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Change password</h2>
+      <div class="sub">Enter your current password to confirm it's you, then set a new one (min 8 characters).</div>
+      <form id="pw-form" autocomplete="off">
+        <label for="cur">Current password</label>
+        <input id="cur" name="current" type="password" autocomplete="current-password" required>
+        <label for="nw">New password</label>
+        <input id="nw" name="new" type="password" autocomplete="new-password" required>
+        <label for="cf">Confirm new password</label>
+        <input id="cf" name="confirm" type="password" autocomplete="new-password" required>
+        <button type="submit">Update password</button>
+        <div class="msg" id="msg"></div>
+      </form>
+    </section>
+  </main>
+<script>
+(function(){
+  var t=localStorage.getItem("aimon-theme")||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){document.getElementById("theme-btn").textContent=
+    document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  icon();
+  document.getElementById("theme-btn").addEventListener("click",function(){
+    var c=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+    document.documentElement.setAttribute("data-theme",c);localStorage.setItem("aimon-theme",c);icon();});
+
+  var CSRF="";
+  function setMsg(txt,good){var m=document.getElementById("msg");m.textContent=txt||"";
+    m.className="msg"+(txt?(good?" ok":" bad"):"");}
+  fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
+    if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}
+  }).catch(function(){});
+
+  document.getElementById("pw-form").addEventListener("submit",function(ev){
+    ev.preventDefault();
+    var f=ev.target;
+    if(f.new.value!==f.confirm.value){setMsg("New passwords do not match.",false);return;}
+    var body=new URLSearchParams({current:f.current.value,new:f.new.value}).toString();
+    fetch("/api/account/password",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},body:body})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+      .then(function(res){
+        if(!res.ok){setMsg(res.j.error||"Update failed.",false);}
+        else{setMsg("Password updated. Other sessions were signed out.",true);f.reset();}
+      }).catch(function(){setMsg("Update failed.",false);});
+  });
+})();
+</script>
+</body>
+</html>

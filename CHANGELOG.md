@@ -4,6 +4,82 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.2.1] — 2026-07-05
+
+### Added
+- **Self-service password change.** Every logged-in user (admin or viewer) now has
+  an *Account* link in the sidebar → `/account`, where they can change their own
+  password. Changing it **requires the current password** (proves it's really them)
+  plus a policy-valid, different new one. On success the user's other sessions are
+  signed out (the current one stays); the change is audited as `account.password`
+  (and a wrong current password as `account.password.fail`). Backed by
+  `GET /api/me` (session identity + CSRF) and `POST /api/account/password`
+  (CSRF-protected, session-only — a bearer token is not a person).
+
+## [1.2.0] — 2026-07-05
+
+### Added
+- **Audit trail.** The platform now records access + admin actions to a SQLite
+  `audit_log` table, and admins review them in the *Activity log* section of
+  `/admin/users` (filter by logins / user changes). Logged events: `login.ok`,
+  `login.fail`, `login.lockout`, `logout`, and `user.create` / `user.disable` /
+  `user.enable` / `user.delete` / `user.reset` — each with actor, target, client
+  IP, and timestamp. Read via `GET /api/admin/audit` (admin-only). Rows are pruned
+  by age (`MONITOR_AUDIT_RETENTION_DAYS`, default 90) alongside the metrics prune.
+
+## [1.1.0] — 2026-07-05
+
+### Added
+- **Multi-user access (username + password login).** External users no longer
+  share one token. Each account has a username, an **email**, a scrypt-hashed
+  password (`hashlib.scrypt` — no new image dependency), and a role:
+  - **admin** — full dashboard access **plus** a *Users* menu to create, disable,
+    reset-password, and delete users (view-only or admin).
+  - **viewer** — read-only dashboard access.
+  Accounts live in SQLite (`users` table); admins manage them from `/admin/users`
+  (UI) or `/api/admin/users` (JSON). The first admin is seeded from
+  `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` / `MONITOR_ADMIN_EMAIL` on an
+  empty users table (idempotent).
+- **Login/session flow.** `/login` + `/logout`; server-side sessions
+  (`aimon_user` cookie: HttpOnly, SameSite=Strict, Secure by default per F3),
+  revalidated against the DB every request so disabling/deleting a user takes
+  effect immediately. Login is IP rate-limited (reuses the F4 lockout). Session
+  TTL via `MONITOR_SESSION_TTL_S` (default 7 days).
+- Admins get a **Users** link + a **Logout** link injected into the sidebar;
+  viewers see only Logout.
+
+### Security
+- Admin write endpoints are **CSRF-protected** (per-session token via
+  `X-CSRF-Token`); bearer-token automation is exempt (not a browser-auto cookie).
+- The last remaining admin cannot be disabled or deleted (lock-out guard).
+- The legacy single `MONITOR_DASHBOARD_TOKEN` keeps working alongside user login
+  (counts as admin for automation/bootstrap). F2 now treats *either* a token *or*
+  at least one user account as configured auth.
+
+## [1.0.7] — 2026-07-04
+
+### Security
+Internal secure code review hardening (no remotely-exploitable bug found; these
+raise the floor and shrink blast radius):
+- **F1 — Docker socket no longer host-root-by-default.** A `:ro` socket mount does
+  not make the Docker API read-only. `docker-compose.yml` now runs a read-only
+  `docker-socket-proxy` (allows only `GET /containers`) and the monitor reaches it
+  over TCP via `MONITOR_DOCKER_API_URL`; the raw socket is not mounted into the
+  monitor. Legacy direct-socket mode still works when the URL is unset.
+- **F2 — no-token no longer boots silently open.** Running without
+  `MONITOR_DASHBOARD_TOKEN` now fails config validation unless `MONITOR_ALLOW_OPEN=1`
+  is set explicitly, so a forgotten token can't silently expose metrics.
+- **F3 — session cookie is `Secure` by default.** The cookie carries the bearer
+  token; it is now marked `Secure` unless `MONITOR_COOKIE_ALLOW_INSECURE=1`
+  (local plain-HTTP testing only).
+- **F4 — lockout no longer evadable via `X-Forwarded-For`.** With
+  `AUTH_TRUSTED_PROXY=1` the client IP is now taken from the rightmost XFF entry
+  (appended by the trusted proxy), so a client can't spoof a leftmost value to
+  dodge the lockout or frame a victim IP.
+- **F5 — CSP `script-src` uses a per-response nonce instead of `'unsafe-inline'`.**
+  Inline `<script>` tags are stamped with a fresh nonce; an injected script without
+  it won't execute. `style-src` keeps `'unsafe-inline'` for benign inline styles.
+
 ## [1.0.6] — 2026-07-04
 
 ### Added

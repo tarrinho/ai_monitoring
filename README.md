@@ -101,7 +101,33 @@ secrets are never logged or persisted. `0` / empty disables a feature.
 | `MONITOR_DB_PATH` | `/data/ai-monitoring.db` | SQLite path (on the `/data` volume) |
 | `MONITOR_SAMPLE_INTERVAL` | `5` | seconds between samples |
 | `MONITOR_HTTP_TIMEOUT` | `4` | per-collector request timeout |
-| `MONITOR_DASHBOARD_TOKEN` | *(empty)* | if set, dashboard + API require it (Bearer / `?token=` → cookie). Empty = open |
+| `MONITOR_DASHBOARD_TOKEN` | *(empty)* | legacy shared token (Bearer / `?token=` → cookie); still works alongside user login |
+| `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` / `MONITOR_ADMIN_EMAIL` | *(empty)* | seed the first **admin** account on an empty users table (idempotent) |
+| `MONITOR_SESSION_TTL_S` | `604800` | login session lifetime (seconds; default 7 days) |
+| `MONITOR_ALLOW_OPEN` | `0` | `1` = run with **no** auth (loopback / behind an auth proxy only) |
+
+### Users & access
+External users log in with their own **username + password** instead of sharing a
+token. Each account has an email and a role:
+
+- **admin** — full dashboards **+** a *Users* menu (`/admin/users`) to create,
+  disable, reset-password, and delete users (viewer or admin).
+- **viewer** — read-only dashboards.
+
+Every logged-in user (admin or viewer) can change **their own** password from the
+*Account* link (`/account`) — it requires entering the current password to confirm
+identity, and signs out their other sessions on success. Admins reset *other*
+users' passwords from `/admin/users`.
+
+Seed the first admin via `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` /
+`MONITOR_ADMIN_EMAIL`, then manage everyone else from `/admin/users`. Passwords are
+scrypt-hashed in SQLite; sessions are HttpOnly + SameSite=Strict + Secure. The
+legacy `MONITOR_DASHBOARD_TOKEN` keeps working for automation.
+
+An **audit trail** records logins (success / failure / lockout), logouts, and every
+user-management action (create / disable / enable / delete / reset) with actor,
+target, and client IP. Admins review it in the *Activity log* on `/admin/users`;
+rows are kept for `MONITOR_AUDIT_RETENTION_DAYS` (default 90).
 
 ### Backends (each optional)
 | Var | Example | Meaning |

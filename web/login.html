@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Sign in</title>
+<link rel="icon" href="/assets/favicon.svg">
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#30363d;
+    --fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--bad:#f85149;--ok:#3fb950}
+  html[data-theme="light"]{--bg:#f6f8fa;--panel:#fff;--panel2:#eaeef2;--line:#d0d7de;
+    --fg:#1f2328;--muted:#59636e;--accent:#0969da;--bad:#cf222e;--ok:#1a7f37}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:28px 26px;width:340px;max-width:92vw;box-shadow:0 8px 30px #0006}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+  .brand svg{width:26px;height:26px}
+  h1{font-size:17px;margin:0;font-weight:700}
+  .sub{color:var(--muted);font-size:12px;margin:2px 0 20px}
+  label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+  input{width:100%;padding:9px 11px;border-radius:7px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--fg);font-size:14px}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{width:100%;margin-top:20px;padding:10px;border:0;border-radius:7px;
+    background:var(--accent);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{filter:brightness(1.08)}
+  .err{display:none;margin-top:14px;padding:9px 11px;border-radius:7px;font-size:13px;
+    background:#f8514922;border:1px solid var(--bad);color:var(--bad)}
+  .foot{margin-top:16px;text-align:center;color:var(--muted);font-size:11px}
+</style>
+</head>
+<body>
+  <form class="card" method="POST" action="/login" autocomplete="off">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)">
+        <rect x="3" y="4" width="18" height="12" rx="2"></rect>
+        <path d="M8 20h8M12 16v4"></path></svg>
+      <h1>AI-Monitoring</h1>
+    </div>
+    <div class="sub">Sign in to access the dashboards</div>
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" autofocus required>
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password" required>
+    <input type="hidden" name="next" id="next" value="/">
+    <button type="submit">Sign in</button>
+    <div class="err" id="err">Invalid username or password.</div>
+    <div class="foot">read-only monitoring · access is logged</div>
+  </form>
+<script>
+(function(){
+  // theme shared with the dashboards
+  var t=localStorage.getItem("aimon-theme")||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  var q=new URLSearchParams(location.search);
+  // preserve where the user was headed
+  var nx=q.get("next"); if(nx && nx.charAt(0)==="/" && nx.charAt(1)!=="/")
+    document.getElementById("next").value=nx;
+  // surface a login error / lockout
+  var e=q.get("e"), box=document.getElementById("err");
+  if(e==="locked"){ box.textContent="Too many attempts — try again later."; box.style.display="block"; }
+  else if(e){ box.style.display="block"; }
+})();
+</script>
+</body>
+</html>

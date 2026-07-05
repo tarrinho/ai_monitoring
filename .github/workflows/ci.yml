@@ -68,7 +68,7 @@ jobs:
       - name: semgrep (OSS registry rules — NO auto / NO token)
         run: semgrep --config p/python --config p/security-audit --error .
       - name: mypy (typed source)
-        run: mypy --ignore-missing-imports app.py config.py collectors/ db.py
+        run: mypy --ignore-missing-imports app.py config.py collectors/ db.py auth.py
       - name: vulture (dead code — informational)
         continue-on-error: true
         run: vulture app.py config.py collectors db.py --min-confidence 80

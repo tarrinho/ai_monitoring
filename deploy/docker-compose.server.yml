@@ -3,7 +3,7 @@
 #   docker compose -f docker-compose.server.yml up -d
 services:
   ai-monitoring:
-    image: ai-monitoring:1.0.6        # the loaded image tag
+    image: ai-monitoring:1.2.1        # the loaded image tag
     container_name: ai-monitoring
     restart: unless-stopped
     env_file: .env                    # copy .env.example → .env and fill in

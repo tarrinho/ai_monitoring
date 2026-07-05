@@ -3,6 +3,8 @@
 # live, unconfigured backends degrade gracefully, and each collector parses
 # real JSON responses correctly.
 import asyncio
+import re
+import time
 
 import aiohttp
 import pytest
@@ -12,7 +14,9 @@ from aiohttp.test_utils import TestClient, TestServer
 import app as appmod
 import config
 import db
+import auth
 import alerts
+import anomaly
 from collectors import host, litellm, ollama, llamacpp, gpu, procs
 
 
@@ -75,7 +79,8 @@ async def test_litellm_page_served_and_gated(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-litellm-1")
     c2 = await _client()
     try:
-        assert (await c2.get("/litellm")).status == 401
+        r2 = await c2.get("/litellm", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
         r = await c2.get("/litellm?token=tok-litellm-1", allow_redirects=False)
         assert r.status == 302  # token -> cookie redirect
         assert "aimon_session=" in r.headers.get("Set-Cookie", "")
@@ -95,7 +100,8 @@ async def test_ollama_page_served_and_gated(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-ol-1")
     c2 = await _client()
     try:
-        assert (await c2.get("/ollama")).status == 401
+        r2 = await c2.get("/ollama", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
         r = await c2.get("/ollama?token=tok-ol-1", allow_redirects=False)
         assert r.status == 302
     finally:
@@ -118,7 +124,8 @@ async def test_llamacpp_page_served_and_gated(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-lc-1")
     c2 = await _client()
     try:
-        assert (await c2.get("/llamacpp")).status == 401
+        r2 = await c2.get("/llamacpp", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
         r = await c2.get("/llamacpp?token=tok-lc-1", allow_redirects=False)
         assert r.status == 302
     finally:
@@ -225,7 +232,8 @@ async def test_gpu_page_served_and_gated(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-gpu-1")
     c2 = await _client()
     try:
-        assert (await c2.get("/gpu")).status == 401
+        r2 = await c2.get("/gpu", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
         r = await c2.get("/gpu?token=tok-gpu-1", allow_redirects=False)
         assert r.status == 302
         assert "aimon_session=" in r.headers.get("Set-Cookie", "")
@@ -1035,6 +1043,9 @@ async def test_cookie_session_strips_token_from_url(monkeypatch):
     # ?token= must convert to an HttpOnly cookie + redirect, so the secret
     # leaves the URL (history/logs/tunnel-inspector) after the first hit.
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sesssecret123")
+    # F3: cookie is Secure by default; the test client speaks plain HTTP and would
+    # drop a Secure cookie, so opt into the insecure path to exercise the reuse flow.
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
     c = await _client()
     try:
         r = await c.get("/?token=sesssecret123", allow_redirects=False)
@@ -1070,6 +1081,67 @@ async def test_security_headers_present():
         assert "aiohttp" not in r.headers.get("Server", "")
     finally:
         await c.close()
+
+
+# ── secure-review fixes (1.0.7): F1 docker-proxy · F2 no-open · F3 secure
+#    cookie · F4 XFF last-hop · F5 nonce CSP ───────────────────────────────────
+def test_f2_no_token_is_fatal_unless_allow_open(monkeypatch):
+    monkeypatch.setattr(config, "MONITOR_PORT", 9925)
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", None)
+    monkeypatch.setattr(config, "ALLOW_OPEN", False)
+    assert any("MONITOR_DASHBOARD_TOKEN" in e for e in config.validate()), \
+        "missing token must be a fatal config error"
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)     # explicit opt-in clears it
+    assert config.validate() == []
+
+
+async def test_f3_session_cookie_secure_by_default(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sesssecret123")
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", False)
+    c = await _client()
+    try:
+        r = await c.get("/?token=sesssecret123", allow_redirects=False)
+        assert "Secure" in r.headers.get("Set-Cookie", ""), \
+            "token-bearing cookie must be Secure by default"
+    finally:
+        await c.close()
+
+
+def test_f4_client_ip_uses_rightmost_xff(monkeypatch):
+    import app
+    monkeypatch.setattr(config, "AUTH_TRUSTED_PROXY", True)
+
+    class _Req:
+        headers = {"X-Forwarded-For": "1.1.1.1, 2.2.2.2, 9.9.9.9"}
+        remote = "10.0.0.1"
+    # rightmost is appended by the trusted proxy; leftmost is client-spoofable
+    assert app._client_ip(_Req()) == "9.9.9.9"
+
+
+async def test_f5_page_uses_script_nonce_not_unsafe_inline(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")   # open so the page serves
+    c = await _client()
+    try:
+        r = await c.get("/")
+        body = await r.text()
+        csp = r.headers["Content-Security-Policy"]
+        m = re.search(r"script-src ([^;]+);", csp)
+        assert m and "'nonce-" in m.group(1) and "'unsafe-inline'" not in m.group(1), \
+            "script-src must use a nonce, not 'unsafe-inline'"
+        nonce = re.search(r"'nonce-([^']+)'", m.group(1)).group(1)
+        assert f'<script nonce="{nonce}"' in body, "inline <script> must carry the CSP nonce"
+    finally:
+        await c.close()
+
+
+def test_f1_containers_uses_tcp_proxy_when_configured(monkeypatch):
+    from collectors import containers
+    monkeypatch.setattr(config, "DOCKER_API_URL", "http://docker-socket-proxy:2375")
+    assert containers._base() == "http://docker-socket-proxy:2375"
+    monkeypatch.setattr(config, "DOCKER_API_URL", None)
+    assert containers._base() == "http://docker"    # legacy unix-socket dummy host
 
 
 async def test_auth_uses_constant_time_compare(monkeypatch):
@@ -1918,7 +1990,8 @@ async def test_alerts_page_served_and_gated(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-al-1")
     c2 = await _client()
     try:
-        assert (await c2.get("/alerts")).status == 401
+        r2 = await c2.get("/alerts", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
         assert (await c2.get("/api/alerts")).status == 401
     finally:
         await c2.close()
@@ -2293,6 +2366,7 @@ def test_config_validate_clean(monkeypatch):
     monkeypatch.setattr(config, "MONITOR_PORT", 9925)
     monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok")   # F2: a token is valid config
     assert config.validate() == []
 
 
@@ -2374,3 +2448,768 @@ def test_key_series_falls_back_to_spend_in_lite(tmp_path, monkeypatch):
     last = pts[-1]
     assert last.get("full-key") == 42        # requests preserved in full mode
     assert last.get("lite-key") == 3.5        # spend used when reqs is None
+
+
+# ── multi-user login + admin user management (1.1.0) ──────────────────────────
+def test_password_hash_roundtrip():
+    h = auth.hash_password("s3cret-pw!")
+    assert h.startswith("scrypt$") and "s3cret-pw!" not in h
+    assert auth.verify_password("s3cret-pw!", h)
+    assert not auth.verify_password("wrong", h)
+    assert not auth.verify_password("s3cret-pw!", "garbage$$$")   # unparseable
+
+
+def test_field_validation():
+    assert auth.password_error("short") and auth.password_error("")
+    assert auth.password_error("longenough8") is None
+    assert auth.valid_username("alice.b_1") and not auth.valid_username("bad name")
+    assert auth.valid_email("a@b.co") and not auth.valid_email("nope")
+
+
+def test_db_user_crud_roundtrip():
+    assert db.user_create("bob", "bob@x.io", "H", "viewer", time.time())
+    assert not db.user_create("bob", "b2@x.io", "H2", "admin", time.time())  # dup name
+    u = db.user_get("bob")
+    assert u and u["email"] == "bob@x.io" and u["role"] == "viewer" and not u["disabled"]
+    assert [x["name"] for x in db.user_list()] == ["bob"]
+    assert db.user_count() == 1 and db.user_count("admin") == 0
+    assert db.user_set_disabled("bob", True) and db.user_get("bob")["disabled"]
+    assert db.user_delete("bob") and db.user_get("bob") is None
+
+
+def test_bootstrap_admin(monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_USER", "root")
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "rootpassword")
+    monkeypatch.setattr(config, "ADMIN_EMAIL", "root@x.io")
+    assert auth.bootstrap_admin() == "root"
+    assert auth.bootstrap_admin() is None          # idempotent: users already exist
+    u = db.user_get("root")
+    assert u and u["role"] == "admin" and u["email"] == "root@x.io"
+
+
+async def test_login_flow_and_session(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("alice", "a@x.io", auth.hash_password("alicepw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        r = await c.post("/login", data={"username": "alice", "password": "alicepw12"},
+                         allow_redirects=False)
+        assert r.status == 302
+        assert "aimon_user=" in r.headers.get("Set-Cookie", "")
+        assert (await c.get("/gpu")).status == 200          # cookie authenticates
+        assert (await c.get("/api/data")).status == 200
+        assert (await c.get("/admin/users")).status == 403  # viewer: no admin
+    finally:
+        await c.close()
+
+
+async def test_login_bad_password_and_lockout(monkeypatch):
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 3)
+    db.user_create("carol", "c@x.io", auth.hash_password("carolpw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        for _ in range(3):
+            r = await c.post("/login", data={"username": "carol", "password": "nope"},
+                             allow_redirects=False)
+            assert r.status == 302 and "e=1" in r.headers.get("Location", "")
+        r = await c.post("/login", data={"username": "carol", "password": "carolpw12"},
+                         allow_redirects=False)
+        assert "e=locked" in r.headers.get("Location", "")   # locked despite right pw
+    finally:
+        await c.close()
+
+
+async def test_disabled_user_denied_next_request(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("dan", "d@x.io", auth.hash_password("danpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "dan", "password": "danpw1234"})
+        assert (await c.get("/gpu")).status == 200
+        db.user_set_disabled("dan", True)                    # no session drop —
+        r = await c.get("/gpu", allow_redirects=False)       # per-request DB recheck
+        assert r.status == 302 and "/login" in r.headers.get("Location", "")
+    finally:
+        await c.close()
+
+
+async def test_admin_manages_users_with_csrf(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "adm", "password": "admpw1234"})
+        d = await (await c.get("/api/admin/users")).json()
+        csrf = d["csrf"]
+        assert csrf and d["me"] == "adm"
+        # create without CSRF token -> 403
+        r = await c.post("/api/admin/users",
+                         data={"username": "newv", "email": "n@x.io",
+                               "password": "newvpw12", "role": "viewer"})
+        assert r.status == 403
+        # with CSRF -> created
+        r = await c.post("/api/admin/users",
+                         data={"username": "newv", "email": "n@x.io",
+                               "password": "newvpw12", "role": "viewer"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        d2 = await (await c.get("/api/admin/users")).json()
+        assert any(u["name"] == "newv" and u["email"] == "n@x.io" for u in d2["users"])
+        # bad email rejected
+        r = await c.post("/api/admin/users",
+                         data={"username": "bad", "email": "nope", "password": "x2345678",
+                               "role": "viewer"}, headers={"X-CSRF-Token": csrf})
+        assert r.status == 400
+    finally:
+        await c.close()
+
+
+async def test_viewer_cannot_reach_admin(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("vv", "v@x.io", auth.hash_password("vvpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "vv", "password": "vvpw1234"})
+        assert (await c.get("/api/admin/users")).status == 403
+        assert (await c.get("/admin/users")).status == 403
+    finally:
+        await c.close()
+
+
+async def test_last_admin_cannot_be_removed(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("solo", "s@x.io", auth.hash_password("solopw12"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "solo", "password": "solopw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "solo", "action": "delete"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400   # refuse to remove the last admin
+    finally:
+        await c.close()
+
+
+async def test_legacy_token_reaches_admin(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "master-tok-123")
+    c = await _client()
+    try:
+        # the master token counts as admin and is CSRF-exempt (not a browser cookie)
+        assert (await c.get("/api/admin/users?token=master-tok-123")).status == 200
+    finally:
+        await c.close()
+
+
+async def test_admin_sidebar_link_role_gated(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm2", "a2@x.io", auth.hash_password("adm2pw12"), "admin", time.time())
+    db.user_create("vw2", "v2@x.io", auth.hash_password("vw2pw123"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "adm2", "password": "adm2pw12"})
+        h = await (await c.get("/")).text()
+        assert "/admin/users" in h and "Logout" in h        # admin sees Users link
+    finally:
+        await c.close()
+    c2 = await _client()
+    try:
+        await c2.post("/login", data={"username": "vw2", "password": "vw2pw123"})
+        h2 = await (await c2.get("/")).text()
+        assert "/admin/users" not in h2 and "Logout" in h2  # viewer: logout only
+    finally:
+        await c2.close()
+
+
+# ── audit trail (1.2.0) ───────────────────────────────────────────────────────
+def test_audit_db_roundtrip():
+    db.audit_add(time.time(), "admin", "user.create", target="bob", ip="1.2.3.4", detail="viewer")
+    db.audit_add(time.time(), "alice", "login.ok", ip="5.6.7.8")
+    rows = db.audit_list(50)
+    assert len(rows) == 2 and rows[0]["action"] == "login.ok"      # newest first
+    assert [r["action"] for r in db.audit_list(50, "user")] == ["user.create"]
+    assert db.audit_prune(time.time() + 1) == 2 and db.audit_list(50) == []
+
+
+async def test_audit_records_login_success_and_failure(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("eve", "e@x.io", auth.hash_password("evepw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "eve", "password": "wrong"})
+        await c.post("/login", data={"username": "eve", "password": "evepw1234"})
+    finally:
+        await c.close()
+    acts = [r["action"] for r in db.audit_list(50)]
+    assert "login.ok" in acts and "login.fail" in acts
+    ok = next(r for r in db.audit_list(50) if r["action"] == "login.ok")
+    assert ok["actor"] == "eve" and ok["ip"]
+
+
+async def test_audit_records_user_management_and_admin_can_view(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("boss", "b@x.io", auth.hash_password("bosspw123"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "boss", "password": "bosspw123"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        await c.post("/api/admin/users",
+                     data={"username": "newbie", "email": "n@x.io",
+                           "password": "newbiepw1", "role": "viewer"},
+                     headers={"X-CSRF-Token": csrf})
+        await c.post("/api/admin/users/action",
+                     data={"username": "newbie", "action": "disable"},
+                     headers={"X-CSRF-Token": csrf})
+        d = await (await c.get("/api/admin/audit")).json()
+        actions = [(e["action"], e["target"], e["actor"]) for e in d["events"]]
+        assert ("user.create", "newbie", "boss") in actions
+        assert ("user.disable", "newbie", "boss") in actions
+        # prefix filter
+        d2 = await (await c.get("/api/admin/audit?action=user")).json()
+        assert all(e["action"].startswith("user.") for e in d2["events"])
+    finally:
+        await c.close()
+
+
+async def test_audit_endpoint_is_admin_only(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("peon", "p@x.io", auth.hash_password("peonpw123"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "peon", "password": "peonpw123"})
+        assert (await c.get("/api/admin/audit")).status == 403
+    finally:
+        await c.close()
+
+
+# ── multi-user + audit: edge cases (QA hardening) ─────────────────────────────
+def test_session_expiry_invalidates(monkeypatch):
+    sid, _csrf = auth.session_new("u1", "viewer")
+    assert auth.session_get(sid) is not None
+    auth._sessions[sid]["expiry"] = 0.0          # force-expire
+    assert auth.session_get(sid) is None
+    assert sid not in auth._sessions             # expired session dropped
+
+
+def test_sessions_drop_user_and_count():
+    auth.session_new("multi", "viewer")
+    auth.session_new("multi", "viewer")
+    auth.session_new("other", "viewer")
+    n = auth.sessions_drop_user("multi")
+    assert n == 2
+    assert all(v["user"] != "multi" for v in auth._sessions.values())
+
+
+def test_valid_username_and_email_bounds():
+    assert auth.valid_username("a") and auth.valid_username("A-b_.9")
+    assert not auth.valid_username("x" * 33)        # >32
+    assert not auth.valid_username("has space") and not auth.valid_username("bad/slash")
+    assert not auth.valid_username("")
+    assert auth.valid_email("a.b+c@sub.example.co")
+    assert not auth.valid_email("no-at") and not auth.valid_email("a@b") and not auth.valid_email("")
+
+
+def test_bootstrap_admin_rejects_weak_or_missing(monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_USER", "root")
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "short")     # < 8 chars
+    monkeypatch.setattr(config, "ADMIN_EMAIL", "r@x.io")
+    assert auth.bootstrap_admin() is None and db.user_count() == 0
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "")           # missing
+    assert auth.bootstrap_admin() is None
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "goodpassword")
+    monkeypatch.setattr(config, "ADMIN_EMAIL", "not-an-email")  # bad email
+    assert auth.bootstrap_admin() is None and db.user_count() == 0
+
+
+async def test_login_cookie_is_httponly(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("hh", "h@x.io", auth.hash_password("hhpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        r = await c.post("/login", data={"username": "hh", "password": "hhpw1234"},
+                         allow_redirects=False)
+        sc = r.headers.get("Set-Cookie", "")
+        assert "aimon_user=" in sc and "HttpOnly" in sc and "SameSite=Strict" in sc
+    finally:
+        await c.close()
+
+
+async def test_login_next_is_open_redirect_safe(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("nn", "n@x.io", auth.hash_password("nnpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        # a local next is honoured
+        r = await c.post("/login", data={"username": "nn", "password": "nnpw1234", "next": "/gpu"},
+                         allow_redirects=False)
+        assert r.headers.get("Location") == "/gpu"
+    finally:
+        await c.close()
+    c2 = await _client()
+    try:
+        # an off-site next is rejected -> home
+        r = await c2.post("/login", data={"username": "nn", "password": "nnpw1234",
+                                          "next": "//evil.example"}, allow_redirects=False)
+        assert r.headers.get("Location") == "/"
+    finally:
+        await c2.close()
+
+
+async def test_logout_invalidates_session(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("lo", "l@x.io", auth.hash_password("lopw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "lo", "password": "lopw1234"})
+        assert (await c.get("/gpu")).status == 200
+        await c.get("/logout")
+        r = await c.get("/gpu", allow_redirects=False)
+        assert r.status == 302 and "/login" in r.headers.get("Location", "")
+    finally:
+        await c.close()
+
+
+async def test_password_reset_forces_relogin(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    db.user_create("usr", "usr@x.io", auth.hash_password("oldpw1234"), "viewer", time.time())
+    admin = await _client()
+    victim = await _client()
+    try:
+        await admin.post("/login", data={"username": "adm", "password": "admpw1234"})
+        await victim.post("/login", data={"username": "usr", "password": "oldpw1234"})
+        assert (await victim.get("/gpu")).status == 200
+        csrf = (await (await admin.get("/api/admin/users")).json())["csrf"]
+        r = await admin.post("/api/admin/users/action",
+                             data={"username": "usr", "action": "reset", "password": "newpw5678"},
+                             headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        # old session no longer valid
+        rr = await victim.get("/gpu", allow_redirects=False)
+        assert rr.status == 302
+        # old password no longer works, new one does
+        assert not auth.verify_password("oldpw1234", db.user_get("usr")["pw_hash"])
+        assert auth.verify_password("newpw5678", db.user_get("usr")["pw_hash"])
+    finally:
+        await admin.close()
+        await victim.close()
+
+
+async def test_disable_then_enable_restores_access(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    db.user_create("flip", "f@x.io", auth.hash_password("flippw12"), "viewer", time.time())
+    admin = await _client()
+    try:
+        await admin.post("/login", data={"username": "adm", "password": "admpw1234"})
+        csrf = (await (await admin.get("/api/admin/users")).json())["csrf"]
+        for action, expect in (("disable", False), ("enable", True)):
+            r = await admin.post("/api/admin/users/action",
+                                 data={"username": "flip", "action": action},
+                                 headers={"X-CSRF-Token": csrf})
+            assert r.status == 200
+            v = await _client()
+            try:
+                lr = await v.post("/login", data={"username": "flip", "password": "flippw12"},
+                                  allow_redirects=False)
+                ok = "aimon_user=" in lr.headers.get("Set-Cookie", "")
+                assert ok is expect
+            finally:
+                await v.close()
+    finally:
+        await admin.close()
+
+
+async def test_disable_last_admin_rejected(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("only", "o@x.io", auth.hash_password("onlypw12"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "only", "password": "onlypw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "only", "action": "disable"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400          # can't disable the last admin
+    finally:
+        await c.close()
+
+
+async def test_create_rejects_bad_role_and_dup_and_weak_pw(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "adm", "password": "admpw1234"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        base = {"email": "z@x.io", "password": "goodpw123"}
+        h = {"X-CSRF-Token": csrf}
+        assert (await c.post("/api/admin/users", data={**base, "username": "z", "role": "root"}, headers=h)).status == 400
+        assert (await c.post("/api/admin/users", data={"username": "z2", "email": "z@x.io", "password": "sh", "role": "viewer"}, headers=h)).status == 400
+        assert (await c.post("/api/admin/users", data={**base, "username": "adm", "role": "viewer"}, headers=h)).status == 409  # dup
+    finally:
+        await c.close()
+
+
+async def test_token_auth_admin_write_is_csrf_exempt(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "mtok-abc-123")
+    c = await _client()
+    try:
+        # bearer/token auth is not a browser cookie -> no CSRF token needed
+        r = await c.post("/api/admin/users?token=mtok-abc-123",
+                         data={"username": "viaTok", "email": "t@x.io",
+                               "password": "tokpw1234", "role": "viewer"})
+        assert r.status == 200 and db.user_get("viaTok") is not None
+    finally:
+        await c.close()
+
+
+async def test_audit_logs_logout_and_reset_and_lockout(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 2)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "adm", "password": "admpw1234"})
+        await c.get("/logout")
+    finally:
+        await c.close()
+    # trigger a lockout from a fresh client
+    c2 = await _client()
+    try:
+        for _ in range(2):
+            await c2.post("/login", data={"username": "adm", "password": "bad"})
+    finally:
+        await c2.close()
+    acts = {r["action"] for r in db.audit_list(200)}
+    assert "logout" in acts and "login.lockout" in acts
+
+
+def test_audit_never_stores_passwords():
+    db.audit_add(time.time(), "adm", "user.create", target="x", ip="1.1.1.1", detail="viewer")
+    for r in db.audit_list(50):
+        assert "pw" not in (r.get("detail") or "").lower()
+        assert "scrypt" not in (r.get("detail") or "")
+
+
+async def test_audit_limit_is_bounded(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "adm", "password": "admpw1234"})
+        d = await (await c.get("/api/admin/audit?limit=999999")).json()   # over-cap
+        assert isinstance(d["events"], list)          # bounded, not an error
+        d2 = await (await c.get("/api/admin/audit?limit=notanint")).json()
+        assert isinstance(d2["events"], list)          # bad param -> default, no 500
+    finally:
+        await c.close()
+
+
+# ============================================================================
+# Unit tests — pure collector / alert / anomaly / config logic. No network, no
+# app, no DB. Fast, deterministic, one behaviour per test.
+# ============================================================================
+def test_unit_fnum_parses_tolerantly():
+    assert gpu._fnum("72.5") == 72.5
+    assert gpu._fnum("[N/A]") is None       # GB10 reports [N/A] for absent metrics
+    assert gpu._fnum(None) is None
+    assert gpu._fnum("") is None
+    assert gpu._fnum(3) == 3.0
+
+
+def test_unit_parse_nvidia_csv_unified_memory_and_throttle():
+    # GB10 unified-memory row: VRAM columns are [N/A] -> None (not 0, not dropped).
+    out = ("NVIDIA GB10, 77.7, [N/A], [N/A], 61, 210, 250, Active\n"
+           "bad, only, three\n")                     # <5 fields -> skipped
+    g = gpu._parse_nvidia_csv(out)
+    assert len(g) == 1
+    row = g[0]
+    assert row["name"] == "NVIDIA GB10"
+    assert row["util"] == 77.7 and row["temp"] == 61.0 and row["power"] == 210.0
+    assert row["vram_used"] is None and row["vram_total"] is None   # unified memory
+    assert row["throttled"] is True                                 # "Active"
+
+
+def test_unit_parse_nvidia_csv_discrete_vram_mib_to_bytes():
+    g = gpu._parse_nvidia_csv("RTX 4090, 40, 1024, 24576, 55, 300, 450, Not Active")
+    assert g[0]["vram_used"] == 1024 * gpu._MiB
+    assert g[0]["vram_total"] == 24576 * gpu._MiB
+    assert g[0]["throttled"] is False
+
+
+def test_unit_alerts_pct_guards_zero_and_none():
+    assert alerts._pct(None, 100) is None
+    assert alerts._pct(50, 0) is None          # div-by-zero -> None, never raises
+    assert alerts._pct(50, None) is None
+    assert alerts._pct(50, 200) == 25.0
+
+
+def test_unit_alerts_evaluate_fires_host_thresholds(monkeypatch):
+    monkeypatch.setattr(config, "ALERT_CPU_PCT", 90)
+    monkeypatch.setattr(config, "ALERT_DISK_PCT", 95)
+    snap = {"collectors": {"host": {"available": True, "cpu_pct": 96,
+                                    "disk": {"pct": 97}}}}
+    keys = {k for k, _ in alerts.evaluate(snap)}
+    assert "cpu" in keys and "disk" in keys
+
+
+def test_unit_alerts_backend_down_but_not_unconfigured(monkeypatch):
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    snap = {"collectors": {
+        "litellm": {"available": False, "error": "conn refused"},   # real outage
+        "ollama":  {"available": False, "error": "unconfigured"},   # never alerts
+    }}
+    keys = {k for k, _ in alerts.evaluate(snap)}
+    assert "down:litellm" in keys
+    assert "down:ollama" not in keys           # unconfigured != down
+
+
+def test_unit_anomaly_spike_on_zero_baseline(monkeypatch):
+    monkeypatch.setattr(config, "ANOMALY_FACTOR", 3.0)
+    monkeypatch.setattr(config, "ANOMALY_MIN_REQS", 5)
+    # baseline 0 with real traffic -> treated as an infinite spike (leaked key).
+    res = anomaly.detect({"available": True},
+                         {"leaked-key": {"recent": 200.0, "baseline": 0.0}})
+    assert any(k == "spike:leaked-key" for k, _ in res)
+
+
+def test_unit_anomaly_ignores_low_volume(monkeypatch):
+    monkeypatch.setattr(config, "ANOMALY_FACTOR", 3.0)
+    monkeypatch.setattr(config, "ANOMALY_MIN_REQS", 50)
+    # huge ratio but below the min-reqs floor -> not a spike (noise suppression).
+    assert anomaly.detect({"available": True},
+                          {"k": {"recent": 10.0, "baseline": 0.1}}) == []
+
+
+def test_unit_anomaly_budget_breach(monkeypatch):
+    monkeypatch.setattr(config, "ANOMALY_KEY_BUDGET_HR", 1.0)
+    snap = {"available": True, "spend_window_min": 60,
+            "top_keys": [{"alias": "spender", "cost": 5.0}]}   # $5/h >= $1/h
+    assert any(k == "budget:spender" for k, _ in anomaly.detect(snap, {}))
+
+
+def test_unit_anomaly_empty_when_backend_unavailable():
+    assert anomaly.detect({"available": False},
+                          {"k": {"recent": 9e9, "baseline": 0.0}}) == []
+
+
+def test_unit_redacted_summary_never_leaks_secret_values(monkeypatch):
+    # use the gate-whitelisted synthetic key so the publish secret-scan doesn't
+    # flag this fixture as a real sk- leak (deploy/publish-github.sh rule 3).
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-supersecretvalue")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-placeholderval")
+    s = config.redacted_summary()
+    assert s["litellm_key"] == "set" and s["dashboard_auth"] == "token"
+    blob = repr(s)
+    assert "supersecret" not in blob and "placeholderval" not in blob
+
+
+def test_unit_validate_flags_fully_open_dashboard(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    monkeypatch.setattr(config, "ALLOW_OPEN", False)
+    assert any("no auth configured" in e for e in config.validate(user_count=0))
+    # a user account counts as configured auth -> no open-auth error
+    assert not any("no auth configured" in e
+                   for e in config.validate(user_count=1))
+
+
+# ============================================================================
+# Performance guards — CPU-bound hot paths must scale ~linearly and stay under a
+# generous ceiling. Assertions are RELATIVE (hardware-independent, survive the
+# emulated cross-arch build gate); the absolute caps are loose smoke checks that
+# still catch a quadratic regression (which blows past them by orders).
+# ============================================================================
+def _spend_rows(n, now):
+    return [{"startTime": now - 10, "endTime": now - 9,
+             "model": f"m{i % 20}", "api_key": f"k{i % 200}",
+             "total_tokens": 10, "response_cost": 0.001} for i in range(n)]
+
+
+def _best(fn, reps=3):
+    best = float("inf")
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def test_perf_parse_spend_scales_subquadratically():
+    now = 1_700_000_000.0
+    ws = now - 3600
+    small = _spend_rows(5_000, now)
+    big = _spend_rows(20_000, now)                    # 4x the rows
+    t_small = _best(lambda: litellm._parse_spend(small, ws, max_rows=10**9))
+    t_big = _best(lambda: litellm._parse_spend(big, ws, max_rows=10**9))
+    # linear => ~4x; O(n^2) => ~16x. Fail well before quadratic (8x slack + floor).
+    assert t_big < (t_small * 8) + 0.05, \
+        f"parse_spend scaling looks super-linear: {t_small:.4f}s -> {t_big:.4f}s"
+
+
+def test_perf_parse_spend_large_payload_bounded():
+    # 50k rows ~ a full busy day of /spend/logs — the freeze scenario. The fix runs
+    # this pure aggregation off the event loop; it must stay cheap and correct.
+    now = 1_700_000_000.0
+    rows = _spend_rows(50_000, now)
+    t = _best(lambda: litellm._parse_spend(rows, now - 3600, max_rows=10**9), reps=1)
+    assert t < 20.0, f"parse_spend on 50k rows too slow: {t:.2f}s"
+    res, kept, total = litellm._parse_spend(rows, now - 3600, max_rows=10**9)
+    assert total == 50_000 and kept == 50_000 and res["requests_window"] == 50_000
+
+
+def test_perf_evaluate_and_detect_stay_cheap(monkeypatch):
+    monkeypatch.setattr(config, "ANOMALY_FACTOR", 3.0)
+    monkeypatch.setattr(config, "ANOMALY_MIN_REQS", 5)
+    monkeypatch.setattr(config, "ALERT_CPU_PCT", 90)
+    snap = {"collectors": {"host": {"available": True, "cpu_pct": 50,
+                                    "disk": {"pct": 10}}}}
+    ll = {"available": True}
+    base = {f"key{i}": {"recent": float(i), "baseline": 1.0} for i in range(2_000)}
+    t = _best(lambda: (alerts.evaluate(snap), anomaly.detect(ll, base)))
+    assert t < 1.0, f"evaluate+detect over 2k keys too slow: {t:.3f}s"
+
+
+def test_perf_db_series_read_bounded(tmp_path, monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "perf.db"))
+    db.init()
+    now = time.time()
+    cols = list(db._METRIC_COLS)
+    ph = ",".join("?" for _ in ("ts", *cols))
+    # 5k raw metric rows, all inside the 1h window (0.5s apart) -> max aggregation.
+    rows = [tuple([now - (5_000 - i) * 0.5] + [10.0 + (i % 40)] * len(cols))
+            for i in range(5_000)]
+    with db._connect() as conn:
+        conn.executemany(
+            f"INSERT INTO metrics(ts,{','.join(cols)}) VALUES({ph})", rows)
+    t = _best(lambda: db.series("1h", max_points=300))
+    assert isinstance(db.series("1h", max_points=300), list)
+    assert t < 2.0, f"series read over 5k rows too slow: {t:.3f}s"
+
+
+# ── self-service password change (1.2.1) ──────────────────────────────────────
+async def _login_get_csrf(c, user, pw):
+    await c.post("/login", data={"username": user, "password": pw})
+    return (await (await c.get("/api/me")).json())["csrf"]
+
+
+async def test_me_endpoint_gives_session_csrf(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("vw", "v@x.io", auth.hash_password("vwpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "vw", "password": "vwpw1234"})
+        d = await (await c.get("/api/me")).json()
+        assert d["user"] == "vw" and d["role"] == "viewer" and d["csrf"]
+    finally:
+        await c.close()
+
+
+async def test_account_page_requires_login(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tk-acc")
+    c = await _client()
+    try:
+        r = await c.get("/account", allow_redirects=False)
+        assert r.status == 302 and "/login" in r.headers.get("Location", "")
+    finally:
+        await c.close()
+
+
+async def test_change_own_password_requires_current(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("carl", "c@x.io", auth.hash_password("oldpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        csrf = await _login_get_csrf(c, "carl", "oldpw1234")
+        # wrong current password -> rejected
+        r = await c.post("/api/account/password",
+                         data={"current": "WRONG", "new": "brandnew99"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400 and "current password" in (await r.json())["error"]
+        # correct current -> changed
+        r = await c.post("/api/account/password",
+                         data={"current": "oldpw1234", "new": "brandnew99"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        u = db.user_get("carl")
+        assert auth.verify_password("brandnew99", u["pw_hash"])
+        assert not auth.verify_password("oldpw1234", u["pw_hash"])
+    finally:
+        await c.close()
+
+
+async def test_change_password_rejects_weak_and_same(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("deb", "d@x.io", auth.hash_password("currentpw1"), "viewer", time.time())
+    c = await _client()
+    try:
+        csrf = await _login_get_csrf(c, "deb", "currentpw1")
+        assert (await c.post("/api/account/password",
+                data={"current": "currentpw1", "new": "short"},
+                headers={"X-CSRF-Token": csrf})).status == 400          # weak
+        assert (await c.post("/api/account/password",
+                data={"current": "currentpw1", "new": "currentpw1"},
+                headers={"X-CSRF-Token": csrf})).status == 400          # unchanged
+    finally:
+        await c.close()
+
+
+async def test_change_password_needs_csrf_and_session(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("ede", "e@x.io", auth.hash_password("edepw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "ede", "password": "edepw1234"})
+        # no CSRF header -> 403
+        r = await c.post("/api/account/password",
+                         data={"current": "edepw1234", "new": "newpw5678"})
+        assert r.status == 403
+    finally:
+        await c.close()
+    # token-only auth (no session) cannot change an account password
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tk-acc2")
+    c2 = await _client()
+    try:
+        r = await c2.post("/api/account/password?token=tk-acc2",
+                          data={"current": "x", "new": "newpw5678"})
+        assert r.status == 401
+    finally:
+        await c2.close()
+
+
+async def test_change_password_invalidates_other_sessions(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("fin", "f@x.io", auth.hash_password("finpw1234"), "viewer", time.time())
+    dev1 = await _client()
+    dev2 = await _client()
+    try:
+        await dev1.post("/login", data={"username": "fin", "password": "finpw1234"})
+        await dev2.post("/login", data={"username": "fin", "password": "finpw1234"})
+        assert (await dev2.get("/gpu")).status == 200
+        csrf = (await (await dev1.get("/api/me")).json())["csrf"]
+        r = await dev1.post("/api/account/password",
+                            data={"current": "finpw1234", "new": "finnew5678"},
+                            headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        # the OTHER device's session is now invalid; the current one still works
+        assert (await dev1.get("/gpu")).status == 200
+        r2 = await dev2.get("/gpu", allow_redirects=False)
+        assert r2.status == 302
+    finally:
+        await dev1.close()
+        await dev2.close()
+
+
+async def test_change_password_is_audited(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("gus", "g@x.io", auth.hash_password("guspw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        csrf = await _login_get_csrf(c, "gus", "guspw1234")
+        await c.post("/api/account/password",
+                     data={"current": "guspw1234", "new": "gusnew5678"},
+                     headers={"X-CSRF-Token": csrf})
+    finally:
+        await c.close()
+    assert "account.password" in {r["action"] for r in db.audit_list(50)}
