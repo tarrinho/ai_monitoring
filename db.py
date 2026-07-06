@@ -193,7 +193,8 @@ def init() -> None:
         # per-user alert webhook (1.2.2): each user can set their own webhook URL.
         _ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
         for col, ddl in (("webhook_url", "TEXT"),
-                         ("webhook_enabled", "INTEGER NOT NULL DEFAULT 0")):
+                         ("webhook_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                         ("must_change_pw", "INTEGER NOT NULL DEFAULT 0")):
             if col not in _ucols:
                 try:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
@@ -645,13 +646,15 @@ def prune() -> int:
 # CRUD for the dashboard `users` table. pw_hash is opaque here (auth.py owns the
 # hashing); db.py only stores/reads it. Every function degrades safely.
 def user_create(name: str, email: str, pw_hash: str, role: str,
-                created: float) -> bool:
-    """Insert a new user. Returns False if the name already exists (or on error)."""
+                created: float, must_change_pw: bool = False) -> bool:
+    """Insert a new user. Returns False if the name already exists (or on error).
+    `must_change_pw` forces a password change on first login (admin-created users)."""
     try:
         with _connect() as conn:
             conn.execute(
-                "INSERT INTO users(name, email, pw_hash, role, created, disabled) "
-                "VALUES (?,?,?,?,?,0)", (name, email, pw_hash, role, created))
+                "INSERT INTO users(name, email, pw_hash, role, created, disabled, "
+                "must_change_pw) VALUES (?,?,?,?,?,0,?)",
+                (name, email, pw_hash, role, created, 1 if must_change_pw else 0))
         return True
     except Exception:
         return False
@@ -662,12 +665,13 @@ def user_get(name: str) -> dict[str, Any] | None:
     try:
         with _connect() as conn:
             r = conn.execute(
-                "SELECT name, email, pw_hash, role, created, last_login, disabled "
-                "FROM users WHERE name = ?", (name,)).fetchone()
+                "SELECT name, email, pw_hash, role, created, last_login, disabled, "
+                "must_change_pw FROM users WHERE name = ?", (name,)).fetchone()
         if not r:
             return None
         return {"name": r[0], "email": r[1], "pw_hash": r[2], "role": r[3],
-                "created": r[4], "last_login": r[5], "disabled": bool(r[6])}
+                "created": r[4], "last_login": r[5], "disabled": bool(r[6]),
+                "must_change_pw": bool(r[7])}
     except Exception:
         return None
 
@@ -677,10 +681,11 @@ def user_list() -> list[dict[str, Any]]:
     try:
         with _connect() as conn:
             rows = conn.execute(
-                "SELECT name, email, role, created, last_login, disabled "
-                "FROM users ORDER BY name").fetchall()
+                "SELECT name, email, role, created, last_login, disabled, "
+                "must_change_pw FROM users ORDER BY name").fetchall()
         return [{"name": r[0], "email": r[1], "role": r[2], "created": r[3],
-                 "last_login": r[4], "disabled": bool(r[5])} for r in rows]
+                 "last_login": r[4], "disabled": bool(r[5]),
+                 "must_change_pw": bool(r[6])} for r in rows]
     except Exception:
         return []
 
@@ -719,10 +724,33 @@ def user_set_password(name: str, pw_hash: str) -> bool:
         return False
 
 
+def user_set_must_change(name: str, must_change: bool) -> bool:
+    """Force (or clear) the first-login password-change requirement for a user."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("UPDATE users SET must_change_pw = ? WHERE name = ?",
+                               (1 if must_change else 0, name))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
 def user_delete(name: str) -> bool:
     try:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM users WHERE name = ?", (name,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def user_update(name: str, email: str, role: str) -> bool:
+    """Edit an existing user's profile (email + role). Returns True if a row was
+    updated. Caller validates email/role and the last-admin guard."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("UPDATE users SET email = ?, role = ? WHERE name = ?",
+                               (email, role, name))
         return (cur.rowcount or 0) > 0
     except Exception:
         return False

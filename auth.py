@@ -88,14 +88,17 @@ def _sweep(now: float) -> None:
             _sessions.pop(sid, None)
 
 
-def session_new(user: str, role: str) -> tuple[str, str]:
-    """Create a session; returns (session_id, csrf_token)."""
+def session_new(user: str, role: str,
+                must_change: bool = False) -> tuple[str, str]:
+    """Create a session; returns (session_id, csrf_token). `must_change` marks a
+    session that is restricted to the password-change flow until the user resets."""
     now = time.time()
     _sweep(now)
     sid = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(24)
     _sessions[sid] = {"user": user, "role": role,
-                      "expiry": now + config.SESSION_TTL_S, "csrf": csrf}
+                      "expiry": now + config.SESSION_TTL_S, "csrf": csrf,
+                      "must_change": bool(must_change)}
     return sid, csrf
 
 

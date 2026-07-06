@@ -119,6 +119,11 @@ Every logged-in user (admin or viewer) can change **their own** password from th
 identity, and signs out their other sessions on success. Admins reset *other*
 users' passwords from `/admin/users`.
 
+A user created by an admin (or whose password an admin resets) **must set their own
+password on first login**: they are confined to `/account` — every other page and API
+is blocked until they choose a new one — and the *Users* table shows a *reset pending*
+badge until they do. The env-seeded bootstrap admin is exempt.
+
 Each user can also set **their own alert webhook** on `/account` (Slack / Discord /
 generic JSON POST) — when an alert fires it is delivered to every enabled user
 webhook plus the operator-set global `ALERT_WEBHOOK_URL`. User URLs are SSRF-guarded
@@ -390,6 +395,11 @@ tests/           full QA suite (static + dynamic + live-integration)
 - **SSRF**: GPU-agent fetch restricted to `http(s)`, bypasses proxy env.
 - **Secrets**: env-only, git-ignored, never logged or stored; boot banner
   redacts. Container runs **non-root** on **Alpine** (0 Trivy HIGH/CRITICAL).
+- **Error logging**: every error is recorded to the server's stderr (`docker logs`)
+  — failed/locked-out logins (with user + IP), denied writes (`4xx`), and unhandled
+  exceptions (`500` + traceback); normal `200` traffic is never logged.
+- **Forced first-login reset**: admin-created / admin-reset accounts must set their
+  own password before reaching anything else (see *Multi-user access* above).
 
 ---
 

@@ -79,7 +79,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.1</div>
+      <div id="sidebar-brand-ver">v1.3.2</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -163,6 +163,22 @@
   function actionBtn(label,cls,fn){var b=document.createElement("button");b.type="button";
     b.className=cls;b.textContent=label;b.addEventListener("click",fn);return b;}
 
+  /* inline profile editor: turn a user row's email + role cells into inputs */
+  function beginEdit(tr,u){
+    var emailTd=tr.children[1], roleTd=tr.children[2], actTd=tr.children[5];
+    emailTd.textContent=""; var ein=document.createElement("input"); ein.type="email";
+    ein.value=u.email||""; ein.style.maxWidth="220px"; emailTd.appendChild(ein);
+    roleTd.textContent=""; var rsel=document.createElement("select"); rsel.style.width="auto";
+    ["viewer","admin"].forEach(function(rv){var o=document.createElement("option");
+      o.value=rv;o.textContent=rv;if(rv===u.role)o.selected=true;rsel.appendChild(o);});
+    roleTd.appendChild(rsel);
+    var wrap=actTd.firstChild; wrap.textContent="";
+    wrap.appendChild(actionBtn("Save","",function(){
+      act({username:u.name,action:"update",email:ein.value.trim(),role:rsel.value});}));
+    wrap.appendChild(actionBtn("Cancel","ghost",function(){ load(); }));
+    ein.focus();
+  }
+
   function render(users){
     var tb=document.getElementById("rows"); tb.textContent="";
     users.forEach(function(u){
@@ -172,9 +188,14 @@
       tr.appendChild(cell(u.name + (u.name===ME?" (you)":"")));
       tr.appendChild(cell(u.email||"—"));
       tr.appendChild(cell(u.role,"pill "+(u.role==="admin"?"admin":"viewer")));
-      tr.appendChild(cell(u.disabled?"disabled":"active","pill "+(u.disabled?"off":"ok")));
+      var statusTd=cell(u.disabled?"disabled":"active","pill "+(u.disabled?"off":"ok"));
+      if(u.must_change_pw&&!u.disabled){var pend=document.createElement("span");
+        pend.className="pill off";pend.style.marginLeft="6px";pend.textContent="reset pending";
+        pend.title="Must set a new password on next login";statusTd.appendChild(pend);}
+      tr.appendChild(statusTd);
       tr.appendChild(cell(fmtTime(u.last_login)));
       var td=document.createElement("td"); var wrap=document.createElement("div"); wrap.className="actions";
+      wrap.appendChild(actionBtn("Edit","ghost",function(){ beginEdit(tr,u); }));
       wrap.appendChild(actionBtn(u.disabled?"Enable":"Disable","ghost",function(){
         act({username:u.name,action:u.disabled?"enable":"disable"});}));
       wrap.appendChild(actionBtn("Reset pw","ghost",function(){
@@ -202,7 +223,7 @@
     "login.lockout":"locked out", "logout":"signed out",
     "user.create":"created user", "user.disable":"disabled user",
     "user.enable":"enabled user", "user.delete":"deleted user",
-    "user.reset":"reset password" };
+    "user.reset":"reset password", "user.update":"updated profile" };
   function loadAudit(){
     var f=document.getElementById("audit-filter").value;
     fetch("/api/admin/audit?limit=200"+(f?("&action="+encodeURIComponent(f)):""))

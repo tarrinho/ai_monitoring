@@ -69,7 +69,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.1</div>
+      <div id="sidebar-brand-ver">v1.3.2</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -92,6 +92,12 @@
     </div>
   </header>
   <main>
+    <div id="force-banner" style="display:none;background:var(--panel2);border:1px solid var(--bad);
+      border-left:3px solid var(--bad);border-radius:8px;padding:12px 14px;margin-bottom:16px;font-size:13px">
+      <strong>Set a new password to continue.</strong>
+      <div class="muted" style="margin-top:4px">Your account was created with a temporary password.
+        The rest of the dashboard stays locked until you choose your own.</div>
+    </div>
     <section class="card">
       <h2>Change password</h2>
       <div class="sub">Enter your current password to confirm it's you, then set a new one (min 8 characters).</div>
@@ -133,11 +139,18 @@
     var c=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
     document.documentElement.setAttribute("data-theme",c);localStorage.setItem("aimon-theme",c);icon();});
 
-  var CSRF="";
+  var CSRF="",MUST=false;
   function setMsg(txt,good){var m=document.getElementById("msg");m.textContent=txt||"";
     m.className="msg"+(txt?(good?" ok":" bad"):"");}
   fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
-    if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}
+    if(d){CSRF=d.csrf||"";MUST=!!d.must_change;
+      document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";
+      if(MUST){                                   // first-login: lock everything but the reset
+        document.getElementById("force-banner").style.display="block";
+        var wh=document.getElementById("wh-form");if(wh&&wh.closest(".card"))wh.closest(".card").style.display="none";
+        document.querySelectorAll("#sidebar-nav a").forEach(function(a){a.style.pointerEvents="none";a.style.opacity=".4";});
+      }
+    }
   }).catch(function(){});
 
   document.getElementById("pw-form").addEventListener("submit",function(ev){
@@ -150,6 +163,8 @@
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
       .then(function(res){
         if(!res.ok){setMsg(res.j.error||"Update failed.",false);}
+        else if(MUST){setMsg("Password set — unlocking dashboard…",true);f.reset();
+          setTimeout(function(){location.href="/";},700);}
         else{setMsg("Password updated. Other sessions were signed out.",true);f.reset();}
       }).catch(function(){setMsg("Update failed.",false);});
   });

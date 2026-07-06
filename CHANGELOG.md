@@ -4,6 +4,42 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.3.2] — 2026-07-06
+
+### Added
+- **Per-account login lockout.** In addition to the existing per-IP throttle, an
+  account is now locked after **10 failed password attempts** (within
+  `MONITOR_AUTH_WINDOW_S`) for **5 minutes** — every further login for that username,
+  *including with the correct password*, is refused (`/login?e=locked`) until it
+  expires. This protects a targeted account even when the attacker rotates source IPs
+  (the per-IP lock alone wouldn't). A successful login clears the counter; the lock is
+  logged (`[auth] account LOCKED user=…`). Tunable via `MONITOR_AUTH_USER_MAX_FAILS`
+  (10) and `MONITOR_AUTH_USER_LOCKOUT_S` (300). Counting an unknown username the same
+  as a real one keeps the lock from leaking which accounts exist.
+- **Forced first-login password change.** A user created by an admin (or whose
+  password an admin **resets**) is flagged `must_change_pw` and, on their next login,
+  is sent to `/account` and **confined** there — every page redirects back to it and
+  every API call returns `403` until they set their own password. Clearing it is
+  automatic on a successful self-service change (`POST /api/account/password`), which
+  also lifts the gate on the live session. The admin *User management* table shows a
+  **“reset pending”** badge for anyone who hasn't reset yet. The env-seeded bootstrap
+  admin is exempt (the operator chose that password deliberately). New DB column
+  `users.must_change_pw` (idempotent `ADD COLUMN`, default `0`); `/api/me` exposes the
+  flag so the account page can render the lock banner.
+- **Server-side error logging.** Every error is now recorded to the server's stderr
+  (`docker logs`), never the normal `200` traffic: failed/locked-out logins
+  (`[auth] login FAILED user=… ip=…`), denied writes (`[deny] METHOD /path -> 4xx ip=…`
+  for `400/403/409/413/415/429`), and unhandled exceptions (`[error] … -> 500` with a
+  full traceback). Implemented as an outermost `_log_mw` middleware plus an explicit
+  log on the login-fail redirect. No new configuration.
+- **Edit a user's profile.** Admins can now change an existing user's **email and
+  role** inline from *User management* → the per-row **Edit** button turns the email
+  and role cells into an input + a viewer/admin dropdown (Save / Cancel). Backed by
+  the `update` action on `POST /api/admin/users/action` (admin-only, CSRF-protected):
+  it validates the email + role, refuses to demote the **last** admin, and is audited
+  as `user.update`. A role change takes effect on the target's next request (roles are
+  revalidated per request). The editor is built with DOM APIs (no `innerHTML`).
+
 ## [1.3.1] — 2026-07-06
 
 ### Security

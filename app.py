@@ -15,6 +15,7 @@ import re
 import secrets
 import sys
 import time
+import traceback
 from html import escape as _html_escape
 from pathlib import Path
 from urllib.parse import quote
@@ -385,6 +386,41 @@ async def _sechdr_mw(request: web.Request, handler):
     return resp
 
 
+# --------------------------------------------------------- server error log ---
+def _log(msg: str) -> None:
+    """Timestamped line to stderr → the server's `docker logs`."""
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+# 4xx codes worth logging as a denial (skip 401 = normal unauth poll, 404 = normal).
+_LOG_STATUSES = frozenset((400, 403, 409, 413, 415, 429))
+
+
+@web.middleware
+async def _log_mw(request: web.Request, handler):
+    """Record every error on the server (security + failures), never the noisy 200s:
+    unhandled exceptions (500 + traceback) and denied writes (400/403/409/429/…).
+    Failed LOGINS are 302 redirects, so they are logged explicitly in the handler."""
+    try:
+        resp = await handler(request)
+    except web.HTTPException as e:
+        if e.status >= 500:
+            _log(f"[error] {request.method} {request.path} -> {e.status}")
+        elif e.status in _LOG_STATUSES:
+            _log(f"[deny] {request.method} {request.path} -> {e.status} "
+                 f"ip={_client_ip(request)}")
+        raise
+    except Exception:                       # unhandled -> aiohttp will 500 it
+        _log(f"[error] {request.method} {request.path} -> 500\n{traceback.format_exc()}")
+        raise
+    if resp.status >= 500:
+        _log(f"[error] {request.method} {request.path} -> {resp.status}")
+    elif resp.status in _LOG_STATUSES:
+        _log(f"[deny] {request.method} {request.path} -> {resp.status} "
+             f"ip={_client_ip(request)}")
+    return resp
+
+
 # ------------------------------------------------------------------- auth -----
 _COOKIE = "aimon_session"       # legacy shared-token session cookie (opaque id)
 _USER_COOKIE = "aimon_user"     # per-user login session id (auth.py sessions)
@@ -491,27 +527,36 @@ _OPEN = ("/healthz", "/login", "/logout", "/metrics")
 # Admin-only surfaces (role must be 'admin' or the legacy master token).
 _ADMIN_PAGES = ("/admin/users",)
 _ADMIN_API_PREFIX = "/api/admin/"
+# The only surfaces a must-change-password session may reach before resetting.
+_MUST_CHANGE_OK = ("/account", "/logout", "/api/me", "/api/account/password")
 
 # Brute-force protection: per-IP failed-token counters + lockouts (in-memory;
 # single-instance app, resets on restart — fine for this purpose).
 _auth_fails: dict[str, collections.deque] = collections.defaultdict(
     lambda: collections.deque(maxlen=128))
 _auth_locked_until: dict[str, float] = {}
+# Same idea keyed by USERNAME (not IP) — a targeted account is locked even if the
+# attacker spreads the guesses across many source IPs.
+_user_fails: dict[str, collections.deque] = collections.defaultdict(
+    lambda: collections.deque(maxlen=128))
+_user_locked_until: dict[str, float] = {}
 
 
 def _prune_auth_state(now: float) -> None:
-    """Bound the per-IP brute-force maps so a flood of distinct source IPs can't
-    grow them without limit (memory DoS). Only runs a full scan once the maps get
-    large; drops expired lockouts and stale/empty fail windows. Cheap and safe —
+    """Bound the brute-force maps so a flood of distinct source IPs / usernames
+    can't grow them without limit (memory DoS). Only runs a full scan once the maps
+    get large; drops expired lockouts and stale/empty fail windows. Cheap and safe —
     an active lockout (locked_until > now) is never removed early."""
-    if len(_auth_locked_until) + len(_auth_fails) < 4096:
+    if (len(_auth_locked_until) + len(_auth_fails)
+            + len(_user_locked_until) + len(_user_fails)) < 4096:
         return
-    for ip in [i for i, u in _auth_locked_until.items() if u <= now]:
-        _auth_locked_until.pop(ip, None)
     win = config.AUTH_WINDOW_S
-    for ip in [i for i, d in _auth_fails.items()
-               if not d or now - d[-1] > win]:
-        _auth_fails.pop(ip, None)
+    for locks, fails in ((_auth_locked_until, _auth_fails),
+                         (_user_locked_until, _user_fails)):
+        for k in [i for i, u in locks.items() if u <= now]:
+            locks.pop(k, None)
+        for k in [i for i, d in fails.items() if not d or now - d[-1] > win]:
+            fails.pop(k, None)
 
 
 def _client_ip(request: web.Request) -> str:
@@ -597,6 +642,14 @@ async def _auth_mw(request: web.Request, handler):
         raise web.HTTPFound(_login_dest(request, p))
     _auth_fails.pop(ip, None)
     _auth_locked_until.pop(ip, None)
+    # First-login gate: an admin-created (or admin-reset) user must set a new
+    # password before reaching anything else. Confine such a session to the
+    # account page + the endpoints that flow drives, everything else is blocked.
+    if _sess and _sess.get("must_change") and p not in _MUST_CHANGE_OK:
+        if p.startswith("/api/"):
+            return web.json_response(
+                {"error": "password change required"}, status=403)
+        raise web.HTTPFound(_fwd_prefix(request) + "/account?force=1")
     if is_admin_path and role != "admin":
         if p.startswith("/api/"):
             return web.json_response({"error": "forbidden"}, status=403)
@@ -767,6 +820,12 @@ async def login_submit_handler(request: web.Request) -> web.Response:
     name = str(data.get("username") or "").strip()
     pw = str(data.get("password") or "")
     nxt = _safe_path(str(data.get("next") or "/"))
+    # Per-account lockout: an account with too many recent failures is refused
+    # regardless of which IP the attempt comes from (survives IP rotation).
+    if name and _user_locked_until.get(name, 0.0) > now:
+        _audit(request, name, "login.lockout")
+        _log(f"[auth] login LOCKOUT (account) user={name!r} ip={ip}")
+        raise web.HTTPFound(_fwd_prefix(request) + "/login?e=locked")
     u = db.user_get(name)
     if u is not None and not u["disabled"]:
         ok = auth.verify_password(pw, u["pw_hash"])
@@ -786,16 +845,38 @@ async def login_submit_handler(request: web.Request) -> web.Response:
             _auth_locked_until[ip] = now + config.AUTH_LOCKOUT_S
             _record_auth_attack(ip)
             fails.clear()
-        _audit(request, name or "?", "login.lockout" if locked else "login.fail")
+        # Per-account counter (only meaningful for a real, non-disabled user).
+        user_locked = False
+        if name:
+            ufails = _user_fails[name]
+            while ufails and now - ufails[0] > config.AUTH_WINDOW_S:
+                ufails.popleft()
+            ufails.append(now)
+            if len(ufails) >= config.AUTH_USER_MAX_FAILS:
+                _user_locked_until[name] = now + config.AUTH_USER_LOCKOUT_S
+                ufails.clear()
+                user_locked = True
+                _log(f"[auth] account LOCKED user={name!r} for "
+                     f"{config.AUTH_USER_LOCKOUT_S:.0f}s ({config.AUTH_USER_MAX_FAILS} "
+                     f"fails) — last ip={ip}")
+        any_lock = locked or user_locked
+        _audit(request, name or "?", "login.lockout" if any_lock else "login.fail")
+        _log(f"[auth] login {'LOCKOUT' if any_lock else 'FAILED'} "
+             f"user={name or '?'!r} ip={ip}")
         q = "?e=1" + ("&next=" + quote(nxt, safe="") if nxt != "/" else "")
         raise web.HTTPFound(_fwd_prefix(request) + "/login" + q)
     _auth_fails.pop(ip, None)
     _auth_locked_until.pop(ip, None)
+    _user_fails.pop(name, None)
+    _user_locked_until.pop(name, None)
     assert u is not None
-    sid, _csrf = auth.session_new(u["name"], u["role"])
+    must_change = bool(u.get("must_change_pw"))
+    sid, _csrf = auth.session_new(u["name"], u["role"], must_change)
     db.user_touch_login(u["name"], now)
     _audit(request, u["name"], "login.ok", detail=u["role"])
-    resp = web.HTTPFound(_fwd_prefix(request) + nxt)
+    # A must-change user is sent to /account and gated there until they reset.
+    dest = "/account?force=1" if must_change else nxt
+    resp = web.HTTPFound(_fwd_prefix(request) + dest)
     _set_user_cookie(resp, sid, request)
     raise resp
 
@@ -819,9 +900,11 @@ async def me_handler(request: web.Request) -> web.Response:
     sess = _session_from_req(request)
     if sess:
         return web.json_response({"user": sess["user"], "role": sess["role"],
-                                  "csrf": sess["csrf"]})
+                                  "csrf": sess["csrf"],
+                                  "must_change": bool(sess.get("must_change"))})
     _, role, _ = _auth_ctx(request)               # token-authed: no session/csrf
-    return web.json_response({"user": None, "role": role, "csrf": ""})
+    return web.json_response({"user": None, "role": role, "csrf": "",
+                              "must_change": False})
 
 
 async def account_page_handler(request: web.Request) -> web.Response:
@@ -851,6 +934,8 @@ async def api_account_password(request: web.Request) -> web.Response:
     if auth.verify_password(new, u["pw_hash"]):
         return web.json_response({"error": "new password must differ from the current one"}, status=400)
     db.user_set_password(sess["user"], auth.hash_password(new))
+    db.user_set_must_change(sess["user"], False)        # requirement satisfied
+    sess["must_change"] = False                         # lift the gate on this session
     auth.sessions_drop_user_except(sess["user"], request.cookies.get(_USER_COOKIE))
     _audit(request, sess["user"], "account.password")
     return web.json_response({"ok": True})
@@ -948,7 +1033,9 @@ async def api_admin_users_create(request: web.Request) -> web.Response:
         return web.json_response({"error": pe}, status=400)
     if db.user_get(name):
         return web.json_response({"error": "user already exists"}, status=409)
-    if not db.user_create(name, email, auth.hash_password(pw), role, time.time()):
+    # Admin-created users must set their own password on first login.
+    if not db.user_create(name, email, auth.hash_password(pw), role, time.time(),
+                          must_change_pw=True):
         return web.json_response({"error": "create failed"}, status=500)
     _mark_users_changed()
     _audit(request, actor, "user.create", target=name, detail=role)
@@ -984,7 +1071,20 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
         if (pe := auth.password_error(pw)):
             return web.json_response({"error": pe}, status=400)
         db.user_set_password(name, auth.hash_password(pw))
+        db.user_set_must_change(name, True)   # admin-set pw is temporary
         auth.sessions_drop_user(name)     # force re-login with the new password
+    elif action == "update":
+        # edit a user's profile (email + role). Role is revalidated per request in
+        # _auth_ctx, so a change takes effect on the target's next request.
+        email = str(data.get("email") or "").strip()
+        role = str(data.get("role") or "").strip()
+        if not auth.valid_email(email):
+            return web.json_response({"error": "invalid email"}, status=400)
+        if role not in auth.ROLES:
+            return web.json_response({"error": "invalid role"}, status=400)
+        if last_admin and role != "admin":     # don't demote the last admin
+            return web.json_response({"error": "cannot demote the last admin"}, status=400)
+        db.user_update(name, email, role)
     else:
         return web.json_response({"error": "unknown action"}, status=400)
     _audit(request, actor, "user." + action, target=name)
@@ -1296,7 +1396,7 @@ async def _on_cleanup(app: web.Application) -> None:
 
 
 def build_app() -> web.Application:
-    app = web.Application(middlewares=[_sechdr_mw, _auth_mw])
+    app = web.Application(middlewares=[_log_mw, _sechdr_mw, _auth_mw])
     app.router.add_get("/", index_handler)
     app.router.add_get("/litellm", litellm_page_handler)
     app.router.add_get("/gpu", gpu_page_handler)

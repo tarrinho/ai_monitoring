@@ -235,7 +235,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.3.1"
+    assert config.VERSION == "AI-Monitoring_1.3.2"
 
 
 def test_ux_improvements_present():
@@ -828,6 +828,14 @@ def test_admin_page_has_audit_log_section():
     assert 'id="audit-rows"' in html and "loadAudit" in html
     assert "/api/admin/audit" in html
     assert "innerHTML" not in html          # still DOM-API only (XSS-safe)
+
+
+def test_admin_page_has_profile_editor():
+    # inline "Edit" per user → change email + role via the update action
+    html = (ROOT / "web" / "admin.html").read_text(encoding="utf-8")
+    assert "beginEdit" in html and '"Edit"' in html
+    assert 'action:"update"' in html
+    assert "innerHTML" not in html          # editor built with DOM APIs, not innerHTML
 
 
 # ============================================================================

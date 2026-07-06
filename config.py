@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.3.1"
+VERSION = "AI-Monitoring_1.3.2"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -98,6 +98,12 @@ METRICS_TOKEN   = _str("MONITOR_METRICS_TOKEN")   # optional scrape-only bearer
 AUTH_MAX_FAILS   = _int("MONITOR_AUTH_MAX_FAILS", 10)
 AUTH_WINDOW_S    = _float("MONITOR_AUTH_WINDOW_S", 300.0)
 AUTH_LOCKOUT_S   = _float("MONITOR_AUTH_LOCKOUT_S", 900.0)
+# Per-ACCOUNT lockout (independent of the per-IP one above): after
+# AUTH_USER_MAX_FAILS bad password attempts on the same username within
+# AUTH_WINDOW_S, that account is locked for AUTH_USER_LOCKOUT_S — this protects a
+# targeted account even when the attacker rotates source IPs.
+AUTH_USER_MAX_FAILS  = _int("MONITOR_AUTH_USER_MAX_FAILS", 10)
+AUTH_USER_LOCKOUT_S  = _float("MONITOR_AUTH_USER_LOCKOUT_S", 300.0)
 AUTH_TRUSTED_PROXY = (_str("MONITOR_AUTH_TRUSTED_PROXY", "0") or "0").lower() in ("1", "true", "yes", "on")
 # Log each collector's availability + error to stderr (docker logs) on startup
 # and whenever it changes — so you can see WHY a panel is missing (e.g. GPU).

@@ -2593,6 +2593,60 @@ async def test_last_admin_cannot_be_removed(monkeypatch):
         await c.close()
 
 
+async def test_admin_can_update_user_profile(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("adm2", "adm2@x.io", auth.hash_password("adm2pw12"), "admin", time.time())
+    db.user_create("bob", "bob@x.io", auth.hash_password("bobpw123"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "adm2", "password": "adm2pw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        # update needs CSRF
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "bob", "action": "update",
+                               "email": "bob2@x.io", "role": "admin"})
+        assert r.status == 403
+        # change email + role (viewer -> admin)
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "bob", "action": "update",
+                               "email": "bob2@x.io", "role": "admin"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        u = db.user_get("bob")
+        assert u["email"] == "bob2@x.io" and u["role"] == "admin"
+        # invalid email rejected
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "bob", "action": "update",
+                               "email": "nope", "role": "viewer"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400
+        # invalid role rejected
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "bob", "action": "update",
+                               "email": "bob2@x.io", "role": "superuser"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400
+    finally:
+        await c.close()
+
+
+async def test_last_admin_cannot_be_demoted(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("solo2", "s2@x.io", auth.hash_password("solo2pw1"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "solo2", "password": "solo2pw1"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "solo2", "action": "update",
+                               "email": "s2@x.io", "role": "viewer"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400                      # can't demote the last admin
+        assert db.user_get("solo2")["role"] == "admin"
+    finally:
+        await c.close()
+
+
 async def test_legacy_token_reaches_admin(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "master-tok-123")
     c = await _client()
@@ -3590,5 +3644,218 @@ async def test_metrics_endpoint_enforces_lockout(monkeypatch):
         # now the IP is locked out even for the correct token
         r = await c.get("/metrics?token=realmetricstoken1")
         assert r.status == 429
+    finally:
+        await c.close()
+
+
+# ── server error logging (1.3.2) ──────────────────────────────────────────────
+async def test_server_logs_failed_login(monkeypatch):
+    logs = []
+    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
+    db.user_create("le", "l@x.io", auth.hash_password("lepw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "le", "password": "WRONG"})
+    finally:
+        await c.close()
+    assert any("login FAILED" in m and "le" in m for m in logs)
+
+
+async def test_server_logs_denied_admin_action(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    logs = []
+    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
+    db.user_create("vw", "v@x.io", auth.hash_password("vwpw1234"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "vw", "password": "vwpw1234"})
+        await c.get("/api/admin/users")           # viewer -> 403
+    finally:
+        await c.close()
+    assert any("[deny]" in m and "403" in m for m in logs)
+
+
+async def test_server_does_not_log_normal_200(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    logs = []
+    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
+    c = await _client()
+    try:
+        assert (await c.get("/healthz")).status == 200
+        assert (await c.get("/gpu")).status == 200
+    finally:
+        await c.close()
+    assert not any("healthz" in m or "/gpu" in m for m in logs)   # no 200 noise
+
+
+async def test_log_mw_logs_unhandled_exception_with_traceback(monkeypatch):
+    logs = []
+    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
+
+    class _Req:
+        method = "GET"
+        path = "/api/boom"
+
+    async def boom(_r):
+        raise ValueError("kaboom")
+    with pytest.raises(ValueError):
+        await appmod._log_mw(_Req(), boom)
+    assert any("500" in m and "Traceback" in m and "kaboom" in m for m in logs)
+
+
+# ── forced first-login password change (1.3.2) ────────────────────────────────
+async def test_admin_created_user_must_change_password(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("padm", "pa@x.io", auth.hash_password("padmpw12"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "padm", "password": "padmpw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users",
+                         data={"username": "fresh", "email": "f@x.io",
+                               "password": "freshpw1", "role": "viewer"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+    finally:
+        await c.close()
+    assert db.user_get("fresh")["must_change_pw"] is True
+
+
+async def test_must_change_user_is_gated_to_account(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("gate", "g@x.io", auth.hash_password("gatepw12"), "viewer",
+                   time.time(), must_change_pw=True)
+    c = await _client()
+    try:
+        r = await c.post("/login", data={"username": "gate", "password": "gatepw12"},
+                         allow_redirects=False)
+        assert r.status == 302 and "/account" in r.headers.get("Location", "")
+        r = await c.get("/gpu", allow_redirects=False)          # page -> /account
+        assert r.status == 302 and "/account" in r.headers.get("Location", "")
+        assert (await c.get("/api/nav")).status == 403          # api -> 403
+        me = await (await c.get("/api/me")).json()              # allowlisted
+        assert me["must_change"] is True
+        assert (await c.get("/account")).status == 200          # reachable
+    finally:
+        await c.close()
+
+
+async def test_changing_password_lifts_the_gate(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("lift", "l@x.io", auth.hash_password("liftpw12"), "viewer",
+                   time.time(), must_change_pw=True)
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "lift", "password": "liftpw12"})
+        csrf = (await (await c.get("/api/me")).json())["csrf"]
+        r = await c.post("/api/account/password",
+                         data={"current": "liftpw12", "new": "liftNEW123"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        assert (await c.get("/gpu")).status == 200              # gate lifted
+        assert db.user_get("lift")["must_change_pw"] is False
+        assert (await (await c.get("/api/me")).json())["must_change"] is False
+    finally:
+        await c.close()
+
+
+async def test_normal_user_not_gated(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("norm", "n@x.io", auth.hash_password("normpw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "norm", "password": "normpw12"})
+        assert (await c.get("/gpu")).status == 200
+        assert (await (await c.get("/api/me")).json())["must_change"] is False
+    finally:
+        await c.close()
+
+
+async def test_admin_reset_forces_password_change(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("radm", "r@x.io", auth.hash_password("radmpw12"), "admin", time.time())
+    db.user_create("victim", "v@x.io", auth.hash_password("victpw12"), "viewer", time.time())
+    assert db.user_get("victim")["must_change_pw"] is False
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "radm", "password": "radmpw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "victim", "action": "reset",
+                               "password": "temp1234"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+    finally:
+        await c.close()
+    assert db.user_get("victim")["must_change_pw"] is True
+
+
+# ── per-account login lockout (1.3.2) ─────────────────────────────────────────
+async def test_account_locks_after_max_failed_attempts(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 10_000)     # isolate the per-USER lock
+    monkeypatch.setattr(config, "AUTH_USER_MAX_FAILS", 10)
+    monkeypatch.setattr(config, "AUTH_USER_LOCKOUT_S", 300.0)
+    db.user_create("lockme", "lm@x.io", auth.hash_password("goodpw123"), "viewer", time.time())
+    appmod._user_fails.pop("lockme", None)
+    appmod._user_locked_until.pop("lockme", None)
+    c = await _client()
+    try:
+        for _ in range(config.AUTH_USER_MAX_FAILS):
+            r = await c.post("/login", data={"username": "lockme", "password": "WRONG"},
+                             allow_redirects=False)
+            assert r.status == 302
+        # account now locked — even the CORRECT password is refused with e=locked
+        r = await c.post("/login", data={"username": "lockme", "password": "goodpw123"},
+                         allow_redirects=False)
+        assert r.status == 302 and "e=locked" in r.headers.get("Location", "")
+        assert appmod._user_locked_until.get("lockme", 0) > time.time()
+    finally:
+        await c.close()
+
+
+async def test_account_lock_is_per_user_not_ip(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 10_000)     # no per-IP lock in this test
+    monkeypatch.setattr(config, "AUTH_USER_MAX_FAILS", 10)
+    db.user_create("victimA", "a@x.io", auth.hash_password("apw12345"), "viewer", time.time())
+    db.user_create("otherB", "b@x.io", auth.hash_password("bpw12345"), "viewer", time.time())
+    for n in ("victimA", "otherB"):
+        appmod._user_fails.pop(n, None)
+        appmod._user_locked_until.pop(n, None)
+    c = await _client()
+    try:
+        for _ in range(10):
+            await c.post("/login", data={"username": "victimA", "password": "WRONG"},
+                         allow_redirects=False)
+        r = await c.post("/login", data={"username": "victimA", "password": "apw12345"},
+                         allow_redirects=False)
+        assert "e=locked" in r.headers.get("Location", "")            # A locked
+        # same IP, different account is unaffected -> logs in (redirect to "/")
+        r = await c.post("/login", data={"username": "otherB", "password": "bpw12345"},
+                         allow_redirects=False)
+        loc = r.headers.get("Location", "")
+        assert r.status == 302 and "/login" not in loc and "e=locked" not in loc
+    finally:
+        await c.close()
+
+
+async def test_successful_login_resets_account_fail_counter(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 10_000)
+    monkeypatch.setattr(config, "AUTH_USER_MAX_FAILS", 10)
+    db.user_create("resetme", "r@x.io", auth.hash_password("okpw1234"), "viewer", time.time())
+    appmod._user_fails.pop("resetme", None)
+    appmod._user_locked_until.pop("resetme", None)
+    c = await _client()
+    try:
+        for _ in range(9):                                   # 9 < 10 -> not locked yet
+            await c.post("/login", data={"username": "resetme", "password": "WRONG"},
+                         allow_redirects=False)
+        r = await c.post("/login", data={"username": "resetme", "password": "okpw1234"},
+                         allow_redirects=False)
+        assert "e=locked" not in r.headers.get("Location", "")
+        assert "resetme" not in appmod._user_fails            # counter cleared on success
     finally:
         await c.close()
