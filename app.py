@@ -27,6 +27,7 @@ import db
 import auth
 import alerts
 import anomaly
+import metrics_prom
 from collectors import host, litellm, ollama, llamacpp, gpu, procs, containers
 
 _notifier = alerts.Notifier()
@@ -486,7 +487,7 @@ def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
 _PAGES = ("/", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
           "/admin/users", "/account")
 # Reachable without a session: the login page/handlers and public assets.
-_OPEN = ("/healthz", "/login", "/logout")
+_OPEN = ("/healthz", "/login", "/logout", "/metrics")
 # Admin-only surfaces (role must be 'admin' or the legacy master token).
 _ADMIN_PAGES = ("/admin/users",)
 _ADMIN_API_PREFIX = "/api/admin/"
@@ -1198,6 +1199,61 @@ async def healthz_handler(request: web.Request) -> web.Response:
     )
 
 
+def _metrics_authed(request: web.Request) -> bool:
+    """A valid session, the dashboard token, OR the dedicated scrape-only token."""
+    authed, _role, _sess = _auth_ctx(request)
+    if authed:
+        return True
+    mt = config.METRICS_TOKEN
+    if mt:
+        tok = _request_token(request)
+        if tok and hmac.compare_digest(tok, mt):
+            return True
+    return False
+
+
+def _lock_remaining(ip: str, now: float) -> float:
+    locked = _auth_locked_until.get(ip, 0.0)
+    return max(0.0, locked - now) if locked > now else 0.0
+
+
+def _record_strike(ip: str, now: float) -> None:
+    """Count a failed-auth attempt for ip; lock the IP out past the threshold."""
+    fails = _auth_fails[ip]
+    while fails and now - fails[0] > config.AUTH_WINDOW_S:
+        fails.popleft()
+    fails.append(now)
+    if len(fails) >= config.AUTH_MAX_FAILS:
+        _auth_locked_until[ip] = now + config.AUTH_LOCKOUT_S
+        _record_auth_attack(ip)
+        fails.clear()
+
+
+async def metrics_handler(request: web.Request) -> web.Response:
+    if not config.METRICS_ENABLED:
+        return web.Response(text="metrics disabled\n", status=404)
+    # L1: /metrics is in _OPEN (self-gated), so enforce the same brute-force lockout
+    # the API middleware applies — a presented-but-wrong token counts as a strike.
+    if _auth_enabled():
+        ip = _client_ip(request)
+        now = time.time()
+        if (rem := _lock_remaining(ip, now)) > 0:
+            return web.json_response({"error": "too many attempts"}, status=429,
+                                     headers={"Retry-After": str(int(rem))})
+        if not _metrics_authed(request):
+            if _request_token(request) or request.cookies.get(_USER_COOKIE):
+                _record_strike(ip, now)
+            return web.Response(text="unauthorized\n", status=401)
+        _auth_fails.pop(ip, None)
+        _auth_locked_until.pop(ip, None)
+    extra = {"users": db.user_count(), "sessions": auth.session_count(),
+             "alerts": len(_notifier.active_keys())}
+    body = metrics_prom.render(_latest, extra)
+    resp = web.Response(text=body)
+    resp.headers["Content-Type"] = metrics_prom.CONTENT_TYPE
+    return resp
+
+
 # --------------------------------------------------------------- lifecycle ----
 async def _on_startup(app: web.Application) -> None:
     session = app[_SESSION] = aiohttp.ClientSession()
@@ -1275,6 +1331,7 @@ def build_app() -> web.Application:
     app.router.add_post("/api/alerts/test", alerts_test_handler)
     app.router.add_get("/api/export", export_handler)
     app.router.add_get("/healthz", healthz_handler)
+    app.router.add_get("/metrics", metrics_handler)
     app.router.add_static("/assets/", path=str(_WEB / "assets"), show_index=False)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)

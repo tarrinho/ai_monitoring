@@ -1,0 +1,99 @@
+# AI-Monitoring Helm values.
+# Fleet model: run ONE chart release per cluster as a Deployment (central, scrapes
+# remote backends over the network) OR as a DaemonSet (one pod per node for per-node
+# host/GPU metrics). A central Prometheus scrapes every pod's /metrics (ServiceMonitor
+# below) and Grafana aggregates the whole fleet by the `instance`/`node` label.
+
+image:
+  repository: ghcr.io/tarrinho/ai_monitoring
+  tag: ""                 # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+
+# "deployment" = one central instance · "daemonset" = one per node (per-node host/GPU)
+mode: deployment
+replicaCount: 1           # only used when mode=deployment
+
+service:
+  type: ClusterIP
+  port: 9925
+
+# Non-sensitive config as plain env. Secrets (tokens/keys) go in `secret` below.
+env:
+  MONITOR_PORT: "9925"
+  MONITOR_METRICS_ENABLED: "1"
+  # point collectors at your backends (Services / external hosts):
+  # LITELLM_BASE_URL: "http://litellm.llm.svc:4000"
+  # OLLAMA_BASE_URL:  "http://ollama.llm.svc:11434"
+  # LLAMACPP_BASE_URL: "http://llamacpp.llm.svc:8080"
+
+# Secret values — set here (chart creates a Secret) or reference an existing one.
+secret:
+  create: true
+  existingSecret: ""      # if set, `create` is ignored and this Secret is used
+  data:
+    MONITOR_ADMIN_USER: "admin"
+    MONITOR_ADMIN_PASSWORD: ""      # REQUIRED (or set a token) — seeds the first admin
+    MONITOR_ADMIN_EMAIL: "admin@example.com"
+    MONITOR_METRICS_TOKEN: ""       # least-privilege token Prometheus scrapes with
+    # LITELLM_MASTER_KEY: "sk-..."
+
+# Prometheus Operator ServiceMonitor (scrapes /metrics). Needs the CRD installed.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  # extra labels so your Prometheus's serviceMonitorSelector picks it up:
+  labels: {}
+  # bearer token secret for scraping (use the same MONITOR_METRICS_TOKEN):
+  bearerTokenSecret:
+    name: ""              # defaults to the chart Secret when empty
+    key: MONITOR_METRICS_TOKEN
+
+persistence:
+  enabled: true           # PVC for /data (SQLite metrics + users + audit)
+  size: 1Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+# DaemonSet extras for per-node host + GPU visibility (mode=daemonset).
+daemonset:
+  hostPID: true           # see host processes (top-N by CPU/RAM), like compose pid:host
+  gpuMetricsFile: ""      # hostPath to the nvidia-smi CSV file (see deploy/gpu-metrics.service)
+  tolerations: []
+  nodeSelector: {}        # e.g. { nvidia.com/gpu.present: "true" }
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits:   { cpu: 500m, memory: 256Mi }
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# pod-level securityContext (restricted Pod Security Standard)
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# container-level securityContext (drop caps, no priv-esc, read-only rootfs +
+# writable /tmp + /data volumes)
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# optional NetworkPolicy — restrict ingress to the dashboard/metrics port. Off by
+# default so cross-namespace Prometheus scraping keeps working. When enabled, allow
+# your Prometheus namespace + the same namespace.
+networkPolicy:
+  enabled: false
+  prometheusNamespace: monitoring

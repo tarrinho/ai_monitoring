@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.2.2"
+VERSION = "AI-Monitoring_1.3.1"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -80,6 +80,16 @@ SESSION_TTL_S  = _float("MONITOR_SESSION_TTL_S", 7 * 24 * 3600.0)
 SESSION_MAX    = _int("MONITOR_SESSION_MAX", 2000)
 # How long the access/admin audit trail is kept (days; admins review it in the UI).
 AUDIT_RETENTION_DAYS = _int("MONITOR_AUDIT_RETENTION_DAYS", 90)
+
+# --- Prometheus / OpenMetrics export -----------------------------------------
+# GET /metrics exposes the latest snapshot in Prometheus text format so an existing
+# Prometheus / Grafana / Datadog / AlertManager stack can scrape it (and a central
+# Prometheus can aggregate a whole fleet of AI-Monitoring instances). It is gated
+# like the rest of the API: a valid session, the dashboard token, OR a dedicated
+# scrape-only token below. Set that so Prometheus gets a least-privilege credential
+# instead of the full dashboard token.
+METRICS_ENABLED = (_str("MONITOR_METRICS_ENABLED", "1") or "1").lower() in ("1", "true", "yes", "on")
+METRICS_TOKEN   = _str("MONITOR_METRICS_TOKEN")   # optional scrape-only bearer
 # Brute-force protection on the dashboard token: after AUTH_MAX_FAILS bad tokens
 # from one client IP within AUTH_WINDOW_S seconds, that IP is locked out (429)
 # for AUTH_LOCKOUT_S. Behind a reverse proxy, set AUTH_TRUSTED_PROXY=1 to read the

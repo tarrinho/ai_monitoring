@@ -1,0 +1,93 @@
+{
+  "title": "AI-Monitoring (fleet)",
+  "uid": "ai-monitoring",
+  "tags": ["ai-monitoring", "llm", "gpu"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(aimon_up, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "title": "Instances up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "expr": "count(aimon_up{instance=~\"$instance\"})", "refId": "A" } ]
+    },
+    {
+      "title": "Backends down",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [ { "expr": "count(aimon_backend_up{instance=~\"$instance\"} == 0) or vector(0)", "refId": "A" } ]
+    },
+    {
+      "title": "Active alerts",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "expr": "sum(aimon_alerts_active{instance=~\"$instance\"})", "refId": "A" } ]
+    },
+    {
+      "title": "LiteLLM spend rate ($/h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "expr": "sum(aimon_litellm_cost_rate_hourly{instance=~\"$instance\"})", "refId": "A" } ]
+    },
+    {
+      "title": "CPU % by instance",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100 } },
+      "targets": [ { "expr": "aimon_host_cpu_percent{instance=~\"$instance\"}", "legendFormat": "{{instance}}", "refId": "A" } ]
+    },
+    {
+      "title": "GPU utilisation % by instance/gpu",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100 } },
+      "targets": [ { "expr": "aimon_gpu_utilization_percent{instance=~\"$instance\"}", "legendFormat": "{{instance}} gpu{{gpu}} {{name}}", "refId": "A" } ]
+    },
+    {
+      "title": "VRAM used %",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100 } },
+      "targets": [ { "expr": "100 * aimon_gpu_vram_used_bytes{instance=~\"$instance\"} / aimon_gpu_vram_total_bytes{instance=~\"$instance\"}", "legendFormat": "{{instance}} gpu{{gpu}}", "refId": "A" } ]
+    },
+    {
+      "title": "llama.cpp tokens/s & LiteLLM req/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "aimon_llamacpp_tokens_per_second{instance=~\"$instance\"}", "legendFormat": "{{instance}} tok/s", "refId": "A" },
+        { "expr": "aimon_litellm_request_rate{instance=~\"$instance\"}", "legendFormat": "{{instance}} req/s", "refId": "B" }
+      ]
+    }
+  ]
+}

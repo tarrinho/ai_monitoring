@@ -1,0 +1,26 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ai-monitoring.fullname" . }}
+  labels:
+    {{- include "ai-monitoring.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ai-monitoring.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      {{- if .Values.serviceMonitor.bearerTokenSecret.key }}
+      authorization:
+        credentials:
+          name: {{ default (include "ai-monitoring.secretName" .) .Values.serviceMonitor.bearerTokenSecret.name }}
+          key: {{ .Values.serviceMonitor.bearerTokenSecret.key }}
+      {{- end }}
+{{- end }}

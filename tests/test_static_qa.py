@@ -134,23 +134,39 @@ def test_overview_charts_grouped_collapsible():
 
 
 def test_all_pages_have_alert_dot():
-    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
+    # live alert dot + unconfigured-backend nav filter on every authenticated page,
+    # incl. admin + account (parity with the dashboards)
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts",
+                 "admin", "account"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert "has-alert" in html and "_alertDot" in html, name
         assert "/api/alerts" in html, name           # polls active alerts
+        assert "/api/nav" in html, name              # hides unconfigured backends
+        # the alert-dot interval must be tracked + cleared (no leaked timer)
+        assert "_timers" in html and "beforeunload" in html, name
 
 
 def test_all_pages_have_collapsible_sidebar():
-    # lateral collapsible sidebar (AntiBot GW pattern) on every dashboard
-    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
+    # lateral collapsible sidebar (AntiBot GW pattern) on EVERY authenticated page —
+    # the dashboards AND the admin (/admin/users) + account pages. Only /login is
+    # exempt (pre-auth, no menu). The main content sits in #main-area beside it.
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts",
+                 "admin", "account"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert 'id="sidebar-nav"' in html, f"{name}: no sidebar"
         assert 'id="sidebar-toggle"' in html and 'id="sidebar-reopen"' in html, name
+        assert 'id="main-area"' in html, f"{name}: content not wrapped in #main-area"
         assert "sb-collapsed" in html and "aimon_sb" in html, name   # collapse + persist
         # all six sections reachable from the sidebar
         for href in ('href="/"', 'href="/litellm"', 'href="/gpu"',
                      'href="/ollama"', 'href="/llamacpp"', 'href="/alerts"'):
             assert href in html, f"{name}: sidebar missing {href}"
+
+
+def test_login_page_has_no_sidebar():
+    # /login is pre-auth: it must NOT show the nav menu (nothing to navigate to yet).
+    html = (ROOT / "web" / "login.html").read_text(encoding="utf-8")
+    assert 'id="sidebar-nav"' not in html
 
 
 def test_all_pages_have_theme_toggle():
@@ -219,7 +235,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.2.2"
+    assert config.VERSION == "AI-Monitoring_1.3.1"
 
 
 def test_ux_improvements_present():
@@ -690,8 +706,8 @@ def test_license_apache2_present_and_wired():
     """packaging: Apache-2.0 LICENSE exists and is referenced in the README. The
     publish allow-list check runs only where the publisher is checked out (dev tree
     on the Mac); the public repo intentionally excludes deploy/publish-github.sh —
-    it embeds the private git-personal SSH alias and lives in a separate private
-    scripts repo — so CI skips that assertion cleanly."""
+    it embeds a private SSH remote alias and lives in a separate private scripts
+    repo — so CI skips that assertion cleanly."""
     lic = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Apache License" in lic and "Version 2.0" in lic
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -865,10 +881,11 @@ def test_regression_no_internal_markers_in_published_files():
     allow = _publish_allow_list()
     if allow is None or _INTERNAL_MARKERS is None:
         return                       # public checkout: nothing to scan for / with
+    # NB: tests/ are NOT skipped here — a marker (a private SSH remote alias) once
+    # leaked via a test docstring, so published test files are scanned too. Fixture
+    # marker literals live in tests/_internal_markers.py, not in the ALLOW-list.
     skip_ext = (".png", ".svg", ".ico", ".js")
     for rel in allow:
-        if rel.startswith("tests/"):
-            continue
         p = ROOT / rel
         if not p.exists() or p.suffix.lower() in skip_ext:
             continue
@@ -932,3 +949,64 @@ def test_account_page_has_webhook_section():
     assert "/api/account/webhook" in html
     assert "innerHTML" not in html                       # DOM-API only
     assert not re.search(r'<[^>]+\son(click|submit|change)=', html)  # no inline handlers
+
+
+# ── Prometheus /metrics + Kubernetes/fleet (1.3.0) ────────────────────────────
+def test_prometheus_metrics_wired():
+    assert (ROOT / "metrics_prom.py").exists()
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert 'add_get("/metrics"' in src and "metrics_prom.render" in src
+    env = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "MONITOR_METRICS_ENABLED" in env and "MONITOR_METRICS_TOKEN" in env
+    # metric names are valid Prometheus identifiers, gauge families
+    mp = (ROOT / "metrics_prom.py").read_text(encoding="utf-8")
+    assert "aimon_up" in mp and "aimon_backend_up" in mp and "# TYPE" in mp
+
+
+def test_k8s_and_helm_and_grafana_shipped():
+    import json
+    for f in ("deploy/k8s/ai-monitoring.yaml", "deploy/k8s/daemonset.yaml",
+              "deploy/helm/ai-monitoring/Chart.yaml",
+              "deploy/helm/ai-monitoring/values.yaml",
+              "deploy/helm/ai-monitoring/templates/workload.yaml",
+              "deploy/grafana/ai-monitoring-dashboard.json"):
+        assert (ROOT / f).exists(), f"missing {f}"
+    k8s = (ROOT / "deploy" / "k8s" / "ai-monitoring.yaml").read_text(encoding="utf-8")
+    for kind in ("kind: Namespace", "kind: Deployment", "kind: Service",
+                 "kind: ServiceMonitor"):
+        assert kind in k8s, kind
+    assert "/metrics" in k8s and "MONITOR_METRICS_TOKEN" in k8s
+    # secrets in the shipped manifest are placeholders only
+    assert "CHANGE_ME" in k8s
+    dash = json.loads((ROOT / "deploy" / "grafana" / "ai-monitoring-dashboard.json").read_text(encoding="utf-8"))
+    assert dash["panels"] and any(
+        "aimon_" in str(t.get("expr", "")) for p in dash["panels"] for t in p.get("targets", []))
+
+
+def test_deploy_artifacts_in_publish_allow_list():
+    allow = _publish_allow_list()
+    if allow is None:
+        return
+    for f in ("deploy/k8s/ai-monitoring.yaml",
+              "deploy/helm/ai-monitoring/Chart.yaml",
+              "deploy/grafana/ai-monitoring-dashboard.json", "metrics_prom.py"):
+        assert f in allow, f"{f} not in publish ALLOW-list"
+
+
+def test_prometheus_example_stack_shipped():
+    base = ROOT / "deploy" / "prometheus-example"
+    for f in ("docker-compose.yml", "prometheus.yml", "README.md",
+              "grafana/provisioning/datasources/prometheus.yml",
+              "grafana/provisioning/dashboards/dashboards.yml"):
+        assert (base / f).exists(), f"missing prometheus-example/{f}"
+    compose = (base / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "prom/prometheus" in compose and "grafana/grafana" in compose
+    assert "MONITOR_METRICS_TOKEN" in compose
+    prom = (base / "prometheus.yml").read_text(encoding="utf-8")
+    assert "/metrics" in prom and "ai-monitoring:9925" in prom
+    # demo tokens are placeholders only
+    assert "CHANGE_ME" in compose and "CHANGE_ME" in prom
+    # shipped + publishable
+    allow = _publish_allow_list()
+    if allow is not None:
+        assert "deploy/prometheus-example/docker-compose.yml" in allow

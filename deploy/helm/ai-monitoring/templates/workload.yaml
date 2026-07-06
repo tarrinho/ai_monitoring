@@ -1,0 +1,109 @@
+{{- $isDaemon := eq .Values.mode "daemonset" -}}
+apiVersion: apps/v1
+kind: {{ if $isDaemon }}DaemonSet{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ include "ai-monitoring.fullname" . }}
+  labels:
+    {{- include "ai-monitoring.labels" . | nindent 4 }}
+spec:
+  {{- if not $isDaemon }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ai-monitoring.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ai-monitoring.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "ai-monitoring.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      {{- if and $isDaemon .Values.daemonset.hostPID }}
+      hostPID: true
+      {{- end }}
+      containers:
+        - name: ai-monitoring
+          image: {{ include "ai-monitoring.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- if and $isDaemon .Values.daemonset.gpuMetricsFile }}
+            - name: GPU_METRICS_FILE
+              value: /gpu/gpu.csv
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "ai-monitoring.secretName" . }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp        # writable /tmp under readOnlyRootFilesystem
+            {{- if and $isDaemon .Values.daemonset.gpuMetricsFile }}
+            - name: gpu-metrics
+              mountPath: /gpu
+              readOnly: true
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if and .Values.persistence.enabled (not $isDaemon) }}
+          persistentVolumeClaim:
+            claimName: {{ include "ai-monitoring.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}   # per-node/ephemeral (DaemonSet or no persistence)
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if and $isDaemon .Values.daemonset.gpuMetricsFile }}
+        - name: gpu-metrics
+          hostPath:
+            path: {{ .Values.daemonset.gpuMetricsFile | quote }}
+            type: Directory
+        {{- end }}
+      {{- if $isDaemon }}
+      {{- with .Values.daemonset.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.daemonset.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- else }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}

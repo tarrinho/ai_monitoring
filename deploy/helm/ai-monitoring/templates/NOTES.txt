@@ -1,0 +1,29 @@
+AI-Monitoring {{ .Chart.AppVersion }} deployed as a {{ .Values.mode }}.
+
+1. Dashboard (port-forward):
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ai-monitoring.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+   open http://localhost:{{ .Values.service.port }}/  (log in with MONITOR_ADMIN_USER / MONITOR_ADMIN_PASSWORD)
+
+2. Prometheus metrics:
+   http://{{ include "ai-monitoring.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/metrics
+   {{- if .Values.serviceMonitor.enabled }}
+   A ServiceMonitor was created — Prometheus Operator will scrape it (bearer: MONITOR_METRICS_TOKEN).
+   {{- else }}
+   Enable scraping with --set serviceMonitor.enabled=true (needs the Prometheus Operator CRD).
+   {{- end }}
+
+{{- if eq .Values.mode "daemonset" }}
+3. Fleet: one pod per node exports its host/GPU metrics. Aggregate in Grafana by the
+   `instance` / `node` label. Import deploy/grafana/ai-monitoring-dashboard.json.
+{{- else }}
+3. Central mode: point LITELLM_BASE_URL / OLLAMA_BASE_URL / LLAMACPP_BASE_URL at your
+   backend Services. For per-node host+GPU metrics, run with --set mode=daemonset.
+{{- end }}
+
+{{- if not .Values.secret.data.MONITOR_ADMIN_PASSWORD }}
+{{- if not .Values.secret.existingSecret }}
+
+WARNING: no MONITOR_ADMIN_PASSWORD or token set — the app refuses to boot open.
+Set secret.data.MONITOR_ADMIN_PASSWORD (or MONITOR_ALLOW_OPEN=1 for loopback only).
+{{- end }}
+{{- end }}

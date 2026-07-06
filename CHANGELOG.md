@@ -4,6 +4,61 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.3.1] — 2026-07-06
+
+### Security
+Hardening from a secure code review of the 1.3.0 additions (no Critical/High):
+- **M1 — `/metrics` can't be broken by a non-finite value.** `metrics_prom` now skips
+  `inf`/`nan` gauges — those render as invalid Prometheus floats (it wants +Inf/NaN)
+  and a single bad line makes Prometheus reject the WHOLE scrape, silently dropping
+  every metric for the instance. (Guard: `test_metrics_skips_non_finite_values`.)
+- **M2 — Kubernetes pods hardened to the restricted Pod Security Standard.** The
+  Deployment/DaemonSet + Helm chart now set `allowPrivilegeEscalation: false`,
+  `readOnlyRootFilesystem: true` (with writable `/data` + `/tmp` volumes),
+  `capabilities.drop: [ALL]`, and `seccompProfile: RuntimeDefault`; plus an optional
+  `NetworkPolicy` (Helm `networkPolicy.enabled`, and a commented template in the raw
+  manifests) to restrict who can reach the dashboard/metrics.
+- **L1 — `/metrics` now honours the brute-force lockout.** A presented-but-wrong
+  token on `/metrics` counts as a strike (was exempt because the path self-gates
+  outside the auth middleware); a locked-out IP gets 429. (Guard:
+  `test_metrics_endpoint_enforces_lockout`.)
+- **L2 — demo stack insecure toggles clearly flagged.** `deploy/prometheus-example`
+  now carries prominent "LOCAL DEMO ONLY — do not deploy as-is" warnings on the
+  `MONITOR_COOKIE_ALLOW_INSECURE`, Grafana `admin/admin`, and placeholder-secret lines.
+
+## [1.3.0] — 2026-07-06
+
+### Added
+- **Prometheus / OpenMetrics export.** `GET /metrics` exposes the latest snapshot as
+  `aimon_*` gauges (host CPU/mem/disk/load, per-GPU util/power/temp/VRAM, per-backend
+  `aimon_backend_up`, LiteLLM req/token/cost/latency, llama.cpp tokens-per-second /
+  KV-cache / slots, Ollama, per-container `aimon_container_up`, top-N process CPU,
+  user/session/alert counts). An existing **Prometheus / Grafana / Datadog /
+  AlertManager** stack can scrape it, and a central Prometheus can aggregate a whole
+  **fleet** of instances. Gated like the API (session / dashboard token / a dedicated
+  scrape-only `MONITOR_METRICS_TOKEN`); toggle with `MONITOR_METRICS_ENABLED`.
+- **Kubernetes / multi-node deployment.** A **Helm chart** (`deploy/helm/ai-monitoring`)
+  and plain manifests (`deploy/k8s/`) run AI-Monitoring centrally (Deployment) or
+  **one pod per node** (DaemonSet, `hostPID` + hostPath GPU CSV), with a
+  **ServiceMonitor** for Prometheus Operator and a ready-made **Grafana dashboard**
+  (`deploy/grafana/ai-monitoring-dashboard.json`) that aggregates the fleet by
+  `instance` — the standard per-node-agent + central-Prometheus fleet pattern.
+
+## [1.2.3] — 2026-07-05
+
+### Security
+- **Internal-identifier leak scrubbed + gate hardened.** A validation pass over the
+  public repo found two low-severity internal-identifier disclosures (no secrets):
+  a private SSH-remote alias named in a test docstring, and the corporate author
+  email (employer domain + employee id) baked into commit metadata by the publisher
+  falling back to the machine's `git config user.email`. Fixed: the docstring no
+  longer names the alias; the publisher now commits with a **fixed public identity**
+  (never the machine's git config — overridable via `GIT_NAME`/`GIT_EMAIL`); the
+  pre-publish gate's marker list now also blocks the alias + employee id; and the
+  leak-regression test scans `tests/` too (fixture literals stay in the unpublished
+  `tests/_internal_markers.py`). Note: HEAD is clean going forward — existing history
+  still carries the old author email until a history rewrite (see `validation/1.2.3.md`).
+
 ## [1.2.2] — 2026-07-05
 
 ### Added

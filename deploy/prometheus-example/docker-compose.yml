@@ -1,0 +1,58 @@
+# Demo stack: AI-Monitoring + Prometheus + Grafana, pre-wired.
+#
+# ⚠️  LOCAL DEMO ONLY — DO NOT DEPLOY AS-IS. It ships intentionally-insecure demo
+#    settings: placeholder passwords/tokens, Grafana admin/admin, and
+#    MONITOR_COOKIE_ALLOW_INSECURE=1 (plain-HTTP cookies). For anything reachable
+#    beyond localhost, use deploy/docker-compose.server.yml or the Helm chart, set
+#    strong secrets, put TLS in front, and remove the insecure toggles below.
+#
+# Start:  docker compose up -d   (from this directory)
+#   • AI-Monitoring dashboard : http://localhost:9925/  (login admin / CHANGE_ME_admin_pw)
+#   • Prometheus              : http://localhost:9090/
+#   • Grafana                 : http://localhost:3000/  (admin / admin — the AI-Monitoring
+#                               datasource + dashboard are auto-provisioned)
+services:
+  ai-monitoring:
+    # defaults to the published image; override with AIMON_IMAGE to test a local build
+    image: ${AIMON_IMAGE:-ghcr.io/tarrinho/ai_monitoring:1.3.1}
+    container_name: aimon-demo
+    restart: unless-stopped
+    environment:
+      MONITOR_ADMIN_USER: admin
+      MONITOR_ADMIN_PASSWORD: CHANGE_ME_admin_pw     # ≥8 chars; change for real use
+      MONITOR_ADMIN_EMAIL: admin@example.com
+      MONITOR_METRICS_ENABLED: "1"
+      # least-privilege scrape token — MUST match prometheus.yml credentials
+      MONITOR_METRICS_TOKEN: CHANGE_ME_scrape_token
+      MONITOR_COOKIE_ALLOW_INSECURE: "1"             # ⚠️ INSECURE — plain-HTTP localhost demo ONLY; remove behind TLS
+    ports:
+      - "9925:9925"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aimon-demo-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - ai-monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aimon-demo-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin            # ⚠️ demo only — change for real use
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # the shipped dashboard, mounted where the provisioning provider looks
+      - ../grafana/ai-monitoring-dashboard.json:/var/lib/grafana/dashboards/ai-monitoring.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

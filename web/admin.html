@@ -11,7 +11,7 @@
   html[data-theme="light"]{--bg:#f6f8fa;--panel:#fff;--panel2:#eaeef2;--line:#d0d7de;
     --fg:#1f2328;--muted:#59636e;--accent:#0969da;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e}
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
     font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
   header{display:flex;align-items:center;gap:12px;padding:14px 20px;
     background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
@@ -42,15 +42,62 @@
   .msg{margin-top:10px;font-size:13px;min-height:18px}
   .msg.bad{color:var(--bad)} .msg.ok{color:var(--ok)}
   .muted{color:var(--muted)}
+  /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:600px){
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
 </style>
 </head>
 <body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.3.1</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/gpu">GPU</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
   <header>
     <h1>User management</h1>
     <div class="sp">
       <span class="muted" id="whoami"></span>
-      <a href="/">← Dashboards</a>
-      <a href="/logout">Logout</a>
       <button class="ghost" id="theme-btn" type="button" title="Toggle theme">🌙</button>
     </div>
   </header>
@@ -92,6 +139,7 @@
       <div class="msg" id="audit-msg"></div>
     </section>
   </main>
+</div>
 <script>
 (function(){
   var t=localStorage.getItem("aimon-theme")||"dark";
@@ -186,6 +234,36 @@
   });
   load();
   loadAudit();
+})();
+</script>
+<script>
+/* collapsible lateral sidebar + nav-filter + alert-dot — parity with dashboards */
+(function(){var KEY="aimon_sb";var _timers=[];
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  window.addEventListener("beforeunload",function(){_timers.forEach(clearInterval);});
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if(a.getAttribute("href")===p)a.classList.add("active");});
+    /* hide nav links for unconfigured backends (same as the dashboards) */
+    fetch("/api/nav").then(function(r){return r.ok?r.json():null;}).then(function(n){
+      if(!n)return;
+      [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+        if(!x[1])document.querySelectorAll('#sidebar-nav a[href="/'+x[0]+'"]').forEach(function(a){a.style.display="none";});
+      });
+    }).catch(function(){});
+    /* live alert dot on the Alerts link */
+    function _alertDot(){fetch("/api/alerts").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      if(!d)return;var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+      if(a)a.classList.toggle("has-alert",(d.active||[]).length>0);
+    }).catch(function(){});}
+    _alertDot();_timers.push(setInterval(_alertDot,10000));
+  });
 })();
 </script>
 </body>

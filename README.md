@@ -229,6 +229,51 @@ multi-year (e.g. `ROLLUP_HOUR_DAYS=730`).
 
 ## Deployment
 
+### Prometheus metrics & Grafana
+
+`GET /metrics` exposes `aimon_*` gauges in Prometheus text format (host CPU/mem/disk,
+per-GPU util/power/temp/VRAM, `aimon_backend_up`, LiteLLM req/token/cost/latency,
+llama.cpp tokens/s + KV-cache, per-container up, top-N process CPU, user/session/alert
+counts). Point any Prometheus/Grafana/Datadog/AlertManager at it:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: ai-monitoring
+    authorization: { credentials: "<MONITOR_METRICS_TOKEN>" }
+    static_configs: [{ targets: ["ai-monitoring:9925"] }]
+```
+
+`/metrics` is gated like the API — a session, the dashboard token, or a dedicated
+scrape-only `MONITOR_METRICS_TOKEN` (recommended; least privilege). Disable with
+`MONITOR_METRICS_ENABLED=0`. A ready-made dashboard ships at
+`deploy/grafana/ai-monitoring-dashboard.json`.
+
+![Grafana fleet dashboard](docs/img/grafana-fleet.png)
+<sub>The shipped Grafana dashboard aggregating a fleet via `/metrics` — Prometheus scrapes each instance.</sub>
+
+### Kubernetes / multi-node fleet
+
+Run it centrally or **one pod per node** and let a central Prometheus aggregate the
+whole fleet (per-node agent + central Prometheus/Grafana — the same pattern DCGM uses).
+
+```bash
+# Helm (central Deployment)
+helm install aimon deploy/helm/ai-monitoring \
+  --set secret.data.MONITOR_ADMIN_PASSWORD=<pw> --set serviceMonitor.enabled=true
+# Helm (per-node DaemonSet, host + GPU metrics)
+helm install aimon deploy/helm/ai-monitoring --set mode=daemonset \
+  --set daemonset.gpuMetricsFile=/var/lib/aimon-gpu --set serviceMonitor.enabled=true
+# or plain manifests
+kubectl apply -f deploy/k8s/ai-monitoring.yaml    # central; add daemonset.yaml for per-node
+```
+
+The chart creates a Service, PVC (Deployment) or emptyDir (DaemonSet), a Secret, and
+an optional **ServiceMonitor** (Prometheus Operator) that scrapes `/metrics` with the
+metrics token. Import the Grafana dashboard and select the `instance` variable.
+
+A ready-to-run demo stack (AI-Monitoring + Prometheus + Grafana, auto-provisioned) is in `deploy/prometheus-example/` — `cd` there and `docker compose up -d`.
+
 ### Docker Compose (default)
 ```bash
 docker compose up -d          # builds locally, runs the QA gate, serves :9925

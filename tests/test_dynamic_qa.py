@@ -3493,3 +3493,102 @@ async def test_sec_webhook_recipients_capped(monkeypatch):
                                  for i in range(10)])
     out = await alerts.Notifier()._recipients()
     assert len(out) == 3                                    # capped at MAX_RECIPIENTS
+
+
+# ── Prometheus /metrics export (1.3.0) ────────────────────────────────────────
+def test_metrics_prom_render_format():
+    import metrics_prom
+    snap = {"ts": 1000, "collectors": {
+        "host": {"available": True, "cpu_pct": 42.0, "mem_pct": 50.0, "load": [1.0], "ncpu": 8},
+        "gpu": {"available": True, "gpus": [{"name": "GB10", "util": 80.0, "vram_used": 5, "vram_total": 10}]},
+        "litellm": {"available": False}, "ollama": {"available": False},
+        "llamacpp": {"available": False},
+        "containers": {"available": True, "containers": [{"name": "x", "running": True}]}}}
+    out = metrics_prom.render(snap, {"users": 2, "sessions": 1, "alerts": 0})
+    assert "# TYPE aimon_up gauge" in out and "\naimon_up 1\n" in out
+    assert 'aimon_backend_up{backend="gpu"} 1' in out
+    assert 'aimon_backend_up{backend="litellm"} 0' in out
+    assert 'aimon_gpu_utilization_percent{gpu="0",name="GB10"} 80' in out
+    assert 'aimon_container_up{name="x"} 1' in out
+    assert "aimon_users_total 2" in out
+    # each metric family declares TYPE exactly once (grouped)
+    assert out.count("# TYPE aimon_backend_up gauge") == 1
+    # no None/blank values leak
+    assert "None" not in out
+
+
+async def test_metrics_endpoint_auth_and_content(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "metricstok123456")
+    c = await _client()
+    try:
+        # gated: no credential -> 401 (not a login redirect)
+        r = await c.get("/metrics", allow_redirects=False)
+        assert r.status == 401
+        # dashboard token works
+        r = await c.get("/metrics?token=metricstok123456")
+        assert r.status == 200
+        assert "text/plain" in r.headers["Content-Type"]
+        assert "aimon_up 1" in await r.text()
+    finally:
+        await c.close()
+
+
+async def test_metrics_dedicated_scrape_token(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "dashtok1234567890")
+    monkeypatch.setattr(config, "METRICS_TOKEN", "scrapetok123456")
+    c = await _client()
+    try:
+        # scrape token is accepted (least-privilege) …
+        assert (await c.get("/metrics?token=scrapetok123456")).status == 200
+        assert (await c.get("/metrics", headers={"Authorization": "Bearer scrapetok123456"})).status == 200
+        # … a wrong token is not
+        assert (await c.get("/metrics?token=nope")).status == 401
+    finally:
+        await c.close()
+
+
+async def test_metrics_open_when_auth_disabled(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    c = await _client()
+    try:
+        assert (await c.get("/metrics")).status == 200
+    finally:
+        await c.close()
+
+
+async def test_metrics_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(config, "METRICS_ENABLED", False)
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    c = await _client()
+    try:
+        assert (await c.get("/metrics")).status == 404
+    finally:
+        await c.close()
+
+
+# ── metrics hardening fixes (1.3.1) ───────────────────────────────────────────
+def test_metrics_skips_non_finite_values():
+    import metrics_prom
+    snap = {"ts": 1, "collectors": {"litellm": {"available": True,
+            "req_rate": float("inf"), "error_pct": float("nan"), "cost_rate_hr": 1.5}}}
+    out = metrics_prom.render(snap)
+    # inf/nan lines would break the whole Prometheus scrape — must be dropped
+    assert " inf" not in out and " nan" not in out and "Inf" not in out and "NaN" not in out
+    assert "aimon_litellm_cost_rate_hourly 1.5" in out       # finite value still emitted
+
+
+async def test_metrics_endpoint_enforces_lockout(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "realmetricstoken1")
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 3)
+    c = await _client()
+    try:
+        # presented-but-wrong token counts as a brute-force strike
+        for _ in range(3):
+            assert (await c.get("/metrics?token=wrong")).status == 401
+        # now the IP is locked out even for the correct token
+        r = await c.get("/metrics?token=realmetricstoken1")
+        assert r.status == 429
+    finally:
+        await c.close()
