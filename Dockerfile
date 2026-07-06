@@ -7,7 +7,7 @@
 # marker, so a regression fails `docker build`. For emulated cross-arch builds
 # (armv7 under QEMU) pass --build-arg RUN_TESTS=0 to skip the slow emulated
 # suite — the tests already ran on the native arch.
-FROM python:3.12-alpine AS base
+FROM python:3.14-alpine AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
