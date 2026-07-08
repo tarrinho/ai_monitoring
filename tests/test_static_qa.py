@@ -95,9 +95,11 @@ def test_dashboard_timers_tracked_and_cleared():
 
 def test_window_selector_and_series_wiring():
     html = WEB.read_text(encoding="utf-8")
-    for w in ("15m", "1h", "24h", "30d"):
+    for w in ("15m", "1h", "24h", "30d", "12mo"):
         assert f'data-w="{w}"' in html, f"missing window button {w}"
     assert "/api/series" in html and "loadSeries" in html
+    # long windows must render calendar dates on the axis, not time-of-day only
+    assert "toLocaleDateString" in html, "fmtT not window-aware for 30d/12mo axis"
 
 
 def test_per_characteristic_charts_defined():
@@ -207,6 +209,12 @@ def test_dashboard_uptime_and_export_wired():
     html = WEB.read_text(encoding="utf-8")
     assert 'id="card-uptime"' in html and "loadUptime" in html
     assert 'id="export-btn"' in html and "/api/export" in html
+    # with no backend history for the window, hide the whole card rather than
+    # leave an empty "no backend history yet" tile
+    body = html[html.find("async function loadUptime"):]
+    body = body[:body.find("function rangedReload")]
+    assert 'getElementById("card-uptime")' in body
+    assert 'card.style.display = "none"' in body
 
 
 def test_overview_top_apps_and_evolution():
@@ -256,7 +264,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.3.3"
+    assert config.VERSION == "AI-Monitoring_1.4.0"
 
 
 def test_ux_improvements_present():
@@ -637,7 +645,7 @@ def test_dockerfile_copies_every_top_level_module():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Extra QA — 1.3.3 dependency / CI toolchain bumps (Dependabot #1/#2/#4)
+# Extra QA — 1.4.0 dependency / CI toolchain bumps (Dependabot #1/#2/#4)
 # ══════════════════════════════════════════════════════════════════════════════
 def test_trivyignore_accepts_hostpid_with_reason():
     # The CI Trivy filesystem scan flags AVD-KSV-0010 (DaemonSet hostPID:true).
@@ -713,6 +721,47 @@ def test_overview_ram_pressure_banner_wired():
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="ram-banner"' in html
     assert "h.mem_pct>=90" in html       # banner shows only under memory pressure
+
+
+def test_overview_leads_with_llm_cost_usage_summary():
+    # Repositioning (1.4.0): a "LLM usage & cost" hero strip is the FIRST card in
+    # <main>, above the infra grid, so spend/tokens/keys are seen first. It binds
+    # to the LiteLLM snapshot and hides when no LiteLLM backend is configured.
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="card-llm-summary"' in html and 'id="llm-summary-kpis"' in html
+    assert "function renderLlmSummary(" in html
+    assert "renderLlmSummary(c.litellm)" in html          # wired into the render loop
+    # it must sit ABOVE the host/infra grid (leads the page)
+    assert html.index('id="card-llm-summary"') < html.index('id="card-host"')
+    # surfaces the cost/usage numbers, gated on backend being configured
+    for tile in ("Spend (window)", "Cost rate", "Tokens", "Requests", "Active keys"):
+        assert tile in html, f"summary missing {tile} tile"
+    assert 'showCard("card-llm-summary", isConfigured(l))' in html
+    # no raw innerHTML sink introduced — uses the sanitized setHtml helper
+    assert "renderLlmSummary" in html and "setHtml(box," in html
+
+
+def test_readme_leads_with_llm_usage_and_states_scope():
+    # Repositioning (1.4.0): the README must lead with the LLM usage/cost value
+    # prop (not read as "just system monitoring") and set scope so nobody expects
+    # SaaS subscription-quota tracking.
+    head = "".join((ROOT / "README.md").read_text(encoding="utf-8").splitlines(keepends=True)[:45]).lower()
+    assert "usage" in head and "cost" in head and "spend" in head, \
+        "README intro must lead with LLM usage/cost/spend"
+    assert "what it is" in head and "isn't" in head, \
+        "README must carry a 'What it is / isn't' scope note"
+    assert "subscription" in head, "scope note must address the subscription-billing expectation"
+
+
+def test_demo_seed_theme_shim_forwards_kwargs():
+    # Regression: the demo server's _serve_page wrapper dropped the user/role
+    # kwargs the app now passes, 500-ing every seeded page. It must accept and
+    # forward **kw to the original _serve_page.
+    src = (ROOT / "scripts" / "demo_seed.py").read_text(encoding="utf-8")
+    assert "def _serve_with_theme(path, prefix=\"\", **kw):" in src, \
+        "theme shim must accept **kw (else user/role kwargs 500 the page)"
+    assert "_orig_serve(path, prefix, **kw)" in src, \
+        "theme shim must forward **kw to the real _serve_page"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

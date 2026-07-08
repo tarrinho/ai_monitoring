@@ -4,7 +4,46 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-07-08
+
+### Added
+- **Overview leads with an “LLM usage & cost” summary.** A new hero strip at the
+  top of the Overview — above the host/GPU/container panels — surfaces the numbers
+  the tool is really about: **spend (window)**, **cost rate ($/h)**, **tokens**
+  (today's total, or in+out throughput), **requests** (+ per-second rate), and
+  **active API keys**. It binds to the existing LiteLLM snapshot, degrades tile by
+  tile across lite/full spend modes (each falls back to `—`), links to the full
+  LiteLLM dashboard, and hides entirely when no LiteLLM backend is configured
+  (pure-infra deployments look unchanged). Rendered through the sanitized `setHtml`
+  sink — no new `innerHTML`. This repositions the dashboard as LLM-usage
+  observability first, system monitoring second.
+
+### Docs
+- **README repositioned.** Tagline now leads with *LLM usage, cost, and
+  infrastructure observability*; added a **“What it is / isn’t”** note clarifying
+  it tracks self-hosted LLM spend/tokens/keys (via LiteLLM) — not third-party SaaS
+  subscription billing — and that per-key **budgets** are on the roadmap.
+
+### Fixed
+- **`scripts/demo_seed.py` 500 on every page.** Its theme-shim wrapper still used
+  the old `_serve_page` signature and didn't forward the `user`/`role` kwargs the
+  app now passes, so the seeded demo server returned 500. The wrapper now forwards
+  `**kw`.
+
 ## [1.3.3] — 2026-07-08
+
+### Added
+- **12-month (`12mo`) time window on every graph.** All windowed dashboards
+  (host, GPU, llama.cpp, LiteLLM) gain a **12mo** button alongside 15m/1h/24h/30d.
+  It reads the 1-hour rollup tier (365-day retention) and is downsampled to ~300
+  buckets (~29 h each), so a year of history renders without touching raw rows.
+  Server accepts `window=12mo` on every series endpoint via `db.WINDOWS`.
+
+### Fixed
+- **30d/12mo x-axis showed no dates.** The chart label formatter emitted
+  time-of-day only (`HH:MM`), so long windows were an unreadable run of repeating
+  times. `fmtT` is now window-aware: **30d** labels show a calendar date
+  (`Jul 8`), **12mo** show month + year (`Jul '26`); shorter windows keep `HH:MM`.
 
 ### Changed
 - **Dependency + toolchain bumps (Dependabot).** Test toolchain moved to

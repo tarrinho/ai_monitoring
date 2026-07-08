@@ -15,14 +15,26 @@
 [![trivy-fs](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/trivy-fs.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 [![build-scan](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/build-scan.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 
-Single-binary observability for a self-hosted LLM stack — **LiteLLM**, **Ollama**,
-**llama.cpp**, **GPU**, and **host** — in one aiohttp app. Collectors poll each
-backend's **native JSON** endpoints (no Prometheus, no exporters, no agents),
-store to SQLite with tiered rollups, and serve six live dashboards.
+**LLM usage, cost, and infrastructure observability for a self-hosted LLM stack.**
+Track **spend, token throughput, and per-API-key usage** through **LiteLLM**,
+alongside the **GPU / host / Ollama / llama.cpp / container** health that inference
+actually runs on — all in one aiohttp app. Collectors poll each backend's **native
+JSON** endpoints (no Prometheus, no exporters, no agents), store to SQLite with
+tiered rollups, and serve live dashboards that **lead with the cost & usage
+numbers**, not just system metrics.
+
+> **What it is / isn't.** AI-Monitoring observes a **self-hosted** LLM stack: LLM
+> **spend / tokens / per-key usage** (from LiteLLM's own accounting, at your
+> configured per-token model costs) *plus* the infra that serves it. It is **not**
+> a third-party **SaaS subscription-billing** tracker — it does not read
+> OpenAI/Anthropic plan quotas unless you route those providers *through* LiteLLM,
+> in which case their spend shows up like any other key. Per-key **budgets** are on
+> the roadmap.
 
 <p align="center">
   <img src="docs/img/dash-ov-dark.png" alt="Overview dashboard" width="100%">
-  <br><em>Overview — host, GPU, containers, top apps, and every metric as live time-series.</em>
+  <br><em>Overview — LLM spend, tokens, and per-key usage up top, then GPU / host /
+  containers / top apps, every metric as live time-series.</em>
 </p>
 
 - **Zero external deps to monitor** — reads `/proc`, Ollama `/api/*`, LiteLLM
@@ -65,7 +77,7 @@ standalone, and the LLM/GPU dashboard links hide until their backend is set.
 | `/llamacpp` | tokens/s, active/total slots, busy %, KV-cache %, context size, status, loaded-model card, over-time charts |
 | `/alerts` | configured channel, thresholds, active breaches, **"Send test alert"**, fired-alert history |
 
-Common controls on every windowed page: **15m / 1h / 24h / 30d** buttons, **◀ ▶
+Common controls on every windowed page: **15m / 1h / 24h / 30d / 12mo** buttons, **◀ ▶
 pan** through history, **🌙/☀️ day-night** (persisted), **collapsible sidebar**,
 **⬇ CSV** export. A pulsing red dot on the sidebar **Alerts** item appears from
 any page when an alert is firing.

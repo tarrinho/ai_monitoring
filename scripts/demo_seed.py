@@ -157,8 +157,10 @@ async def _fake_sample(session):
 _orig_serve = A._serve_page
 
 
-def _serve_with_theme(path, prefix=""):
-    resp = _orig_serve(path, prefix)
+def _serve_with_theme(path, prefix="", **kw):
+    # forward user/role (and any future kwargs) to the real _serve_page so the
+    # sidebar user/admin links render — the app now stamps those in server-side.
+    resp = _orig_serve(path, prefix, **kw)
     html = resp.text
     if html:
         shim = ("<script>(function(){var p=new URLSearchParams(location.search)"

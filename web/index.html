@@ -190,7 +190,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.3</div>
+      <div id="sidebar-brand-ver">v1.4.0</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -214,6 +214,7 @@
     <button data-w="1h" class="active">1h</button>
     <button data-w="24h">24h</button>
     <button data-w="30d">30d</button>
+    <button data-w="12mo">12mo</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
@@ -225,6 +226,15 @@
 </header>
 <main>
   <div id="status-strip" class="strip"><span class="mut">connecting…</span></div>
+  <!-- LLM usage & cost — the headline this tool is about; leads the page so the
+       spend/token/key story is the first thing seen, above the infra panels.
+       Hidden when no LiteLLM backend is configured (pure-infra deployments). -->
+  <section class="card" id="card-llm-summary" style="display:none">
+    <h2>LLM usage &amp; cost <span id="llm-summary-badge" class="badge"></span>
+      <span class="mut" style="font-weight:normal;font-size:12px;margin-left:6px">rolling window · via LiteLLM</span>
+      <a href="/litellm" class="mut" style="font-weight:normal;font-size:12px;margin-left:8px">details →</a></h2>
+    <div class="kpis" id="llm-summary-kpis"></div>
+  </section>
   <div id="ram-banner" class="ram-banner"></div>
   <div class="grid">
   <section class="card" id="card-host">
@@ -338,6 +348,11 @@ const HELP={
   "Load 1m":"1-minute load average (runnable + uninterruptible tasks)","CPUs":"Logical core count",
   "GPU util":"GPU compute utilisation","VRAM used":"GPU memory in use / total",
   "Power":"GPU power draw","Temp":"Hottest GPU sensor","Throttled":"GPU clock-throttling (thermal/power)","GPUs":"Number of GPUs",
+  "Spend (window)":"LiteLLM spend over the rolling window (cost of all requests)",
+  "Cost rate":"Projected spend per hour at the current rate",
+  "Tokens":"Tokens processed — today's total, or in+out throughput per second",
+  "Requests":"Requests in the rolling window (· per-second rate when available)",
+  "Active keys":"Distinct API keys with spend in the window (top 10 tracked)",
   "Backlog":"LiteLLM in-flight requests waiting to dispatch",
   "Wait avg":"Avg LLM response time (from spend logs)","Wait max":"Slowest response in the window",
   "Reqs (win)":"Requests in the rolling window",
@@ -461,7 +476,12 @@ function mkChart(canvas, cfg){
 })();
 
 function fmtT(t){
-  return t ? new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "";
+  if(!t) return "";
+  const d=new Date(t*1000);
+  // long windows show a calendar date so 30d/12mo axes are legible
+  if(WIN==="12mo") return d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2);
+  if(WIN==="30d")  return d.toLocaleDateString([],{month:"short",day:"numeric"});
+  return d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
 }
 function fmtCur(cfg, v){
   if(v==null) return "—";
@@ -692,6 +712,39 @@ function renderGpu(g){
       +`<th class="num">temp</th></tr>${rows}</table>`);
   } else setHtml(document.getElementById("gpu-list"),"");   // single/no GPU: name is in the header now
 }
+// Headline "LLM usage & cost" strip at the top of the overview. Surfaces the
+// spend / token / request / key numbers that were previously only reachable on
+// the LiteLLM page, so the tool reads as LLM-usage observability first. Resilient
+// to lite vs full spend mode (fields differ) — every tile degrades to "—".
+function renderLlmSummary(l){
+  showCard("card-llm-summary", isConfigured(l));
+  if(!isConfigured(l)) return;
+  const b=document.getElementById("llm-summary-badge");
+  const box=document.getElementById("llm-summary-kpis");
+  if(!l||!l.available){ badge(b,false);
+    setHtml(box, `<div class="unavail">${escapeHtml(errText(l&&l.error))}</div>`); return; }
+  badge(b,true,"live");
+  const num=n=>{ try{ return Number(n).toLocaleString(); }catch(e){ return String(n); } };
+  // spend over the window: cost_window (full mode) or sum of top-key spend (lite)
+  let spend="—";
+  if(l.cost_window!=null) spend="$"+l.cost_window;
+  else if(l.top_keys&&l.top_keys.length)
+    spend="$"+l.top_keys.reduce((s,k)=>s+(k.cost||0),0).toFixed(4);
+  const rate = l.cost_rate_hr!=null ? "$"+l.cost_rate_hr+"/h" : "—";
+  // tokens: today's total (lite) or in+out throughput per second (full)
+  let toks="—";
+  if(l.tokens_today!=null) toks=num(l.tokens_today);
+  else if(l.tok_in_rate!=null) toks=Math.round(l.tok_in_rate+(l.tok_out_rate||0))+" tok/s";
+  const reqs=(l.requests_window!=null?l.requests_window:0)
+    +(l.req_rate!=null?" · "+l.req_rate+"/s":"");
+  const keys=(l.top_keys&&l.top_keys.length!=null)?l.top_keys.length:"—";
+  setHtml(box,
+      kpi("Spend (window)", spend)
+    + kpi("Cost rate", rate)
+    + kpi("Tokens", toks)
+    + kpi("Requests", reqs)
+    + kpi("Active keys", keys));
+}
 function renderLitellm(l){
   showCard("card-litellm", isConfigured(l));
   if(!isConfigured(l)) return;
@@ -764,7 +817,7 @@ function renderLlamacpp(c){
 // ---- poll ------------------------------------------------------------------
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
-const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
+const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
 let WIN = "1h";
 
 async function api(path){
@@ -839,8 +892,13 @@ function _syncGroupCounts(){
 async function loadUptime(){
   const d = await api("/api/uptime?window="+WIN);
   const body = document.getElementById("uptime-body");
+  const card = document.getElementById("card-uptime");
+  // Hide the whole card when there's no backend history for this window
+  // (self-healing: it reappears as soon as the window has uptime data).
   if(!d || !d.uptime || !Object.keys(d.uptime).length){
+    if(card) card.style.display = "none";
     setHtml(body, `<div class="unavail">no backend history yet</div>`); return; }
+  if(card) card.style.display = "";
   let rows = Object.entries(d.uptime).map(([b,u])=>{
     const cls = u.uptime_pct>=99?"":u.uptime_pct>=95?"warn":"bad";
     return `<tr><td>${escapeHtml(b)}</td>`
@@ -926,7 +984,7 @@ function applySnapshot(d){
   document.getElementById("ver").textContent = _ver||"";
   const snap = d.latest||{}; const c = snap.collectors||{};
   renderStrip(c);
-  renderHost(c.host); renderGpu(c.gpu); renderLitellm(c.litellm);
+  renderHost(c.host); renderGpu(c.gpu); renderLlmSummary(c.litellm); renderLitellm(c.litellm);
   renderHostDetail(c.host, c.gpu);
   renderOllama(c.ollama); renderLlamacpp(c.llamacpp); renderProcs(c.procs, c.host);
   renderContainers(c.containers);

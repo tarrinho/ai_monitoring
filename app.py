@@ -718,7 +718,11 @@ def _fwd_prefix(request: web.Request) -> str:
 # links/fetches, never bare "/" inside data. Order-independent, single pass each.
 def _apply_prefix(html: str, p: str) -> str:
     for marker in (' href="/', ' src="/', 'fetch("/', 'api("/',
-                   '.open("/', 'a[href="/'):
+                   '.open("/', 'a[href="/',
+                   # form POST target (login) and JS root redirects (account) —
+                   # without these the login form / post-change nav escape the
+                   # sub-path and hit the proxy root instead of the app.
+                   ' action="/', 'location.href="/'):
         html = html.replace(marker, marker[:-1] + p + "/")
     return html
 
@@ -762,11 +766,17 @@ def _sidebar_extra(user: str | None, role: str | None, prefix: str) -> str:
 
 
 def _serve_page(path: Path, prefix: str = "", user: str | None = None,
-                role: str | None = None) -> web.Response:
+                role: str | None = None, show_alerts: bool = True) -> web.Response:
     try:
         html = path.read_text(encoding="utf-8")
     except Exception:
         return web.Response(text="dashboard missing", status=500)
+    # Token/PAT access has no user identity to own alert config, so drop the
+    # sidebar Alerts link for it (the JS alert-dot selector is left intact — it
+    # no-ops when the anchor is gone). Done before _apply_prefix so it matches
+    # the raw href regardless of any sub-path prefix.
+    if not show_alerts:
+        html = html.replace('<a href="/alerts">Alerts</a>', "")
     if prefix:
         html = _apply_prefix(html, prefix)
     extra = _sidebar_extra(user, role, prefix)
@@ -786,9 +796,12 @@ def _page(request: web.Request, path: Path, dest: str) -> web.Response:
     """Serve a dashboard page: move ?token= into a cookie, then render with the
     current user's sidebar links (Users/logout) stamped in server-side."""
     _maybe_cookie_redirect(request, dest)
-    _, role, sess = _auth_ctx(request)
+    authed, role, sess = _auth_ctx(request)
     user = sess["user"] if sess else None
-    return _serve_page(path, _fwd_prefix(request), user=user, role=role)
+    # token / PAT access is authenticated but has no user session → hide Alerts
+    token_auth = authed and sess is None
+    return _serve_page(path, _fwd_prefix(request), user=user, role=role,
+                       show_alerts=not token_auth)
 
 
 async def index_handler(request: web.Request) -> web.Response:

@@ -162,7 +162,8 @@ _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
 _METRIC_TABLES = ["metrics", "metrics_1m", "metrics_1h"]
 
 # Named windows -> seconds.
-WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "30d": 2592000}
+WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "30d": 2592000,
+           "12mo": 31536000}
 
 
 @contextmanager

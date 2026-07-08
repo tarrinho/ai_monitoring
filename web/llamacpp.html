@@ -139,7 +139,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.3</div>
+      <div id="sidebar-brand-ver">v1.4.0</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -163,6 +163,7 @@
     <button data-w="1h">1h</button>
     <button data-w="24h" class="active">24h</button>
     <button data-w="30d">30d</button>
+    <button data-w="12mo">12mo</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
@@ -240,13 +241,13 @@ function mkChart(canvas, cfg){
     _charts[cfg.id]=mkChart(cv,cfg);
   }
 })();
-function fmtT(t){ return t?new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""; }
+function fmtT(t){ if(!t) return ""; const d=new Date(t*1000); return WIN==="12mo"?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):WIN==="30d"?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
 function fmtCur(v){ return v==null?"—":(Math.round(v*100)/100); }
 function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
 
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
-const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
+const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
 let WIN = "24h";
 async function api(path){
   if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))

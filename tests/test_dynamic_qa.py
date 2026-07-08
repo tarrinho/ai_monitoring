@@ -66,6 +66,35 @@ async def test_index_and_assets_served():
         await c.close()
 
 
+def test_serve_page_accepts_user_and_role_kwargs():
+    # Regression (1.4.0): every page handler calls _serve_page(path, prefix,
+    # user=, role=); a wrapper/caller that drops those kwargs returns 500 on
+    # every page (this is exactly what broke scripts/demo_seed.py). Guard the
+    # signature + that the user/role path renders (admin sidebar injected).
+    resp = appmod._serve_page(appmod._WEB / "index.html", "",
+                              user="alice", role="admin")
+    assert isinstance(resp, web.Response) and resp.status == 200
+    body = resp.text or ""
+    assert "card-llm-summary" in body          # the new overview strip
+    assert "Users" in body                     # admin-only sidebar link injected
+    # anonymous (no user/role) must also render, not error
+    anon = appmod._serve_page(appmod._WEB / "index.html", "")
+    assert anon.status == 200 and "Users" not in (anon.text or "")
+
+
+def test_overview_summary_hidden_when_litellm_unconfigured():
+    # The LLM cost/usage strip must not leave an empty panel on a pure-infra
+    # deployment: it is display:none by default and only shown by JS when the
+    # LiteLLM backend is configured (showCard(..., isConfigured(l))).
+    html = (appmod._WEB / "index.html").read_text(encoding="utf-8")
+    i = html.find('id="card-llm-summary"')
+    assert i > 0
+    # the element ships hidden (JS reveals it only when configured)
+    tag = html[i:html.find(">", i)]
+    assert "display:none" in tag
+    assert 'showCard("card-llm-summary", isConfigured(l))' in html
+
+
 async def test_litellm_page_served_and_gated(monkeypatch):
     c = await _client()
     try:
@@ -286,6 +315,15 @@ async def test_subpath_prefix_rewrites_links():
         r2 = await c.get("/")
         h2 = await r2.text()
         assert 'href="/litellm"' in h2 and f'href="{P}/litellm"' not in h2
+        # login form POST target must carry the prefix, else the login submit
+        # escapes the sub-path and hits the proxy root ("/login" → 404).
+        rl = await c.get("/login", headers={"X-Forwarded-Prefix": P})
+        hl = await rl.text()
+        assert f'action="{P}/login"' in hl, "login form action not prefixed"
+        assert 'action="/login"' not in hl
+        # unprefixed login page keeps the bare action (root mount unchanged)
+        rl2 = await c.get("/login")
+        assert 'action="/login"' in (await rl2.text())
     finally:
         await c.close()
 
@@ -1229,8 +1267,14 @@ async def test_series_endpoint():
         assert r.status == 200
         d = await r.json()
         assert d["window"] == "15m"
-        assert set(d["windows"]) >= {"15m", "1h", "24h", "30d"}
+        assert set(d["windows"]) >= {"15m", "1h", "24h", "30d", "12mo"}
         assert isinstance(d["points"], list)
+        # 12-month window is accepted and served (reads the 1-hour rollup tier)
+        r12 = await c.get("/api/series?window=12mo")
+        assert r12.status == 200
+        d12 = await r12.json()
+        assert d12["window"] == "12mo"
+        assert isinstance(d12["points"], list)
         # bad window falls back to 1h, never errors
         r2 = await c.get("/api/series?window=bogus")
         assert (await r2.json())["window"] == "1h"
@@ -1864,6 +1908,10 @@ def test_key_series_rollup_serves_year_window(tmp_path, monkeypatch):
     out = db.key_series("30d", top_n=5)
     assert out["labels"] == ["A"]
     assert len(out["points"]) >= 5                # multiple hourly buckets
+    # 12-month window reads the same 1-hour rollup tier (>24h → hourly table);
+    # its buckets are far wider (~29h) so the same data folds into fewer points.
+    out12 = db.key_series("12mo", top_n=5)
+    assert out12["labels"] == ["A"] and len(out12["points"]) >= 1
     # raw-only 1h window has nothing that old → empty (proves it used rollup)
     assert db.key_series("1h", top_n=5)["labels"] == []
 
@@ -2523,6 +2571,43 @@ async def test_login_flow_and_session(monkeypatch):
         assert (await c.get("/gpu")).status == 200          # cookie authenticates
         assert (await c.get("/api/data")).status == 200
         assert (await c.get("/admin/users")).status == 403  # viewer: no admin
+    finally:
+        await c.close()
+
+
+async def test_token_auth_hides_alerts_link(monkeypatch):
+    """Token/PAT access has no user identity to own alert config, so the sidebar
+    Alerts link is stripped for it — while the JS alert-dot selector is kept and
+    the other nav links remain."""
+    TOK = "alerts-hide-tok-1234"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
+    c = await _client()
+    try:
+        # Bearer header authenticates as the master token and returns HTML
+        # directly (no ?token= cookie redirect).
+        r = await c.get("/", headers={"Authorization": "Bearer " + TOK})
+        assert r.status == 200
+        h = await r.text()
+        assert '<a href="/alerts">Alerts</a>' not in h      # link removed
+        assert '<a href="/gpu">' in h                        # other nav intact
+        assert 'a[href="/alerts"]' in h                      # alert-dot JS kept
+    finally:
+        await c.close()
+
+
+async def test_user_session_keeps_alerts_link(monkeypatch):
+    """A logged-in user (unlike a bare token) still sees the Alerts link."""
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("ally", "ally@x.io", auth.hash_password("allypw123"),
+                   "viewer", time.time())
+    c = await _client()
+    try:
+        r = await c.post("/login",
+                         data={"username": "ally", "password": "allypw123"},
+                         allow_redirects=False)
+        assert r.status == 302
+        h = await (await c.get("/")).text()
+        assert '<a href="/alerts">Alerts</a>' in h           # user keeps Alerts
     finally:
         await c.close()
 
