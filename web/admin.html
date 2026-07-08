@@ -79,7 +79,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.2</div>
+      <div id="sidebar-brand-ver">v1.3.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -200,6 +200,11 @@
         act({username:u.name,action:u.disabled?"enable":"disable"});}));
       wrap.appendChild(actionBtn("Reset pw","ghost",function(){
         var np=prompt("New password for "+u.name+" (min 8 chars):"); if(np) act({username:u.name,action:"reset",password:np});}));
+      if(!u.must_change_pw){
+        wrap.appendChild(actionBtn("Force reset","ghost",function(){
+          if(confirm("Force "+u.name+" to set a new password on next login? Their current sessions end immediately; their password is not changed."))
+            act({username:u.name,action:"force_reset"});}));
+      }
       wrap.appendChild(actionBtn("Delete","danger",function(){
         if(confirm("Delete user "+u.name+"? This cannot be undone.")) act({username:u.name,action:"delete"});}));
       td.appendChild(wrap); tr.appendChild(td); tb.appendChild(tr);
@@ -223,7 +228,9 @@
     "login.lockout":"locked out", "logout":"signed out",
     "user.create":"created user", "user.disable":"disabled user",
     "user.enable":"enabled user", "user.delete":"deleted user",
-    "user.reset":"reset password", "user.update":"updated profile" };
+    "user.reset":"reset password", "user.update":"updated profile",
+    "user.force_reset":"forced password reset",
+    "token.create":"created API token", "token.revoke":"revoked API token" };
   function loadAudit(){
     var f=document.getElementById("audit-filter").value;
     fetch("/api/admin/audit?limit=200"+(f?("&action="+encodeURIComponent(f)):""))

@@ -139,7 +139,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.2</div>
+      <div id="sidebar-brand-ver">v1.3.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -164,6 +164,7 @@
     <button data-w="24h" class="active">24h</button>
     <button data-w="30d">30d</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
+    <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
     <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
@@ -316,6 +317,10 @@ function fmtRange(ts){
 function updateRangeUI(){
   const now=Date.now()/1000;
   document.getElementById("nav-right").disabled = !TIMEEND;
+  const _liveBtn=document.getElementById("nav-live");
+  if(_liveBtn){ _liveBtn.disabled=!TIMEEND;
+    _liveBtn.style.color=TIMEEND?"var(--accent)":"";
+    _liveBtn.style.borderColor=TIMEEND?"var(--accent)":""; }
   const lbl=document.getElementById("range-lbl");
   // absolute window bounds shown at the top — start → end, refreshed on every
   // pan (◀ ▶) and window change.
@@ -334,6 +339,9 @@ document.getElementById("nav-right").addEventListener("click",()=>{
   if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
   if(TIMEEND>=Date.now()/1000) TIMEEND=null;
   updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-live").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{

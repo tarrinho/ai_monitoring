@@ -1,0 +1,10 @@
+# Trivy ignore file — accepted-risk register for the filesystem misconfig scan.
+# Each entry MUST document why the finding is a deliberate design choice, not a defect.
+
+# AVD-KSV-0010 — DaemonSet sets spec.template.spec.hostPID: true
+# ACCEPTED (by design): the node DaemonSet (deploy/k8s/daemonset.yaml) needs the
+# host PID namespace to enumerate host processes for the "top-N by CPU/RAM"
+# host-monitoring collector. This is the core function of the node agent; without
+# hostPID it cannot see host processes. The container is otherwise hardened
+# (runAsNonRoot, read-only mounts, no host writes). Owner: Pedro Tarrinho.
+AVD-KSV-0010

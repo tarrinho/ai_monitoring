@@ -146,7 +146,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.2</div>
+      <div id="sidebar-brand-ver">v1.3.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -170,6 +170,7 @@
     <button data-w="24h" class="active">24h</button>
     <button data-w="30d">30d</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
+    <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
     <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
@@ -206,6 +207,13 @@
   <section class="card span-2" id="card-keytime">
     <h2>Top 10 API keys over time <span id="keytime-metric" class="badge">by requests</span> — <span id="keytime-win">24h</span></h2>
     <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-keydelta">
+    <h2>Top 10 API keys — requests in window <span id="keydelta-win" class="badge"></span></h2>
+    <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
+      cumulative requests during the window (running total from the window start), so a key with no new activity stays flat at 0</div>
+    <div class="chart-wrap" style="height:260px"><canvas id="keydelta-chart"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-corr">
@@ -344,7 +352,7 @@ let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000};
 let WIN = "24h";
 async function api(path){
-  if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
+  if(TIMEEND && /\/api\/(series|keyseries|keydelta|procseries)/.test(path))
     path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
   try{
     const sep=path.includes("?")?"&":"?";
@@ -464,6 +472,31 @@ const keyTimeChart = new Chart(document.getElementById("keytime-chart"), {
 function keyDisp(label){
   const s=String(label||"?");
   return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s;
+}
+
+// Top-10 keys by NET requests per interval — one colored line per key (timeline).
+const keyDeltaChart = new Chart(document.getElementById("keydelta-chart"), {
+  type:"line",
+  data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+});
+async function loadKeyDelta(){
+  const d=await api("/api/keydelta?window="+WIN);
+  const w=document.getElementById("keydelta-win"); if(w) w.textContent=WIN;
+  if(!d) return;
+  const pts=d.points||[]; const labels=d.labels||[];
+  keyDeltaChart.data.labels=pts.map(p=>fmtT(p.t));
+  keyDeltaChart.data.datasets=labels.map((lab,i)=>({
+    label:keyDisp(lab),
+    data:pts.map(p=>p[lab]==null?null:p[lab]),
+    borderColor:KEY_COLORS[i%KEY_COLORS.length],
+    backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
+  keyDeltaChart.update("none");
 }
 async function loadAnomalies(){
   const d=await api("/api/anomalies");
@@ -645,7 +678,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadCorr(); loadImpact(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -653,6 +686,10 @@ function fmtRange(ts){
 function updateRangeUI(){
   const now=Date.now()/1000;
   document.getElementById("nav-right").disabled = !TIMEEND;
+  const _liveBtn=document.getElementById("nav-live");
+  if(_liveBtn){ _liveBtn.disabled=!TIMEEND;
+    _liveBtn.style.color=TIMEEND?"var(--accent)":"";
+    _liveBtn.style.borderColor=TIMEEND?"var(--accent)":""; }
   const lbl=document.getElementById("range-lbl");
   // absolute window bounds shown at the top — start → end, refreshed on every
   // pan (◀ ▶) and window change.
@@ -672,12 +709,15 @@ document.getElementById("nav-right").addEventListener("click",()=>{
   if(TIMEEND>=Date.now()/1000) TIMEEND=null;
   updateRangeUI(); rangedReload();
 });
+document.getElementById("nav-live").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
+});
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
     b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
     document.getElementById("win-label").textContent=WIN;
-    loadSeries(); loadKeyTime(); loadCorr(); loadImpact();
+    loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -700,6 +740,7 @@ async function tick(){
   }
   await loadSeries();
   await loadKeyTime();
+  await loadKeyDelta();
   await loadCorr();
   await loadImpact();
   await loadAnomalies();

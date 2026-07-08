@@ -87,6 +87,23 @@ CREATE TABLE IF NOT EXISTS users (
     disabled   INTEGER NOT NULL DEFAULT 0
 );
 
+-- Per-user API tokens (personal access tokens). A token carries its OWN role
+-- (a viewer may only mint viewer tokens; an admin may mint viewer or admin). Only
+-- the SHA-256 of the secret is stored — the raw value is shown once at creation.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id         TEXT PRIMARY KEY,          -- public id (for listing / revoke)
+    owner      TEXT NOT NULL,             -- username that owns the token
+    role       TEXT NOT NULL DEFAULT 'viewer',
+    label      TEXT NOT NULL DEFAULT '',
+    token_hash TEXT NOT NULL UNIQUE,      -- sha256 hex of the raw token
+    prefix     TEXT NOT NULL DEFAULT '',  -- first chars, for display only
+    created    REAL NOT NULL,
+    last_used  REAL,
+    disabled   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash  ON api_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_owner ON api_tokens(owner);
+
 -- Access + admin-action audit trail (admins review it in /admin/users). action is
 -- a dotted key (login.ok, login.fail, login.lockout, logout, user.create, ...);
 -- actor = who did it, target = the affected user (for user.* actions).
@@ -332,6 +349,106 @@ def key_series(window: str, max_points: int = 300,
         return {"labels": [], "points": []}
 
 
+def key_series_window_delta(window: str, top_n: int = 10,
+                            end: float | None = None) -> dict[str, Any]:
+    """Top-N keys by NET requests made DURING the window: value at the end minus
+    value at the start (per key). A key whose count is unchanged over the window
+    (e.g. 1000 → 1000) yields 0 — this shows *activity in the window*, not the
+    running total the over-time chart plots. Reset-safe: if the counter dropped
+    (daily reset), the end value is used instead of a negative delta.
+
+    Returns {"labels": [...], "deltas": [...]} aligned by index (bar chart)."""
+    secs = WINDOWS.get(window, WINDOWS["1h"])
+    end = end or time.time()
+    start = end - secs
+    if secs <= WINDOWS["1h"]:
+        table, tc = "key_series", "ts"
+    elif secs <= WINDOWS["24h"]:
+        table, tc = "key_series_1m", "bucket"
+    else:
+        table, tc = "key_series_1h", "bucket"
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                f"SELECT b.label, "
+                f"  (SELECT reqs FROM {table} WHERE label=b.label AND {tc}=b.mx) AS lastv, "
+                f"  (SELECT reqs FROM {table} WHERE label=b.label AND {tc}=b.mn) AS firstv "
+                f"FROM (SELECT label, MIN({tc}) mn, MAX({tc}) mx FROM {table} "
+                f"      WHERE {tc} >= ? AND {tc} <= ? GROUP BY label) b",
+                (start, end)).fetchall()
+        out = []
+        for label, lastv, firstv in rows:
+            if lastv is None:
+                continue
+            fv = firstv if firstv is not None else 0.0
+            delta = (lastv - fv) if lastv >= fv else lastv     # reset-safe
+            out.append({"label": label, "delta": max(0.0, round(delta, 2))})
+        out.sort(key=lambda x: x["delta"], reverse=True)
+        out = out[:top_n]
+        return {"labels": [o["label"] for o in out],
+                "deltas": [o["delta"] for o in out]}
+    except Exception:
+        return {"labels": [], "deltas": []}
+
+
+def key_delta_series(window: str, max_points: int = 300, top_n: int = 10,
+                     end: float | None = None) -> dict[str, Any]:
+    """Timeline of CUMULATIVE requests over the window for the top-N keys (ranked by
+    their total net requests). Each point is the running total of requests made
+    *since the window start* — so the line climbs from ~0 to the key's window total,
+    and an idle key (1000 → 1000) stays a flat 0 line. Built by summing per-bucket
+    increases (reset-safe: a negative step from a daily counter reset contributes the
+    bucket's own value instead). Same tiering as `key_series`.
+
+    Returns {"labels": [...], "points": [{t, <label>: cumulative, ...}]} for the chart."""
+    secs = WINDOWS.get(window, WINDOWS["1h"])
+    end = end or time.time()
+    start = end - secs
+    bsize = max(1.0, secs / max_points)
+    if secs <= WINDOWS["1h"]:
+        table, tc = "key_series", "ts"
+    elif secs <= WINDOWS["24h"]:
+        table, tc = "key_series_1m", "bucket"
+    else:
+        table, tc = "key_series_1h", "bucket"
+    try:
+        ranked = key_series_window_delta(window, top_n, end)["labels"]
+        if not ranked:
+            return {"labels": [], "points": []}
+        ph = ",".join("?" for _ in ranked)
+        with _connect() as conn:
+            rows = conn.execute(
+                f"SELECT CAST(({tc} - ?) / ? AS INT) AS bkt, AVG({tc}), label, "
+                f"AVG(reqs) FROM {table} "
+                f"WHERE {tc} >= ? AND {tc} <= ? AND label IN ({ph}) "
+                f"GROUP BY bkt, label ORDER BY bkt",
+                (start, bsize, start, end, *ranked)).fetchall()
+        # absolute per-bucket value per label -> per-bucket step -> running total
+        buckets: dict[int, dict] = {}
+        for bkt, avg_ts, label, avg_reqs in rows:
+            b = buckets.setdefault(bkt, {"t": avg_ts, "_abs": {}})
+            b["_abs"][label] = avg_reqs
+        prev: dict[str, float] = {}
+        cum: dict[str, float] = {}
+        points = []
+        for k in sorted(buckets):
+            b = buckets[k]
+            pt = {"t": b["t"]}
+            for label, v in b["_abs"].items():
+                if label in prev:
+                    step = v - prev[label]
+                    step = step if step >= 0 else v      # reset-safe
+                else:
+                    step = 0.0                            # first observed bucket
+                cum[label] = cum.get(label, 0.0) + step
+                pt[label] = round(cum[label], 2)         # cumulative since window start
+                prev[label] = v
+            points.append(pt)
+        return {"labels": ranked, "points": points}
+    except Exception:
+        return {"labels": [], "points": []}
+
+
 def prune_key_series() -> None:
     """Tiered retention for per-key / per-app series + alert/anomaly history.
     Raw kept ROLLUP_RAW_HOURS; 1-min rollup ROLLUP_MIN_DAYS; 1-hour rollup +
@@ -428,7 +545,17 @@ def proc_series(kind: str, window: str, max_points: int = 200,
         for bkt, avg_ts, app, val in rows:
             b = buckets.setdefault(bkt, {"t": avg_ts})
             b[app] = round(val, 2)
-        return {"apps": top, "points": [buckets[k] for k in sorted(buckets)]}
+        # Densify: every top-N app carries a value at EVERY bucket (0 when it had no
+        # sample there — process absent / not in top-N then). A stacked chart must
+        # get real 0s, not gaps, or it draws phantom diagonals across the missing
+        # points instead of a flat 0.
+        pts = []
+        for k in sorted(buckets):
+            b = buckets[k]
+            for app in top:
+                b.setdefault(app, 0)
+            pts.append(b)
+        return {"apps": top, "points": pts}
     except Exception:
         return {"apps": [], "points": []}
 
@@ -738,10 +865,88 @@ def user_set_must_change(name: str, must_change: bool) -> bool:
 def user_delete(name: str) -> bool:
     try:
         with _connect() as conn:
+            conn.execute("DELETE FROM api_tokens WHERE owner = ?", (name,))  # cascade
             cur = conn.execute("DELETE FROM users WHERE name = ?", (name,))
         return (cur.rowcount or 0) > 0
     except Exception:
         return False
+
+
+# ── per-user API tokens ───────────────────────────────────────────────────────
+def api_token_create(tid: str, owner: str, role: str, label: str,
+                     token_hash: str, prefix: str, created: float) -> bool:
+    """Persist a new personal access token (only its hash). False on error/dup."""
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO api_tokens(id, owner, role, label, token_hash, prefix, "
+                "created) VALUES (?,?,?,?,?,?,?)",
+                (tid, owner, role, label, token_hash, prefix, created))
+        return True
+    except Exception:
+        return False
+
+
+def api_token_lookup(token_hash: str) -> dict[str, Any] | None:
+    """Resolve a presented token (by hash) to its owner + role, but only if the
+    token is enabled AND its owner still exists and is not disabled. None otherwise."""
+    try:
+        with _connect() as conn:
+            r = conn.execute(
+                "SELECT t.id, t.owner, t.role FROM api_tokens t "
+                "JOIN users u ON u.name = t.owner "
+                "WHERE t.token_hash = ? AND t.disabled = 0 AND u.disabled = 0",
+                (token_hash,)).fetchone()
+        if not r:
+            return None
+        return {"id": r[0], "owner": r[1], "role": r[2]}
+    except Exception:
+        return None
+
+
+def api_token_list(owner: str) -> list[dict[str, Any]]:
+    """A user's tokens WITHOUT the hash — safe for the account UI."""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, role, label, prefix, created, last_used, disabled "
+                "FROM api_tokens WHERE owner = ? ORDER BY created DESC",
+                (owner,)).fetchall()
+        return [{"id": r[0], "role": r[1], "label": r[2], "prefix": r[3],
+                 "created": r[4], "last_used": r[5], "disabled": bool(r[6])}
+                for r in rows]
+    except Exception:
+        return []
+
+
+def api_token_count(owner: str) -> int:
+    try:
+        with _connect() as conn:
+            r = conn.execute("SELECT COUNT(*) FROM api_tokens WHERE owner = ?",
+                             (owner,)).fetchone()
+        return int(r[0]) if r else 0
+    except Exception:
+        return 0
+
+
+def api_token_revoke(tid: str, owner: str) -> bool:
+    """Delete a token — scoped to its owner so a user can only revoke their own."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM api_tokens WHERE id = ? AND owner = ?",
+                               (tid, owner))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def api_token_touch(tid: str, ts: float) -> None:
+    """Best-effort last-used stamp (throttled by the caller)."""
+    try:
+        with _connect() as conn:
+            conn.execute("UPDATE api_tokens SET last_used = ? WHERE id = ?", (ts, tid))
+    except Exception:
+        pass
 
 
 def user_update(name: str, email: str, role: str) -> bool:

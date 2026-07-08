@@ -123,6 +123,27 @@ def test_windowed_pages_have_time_nav_arrows():
         assert 'id="range-lbl"' in html, name
 
 
+def test_litellm_has_window_delta_key_chart():
+    # new "requests in window" (delta) bar chart alongside the over-time keys chart
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert 'id="keydelta-chart"' in html
+    assert "/api/keydelta" in html and "loadKeyDelta" in html and "keyDeltaChart" in html
+    # it is a timeline (line chart plotting per-interval points), not a bar
+    assert 'type:"line"' in html and "d.points" in html
+
+
+def test_windowed_pages_have_live_button():
+    # a "Live" button jumps the window back to the current time (TIMEEND=null),
+    # enabled only when panned into history.
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'id="nav-live"' in html, name
+        # click handler snaps to live; disabled state tracks TIMEEND
+        assert 'getElementById("nav-live").addEventListener' in html, name
+        assert "TIMEEND=null; updateRangeUI()" in html, name
+        assert '_liveBtn.disabled=!TIMEEND' in html, name
+
+
 def test_overview_charts_grouped_collapsible():
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert "chart-group" in html and "group-hd" in html
@@ -235,7 +256,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.3.2"
+    assert config.VERSION == "AI-Monitoring_1.3.3"
 
 
 def test_ux_improvements_present():
@@ -601,7 +622,7 @@ def test_dockerfile_nonroot_and_healthcheck():
 def test_dockerfile_alpine_multiarch_hardened():
     # Alpine base (0 HIGH/CRITICAL vs 11 on Debian slim) + multi-arch build knobs
     df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "python:3.12-alpine" in df, "base must be Alpine (vuln-minimal)"
+    assert "python:3.14-alpine" in df, "base must be Alpine (vuln-minimal)"
     assert "ARG RUN_TESTS" in df, "cross-arch builds need a test-skip toggle"
     assert "--upgrade pip" in df, "pip must be upgraded (clears pip CVEs)"
     assert "adduser" in df and "USER monitor" in df   # non-root on BusyBox
@@ -613,6 +634,61 @@ def test_dockerfile_copies_every_top_level_module():
     df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     for mod in ("config.py", "db.py", "app.py", "alerts.py", "anomaly.py"):
         assert mod in df, f"Dockerfile does not COPY {mod} — container will crash"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Extra QA — 1.3.3 dependency / CI toolchain bumps (Dependabot #1/#2/#4)
+# ══════════════════════════════════════════════════════════════════════════════
+def test_trivyignore_accepts_hostpid_with_reason():
+    # The CI Trivy filesystem scan flags AVD-KSV-0010 (DaemonSet hostPID:true).
+    # That is required by design for the host-process (top-N CPU/RAM) collector,
+    # so it is an ACCEPTED risk documented in .trivyignore — not a silent mute.
+    ti = ROOT / ".trivyignore"
+    assert ti.exists(), ".trivyignore missing — CI fs scan will stay red on hostPID"
+    body = ti.read_text(encoding="utf-8")
+    # the id must be present as its own (non-comment) line
+    ids = [ln.strip() for ln in body.splitlines()
+           if ln.strip() and not ln.lstrip().startswith("#")]
+    assert "AVD-KSV-0010" in ids, "AVD-KSV-0010 must be an active ignore entry"
+    low = body.lower()
+    assert "hostpid" in low and ("by design" in low or "accepted" in low), \
+        "every .trivyignore entry must document why it is accepted"
+
+
+def test_trivyignore_is_published():
+    # the ignore file only helps CI if the publish ALLOW-list actually ships it
+    pub = ROOT / "deploy" / "publish-github.sh"
+    if not pub.exists():           # publish script is not always vendored
+        return
+    assert ".trivyignore" in pub.read_text(encoding="utf-8"), \
+        ".trivyignore must be in the publish ALLOW-list or CI never sees it"
+
+
+def test_requirements_dev_pins_pytest9_toolchain():
+    req = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    assert "pytest>=9.1.1,<10" in req, "pytest must be pinned to the 9.x line"
+    assert "pytest-asyncio>=1.4.0" in req, "pytest-asyncio must be the 1.x line"
+
+
+def test_ci_actions_pinned_to_current_majors():
+    # Dependabot #4 — the pinned action versions CI runs on. Stale pins reopen
+    # the same PR every week and (for checkout<v7) carry the node20 deprecation.
+    want = {
+        ".github/workflows/ci.yml": [
+            "actions/checkout@v7", "aquasecurity/trivy-action@v0.36.0",
+        ],
+        ".github/workflows/release.yml": [
+            "actions/checkout@v7", "docker/setup-qemu-action@v4",
+            "docker/setup-buildx-action@v4", "docker/login-action@v4",
+            "docker/build-push-action@v7",
+        ],
+    }
+    for rel, pins in want.items():
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for pin in pins:
+            assert pin in text, f"{rel} must pin {pin}"
+        # no stale predecessor left behind
+        assert "actions/checkout@v5" not in text, f"{rel} has a stale checkout pin"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -747,6 +823,12 @@ def test_gpu_stacked_per_app_cpu_chart():
     assert re.search(r'fill:\s*i\s*\?\s*["\']-1["\']\s*:\s*["\']origin["\']', html), \
         "appcpu stacked chart must fill to previous dataset, not to zero"
     assert "/api/procseries?kind=cpu" in html
+    # a missing app-in-a-bucket must be 0, NOT null, and spanGaps must be off — else
+    # a null gets span-gapped into a phantom diagonal band across the gap.
+    assert re.search(r'p\[a\]==null\?0:p\[a\]', html), \
+        "absent app must map to 0 (not null) on the stacked chart"
+    assert re.search(r'spanGaps:\s*false', html), \
+        "stacked appcpu chart must not spanGaps (0-fill instead)"
 
 
 def test_procs_reader_exposes_top10():

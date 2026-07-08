@@ -2,8 +2,8 @@ apiVersion: v2
 name: ai-monitoring
 description: Read-only monitor for a local LLM stack (host / GPU / Ollama / llama.cpp / LiteLLM / containers) with a Prometheus /metrics endpoint for fleet aggregation.
 type: application
-version: 1.3.2          # chart version — keep in step with the app version
-appVersion: "1.3.2"    # AI-Monitoring image tag
+version: 1.3.3          # chart version — keep in step with the app version
+appVersion: "1.3.3"    # AI-Monitoring image tag
 home: https://github.com/tarrinho/ai_monitoring
 sources:
   - https://github.com/tarrinho/ai_monitoring

@@ -69,7 +69,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.2</div>
+      <div id="sidebar-brand-ver">v1.3.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -126,6 +126,37 @@
         <div class="msg" id="wh-msg"></div>
       </form>
     </section>
+    <section class="card" id="tok-card">
+      <h2>API tokens</h2>
+      <div class="sub">Personal access tokens for scripts / the API. Send as
+        <code>Authorization: Bearer &lt;token&gt;</code>. The secret is shown once — store it safely.
+        <span id="tok-role-note"></span></div>
+      <form id="tok-form" autocomplete="off">
+        <label for="toklabel">Label</label>
+        <input id="toklabel" name="label" maxlength="64" placeholder="e.g. grafana-scrape">
+        <div id="tok-role-wrap" style="display:none">
+          <label for="tokrole">Token permission</label>
+          <select id="tokrole" name="role" style="width:100%;padding:9px 11px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--fg)">
+            <option value="viewer">viewer (read-only)</option>
+            <option value="admin">admin (full access)</option>
+          </select>
+        </div>
+        <button type="submit">Create token</button>
+        <div class="msg" id="tok-msg"></div>
+      </form>
+      <div id="tok-new" style="display:none;margin-top:12px;padding:12px 14px;border:1px solid var(--ok);border-radius:8px;background:var(--panel2)">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Copy your new token now — it won't be shown again:</div>
+        <code id="tok-new-val" style="display:block;word-break:break-all;font-size:13px;padding:8px;background:var(--bg);border-radius:6px"></code>
+        <button type="button" id="tok-copy" style="margin-top:8px;background:var(--panel2);color:var(--fg);border:1px solid var(--line)">Copy</button>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:14px">
+        <thead><tr style="color:var(--muted);text-align:left">
+          <th style="padding:6px 4px;font-weight:500">Label</th><th style="padding:6px 4px;font-weight:500">Role</th>
+          <th style="padding:6px 4px;font-weight:500">Prefix</th><th style="padding:6px 4px;font-weight:500">Last used</th><th></th>
+        </tr></thead>
+        <tbody id="tok-rows"></tbody>
+      </table>
+    </section>
   </main>
 </div>
 <script>
@@ -139,19 +170,79 @@
     var c=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
     document.documentElement.setAttribute("data-theme",c);localStorage.setItem("aimon-theme",c);icon();});
 
-  var CSRF="",MUST=false;
+  var CSRF="",MUST=false,ROLE="viewer";
   function setMsg(txt,good){var m=document.getElementById("msg");m.textContent=txt||"";
     m.className="msg"+(txt?(good?" ok":" bad"):"");}
   fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
-    if(d){CSRF=d.csrf||"";MUST=!!d.must_change;
+    if(d){CSRF=d.csrf||"";MUST=!!d.must_change;ROLE=d.role||"viewer";
       document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";
       if(MUST){                                   // first-login: lock everything but the reset
         document.getElementById("force-banner").style.display="block";
-        var wh=document.getElementById("wh-form");if(wh&&wh.closest(".card"))wh.closest(".card").style.display="none";
+        ["wh-form","tok-form"].forEach(function(id){var f=document.getElementById(id);
+          if(f&&f.closest(".card"))f.closest(".card").style.display="none";});
         document.querySelectorAll("#sidebar-nav a").forEach(function(a){a.style.pointerEvents="none";a.style.opacity=".4";});
-      }
+      }else{ initTokens(); }
     }
   }).catch(function(){});
+
+  // ── API tokens ──
+  function tokMsg(txt,good){var m=document.getElementById("tok-msg");m.textContent=txt||"";
+    m.className="msg"+(txt?(good?" ok":" bad"):"");}
+  function fmtWhen(ts){if(!ts)return "never";var d=new Date(ts*1000);return d.toLocaleString();}
+  function loadTokens(){
+    fetch("/api/account/tokens").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      var tb=document.getElementById("tok-rows");tb.textContent="";
+      if(!d)return;
+      (d.tokens||[]).forEach(function(t){
+        var tr=document.createElement("tr");tr.style.borderTop="1px solid var(--line)";
+        function c(x){var td=document.createElement("td");td.style.padding="7px 4px";td.textContent=x;return td;}
+        tr.appendChild(c(t.label||"—"));
+        tr.appendChild(c(t.role));
+        tr.appendChild(c((t.prefix||"")+"…"));
+        tr.appendChild(c(fmtWhen(t.last_used)));
+        var td=document.createElement("td");td.style.padding="7px 4px";td.style.textAlign="right";
+        var b=document.createElement("button");b.type="button";b.textContent="Revoke";
+        b.style.cssText="background:transparent;color:var(--bad);border:1px solid var(--bad);width:auto;margin:0;padding:4px 10px;font-size:12px";
+        b.addEventListener("click",function(){
+          if(!confirm("Revoke token \""+(t.label||t.id)+"\"? Anything using it stops working immediately.")) return;
+          var body=new URLSearchParams({id:t.id}).toString();
+          fetch("/api/account/tokens/revoke",{method:"POST",
+            headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},body:body})
+            .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+            .then(function(res){if(res.ok){loadTokens();}else{tokMsg(res.j.error||"Revoke failed.",false);}})
+            .catch(function(){tokMsg("Revoke failed.",false);});
+        });
+        td.appendChild(b);tr.appendChild(td);tb.appendChild(tr);
+      });
+    }).catch(function(){});
+  }
+  function initTokens(){
+    if(ROLE==="admin"){document.getElementById("tok-role-wrap").style.display="block";
+      document.getElementById("tok-role-note").textContent="As an admin you can choose the token's permission level.";}
+    else{document.getElementById("tok-role-note").textContent="Your tokens have viewer (read-only) permission.";}
+    loadTokens();
+    document.getElementById("tok-form").addEventListener("submit",function(ev){
+      ev.preventDefault();
+      var params={label:document.getElementById("toklabel").value.trim()};
+      if(ROLE==="admin")params.role=document.getElementById("tokrole").value;
+      fetch("/api/account/tokens",{method:"POST",
+        headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+        body:new URLSearchParams(params).toString()})
+        .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+        .then(function(res){
+          if(!res.ok){tokMsg(res.j.error||"Create failed.",false);return;}
+          tokMsg("",true);
+          document.getElementById("tok-new-val").textContent=res.j.token;
+          document.getElementById("tok-new").style.display="block";
+          document.getElementById("toklabel").value="";
+          loadTokens();
+        }).catch(function(){tokMsg("Create failed.",false);});
+    });
+    document.getElementById("tok-copy").addEventListener("click",function(){
+      var v=document.getElementById("tok-new-val").textContent;
+      if(navigator.clipboard){navigator.clipboard.writeText(v).then(function(){tokMsg("Copied.",true);},function(){});}
+    });
+  }
 
   document.getElementById("pw-form").addEventListener("submit",function(ev){
     ev.preventDefault();

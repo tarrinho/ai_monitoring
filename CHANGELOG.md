@@ -4,9 +4,51 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.3.3] — 2026-07-08
+
+### Changed
+- **Dependency + toolchain bumps (Dependabot).** Test toolchain moved to
+  `pytest>=9.1.1,<10` and `pytest-asyncio>=1.4.0` (full suite green on the new
+  majors); runtime base image bumped to `python:3.14-alpine`; CI actions bumped —
+  `actions/checkout@v7`, `aquasecurity/trivy-action@v0.36.0`,
+  `docker/setup-qemu-action@v4`, `docker/setup-buildx-action@v4`,
+  `docker/login-action@v4`, `docker/build-push-action@v7`.
+
+### Fixed
+- **CI Trivy filesystem scan.** Added a documented `.trivyignore` accepting
+  `AVD-KSV-0010` (node DaemonSet `hostPID: true`) — it is required by design for
+  the host-process (top-N CPU/RAM) collector, not a defect. The image scan was
+  already clean; this unblocks the filesystem-scan job that had been red on every
+  push.
+
 ## [1.3.2] — 2026-07-06
 
 ### Added
+- **LiteLLM “Top 10 API keys — requests in window” timeline.** A new line chart next
+  to *Top 10 API keys over time* that plots the **cumulative requests during the
+  window** — a running total from the window start, so the line climbs from ~0 to each
+  key's window total and a key with no new activity (1000 → 1000) stays a **flat 0
+  line**. Top-10 ranked by total net requests over the window; follows the
+  window/pan/**Live** controls. Backed by `GET /api/keydelta` + `db.key_delta_series`
+  (tiered raw/1m/1h like the over-time chart; sums per-bucket increases, reset-safe — a
+  mid-window daily counter reset contributes that bucket's own value instead of a
+  negative step).
+- **“Live” button on the time window.** Every windowed dashboard (Overview, LiteLLM,
+  GPU, Ollama, llama.cpp) gains a **Live** button next to the ◀ ▶ pan arrows that snaps
+  the view straight back to the current time (`TIMEEND=null`) instead of paging forward
+  one window at a time. It is disabled (greyed) while already live and highlights in the
+  accent colour once you've panned into history.
+- **Per-user API tokens (personal access tokens).** Every user can mint their own
+  bearer tokens from *Account* → *API tokens* for scripts / the API
+  (`Authorization: Bearer aimon_pat_…`). A **viewer** can only create **viewer**
+  (read-only) tokens; an **admin** chooses the token's permission (viewer *or* admin).
+  A token carries its own role, so a viewer's token can never reach an admin endpoint
+  (enforced server-side — the role field is ignored for non-admins). The raw secret is
+  shown **once** at creation; only its SHA-256 is stored. Tokens are listed with
+  label / role / prefix / last-used, revocable instantly, capped at 20 per user, and
+  stop working the moment the owner is disabled or deleted (cascade). Backed by
+  `GET/POST /api/account/tokens` and `POST /api/account/tokens/revoke` (session-only,
+  CSRF-protected); create/revoke are audited (`token.create`, `token.revoke`).
 - **Per-account login lockout.** In addition to the existing per-IP throttle, an
   account is now locked after **10 failed password attempts** (within
   `MONITOR_AUTH_WINDOW_S`) for **5 minutes** — every further login for that username,
@@ -25,7 +67,16 @@ Versioning: [SemVer](https://semver.org/).
   **“reset pending”** badge for anyone who hasn't reset yet. The env-seeded bootstrap
   admin is exempt (the operator chose that password deliberately). New DB column
   `users.must_change_pw` (idempotent `ADD COLUMN`, default `0`); `/api/me` exposes the
-  flag so the account page can render the lock banner.
+  flag so the account page can render the lock banner. Because the column defaults to
+  `0`, users that existed **before** this feature are not retroactively flagged — use
+  **Force reset** (below) to require them to reset.
+- **Admin “Force reset” action.** A per-row button in *User management* flags a user
+  `must_change_pw` and ends their active sessions immediately, forcing them to choose a
+  new password on next login **without** the admin setting one (their current password
+  keeps working only to reach `/account`). This is how you apply the reset rule to
+  pre-existing accounts. Backed by the `force_reset` action on
+  `POST /api/admin/users/action` (admin-only, CSRF-protected, audited as
+  `user.force_reset`); the button hides once a user is already pending.
 - **Server-side error logging.** Every error is now recorded to the server's stderr
   (`docker logs`), never the normal `200` traffic: failed/locked-out logins
   (`[auth] login FAILED user=… ip=…`), denied writes (`[deny] METHOD /path -> 4xx ip=…`
@@ -39,6 +90,25 @@ Versioning: [SemVer](https://semver.org/).
   it validates the email + role, refuses to demote the **last** admin, and is audited
   as `user.update`. A role change takes effect on the target's next request (roles are
   revalidated per request). The editor is built with DOM APIs (no `innerHTML`).
+
+### Fixed
+- **“CPU usage by app (stacked)” phantom bands.** An app that had no sample in a time
+  bucket (process absent / not in the top-N then) was left out of that point, so the
+  frontend saw `null` and — with `spanGaps` on — drew a straight diagonal across the
+  gap, producing huge phantom stacked bands. `db.proc_series` now densifies every
+  bucket (absent app → **0**), and the chart maps missing → `0` with `spanGaps:false`,
+  so an absent process draws a flat 0.
+- **GPU stuck at 0% (file mode).** The host-side `gpu-metrics.service` writer moved
+  into a standalone script (`deploy/gpu-metrics-writer.sh`): an *inline* systemd
+  `ExecStart` mangles a literal `%` (a unit specifier), which silently corrupted the
+  embedded `awk` (`printf "%d"`) and crashed the writer, **freezing the CSV** on the
+  last value — a dashboard stuck at 0% even under load. The writer now also (1) reads
+  **`nvidia-smi dmon`-averaged** utilization instead of the instantaneous
+  `utilization.gpu` point, which bursty LLM load aliases to ~0; (2) wraps every
+  `nvidia-smi` call in `timeout` so a D-state hang under GPU load can't freeze the
+  loop; and (3) sets an explicit `PATH` + a `sleep` floor. Docs lower the recommended
+  `GPU_FILE_MAX_AGE` to `30` so a dead writer surfaces as *unavailable* fast instead
+  of showing a frozen reading for minutes.
 
 ## [1.3.1] — 2026-07-06
 

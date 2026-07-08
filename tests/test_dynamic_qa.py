@@ -985,6 +985,28 @@ def test_db_proc_series_multiline(tmp_path, monkeypatch):
     assert set(ram["apps"]) == {"python", "node"}
 
 
+def test_db_proc_series_densifies_absent_app_to_zero(tmp_path, monkeypatch):
+    # an app present only in SOME buckets must read 0 (not be missing) in the others,
+    # so the stacked chart draws a flat 0 instead of a phantom diagonal across the gap.
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "psd.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for t in range(600, 0, -30):
+        procs = [{"app": "steady", "cpu": 50}]
+        if t <= 60:                                # 'blip' only in the last 2 buckets
+            procs.append({"app": "blip", "cpu": 90})
+        db.insert_proc_series(now - t, "cpu", procs, "cpu")
+    out = db.proc_series("cpu", "15m", top_n=5)
+    assert set(out["apps"]) == {"steady", "blip"}
+    for p in out["points"]:                        # every bucket carries every app
+        for app in out["apps"]:
+            assert app in p, f"{app} not densified into a bucket"
+    assert out["points"][0]["blip"] == 0           # absent -> 0, not a gap
+    assert out["points"][0]["steady"] > 0
+
+
 async def test_procseries_endpoint():
     c = await _client()
     try:
@@ -3857,5 +3879,233 @@ async def test_successful_login_resets_account_fail_counter(monkeypatch):
                          allow_redirects=False)
         assert "e=locked" not in r.headers.get("Location", "")
         assert "resetme" not in appmod._user_fails            # counter cleared on success
+    finally:
+        await c.close()
+
+
+# ── admin "Force reset" action (1.3.2) ────────────────────────────────────────
+async def test_admin_force_reset_flags_user(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("fadm", "fa@x.io", auth.hash_password("fadmpw12"), "admin", time.time())
+    db.user_create("frtarget", "t@x.io", auth.hash_password("frtpw123"), "viewer", time.time())
+    assert db.user_get("frtarget")["must_change_pw"] is False
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "fadm", "password": "fadmpw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "frtarget", "action": "force_reset"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+    finally:
+        await c.close()
+    assert db.user_get("frtarget")["must_change_pw"] is True   # flagged, password unchanged
+
+
+async def test_force_reset_gates_target_on_next_login(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("fadm2", "fa2@x.io", auth.hash_password("fadm2pw1"), "admin", time.time())
+    db.user_create("victimF", "vf@x.io", auth.hash_password("victimFpw"), "viewer", time.time())
+    ca = await _client()
+    try:
+        await ca.post("/login", data={"username": "fadm2", "password": "fadm2pw1"})
+        csrf = (await (await ca.get("/api/admin/users")).json())["csrf"]
+        r = await ca.post("/api/admin/users/action",
+                          data={"username": "victimF", "action": "force_reset"},
+                          headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+    finally:
+        await ca.close()
+    # target logs in with their UNCHANGED password -> still forced to /account
+    cv = await _client()
+    try:
+        r = await cv.post("/login", data={"username": "victimF", "password": "victimFpw"},
+                          allow_redirects=False)
+        assert r.status == 302 and "/account" in r.headers.get("Location", "")
+        assert (await cv.get("/api/nav")).status == 403        # rest of app blocked
+    finally:
+        await cv.close()
+
+
+# ── per-user API tokens (1.3.2) ───────────────────────────────────────────────
+async def test_viewer_creates_viewer_token_that_authenticates(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("vtok", "v@x.io", auth.hash_password("vtokpw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "vtok", "password": "vtokpw12"})
+        csrf = (await (await c.get("/api/me")).json())["csrf"]
+        r = await c.post("/api/account/tokens", data={"label": "mytok"},
+                         headers={"X-CSRF-Token": csrf})
+        j = await r.json()
+        assert r.status == 200 and j["role"] == "viewer"
+        tok = j["token"]
+        assert tok.startswith("aimon_pat_")
+        lst = await (await c.get("/api/account/tokens")).json()
+        assert lst["tokens"] and all("token" not in t and "token_hash" not in t
+                                     for t in lst["tokens"])       # no secret leak
+    finally:
+        await c.close()
+    c2 = await _client()                                            # fresh, no cookie
+    try:
+        assert (await c2.get("/api/nav",
+                             headers={"Authorization": "Bearer " + tok})).status == 200
+        # a viewer token cannot reach the admin API
+        assert (await c2.get("/api/admin/users",
+                             headers={"Authorization": "Bearer " + tok})).status == 403
+    finally:
+        await c2.close()
+
+
+async def test_viewer_cannot_mint_admin_token(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("vt2", "v2@x.io", auth.hash_password("vt2pw123"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "vt2", "password": "vt2pw123"})
+        csrf = (await (await c.get("/api/me")).json())["csrf"]
+        j = await (await c.post("/api/account/tokens",
+                                data={"label": "x", "role": "admin"},
+                                headers={"X-CSRF-Token": csrf})).json()
+        assert j["role"] == "viewer"                                # privilege guard downgrades
+    finally:
+        await c.close()
+
+
+async def test_admin_mints_admin_token_reaching_admin_api(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("atok", "a@x.io", auth.hash_password("atokpw12"), "admin", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "atok", "password": "atokpw12"})
+        csrf = (await (await c.get("/api/me")).json())["csrf"]
+        j = await (await c.post("/api/account/tokens",
+                                data={"label": "adm", "role": "admin"},
+                                headers={"X-CSRF-Token": csrf})).json()
+        assert j["role"] == "admin"
+        tok = j["token"]
+    finally:
+        await c.close()
+    c2 = await _client()
+    try:
+        assert (await c2.get("/api/admin/users",
+                             headers={"Authorization": "Bearer " + tok})).status == 200
+    finally:
+        await c2.close()
+
+
+async def test_token_create_requires_csrf(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("ctok", "c@x.io", auth.hash_password("ctokpw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "ctok", "password": "ctokpw12"})
+        r = await c.post("/api/account/tokens", data={"label": "nocsrf"})   # no CSRF header
+        assert r.status == 403
+    finally:
+        await c.close()
+
+
+async def test_token_revoke_stops_it(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("rtok", "r@x.io", auth.hash_password("rtokpw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "rtok", "password": "rtokpw12"})
+        csrf = (await (await c.get("/api/me")).json())["csrf"]
+        j = await (await c.post("/api/account/tokens", data={"label": "z"},
+                                headers={"X-CSRF-Token": csrf})).json()
+        tok, tid = j["token"], j["id"]
+        c2 = await _client()
+        assert (await c2.get("/api/nav",
+                             headers={"Authorization": "Bearer " + tok})).status == 200
+        await c2.close()
+        assert (await c.post("/api/account/tokens/revoke", data={"id": tid},
+                             headers={"X-CSRF-Token": csrf})).status == 200
+    finally:
+        await c.close()
+    c3 = await _client()
+    try:
+        assert (await c3.get("/api/nav",
+                             headers={"Authorization": "Bearer " + tok})).status == 401
+    finally:
+        await c3.close()
+
+
+def test_user_delete_cascades_api_tokens():
+    import hashlib
+    db.user_create("cdel", "c@x.io", auth.hash_password("cdelpw12"), "viewer", time.time())
+    raw = "aimon_pat_" + "y" * 20
+    db.api_token_create("tidC", "cdel", "viewer", "l",
+                        hashlib.sha256(raw.encode()).hexdigest(), "p", time.time())
+    assert db.api_token_count("cdel") == 1
+    db.user_delete("cdel")
+    assert db.api_token_count("cdel") == 0
+
+
+# ── Top-10 keys "requests in window" delta chart (1.3.2) ──────────────────────
+def _clear_key_series():
+    """Isolate per-key delta tests from cross-run pollution (the shared test DB is
+    not reset for key_series between runs)."""
+    db.init()
+    with db._connect() as conn:
+        conn.execute("DELETE FROM key_series")
+        conn.execute("DELETE FROM key_series_1m")
+        conn.execute("DELETE FROM key_series_1h")
+
+
+def test_key_series_window_delta_computes_net_requests():
+    _clear_key_series()
+    now = time.time()
+    # ZED: 1000 -> 1000 (no new requests) => delta 0; ACT: 100 -> 600 => 500
+    db.insert_key_series(now - 1800, [{"key": "kz", "alias": "ZED_delta", "reqs": 1000},
+                                      {"key": "ka", "alias": "ACT_delta", "reqs": 100}])
+    db.insert_key_series(now - 60,   [{"key": "kz", "alias": "ZED_delta", "reqs": 1000},
+                                      {"key": "ka", "alias": "ACT_delta", "reqs": 600}])
+    res = db.key_series_window_delta("1h")
+    m = dict(zip(res["labels"], res["deltas"]))
+    assert m.get("ACT_delta") == 500
+    assert m.get("ZED_delta") == 0                         # matches the user's example
+    assert res["labels"].index("ACT_delta") < res["labels"].index("ZED_delta")  # ranked by delta
+
+
+def test_key_series_window_delta_is_reset_safe():
+    _clear_key_series()
+    now = time.time()
+    db.insert_key_series(now - 1800, [{"key": "kr", "alias": "RST_delta", "reqs": 900}])
+    db.insert_key_series(now - 60,   [{"key": "kr", "alias": "RST_delta", "reqs": 50}])  # daily reset
+    res = db.key_series_window_delta("1h")
+    m = dict(zip(res["labels"], res["deltas"]))
+    assert m.get("RST_delta") == 50                        # end value, never negative
+
+
+def test_key_delta_series_is_cumulative_timeline():
+    _clear_key_series()
+    now = time.time()
+    # counter 100 -> 100 -> 400 : cumulative-in-window climbs 0 -> 0 -> 300
+    db.insert_key_series(now - 2400, [{"key": "kt", "alias": "TL_delta", "reqs": 100}])
+    db.insert_key_series(now - 1200, [{"key": "kt", "alias": "TL_delta", "reqs": 100}])
+    db.insert_key_series(now - 30,   [{"key": "kt", "alias": "TL_delta", "reqs": 400}])
+    res = db.key_delta_series("1h")
+    assert "TL_delta" in res["labels"]
+    series = [p.get("TL_delta") for p in res["points"] if "TL_delta" in p]
+    assert series[0] == 0                        # starts at 0 (window start)
+    assert series == sorted(series)              # monotonic non-decreasing (cumulative)
+    assert series[-1] == 300                     # ends at the window total
+
+
+async def test_keydelta_endpoint_returns_timeline(monkeypatch):
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    _clear_key_series()
+    c = await _client()
+    try:
+        now = time.time()
+        db.insert_key_series(now - 1800, [{"key": "ek", "alias": "EP_delta", "reqs": 10}])
+        db.insert_key_series(now - 30,   [{"key": "ek", "alias": "EP_delta", "reqs": 40}])
+        d = await (await c.get("/api/keydelta?window=1h")).json()
+        assert d["window"] == "1h" and "labels" in d and "points" in d
+        series = [p.get("EP_delta") for p in d["points"] if "EP_delta" in p]
+        assert series[-1] == 30                 # cumulative ends at the window total
     finally:
         await c.close()

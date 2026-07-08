@@ -22,7 +22,7 @@ jobs:
     name: secret scan (TruffleHog + gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # full history so both scanners see past commits
       - name: TruffleHog
@@ -53,7 +53,7 @@ jobs:
     name: lint + type (ruff / bandit / semgrep / mypy / vulture)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -77,7 +77,7 @@ jobs:
     name: pytest (static + dynamic)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -88,9 +88,9 @@ jobs:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Trivy fs (HIGH/CRITICAL → fail)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -104,11 +104,11 @@ jobs:
     name: build (test gate) + Trivy image scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build image (in-image test gate)
         run: docker build --build-arg RUN_TESTS=1 -t ai-monitoring:ci .
       - name: Trivy image (HIGH/CRITICAL → fail)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: ai-monitoring:ci

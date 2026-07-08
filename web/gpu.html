@@ -140,7 +140,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.3.2</div>
+      <div id="sidebar-brand-ver">v1.3.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -164,6 +164,7 @@
     <button data-w="24h">24h</button>
     <button data-w="30d">30d</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
+    <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
     <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
@@ -277,13 +278,16 @@ async function loadAppCpu(){
   const pts=d.points||[], apps=d.apps||[];
   appCpuChart.data.labels=pts.map(p=>fmtT(p.t));
   appCpuChart.data.datasets=apps.map((a,i)=>({label:a,
-    data:pts.map(p=>p[a]==null?null:p[a]),
+    // an app with no sample in a bucket (process absent / not in top-N then) is 0,
+    // NOT null: on a STACKED area a null gets span-gapped into a straight diagonal
+    // across the gap, producing the huge phantom bands. A flat 0 draws correctly.
+    data:pts.map(p=>p[a]==null?0:p[a]),
     borderColor:PROC_COLORS[i%PROC_COLORS.length],
     backgroundColor:PROC_COLORS[i%PROC_COLORS.length]+"66",
     // stacked area: fill to the previous dataset (not to zero) so each band shows
     // its own pure colour — fill:true fills to origin, stacking translucent layers
     // and blending every band with the ones below (green→olive, pink→mauve).
-    borderWidth:1,pointRadius:0,tension:.25,fill:i?"-1":"origin",spanGaps:true}));
+    borderWidth:1,pointRadius:0,tension:.25,fill:i?"-1":"origin",spanGaps:false}));
   appCpuChart.update("none");
 }
 function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(Math.round(v*100)/100)+(cfg.unit||"")); }
@@ -364,6 +368,10 @@ function fmtRange(ts){
 function updateRangeUI(){
   const now=Date.now()/1000;
   document.getElementById("nav-right").disabled = !TIMEEND;
+  const _liveBtn=document.getElementById("nav-live");
+  if(_liveBtn){ _liveBtn.disabled=!TIMEEND;
+    _liveBtn.style.color=TIMEEND?"var(--accent)":"";
+    _liveBtn.style.borderColor=TIMEEND?"var(--accent)":""; }
   const lbl=document.getElementById("range-lbl");
   // absolute window bounds shown at the top — start → end, refreshed on every
   // pan (◀ ▶) and window change.
@@ -382,6 +390,9 @@ document.getElementById("nav-right").addEventListener("click",()=>{
   if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
   if(TIMEEND>=Date.now()/1000) TIMEEND=null;
   updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-live").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{

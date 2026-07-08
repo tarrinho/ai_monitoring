@@ -1,21 +1,28 @@
 # deploy/gpu-metrics.service — write nvidia-smi metrics to a file for AI-Monitoring.
 #
 # The SAFE way to expose a LOCAL host GPU to the (Alpine) monitor container: this
-# host-side service writes nvidia-smi CSV to a file every few seconds; the monitor
-# bind-mounts that file READ-ONLY (no SSH, no network, no shell access to the host).
+# host-side service runs gpu-metrics-writer.sh, which writes nvidia-smi CSV to a
+# file; the monitor bind-mounts that file READ-ONLY (no SSH, no network, no shell
+# access to the host).
 #
 # Install on the GPU host:
 #   sudo mkdir -p /var/lib/aimon-gpu && sudo chmod 755 /var/lib/aimon-gpu
+#   sudo install -m 0755 deploy/gpu-metrics-writer.sh /usr/local/bin/aimon-gpu-writer.sh
 #   sudo cp deploy/gpu-metrics.service /etc/systemd/system/
 #   sudo systemctl enable --now gpu-metrics.service
 # The non-root monitor (uid 10001) must be able to traverse the dir (755 above)
-# and read the file — `umask 022` below makes each written file world-readable.
+# and read the file — the writer's `umask 022` makes each written file world-readable.
 #   # then in the monitor's docker-compose.yml, mount the dir read-only:
 #   #   volumes:
 #   #     - /var/lib/aimon-gpu:/gpu:ro
-#   # and in .env:  GPU_METRICS_FILE=/gpu/gpu.csv
+#   # and in .env:  GPU_METRICS_FILE=/gpu/gpu.csv  and  GPU_FILE_MAX_AGE=30
 #
-# Writes atomically (tmp + mv) so the container never reads a half-written file.
+# The writer lives in a SEPARATE script (not inline here) on purpose: an inline
+# ExecStart mangles literal `%` (a systemd unit specifier), which corrupts an
+# embedded awk `printf "%d"` and crashes the writer — freezing the CSV at a stale
+# value. Utilization is dmon-averaged (bursty LLM load aliases the instantaneous
+# counter to 0) and every nvidia-smi call is `timeout`-wrapped (survives a D-state
+# hang under GPU load). See gpu-metrics-writer.sh.
 [Unit]
 Description=Write nvidia-smi metrics to a file for AI-Monitoring
 After=multi-user.target
@@ -24,13 +31,7 @@ After=multi-user.target
 Type=simple
 Restart=always
 RestartSec=5
-# The query columns MUST match what the collector expects (name, util, mem.used,
-# mem.total, temp, power.draw, power.limit, throttle).
-ExecStart=/bin/sh -c 'while true; do \
-  nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.hw_slowdown \
-  --format=csv,noheader,nounits > /var/lib/aimon-gpu/gpu.csv.tmp 2>/dev/null \
-  && mv -f /var/lib/aimon-gpu/gpu.csv.tmp /var/lib/aimon-gpu/gpu.csv; \
-  sleep 5; done'
+ExecStart=/usr/local/bin/aimon-gpu-writer.sh
 
 [Install]
 WantedBy=multi-user.target

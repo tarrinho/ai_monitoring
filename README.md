@@ -59,7 +59,7 @@ standalone, and the LLM/GPU dashboard links hide until their backend is set.
 | Path | Shows |
 |------|-------|
 | `/` (Overview) | Host CPU/mem/disk/load, **top-5 apps by CPU & RAM** + per-app evolution, uptime, and all metrics as time-series grouped into collapsible **Host / GPU / LLM** sections |
-| `/litellm` | wait avg + **p50/p95/p99 + SLO**, req/s, prompt/completion tok/s, error %, cost/h, **backlog** (in-flight), TTFT, cache hit; per-model table (with p95/SLO); **top-10 keys** (bar + over-time, colored); **failed-request viewer**; **key anomalies**; concurrency-vs-latency |
+| `/litellm` | wait avg + **p50/p95/p99 + SLO**, req/s, prompt/completion tok/s, error %, cost/h, **backlog** (in-flight), TTFT, cache hit; per-model table (with p95/SLO); **top-10 keys** (bar + cumulative-over-time + **requests-in-window timeline** = net requests per interval, colored); **failed-request viewer**; **key anomalies**; concurrency-vs-latency |
 | `/gpu` | util, VRAM used/%/total, power, temp, throttle, per-GPU table, tokens/watt — local `nvidia-smi`/`rocm-smi` **or a remote GPU box over SSH / HTTP agent** |
 | `/ollama` | running/installed models, RAM/VRAM, %-on-GPU, per-model params/quant/unload-countdown, over-time charts |
 | `/llamacpp` | tokens/s, active/total slots, busy %, KV-cache %, context size, status, loaded-model card, over-time charts |
@@ -124,6 +124,12 @@ password on first login**: they are confined to `/account` — every other page 
 is blocked until they choose a new one — and the *Users* table shows a *reset pending*
 badge until they do. The env-seeded bootstrap admin is exempt.
 
+Each user can mint **personal API tokens** on `/account` for scripts / the API
+(sent as `Authorization: Bearer aimon_pat_…`). A viewer can only create read-only
+(viewer) tokens; an admin picks the token's permission (viewer or admin). The secret
+is shown once at creation (only its SHA-256 is stored), tokens are revocable, and they
+stop working the instant the owner is disabled or deleted.
+
 Each user can also set **their own alert webhook** on `/account` (Slack / Discord /
 generic JSON POST) — when an alert fires it is delivered to every enabled user
 webhook plus the operator-set global `ALERT_WEBHOOK_URL`. User URLs are SSRF-guarded
@@ -158,7 +164,7 @@ rows are kept for `MONITOR_AUDIT_RETENTION_DAYS` (default 90).
 | `SLO_LATENCY_MS` | `2000` | latency SLO target (% of requests under it) |
 | `OLLAMA_BASE_URL` | `http://host:11434` | Ollama (no key needed) |
 | `LLAMACPP_BASE_URL` / `LLAMACPP_API_KEY` | `http://host:8080` / *(opt)* | llama.cpp server |
-| `GPU_METRICS_FILE` / `GPU_FILE_MAX_AGE` | `/gpu/gpu.csv` / `60` | **LOCAL host GPU, safest**: host writes `nvidia-smi` CSV to a file (see `deploy/gpu-metrics.service`); monitor reads it **read-only** — no SSH/network/shell. Stale file (> max-age) → panel hides |
+| `GPU_METRICS_FILE` / `GPU_FILE_MAX_AGE` | `/gpu/gpu.csv` / `30` | **LOCAL host GPU, safest**: host writes `nvidia-smi` CSV to a file (see `deploy/gpu-metrics.service`); monitor reads it **read-only** — no SSH/network/shell. Stale file (> max-age) → panel hides |
 | `GPU_SSH` / `GPU_SSH_PORT` / `GPU_SSH_KEY` | `user@gpuhost` / `22` / `/keys/id` | **remote** GPU via agentless SSH `nvidia-smi` |
 | `GPU_METRICS_URL` | `http://gpuhost:9835/gpu` | **remote** GPU via an HTTP agent returning `{gpus:[…]}` |
 | `MONITOR_CONTAINERS` | *(empty = all)* | **Containers** card: liveness + alive-time via the Docker API. **Empty → auto-discovers ALL host containers**; a comma-separated list restricts to those names. Needs the Docker socket mounted (compose does this) + `DOCKER_GID` set to the host `docker` group id so the non-root monitor can read it. **Note:** mounting `docker.sock` grants Docker control — the monitor only issues read-only GETs, but treat it accordingly. |
@@ -177,6 +183,7 @@ no SSH, no network, no shell into the host.
 ```bash
 # on the GPU host:
 sudo mkdir -p /var/lib/aimon-gpu && sudo chmod 755 /var/lib/aimon-gpu
+sudo install -m 0755 deploy/gpu-metrics-writer.sh /usr/local/bin/aimon-gpu-writer.sh
 sudo cp deploy/gpu-metrics.service /etc/systemd/system/
 sudo systemctl enable --now gpu-metrics.service      # writes /var/lib/aimon-gpu/gpu.csv
 ```
@@ -187,7 +194,7 @@ sudo systemctl enable --now gpu-metrics.service      # writes /var/lib/aimon-gpu
 ```
 ```bash
 # in .env:
-GPU_METRICS_FILE=/gpu/gpu.csv        # GPU_FILE_MAX_AGE=60 → stale file hides the panel
+GPU_METRICS_FILE=/gpu/gpu.csv        # GPU_FILE_MAX_AGE=30 → stale file hides the panel
 ```
 
 **Mode 1 — remote GPU over SSH** (agentless): `GPU_SSH=user@gpuhost` +

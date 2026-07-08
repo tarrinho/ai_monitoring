@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import hmac
 import json
 import re
@@ -504,10 +505,43 @@ def _auth_enabled() -> bool:
     return bool(config.DASHBOARD_TOKEN) or _any_users()
 
 
+_PAT_PREFIX = "aimon_pat_"          # marks a personal access token
+_pat_used: dict[str, float] = {}    # token-id -> last DB last_used write (throttle)
+
+
+def _hash_token(tok: str) -> str:
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()
+
+
+def _new_pat() -> tuple[str, str, str]:
+    """Mint (raw_token, public_id, display_prefix) for a new personal access token."""
+    secret = secrets.token_urlsafe(32)
+    raw = _PAT_PREFIX + secret
+    tid = secrets.token_urlsafe(6)
+    return raw, tid, raw[:len(_PAT_PREFIX) + 6]
+
+
+def _pat_auth(request: web.Request) -> tuple[str, str] | None:
+    """If the request carries a valid personal access token, return (owner, role).
+    Throttles the last-used DB write to at most once per 60 s per token."""
+    tok = _request_token(request)
+    if not tok or not tok.startswith(_PAT_PREFIX):
+        return None
+    row = db.api_token_lookup(_hash_token(tok))
+    if not row:
+        return None
+    now = time.time()
+    if now - _pat_used.get(row["id"], 0.0) > 60:
+        _pat_used[row["id"]] = now
+        db.api_token_touch(row["id"], now)
+    return row["owner"], row["role"]
+
+
 def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
     """(authenticated, role, session). A valid user session confirms its DB user is
     still present + enabled; the legacy master token counts as full 'admin' access
-    (it is the operator's shared secret). Returns role=None when unauthenticated."""
+    (it is the operator's shared secret); a personal access token grants ITS role.
+    Returns role=None when unauthenticated."""
     sess = _session_from_req(request)
     if sess:
         u = db.user_get(sess["user"])
@@ -516,6 +550,9 @@ def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
         auth.session_drop(request.cookies.get(_USER_COOKIE))   # user gone/disabled
     if _token_ok(_request_token(request)) or _token_cookie_valid(request):
         return True, "admin", None
+    pat = _pat_auth(request)
+    if pat:
+        return True, pat[1], None       # (owner, role) -> role
     return False, None, None
 
 
@@ -941,6 +978,63 @@ async def api_account_password(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# ── per-user API tokens (self-service personal access tokens) ─────────────────
+_MAX_TOKENS_PER_USER = 20
+
+
+async def api_account_tokens_get(request: web.Request) -> web.Response:
+    """List YOUR tokens (metadata only — the secret is never returned again)."""
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in"}, status=401)
+    return web.json_response({"tokens": db.api_token_list(sess["user"]),
+                              "role": sess["role"]})
+
+
+async def api_account_tokens_create(request: web.Request) -> web.Response:
+    """Mint a personal access token. A viewer may only create a VIEWER token; an
+    admin may choose the token's role (viewer or admin). The raw secret is returned
+    exactly once."""
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in"}, status=401)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    if db.api_token_count(sess["user"]) >= _MAX_TOKENS_PER_USER:
+        return web.json_response(
+            {"error": f"token limit reached ({_MAX_TOKENS_PER_USER})"}, status=400)
+    data = await request.post()
+    label = str(data.get("label") or "").strip()[:64]
+    want = str(data.get("role") or "viewer").strip()
+    # Privilege guard: only an admin can mint an admin-scoped token.
+    role = (want if want in auth.ROLES else "viewer") if sess["role"] == "admin" \
+        else "viewer"
+    raw, tid, prefix = _new_pat()
+    if not db.api_token_create(tid, sess["user"], role, label,
+                               _hash_token(raw), prefix, time.time()):
+        return web.json_response({"error": "create failed"}, status=500)
+    _audit(request, sess["user"], "token.create", target=tid, detail=role)
+    # The secret is shown ONCE here and is otherwise unrecoverable (only its hash
+    # is stored).
+    return web.json_response({"ok": True, "id": tid, "token": raw,
+                              "role": role, "label": label})
+
+
+async def api_account_tokens_revoke(request: web.Request) -> web.Response:
+    """Revoke (delete) one of YOUR tokens by id."""
+    sess = _session_from_req(request)
+    if not sess:
+        return web.json_response({"error": "log in"}, status=401)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    tid = str(data.get("id") or "").strip()
+    if not db.api_token_revoke(tid, sess["user"]):
+        return web.json_response({"error": "no such token"}, status=404)
+    _audit(request, sess["user"], "token.revoke", target=tid)
+    return web.json_response({"ok": True})
+
+
 # ── per-user alert webhook (self-service) ─────────────────────────────────────
 async def api_account_webhook_get(request: web.Request) -> web.Response:
     sess = _session_from_req(request)
@@ -1073,6 +1167,11 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
         db.user_set_password(name, auth.hash_password(pw))
         db.user_set_must_change(name, True)   # admin-set pw is temporary
         auth.sessions_drop_user(name)     # force re-login with the new password
+    elif action == "force_reset":
+        # Require the user to choose a new password on next login WITHOUT the admin
+        # setting one (keeps their current password working only to reach /account).
+        db.user_set_must_change(name, True)
+        auth.sessions_drop_user(name)     # end active sessions so the gate applies now
     elif action == "update":
         # edit a user's profile (email + role). Role is revalidated per request in
         # _auth_ctx, so a change takes effect on the target's next request.
@@ -1168,6 +1267,23 @@ async def keyseries_handler(request: web.Request) -> web.Response:
         pts = 200
     pts = max(30, min(pts, 1000))
     data = db.key_series(window, pts, end=_q_end(request))
+    return web.json_response({"window": window, **data})
+
+
+async def keydelta_handler(request: web.Request) -> web.Response:
+    """Timeline of CUMULATIVE requests during the window per top key — each point is
+    the running total of requests made since the window start, so the line climbs to
+    the key's window total and an idle key is a flat 0 line. Top-N ranked by total
+    net requests over the window."""
+    window = request.query.get("window", "1h")
+    if window not in db.WINDOWS:
+        window = "1h"
+    try:
+        pts = int(request.query.get("points", "200"))
+    except ValueError:
+        pts = 200
+    pts = max(30, min(pts, 1000))
+    data = db.key_delta_series(window, pts, end=_q_end(request))
     return web.json_response({"window": window, **data})
 
 
@@ -1413,6 +1529,9 @@ def build_app() -> web.Application:
     app.router.add_get("/api/account/webhook", api_account_webhook_get)
     app.router.add_post("/api/account/webhook", api_account_webhook_set)
     app.router.add_post("/api/account/webhook/test", api_account_webhook_test)
+    app.router.add_get("/api/account/tokens", api_account_tokens_get)
+    app.router.add_post("/api/account/tokens", api_account_tokens_create)
+    app.router.add_post("/api/account/tokens/revoke", api_account_tokens_revoke)
     app.router.add_get("/admin/users", admin_users_page_handler)
     app.router.add_get("/api/admin/users", api_admin_users_list)
     app.router.add_post("/api/admin/users", api_admin_users_create)
@@ -1424,6 +1543,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/events", events_handler)
     app.router.add_get("/api/stream", stream_handler)
     app.router.add_get("/api/keyseries", keyseries_handler)
+    app.router.add_get("/api/keydelta", keydelta_handler)
     app.router.add_get("/api/procseries", procseries_handler)
     app.router.add_get("/api/anomalies", anomalies_handler)
     app.router.add_get("/api/nav", nav_handler)
@@ -1464,6 +1584,7 @@ def startup_selfcheck() -> list[str]:
              if r.resource}
     for need in ("/", "/litellm", "/gpu", "/ollama", "/alerts", "/api/data",
                  "/api/series", "/api/uptime", "/api/keyseries",
+                 "/api/keydelta",
                  "/api/procseries", "/api/anomalies", "/api/nav",
                  "/api/alerts", "/api/export", "/healthz"):
         if need not in paths:

@@ -1,13 +1,13 @@
 # AI-Monitoring — multi-stage, multi-arch build (amd64 / arm64 / arm/v7).
 #
-# Base is python:3.12-alpine — Debian slim carried ~11 HIGH/CRITICAL OS CVEs
+# Base is python:3.14-alpine — Debian slim carried ~11 HIGH/CRITICAL OS CVEs
 # (perl/ncurses/libacl, many Debian "fix_deferred"); Alpine ships 0.
 #
 # The `test` stage runs the FULL QA suite; the runtime stage depends on its
 # marker, so a regression fails `docker build`. For emulated cross-arch builds
 # (armv7 under QEMU) pass --build-arg RUN_TESTS=0 to skip the slow emulated
 # suite — the tests already ran on the native arch.
-FROM python:3.12-alpine AS base
+FROM python:3.14-alpine AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
