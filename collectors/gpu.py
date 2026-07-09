@@ -23,7 +23,7 @@ _MiB = 1024 * 1024
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Redirect handler that refuses to follow 3xx — returning None makes urllib
     raise the HTTPError instead of chasing the Location (SSRF guard for _http)."""
-    def redirect_request(self, *args, **kwargs):   # noqa: D102
+    def redirect_request(self, *_args, **_kwargs):   # noqa: D102
         return None
 
 _NVIDIA_QUERY = [

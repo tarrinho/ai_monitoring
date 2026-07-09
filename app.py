@@ -567,6 +567,13 @@ _ADMIN_API_PREFIX = "/api/admin/"
 # The only surfaces a must-change-password session may reach before resetting.
 _MUST_CHANGE_OK = ("/account", "/logout", "/api/me", "/api/account/password")
 
+
+def _is_alerts_path(p: str) -> bool:
+    """The Alerts page + its API. Alert config (webhook URLs, thresholds) is
+    sensitive, so these must never be served without authentication — even when
+    the rest of the dashboard is opened (MONITOR_ALLOW_OPEN)."""
+    return p == "/alerts" or p.startswith("/api/alerts")
+
 # Brute-force protection: per-IP failed-token counters + lockouts (in-memory;
 # single-instance app, resets on restart — fine for this purpose).
 _auth_fails: dict[str, collections.deque] = collections.defaultdict(
@@ -637,6 +644,11 @@ async def _auth_mw(request: web.Request, handler):
     # Access = a valid per-user login session OR the legacy master token. Static
     # assets, /healthz and the login endpoints stay open so the form can render.
     if not _auth_enabled():
+        # Even with the dashboard opened, alert config must not be exposed without
+        # auth — and open mode has no credential to satisfy, so deny it outright.
+        if _is_alerts_path(request.path):
+            return web.json_response(
+                {"error": "alerts require authentication"}, status=403)
         return await handler(request)
     p = request.path
     if p in _OPEN or p.startswith("/assets/"):
@@ -796,12 +808,13 @@ def _page(request: web.Request, path: Path, dest: str) -> web.Response:
     """Serve a dashboard page: move ?token= into a cookie, then render with the
     current user's sidebar links (Users/logout) stamped in server-side."""
     _maybe_cookie_redirect(request, dest)
-    authed, role, sess = _auth_ctx(request)
+    _authed, role, sess = _auth_ctx(request)
     user = sess["user"] if sess else None
-    # token / PAT access is authenticated but has no user session → hide Alerts
-    token_auth = authed and sess is None
+    # Alerts is user-owned & sensitive: only a real login session gets the link.
+    # Token/PAT (sess is None) and open mode are denied at the route in _auth_mw,
+    # so their link is hidden too — no dead link that just 403s.
     return _serve_page(path, _fwd_prefix(request), user=user, role=role,
-                       show_alerts=not token_auth)
+                       show_alerts=sess is not None)
 
 
 async def index_handler(request: web.Request) -> web.Response:

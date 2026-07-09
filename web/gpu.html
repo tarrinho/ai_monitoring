@@ -140,7 +140,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.4.0</div>
+      <div id="sidebar-brand-ver">v1.4.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -257,7 +257,10 @@ function mkChart(canvas, cfg){
     _charts[cfg.id]=mkChart(cv,cfg);
   }
 })();
-function fmtT(t){ if(!t) return ""; const d=new Date(t*1000); return WIN==="12mo"?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):WIN==="30d"?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+function fmtT(t){ if(!t) return ""; return new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+// axisT(pts): label granularity from the ACTUAL data span, not the window name,
+// so a 12mo view with only days of history shows distinct day labels.
+function axisT(pts){ const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean); const span=ts.length>1?Math.max(...ts)-Math.min(...ts):0; return function(p){ const t=(p&&typeof p==="object")?p.t:p; if(!t) return ""; const d=new Date(t*1000); return span>180*86400?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):span>2*86400?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }; }
 
 // Stacked per-app CPU% over time (top-10 apps, one colour each).
 const PROC_COLORS=["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff","#ff7b72",
@@ -277,7 +280,7 @@ async function loadAppCpu(){
   const d=await api("/api/procseries?kind=cpu&window="+WIN);
   if(!d) return;
   const pts=d.points||[], apps=d.apps||[];
-  appCpuChart.data.labels=pts.map(p=>fmtT(p.t));
+  appCpuChart.data.labels=pts.map(axisT(pts));
   appCpuChart.data.datasets=apps.map((a,i)=>({label:a,
     // an app with no sample in a bucket (process absent / not in top-N then) is 0,
     // NOT null: on a STACKED area a null gets span-gapped into a straight diagonal
@@ -349,7 +352,7 @@ function renderKpis(g){
 async function loadSeries(){
   const d=await api("/api/series?window="+WIN);
   if(!d) return;
-  const pts=d.points||[]; const labels=pts.map(p=>fmtT(p.t));
+  const pts=d.points||[]; const labels=pts.map(axisT(pts));
   for(const cfg of CHARTS){
     const ch=_charts[cfg.id];
     ch.data.labels=labels;

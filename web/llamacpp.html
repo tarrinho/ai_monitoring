@@ -139,7 +139,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.4.0</div>
+      <div id="sidebar-brand-ver">v1.4.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -241,7 +241,9 @@ function mkChart(canvas, cfg){
     _charts[cfg.id]=mkChart(cv,cfg);
   }
 })();
-function fmtT(t){ if(!t) return ""; const d=new Date(t*1000); return WIN==="12mo"?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):WIN==="30d"?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+function fmtT(t){ if(!t) return ""; return new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+// axisT(pts): label granularity from the ACTUAL data span, not the window name.
+function axisT(pts){ const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean); const span=ts.length>1?Math.max(...ts)-Math.min(...ts):0; return function(p){ const t=(p&&typeof p==="object")?p.t:p; if(!t) return ""; const d=new Date(t*1000); return span>180*86400?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):span>2*86400?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }; }
 function fmtCur(v){ return v==null?"—":(Math.round(v*100)/100); }
 function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
 
@@ -298,7 +300,7 @@ function renderKpis(lc){
 async function loadSeries(){
   const d=await api("/api/series?window="+WIN);
   if(!d) return;
-  const pts=d.points||[]; const labels=pts.map(p=>fmtT(p.t));
+  const pts=d.points||[]; const labels=pts.map(axisT(pts));
   for(const cfg of CHARTS){
     const ch=_charts[cfg.id];
     ch.data.labels=labels;

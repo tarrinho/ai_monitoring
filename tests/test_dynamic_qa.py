@@ -1928,6 +1928,9 @@ def test_proc_series_rollup_serves_year_window(tmp_path, monkeypatch):
     db.rollup()
     out = db.proc_series("cpu", "30d", top_n=5)
     assert out["apps"] == ["svc"] and out["points"]
+    # 12-month window reads the same 1-hour rollup tier (>24h → hourly table)
+    out12 = db.proc_series("cpu", "12mo", top_n=5)
+    assert out12["apps"] == ["svc"] and out12["points"]
 
 
 def test_key_series_end_param_pans(tmp_path, monkeypatch):
@@ -1996,10 +1999,13 @@ async def test_nav_endpoint_shape():
         await c.close()
 
 
-async def test_alerts_endpoint_shape():
+async def test_alerts_endpoint_shape(monkeypatch):
+    # alert config is auth-gated (never open), so present a credential
+    TOK = "alerts-shape-tok-1"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
     c = await _client()
     try:
-        r = await c.get("/api/alerts")
+        r = await c.get("/api/alerts", headers={"Authorization": "Bearer " + TOK})
         assert r.status == 200
         d = await r.json()
         assert "channels" in d and "thresholds" in d
@@ -2049,22 +2055,21 @@ def test_channels_and_thresholds_status(monkeypatch):
 
 
 async def test_alerts_page_served_and_gated(monkeypatch):
+    # alert config is never open — it serves only WITH a credential and is gated
+    # (redirect / 401) without one, even though the rest of the app may be open.
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-al-1")
     c = await _client()
     try:
-        r = await c.get("/alerts")
+        r = await c.get("/alerts", headers={"Authorization": "Bearer tok-al-1"})
         assert r.status == 200
         html = await r.text()
         assert "Alerts" in html and "Send test alert" in html
+        # gated without a credential
+        r2 = await c.get("/alerts", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
+        assert (await c.get("/api/alerts")).status == 401
     finally:
         await c.close()
-    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-al-1")
-    c2 = await _client()
-    try:
-        r2 = await c2.get("/alerts", allow_redirects=False)
-        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
-        assert (await c2.get("/api/alerts")).status == 401
-    finally:
-        await c2.close()
 
 
 async def test_anomalies_endpoint():
@@ -2610,6 +2615,74 @@ async def test_user_session_keeps_alerts_link(monkeypatch):
         assert '<a href="/alerts">Alerts</a>' in h           # user keeps Alerts
     finally:
         await c.close()
+
+
+async def test_pat_auth_hides_alerts_link(monkeypatch):
+    """A personal access token is token-auth (sess is None) → Alerts hidden too."""
+    db.user_create("pab", "pab@x.io", auth.hash_password("pabpw1234"),
+                   "viewer", time.time())
+    raw, tid, prefix = appmod._new_pat()
+    assert db.api_token_create(tid, "pab", "viewer", "t",
+                               appmod._hash_token(raw), prefix, time.time())
+    c = await _client()
+    try:
+        r = await c.get("/", headers={"Authorization": "Bearer " + raw})
+        assert r.status == 200
+        assert '<a href="/alerts">Alerts</a>' not in (await r.text())
+    finally:
+        await c.close()
+
+
+async def test_open_mode_denies_alerts():
+    """Open mode (no token, no users) has no authentication, so alert config —
+    webhook URLs, thresholds — must be denied, and its sidebar link hidden so
+    there is no dead link that just 403s."""
+    c = await _client()
+    try:
+        h = await (await c.get("/")).text()      # overview still open...
+        assert '<a href="/alerts">Alerts</a>' not in h   # ...but Alerts link gone
+        assert (await c.get("/alerts")).status == 403        # page denied
+        assert (await c.get("/api/alerts")).status == 403    # API denied
+        # a benign open endpoint is unaffected
+        assert (await c.get("/healthz")).status == 200
+    finally:
+        await c.close()
+
+
+async def test_token_mode_still_allows_alerts_access(monkeypatch):
+    """Guard against over-restricting: with auth enabled, the master token still
+    reaches the alerts page + API (its link is hidden, but access is allowed)."""
+    TOK = "alerts-access-tok-12"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
+    c = await _client()
+    try:
+        hdr = {"Authorization": "Bearer " + TOK}
+        assert (await c.get("/alerts", headers=hdr)).status == 200
+        assert (await c.get("/api/alerts", headers=hdr)).status == 200
+    finally:
+        await c.close()
+
+
+def test_apply_prefix_covers_form_action_and_js_redirect():
+    """_apply_prefix must rewrite the login form POST target and the account
+    page's JS root redirect, not just href/src/fetch — else they escape a
+    reverse-proxy sub-path."""
+    html = ('<a href="/x">|<form action="/login">|'
+            'fetch("/api/a")|api("/api/b")|location.href="/";')
+    out = appmod._apply_prefix(html, "/ai_monitoring")
+    assert 'href="/ai_monitoring/x"' in out
+    assert 'action="/ai_monitoring/login"' in out          # login POST
+    assert 'fetch("/ai_monitoring/api/a"' in out
+    assert 'api("/ai_monitoring/api/b"' in out
+    assert 'location.href="/ai_monitoring/"' in out         # account redirect
+
+
+def test_gpu_http_collector_refuses_redirects():
+    """SSRF guard: the GPU HTTP collector's redirect handler returns None so
+    urllib raises on any 3xx instead of chasing the Location header."""
+    h = gpu._NoRedirect()
+    assert h.redirect_request(None, None, 302, "Found", {}, "http://evil/") is None
+    assert h.redirect_request(None, None, 301, "Moved", {}, "http://x/") is None
 
 
 async def test_login_bad_password_and_lockout(monkeypatch):

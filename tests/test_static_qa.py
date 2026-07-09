@@ -2,8 +2,13 @@
 # Enforces the rules.md invariants that apply to this project: env-only
 # secrets, dashboard security (§17), version consistency (§0a), fail-fast
 # config, and container hardening.
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 import config
 
@@ -99,7 +104,58 @@ def test_window_selector_and_series_wiring():
         assert f'data-w="{w}"' in html, f"missing window button {w}"
     assert "/api/series" in html and "loadSeries" in html
     # long windows must render calendar dates on the axis, not time-of-day only
-    assert "toLocaleDateString" in html, "fmtT not window-aware for 30d/12mo axis"
+    assert "toLocaleDateString" in html, "axis not date-aware for 30d/12mo"
+
+
+def test_axis_labels_adapt_to_data_span_not_window():
+    # Bug: a 12mo view holding only a few days of history rendered the SAME
+    # "Jul '26" on every tick (label granularity was chosen from the window name,
+    # not the data). Fix: axisT(pts) picks granularity from the actual span of the
+    # plotted points. Every windowed dashboard must use it and must NOT branch the
+    # axis format on the window name (WIN==="12mo"/"30d").
+    for name in ("index", "gpu", "ollama", "llamacpp", "litellm"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert "function axisT(pts)" in html, f"{name}: missing span-aware axisT"
+        # axis label maps go through axisT(...), not the old per-window fmtT
+        assert "axisT(pts)" in html or "axisT(feed.points)" in html, \
+            f"{name}: chart labels not built from axisT"
+        assert 'WIN==="12mo"' not in html and 'WIN==="30d"' not in html, \
+            f"{name}: axis format still keyed off the window name, not the data span"
+        # the span thresholds (≈2 days, ≈180 days) drive month/day/time granularity
+        assert "180*86400" in html and "2*86400" in html, \
+            f"{name}: axisT missing span thresholds"
+
+
+def test_axisT_granularity_by_span_behavior():
+    """Behavioral guard for the reported "days wrong" bug: axisT must pick the
+    label granularity from the DATA span — time for ≤2d, calendar day for
+    ≤180d, month+'yy beyond — not from the window name. Runs the real JS via
+    node (skipped if node is unavailable)."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function axisT\(pts\)\{[\s\S]*?\n\}", html)
+    assert m, "axisT not found in index.html"
+    t0 = 1700000000                       # fixed epoch; no Date.now in the logic
+    script = m.group(0) + f"""
+const t0={t0}, day=86400;
+const P = s => [{{t:t0}}, {{t:t0+s}}];
+console.log(JSON.stringify([
+  axisT(P(3600))(t0),        // 1h span  -> time
+  axisT(P(3*day))(t0),       // 3d span  -> "Mon D"
+  axisT(P(300*day))(t0),     // 300d span-> "Mon 'YY"
+]));
+"""
+    out = subprocess.run([node, "-e", script], capture_output=True,
+                         text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    hour, days, year = json.loads(out.stdout)
+    assert re.match(r"^\d{1,2}:\d{2}", hour), f"hour span not a time: {hour!r}"
+    assert re.match(r"^[A-Z][a-z]{2}\s+\d{1,2}$", days), \
+        f"day span not 'Mon D': {days!r}"
+    assert re.match(r"^[A-Z][a-z]{2} '\d{2}$", year), \
+        f"year span not \"Mon 'YY\": {year!r}"
 
 
 def test_per_characteristic_charts_defined():
@@ -214,7 +270,8 @@ def test_dashboard_uptime_and_export_wired():
     body = html[html.find("async function loadUptime"):]
     body = body[:body.find("function rangedReload")]
     assert 'getElementById("card-uptime")' in body
-    assert 'card.style.display = "none"' in body
+    assert 'card.style.display = "none"' in body          # empty window → hide
+    assert 'card.style.display = ""' in body              # data present → restore
 
 
 def test_overview_top_apps_and_evolution():
@@ -264,7 +321,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.4.0"
+    assert config.VERSION == "AI-Monitoring_1.4.1"
 
 
 def test_ux_improvements_present():

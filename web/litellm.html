@@ -146,7 +146,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.4.0</div>
+      <div id="sidebar-brand-ver">v1.4.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -344,7 +344,9 @@ function mkChart(canvas, cfg){
     _charts[cfg.id]=mkChart(cv,cfg);
   }
 })();
-function fmtT(t){ if(!t) return ""; const d=new Date(t*1000); return WIN==="12mo"?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):WIN==="30d"?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+function fmtT(t){ if(!t) return ""; return new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+// axisT(pts): label granularity from the ACTUAL data span, not the window name.
+function axisT(pts){ const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean); const span=ts.length>1?Math.max(...ts)-Math.min(...ts):0; return function(p){ const t=(p&&typeof p==="object")?p.t:p; if(!t) return ""; const d=new Date(t*1000); return span>180*86400?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):span>2*86400?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }; }
 function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(cfg.unit?(Math.round(v*100)/100)+cfg.unit:Math.round(v*100)/100)); }
 function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
 
@@ -490,7 +492,7 @@ async function loadKeyDelta(){
   const w=document.getElementById("keydelta-win"); if(w) w.textContent=WIN;
   if(!d) return;
   const pts=d.points||[]; const labels=d.labels||[];
-  keyDeltaChart.data.labels=pts.map(p=>fmtT(p.t));
+  keyDeltaChart.data.labels=pts.map(axisT(pts));
   keyDeltaChart.data.datasets=labels.map((lab,i)=>({
     label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
@@ -582,7 +584,7 @@ const _SVC_COLORS = ["#7ee787","#f0883e","#58a6ff","#bc8cff","#f778ba"];
 function _svcDatasets(feed){
   if(!(feed && feed.points && feed.apps)) return {labels:[],datasets:[]};
   const apps=(feed.apps||[]).filter(a=>/llama|ollama/i.test(a));   // LLM servers only
-  return {labels:feed.points.map(p=>fmtT(p.t)),
+  return {labels:feed.points.map(axisT(feed.points)),
     datasets:apps.map((a,i)=>({label:a,
       data:feed.points.map(p=>p[a]==null?null:p[a]),
       borderColor:_SVC_COLORS[i%_SVC_COLORS.length],borderWidth:1.4,pointRadius:0,
@@ -600,7 +602,7 @@ async function loadImpact(){
   const pr=await api("/api/procseries?kind=ram&window="+WIN);
   if(!s) return;
   const pts=s.points||[];
-  impactChart.data.labels=pts.map(p=>fmtT(p.t));
+  impactChart.data.labels=pts.map(axisT(pts));
   impactChart.data.datasets[0].data=pts.map(p=>p.reqrate==null?null:p.reqrate);
   impactChart.data.datasets[1].data=pts.map(p=>p.gpu==null?null:p.gpu);
   impactChart.data.datasets[2].data=pts.map(p=>p.kvcache==null?null:p.kvcache);
@@ -626,7 +628,7 @@ async function loadCorr(){
   document.getElementById("corr-win").textContent=WIN;
   if(!d) return;
   const pts=d.points||[];
-  corrChart.data.labels=pts.map(p=>fmtT(p.t));
+  corrChart.data.labels=pts.map(axisT(pts));
   corrChart.data.datasets[0].data=pts.map(p=>p.conc==null?null:p.conc);
   corrChart.data.datasets[1].data=pts.map(p=>p.p95==null?null:p.p95);
   corrChart.update("none");
@@ -640,7 +642,7 @@ async function loadKeyTime(){
   if(km) km.textContent = _spendMode==="lite" ? "by spend ($)" : "by requests";
   if(!d){ return; }
   const pts=d.points||[]; const labels=d.labels||[];
-  keyTimeChart.data.labels=pts.map(p=>fmtT(p.t));
+  keyTimeChart.data.labels=pts.map(axisT(pts));
   keyTimeChart.data.datasets=labels.map((lab,i)=>({
     label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
@@ -667,7 +669,7 @@ function renderFailures(l){
 async function loadSeries(){
   const d=await api("/api/series?window="+WIN);
   if(!d) return;
-  const pts=d.points||[]; const labels=pts.map(p=>fmtT(p.t));
+  const pts=d.points||[]; const labels=pts.map(axisT(pts));
   for(const cfg of CHARTS){
     const ch=_charts[cfg.id];
     ch.data.labels=labels;

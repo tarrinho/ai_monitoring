@@ -46,6 +46,10 @@ def _reset_auth_state():
         with _db._connect() as conn:
             conn.execute("DELETE FROM users")
             conn.execute("DELETE FROM audit_log")
+            # api_tokens are per-user and capped (20/user); the shared on-disk
+            # test DB persists across runs, so without this a user's tokens pile
+            # up until create hits the cap (400). Reset them like users/sessions.
+            conn.execute("DELETE FROM api_tokens")
     except Exception:
         pass
     _app._users_seen["checked"] = 0.0

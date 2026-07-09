@@ -190,7 +190,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.4.0</div>
+      <div id="sidebar-brand-ver">v1.4.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -475,13 +475,25 @@ function mkChart(canvas, cfg){
   }
 })();
 
-function fmtT(t){
+function fmtT(t){   // single timestamp → time-of-day (event rows, tooltips)
   if(!t) return "";
-  const d=new Date(t*1000);
-  // long windows show a calendar date so 30d/12mo axes are legible
-  if(WIN==="12mo") return d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2);
-  if(WIN==="30d")  return d.toLocaleDateString([],{month:"short",day:"numeric"});
-  return d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  return new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+}
+// axisT(pts) → a label formatter whose granularity is chosen from the ACTUAL
+// data span, not the window name. A 12mo view holding only a few days of history
+// must show distinct day labels (Jul 3 … Jul 8), not the same "Jul '26" on every
+// tick; a full year still collapses to month + year.
+function axisT(pts){
+  const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean);
+  const span=ts.length>1 ? Math.max(...ts)-Math.min(...ts) : 0;
+  return function(p){
+    const t=(p&&typeof p==="object")?p.t:p;
+    if(!t) return "";
+    const d=new Date(t*1000);
+    if(span > 180*86400) return d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2);
+    if(span > 2*86400)   return d.toLocaleDateString([],{month:"short",day:"numeric"});
+    return d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  };
 }
 function fmtCur(cfg, v){
   if(v==null) return "—";
@@ -655,7 +667,7 @@ function mkEvo(id, isBytes){
 const cpuEvo=mkEvo("cpuevo-chart",false), ramEvo=mkEvo("ramevo-chart",true);
 function fillEvo(chart, d, unit){
   const pts=d.points||[], apps=d.apps||[];
-  chart.data.labels=pts.map(p=>fmtT(p.t));
+  chart.data.labels=pts.map(axisT(pts));
   chart.data.datasets=apps.map((a,i)=>({label:a+(unit||""),
     data:pts.map(p=>p[a]==null?null:p[a]),
     borderColor:PROC_COLORS[i%PROC_COLORS.length],
@@ -841,7 +853,7 @@ async function loadSeries(){
   const d = await api("/api/series?window="+WIN);
   if(!d) return;
   const pts = d.points || [];
-  const labels = pts.map(p=>fmtT(p.t));
+  const labels = pts.map(axisT(pts));
   for(const cfg of CHARTS){
     const ch = _charts[cfg.id];
     ch.data.labels = labels;

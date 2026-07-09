@@ -4,6 +4,38 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.4.1] — 2026-07-09
+
+### Security
+- **Alert config requires authentication — always.** The Alerts page and
+  `/api/alerts*` now return **403** when the dashboard is opened without auth
+  (`MONITOR_ALLOW_OPEN` / no token + no users), so webhook URLs and thresholds are
+  never exposed unauthenticated. The sidebar **Alerts** link is shown only to a
+  real login session (hidden for token/PAT access and open mode — no dead link
+  that just 403s). Token/PAT access to alerts is unchanged (master token = admin,
+  PAT = its role).
+
+### Fixed
+- **Reverse-proxy sub-path login.** `_apply_prefix` now also rewrites the login
+  form `action="/login"` and the account page's `location.href="/"` redirect, so
+  behind `X-Forwarded-Prefix` (e.g. `/ai_monitoring`) the login POST and
+  post-password-change nav stay inside the sub-path instead of hitting the proxy
+  root.
+- **12-month axis showed a bogus “day”.** The `12mo` label used a 2-digit year
+  (`Jul 25`) that read as *July 25th*; the axis is now span-aware (`axisT`) and
+  renders `Jul '25` for a year span, `Jul 8` for a multi-day span, `HH:MM` for a
+  short span — chosen from the data span, not the window name.
+- **Uptime card no longer shows an empty tile.** When a window has no backend
+  history the whole card is hidden (self-healing when data returns).
+- **CI lint annotation (vulture exit 3).** The GPU SSRF-guard override
+  (`_NoRedirect.redirect_request`) had unused `*args/**kwargs`; renamed to
+  `*_args/**_kwargs`. Runtime behavior unchanged; now regression-tested.
+
+### Added
+- **12-month (`12mo`) time window on every graph** (host, GPU, llama.cpp,
+  LiteLLM), backed by the 1-hour rollup tier (365-day retention).
+- **Token / PAT access hides the Alerts link** (see Security).
+
 ## [1.4.0] — 2026-07-08
 
 ### Added
@@ -25,6 +57,16 @@ Versioning: [SemVer](https://semver.org/).
   subscription billing — and that per-key **budgets** are on the roadmap.
 
 ### Fixed
+- **Time-axis labels repeated the same month on long windows.** The chart label
+  formatter chose its granularity from the *window name* (`12mo`/`30d`), so a 12mo
+  view holding only a few days of history drew the identical `Jul '26` on every
+  tick (and `30d` similarly). Replaced with `axisT(pts)`, which picks granularity
+  from the **actual span of the plotted data**: > 180 d → month + year
+  (`Jul '26`), > 2 d → month + day (`Jul 3`), else time-of-day. So five days of
+  history on a 12mo axis now reads `Jul 3 … Jul 8`, while a full year still
+  collapses to distinct months. Applied to every windowed dashboard (Overview,
+  GPU, Ollama, llama.cpp, LiteLLM); single-timestamp uses (event rows) keep the
+  plain time formatter.
 - **`scripts/demo_seed.py` 500 on every page.** Its theme-shim wrapper still used
   the old `_serve_page` signature and didn't forward the `user`/`role` kwargs the
   app now passes, so the seeded demo server returned 500. The wrapper now forwards
