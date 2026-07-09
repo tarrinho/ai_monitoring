@@ -4,6 +4,36 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.4.3] — 2026-07-09
+
+### Fixed
+- **Ollama dashboard was missing the 12-month window.** It only offered
+  15m/1h/24h/30d (no `12mo` button, and `12mo` absent from its `WSECS` map so pan
+  would break) — the one page the "12mo on all graphs" pass skipped. Added the
+  button + `WSECS` entry; its charts already support the year window server-side.
+
+### Tests
+- **Window-card QA guards.** `test_all_windowed_pages_have_full_window_set`
+  enforces the full 15m/1h/24h/30d/12mo button set + `12mo` in `WSECS` on every
+  windowed page. `test_every_windowed_loader_is_in_the_reload_path` asserts every
+  JS loader that fetches a `?window=` endpoint is called from `rangedReload` — so a
+  card can never silently ignore the selector again (the Per-model regression
+  class; verified to flag a synthetic break).
+
+## [1.4.2] — 2026-07-09
+
+### Fixed
+- **Per-model table now follows the time window.** It was a fixed collector
+  snapshot (lite mode = today-only via `/global/activity/model?start_date=today`;
+  full mode = last `LITELLM_SPEND_WINDOW_MIN` = 15 min) and ignored the
+  15m/1h/24h/30d/12mo selector, so switching to 24h never showed yesterday. New
+  `GET /api/litellm/models?window=…` queries LiteLLM's pre-aggregated per-model
+  endpoint for the selected date range (day-granular: 24h opens yesterday, 30d/12mo
+  open prior months) — the cheap aggregate, **not** the heavy `/spend/logs`. The
+  table reloads on window change / pan / Live and shows requests + tokens over the
+  window plus the live serving-process CPU/RAM. Header shows the active window.
+  Per-model latency/cost still require `spend_mode=full` (KPI tiles).
+
 ## [1.4.1] — 2026-07-09
 
 ### Security

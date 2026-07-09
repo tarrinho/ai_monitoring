@@ -336,6 +336,34 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
     return out
 
 
+async def per_model_range(session: aiohttp.ClientSession,
+                          start_date: str, end_date: str) -> list[dict] | None:
+    """Per-model requests + tokens over a [start_date, end_date] day range, via the
+    pre-aggregated `/global/activity/model` endpoint (day-granular, ~0 CPU — NOT the
+    heavy /spend/logs). This lets the dashboard's Per-model table honor the time
+    window (incl. prior days) instead of only the collector's fixed rolling window.
+
+    Returns rows sorted by requests (top 50), or None when LiteLLM is unconfigured
+    or the call fails (so the caller can tell 'no data' from 'not available')."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    pm, err = await fetch_json(
+        session,
+        f"{base}/global/activity/model?start_date={start_date}&end_date={end_date}",
+        headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None or not isinstance(pm, list):
+        return None
+    rows = [{
+        "model": m.get("model", "?"),
+        "reqs": int(m.get("sum_api_requests") or 0),
+        "tokens": int(m.get("sum_total_tokens") or 0),
+    } for m in pm]
+    rows.sort(key=lambda r: r["reqs"], reverse=True)
+    return rows[:50]
+
+
 async def _heavy_sample(session: aiohttp.ClientSession, base: str,
                         h: dict, now: float) -> dict:
     """Expensive half of the LiteLLM sample — the /spend/logs pull (whole-day

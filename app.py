@@ -1332,6 +1332,28 @@ async def nav_handler(request: web.Request) -> web.Response:
     })
 
 
+async def litellm_models_handler(request: web.Request) -> web.Response:
+    """Per-model requests + tokens for the SELECTED window, queried live from
+    LiteLLM's pre-aggregated per-model endpoint so the table honors
+    15m/1h/24h/30d/12mo — including prior days — instead of only the collector's
+    fixed rolling window (which is today-only / last-15-min)."""
+    window = request.query.get("window", "24h")
+    if window not in db.WINDOWS:
+        window = "24h"
+    now = time.time()
+    secs = db.WINDOWS[window]
+    # /global/activity/model is day-granular: open at the day the window starts,
+    # close tomorrow so today is fully covered. A rolling 24h thus spans yesterday
+    # + today (the reported gap). Sub-day windows collapse to today (endpoint's
+    # finest granularity is a day).
+    start = time.strftime("%Y-%m-%d", time.gmtime(now - secs))
+    end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    rows = await litellm.per_model_range(request.app[_SESSION], start, end)
+    return web.json_response({"window": window, "start_date": start,
+                              "end_date": end, "per_model": rows or [],
+                              "available": rows is not None})
+
+
 async def alerts_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "channels": alerts.channels_status(),
@@ -1573,6 +1595,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/procseries", procseries_handler)
     app.router.add_get("/api/anomalies", anomalies_handler)
     app.router.add_get("/api/nav", nav_handler)
+    app.router.add_get("/api/litellm/models", litellm_models_handler)
     app.router.add_get("/api/alerts", alerts_handler)
     app.router.add_post("/api/alerts/test", alerts_test_handler)
     app.router.add_get("/api/export", export_handler)
@@ -1612,6 +1635,7 @@ def startup_selfcheck() -> list[str]:
                  "/api/series", "/api/uptime", "/api/keyseries",
                  "/api/keydelta",
                  "/api/procseries", "/api/anomalies", "/api/nav",
+                 "/api/litellm/models",
                  "/api/alerts", "/api/export", "/healthz"):
         if need not in paths:
             problems.append(f"route not registered: {need}")

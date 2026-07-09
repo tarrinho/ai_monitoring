@@ -158,6 +158,42 @@ console.log(JSON.stringify([
         f"year span not \"Mon 'YY\": {year!r}"
 
 
+def test_all_windowed_pages_have_full_window_set():
+    # every dashboard with a time-window selector must offer the SAME set of
+    # windows — incl. 30d + 12mo — and carry them in WSECS so pan works. (ollama
+    # was missing 12mo; this guards against any page drifting again.)
+    for name in ("index", "gpu", "ollama", "llamacpp", "litellm"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        for w in ("15m", "1h", "24h", "30d", "12mo"):
+            assert f'data-w="{w}"' in html, f"{name}: missing window button {w}"
+        assert '"12mo":31536000' in html, f"{name}: 12mo not in WSECS (pan breaks)"
+
+
+def test_every_windowed_loader_is_in_the_reload_path():
+    # QA guard: any JS loader that fetches a `?window=` endpoint MUST be called in
+    # the window-change reload path (rangedReload), else its card silently ignores
+    # the time-window selector — exactly how the Per-model table regressed. The
+    # export button reads the window too but is a download, not a card → excluded.
+    for name in ("index", "gpu", "ollama", "llamacpp", "litellm"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        m = re.search(r"function rangedReload\(\)\{([^}]*)\}", html)
+        assert m, f"{name}: no rangedReload()"
+        reload_body = m.group(1)
+        loaders = set()
+        for mm in re.finditer(r'window="\+WIN', html):
+            nl = html.rfind("\n", 0, mm.start())
+            line = html[nl:html.find("\n", mm.start())]
+            if "/api/export" in line:        # download button, not a card loader
+                continue
+            fns = re.findall(r"function\s+([A-Za-z_]\w*)\s*\(", html[:mm.start()])
+            if fns:
+                loaders.add(fns[-1])         # nearest enclosing function
+        missing = [f for f in loaders
+                   if f != "rangedReload" and (f + "(") not in reload_body]
+        assert not missing, \
+            f"{name}: windowed loaders ignore the selector (not in reload): {missing}"
+
+
 def test_per_characteristic_charts_defined():
     html = WEB.read_text(encoding="utf-8")
     assert 'id="chart-grid"' in html and 'id="card-gpu"' in html
@@ -179,6 +215,18 @@ def test_windowed_pages_have_time_nav_arrows():
         assert 'id="nav-left"' in html and 'id="nav-right"' in html, name
         assert "TIMEEND" in html and 'end="+TIMEEND' in html, name   # panned query
         assert 'id="range-lbl"' in html, name
+
+
+def test_litellm_per_model_table_follows_window():
+    # the Per-model table must be window-aware (loadModels -> /api/litellm/models,
+    # reloaded on window change), not a fixed "rolling window" snapshot
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "async function loadModels()" in html
+    assert "/api/litellm/models?window=" in html
+    assert 'id="ll-models-win"' in html                 # window shown in header
+    assert "Per-model (rolling window)" not in html     # old fixed label gone
+    # reloaded when the window changes (rangedReload) — not just once
+    assert html.count("loadModels()") >= 3
 
 
 def test_litellm_has_window_delta_key_chart():
@@ -321,7 +369,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.4.1"
+    assert config.VERSION == "AI-Monitoring_1.4.3"
 
 
 def test_ux_improvements_present():

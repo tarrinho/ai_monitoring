@@ -1933,6 +1933,65 @@ def test_proc_series_rollup_serves_year_window(tmp_path, monkeypatch):
     assert out12["apps"] == ["svc"] and out12["points"]
 
 
+def test_series_returns_full_span_for_long_windows(tmp_path, monkeypatch):
+    """The 30d + 12mo charts must render the FULL window span when the DB holds
+    the history — the user-reported "only from the 1st of the month" was limited
+    DB history, NOT a query clamp. Seed metrics_1h hourly across 400 days and
+    assert db.series() spans ~30 days for 30d and ~a year for 12mo, all populated."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "span.db"))
+    db.init()
+    now = 1_700_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    cols = db._METRIC_COLS
+    ph = ",".join("?" * len(cols))
+    ins = f"INSERT OR REPLACE INTO metrics_1h(bucket,{','.join(cols)}) VALUES (?,{ph})"
+    with db._connect() as conn:
+        for h in range(400 * 24):                       # 400 days of hourly buckets
+            b = int((now - h * 3600) / 3600) * 3600
+            conn.execute(ins, (b, *[float(h % 97 + 1)] * len(cols)))
+
+    def span(w):
+        pts = db.series(w, 300)
+        ts = [p["t"] for p in pts if p.get("t")]
+        return ((max(ts) - min(ts)) / 86400, len(pts),
+                all(p.get("cpu") is not None for p in pts))
+
+    s30, n30, ok30 = span("30d")
+    s12, n12, ok12 = span("12mo")
+    assert s30 >= 28 and n30 >= 100 and ok30, f"30d span={s30:.1f}d pts={n30}"
+    assert s12 >= 350 and n12 >= 100 and ok12, f"12mo span={s12:.1f}d pts={n12}"
+    # 12mo must reach further back than 30d (proves the window drives the range)
+    assert s12 > s30
+
+
+def test_demo_seed_long_history_populates_rollup_tiers(tmp_path, monkeypatch):
+    """demo_seed.seed_long_history fills the 1h + 1m rollup tiers directly so the
+    demo showcases 30d/12mo out of the box. Run a small span (fast) and assert the
+    tiers are populated and db.series reads them."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "demo.db"))
+    monkeypatch.setenv("DEMO_HISTORY_DAYS", "8")
+    monkeypatch.setenv("DEMO_HISTORY_MIN_DAYS", "1")
+    monkeypatch.delenv("DEMO_FAST", raising=False)
+    db.init()
+    import scripts.demo_seed as ds
+    now = 1_700_000_000.0
+    ds.seed_long_history(now)
+    with db._connect() as conn:
+        n1h = conn.execute("SELECT COUNT(*) FROM metrics_1h").fetchone()[0]
+        n1m = conn.execute("SELECT COUNT(*) FROM metrics_1m").fetchone()[0]
+        nks = conn.execute("SELECT COUNT(*) FROM key_series_1h").fetchone()[0]
+        nps = conn.execute("SELECT COUNT(*) FROM proc_series_1h").fetchone()[0]
+    assert n1h >= 8 * 24 - 2, f"metrics_1h under-seeded: {n1h}"
+    assert n1m >= 24 * 60 - 2, f"metrics_1m under-seeded: {n1m}"
+    assert nks > 0 and nps > 0, f"key/proc 1h empty: {nks}/{nps}"
+    # the seeded 1h tier is readable via the series API for a >24h window
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    pts = db.series("30d", 300)
+    assert pts and any(p.get("cpu") is not None for p in pts)
+
+
 def test_key_series_end_param_pans(tmp_path, monkeypatch):
     import config as cfg
     monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "kpan.db"))
@@ -2012,6 +2071,36 @@ async def test_alerts_endpoint_shape(monkeypatch):
         assert "active" in d and "history" in d
         ids = {ch["id"] for ch in d["channels"]}
         assert ids == {"webhook"}          # webhook-only
+    finally:
+        await c.close()
+
+
+async def test_litellm_models_window_endpoint(monkeypatch):
+    """Per-model table endpoint honors the window: the date range follows
+    15m/1h/24h/30d/12mo (24h opens yesterday so prior-day records show), bad
+    windows fall back to 24h, and it degrades cleanly when LiteLLM is unconfigured."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "modeltok-1")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")   # unconfigured in tests
+    hdr = {"Authorization": "Bearer modeltok-1"}
+    c = await _client()
+    try:
+        # gated like the rest of /api/
+        assert (await c.get("/api/litellm/models")).status == 401
+        r = await c.get("/api/litellm/models?window=24h", headers=hdr)
+        assert r.status == 200
+        d = await r.json()
+        assert d["window"] == "24h"
+        assert d["available"] is False and d["per_model"] == []   # unconfigured
+        # 24h is day-granular and opens YESTERDAY, covering prior-day records
+        y = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+        assert d["start_date"] == y and d["start_date"] < d["end_date"]
+        # bad window falls back to 24h
+        assert (await (await c.get("/api/litellm/models?window=bogus",
+                                   headers=hdr)).json())["window"] == "24h"
+        # 30d opens further back than 24h
+        d30 = await (await c.get("/api/litellm/models?window=30d",
+                                 headers=hdr)).json()
+        assert d30["start_date"] < d["start_date"]
     finally:
         await c.close()
 

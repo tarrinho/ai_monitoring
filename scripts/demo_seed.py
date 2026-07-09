@@ -126,9 +126,52 @@ def make_snap(ts):
     }}
 
 
+def seed_long_history(now):
+    """Seed the rollup tiers DIRECTLY so the 30d + 12mo windows showcase a full
+    span in the demo. Raw+rollup can't backfill a year (the 1-hour rollup only
+    looks back 3 days), so we write the aggregated tiers straight:
+      - metrics_1h / key_series_1h / proc_series_1h : hourly, 370 days → 30d + 12mo
+      - metrics_1m                                  : 1-minute, 2 days → 24h
+    Set DEMO_FAST=1 to skip (2-hour raw only, for quick screenshot runs).
+    DEMO_HISTORY_DAYS (default 370) / DEMO_HISTORY_MIN_DAYS (default 2) tune the
+    hourly and 1-minute spans."""
+    if os.environ.get("DEMO_FAST"):
+        return
+    hist_days = int(os.environ.get("DEMO_HISTORY_DAYS", "370"))
+    min_days = int(os.environ.get("DEMO_HISTORY_MIN_DAYS", "2"))
+    cols = db._METRIC_COLS
+    ph = ",".join("?" * len(cols))
+    ins_1h = f"INSERT OR REPLACE INTO metrics_1h(bucket,{','.join(cols)}) VALUES (?,{ph})"
+    ins_1m = f"INSERT OR REPLACE INTO metrics_1m(bucket,{','.join(cols)}) VALUES (?,{ph})"
+    with db._connect() as conn:
+        for h in range(hist_days * 24):                # hourly
+            b = int((now - h * 3600) / 3600) * 3600
+            snap = make_snap(b)
+            c = snap["collectors"]
+            vals = A._metrics_row(snap)
+            conn.execute(ins_1h, (b, *[vals.get(col) for col in cols]))
+            for k in c["litellm"]["top_keys"]:
+                lab = k.get("alias") or k.get("key") or "?"
+                rq = k.get("reqs")
+                rq = rq if rq is not None else (k.get("cost") or 0)
+                conn.execute(
+                    "INSERT INTO key_series_1h(bucket,label,reqs) VALUES (?,?,?)",
+                    (b, str(lab)[:80], float(rq or 0)))
+            for kind, key in (("cpu", "top_cpu"), ("ram", "top_ram")):
+                for a in c["procs"][key]:
+                    conn.execute(
+                        "INSERT INTO proc_series_1h(bucket,kind,app,val) VALUES (?,?,?,?)",
+                        (b, kind, str(a.get("app", "?"))[:80], float(a.get(kind) or 0)))
+        for m in range(min_days * 24 * 60):            # 1-minute → 24h
+            b = int((now - m * 60) / 60) * 60
+            vals = A._metrics_row(make_snap(b))
+            conn.execute(ins_1m, (b, *[vals.get(col) for col in cols]))
+
+
 def seed_history():
     db.init()
     now = time.time()
+    seed_long_history(now)     # a year of hourly history → 30d + 12mo windows
     # 2h of 1-minute points so every chart shows a full line immediately
     for i in range(120, 0, -1):
         ts = now - i * 60

@@ -146,7 +146,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.4.1</div>
+      <div id="sidebar-brand-ver">v1.4.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -186,7 +186,7 @@
   </section>
 
   <section class="card span-2" id="card-models">
-    <h2>Per-model (rolling window)</h2>
+    <h2>Per-model — <span class="badge" id="ll-models-win">24h</span></h2>
     <div id="ll-models"><div class="unavail">no data</div></div>
   </section>
 
@@ -402,37 +402,39 @@ function renderKpis(l){
   add("Cache hit", l.cache_hit_pct, "%");
   add("Cache saved", l.cache_saved!=null?("$"+l.cache_saved):null, "");
   setHtml(document.getElementById("ll-kpis"), t.join(""));
-  // lite mode uses server-side aggregates (near-zero CPU) but has no latency data
-  const liteNote = l.spend_mode==="lite"
-    ? `<div class="unavail">Lite mode — latency (p50/p95/p99, TTFT, SLO), rates `
-      +`(req/s, error %, cost/h) and cache stats are unavailable; server-side `
-      +`aggregates keep CPU near zero. Set LITELLM_SPEND_MODE=full for the full set.</div>`
-    : "";
-  if(l.per_model&&l.per_model.length){
-    // full-only columns (latency + cost) are dropped in lite mode — no "—" wall
-    let rows=l.per_model.map(m=>{
-      const slo=m.slo_pct;
-      const sloCls=slo==null?"":(slo>=99?"recover":(slo>=95?"":"fire"));
-      const sb=servedBy(m.model);
-      const svc=svcProc(sb);   // serving process CPU% + RSS (from procs collector)
-      return `<tr><td>${escapeHtml(m.model||"(unnamed)")}`
+  // The Per-model table is rendered separately by loadModels() so it can honor
+  // the time-window selector (queries LiteLLM's aggregated per-model endpoint for
+  // the selected date range, incl. prior days) instead of this fixed snapshot.
+}
+
+// Per-model requests+tokens for the SELECTED window (follows 15m/1h/24h/30d/12mo).
+// Backed by /api/litellm/models -> LiteLLM /global/activity/model (day-granular,
+// cheap aggregate), so 24h shows yesterday+today and 30d/12mo show prior months.
+async function loadModels(){
+  const winEl=document.getElementById("ll-models-win"); if(winEl) winEl.textContent=WIN;
+  const d=await api("/api/litellm/models?window="+WIN);
+  const el=document.getElementById("ll-models");
+  if(!d){ return; }
+  if(!d.available){
+    setHtml(el,`<div class="unavail">LiteLLM not configured</div>`); return; }
+  const pm=d.per_model||[];
+  if(!pm.length){ setHtml(el,`<div class="unavail">no requests in this window</div>`); return; }
+  const rows=pm.map(m=>{
+    const sb=servedBy(m.model);
+    const svc=svcProc(sb);   // serving-process CPU%/RSS (from procs collector) — live
+    return `<tr><td>${escapeHtml(m.model||"(unnamed)")}`
       +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")+`</td>`
-      +`<td class="num">${m.reqs}</td>`
+      +`<td class="num">${(m.reqs||0).toLocaleString()}</td>`
+      +`<td class="num">${(m.tokens||0).toLocaleString()}</td>`
       +`<td class="num">${svc.cpu!=null?svc.cpu+'%':'—'}</td>`
-      +`<td class="num">${svc.ram!=null?bytes(svc.ram):'—'}</td>`
-      +(lite?"":`<td class="num">${m.wait_avg_ms!=null?m.wait_avg_ms+' ms':'—'}</td>`
-        +`<td class="num">${m.p95_ms!=null?m.p95_ms+' ms':'—'}</td>`
-        +`<td class="num ${sloCls}">${slo!=null?slo+'%':'—'}</td>`)
-      +`<td class="num">${m.tokens}</td>`
-      +(lite?"":`<td class="num">${m.cost!=null?'$'+m.cost:'—'}</td>`)+`</tr>`;}).join("");
-    setHtml(document.getElementById("ll-models"), liteNote
-      +`<table><tr><th>Model</th><th class="num">reqs</th>`
-      +`<th class="num">svc CPU</th><th class="num">svc RAM</th>`
-      +(lite?"":`<th class="num">wait avg</th><th class="num">p95</th><th class="num">SLO</th>`)
-      +`<th class="num">tok</th>`+(lite?"":`<th class="num">cost</th>`)
-      +`</tr>${rows}</table>`);
-  } else setHtml(document.getElementById("ll-models"),
-      liteNote+`<div class="unavail">no requests in window</div>`);
+      +`<td class="num">${svc.ram!=null?bytes(svc.ram):'—'}</td></tr>`;}).join("");
+  setHtml(el,`<div class="unavail" style="margin-bottom:6px">reqs + tokens are totals `
+    +`over the selected window (${escapeHtml(d.start_date)} → today, day-granular); `
+    +`svc CPU / RAM are the live serving-process cost. Latency / cost per model need `
+    +`spend_mode=full (shown in the KPI tiles above).</div>`
+    +`<table><tr><th>Model</th><th class="num">reqs</th><th class="num">tokens</th>`
+    +`<th class="num">svc CPU</th><th class="num">svc RAM</th>`
+    +`</tr>${rows}</table>`);
 }
 
 // Top-10 API keys — horizontal bar chart (categorical, updates each tick).
@@ -681,7 +683,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact(); loadModels(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -720,7 +722,7 @@ document.querySelectorAll("#windows button[data-w]").forEach(b=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
     b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
     document.getElementById("win-label").textContent=WIN;
-    loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact();
+    loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact(); loadModels();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -747,6 +749,7 @@ async function tick(){
   await loadCorr();
   await loadImpact();
   await loadAnomalies();
+  await loadModels();     // cheap pre-aggregated endpoint (NOT /spend/logs)
 }
 updateRangeUI();
 tick();
