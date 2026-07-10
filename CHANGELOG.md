@@ -4,7 +4,101 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.5.2] — 2026-07-10
+
+### Fixed
+- **Spend-over-time chart was empty against real LiteLLM.** `spend_activity` read the
+  daily rows from `data`, but LiteLLM nests them under **`daily_data`** (and
+  `/global/activity` carries no spend). The parser is now shape-tolerant
+  (`daily_data`/`data`/`results`, aliased field names) and falls back to
+  `/global/spend/report` for daily spend. The empty-state message now names the real
+  cause (LiteLLM connectivity) instead of talking about the real/reference split.
+- **Model classification mislabelled self-hosted models as external.** A blank/absent
+  model name was counted as **real** external spend; bare open-weight names (e.g.
+  `gemma4`) had no provider prefix and defaulted to external. Now a blank model is
+  **`unknown`** (never real/reference), and open-weight FAMILIES
+  (`MONITOR_INTERNAL_MODEL_FAMILIES`: gemma/qwen/mistral/deepseek/…) classify as
+  self-hosted reference.
+
+### Added
+- **Usage mix (real vs reference by tokens/requests) — works in lite mode.**
+  `/api/litellm/models` returns a `usage` split (real/reference/unknown by tokens +
+  requests) and the Per-model card shows a mix bar + headline
+  (e.g. *“98% of tokens self-hosted (reference) · 2% external (real)”*) plus a
+  self-hosted / external / unattributed chip per row. This tells the real/reference
+  story even when per-model **cost** is unavailable (lite mode).
+
+## [1.5.1] — 2026-07-10
+
+### Added
+- **Budgets are read from LiteLLM itself.** `key_budgets()` queries
+  `GET /key/list?return_full_object=true` (master-key) for each key's real
+  `max_budget`, `spend`, and team, so the Spend & Quota page fills in with **zero
+  configuration**. `MONITOR_KEY_BUDGETS` still works and now acts as an explicit
+  **override**; a LiteLLM without `/key/list` falls back to it. `/api/budgets`
+  reports which source it used via `budget_source` (`litellm` / `env` / `none`).
+
+### Fixed
+- **Keys with no budget were silently hidden.** `budget_rows` skipped any key whose
+  budget was 0, so uncapped spend simply disappeared from the page. Such keys are
+  now **always listed** — spend, reference cost and burn/day are shown, with
+  `budget`/`pct`/`days_to_cap` = `null` and status `none`, ranked after the budgeted
+  keys. The gap is surfaced rather than hidden: a **callout** names how many keys
+  are unbudgeted and how much real spend is uncapped, the summary reads *“N of M
+  keys budgeted”*, team cards show `N unbudgeted`, and each row carries a **“No
+  budget”** pill. So the bar still renders, an unbudgeted key is drawn against an
+  **implied baseline = the month's top spender** (`implied_budget`/`implied_pct`),
+  shown muted + hatched with a `ref*` label and a footnote. The baseline is purely
+  visual: `budget`/`pct`/`days_to_cap` stay `null`, it consumes no quota and never
+  triggers a cap alert.
+- **Misleading empty state.** It told operators to “set per-key max_budget in
+  LiteLLM”, which was never implemented. It now names what actually works
+  (`LITELLM_BASE_URL` + `LITELLM_MASTER_KEY`; budgets optional) — and, with the
+  `/key/list` read above, the original promise is now true.
+
+## [1.5.0] — 2026-07-10
+
+### Added
+- **New “Spend & Quota” page (`/spend`) — the LLM-cost landing.** A dedicated,
+  first-in-the-sidebar page that leads with the money story: a real-cash summary
+  strip, a **spend-over-time** chart (30-day daily / 12-month monthly toggle) with
+  **year-to-date per-year totals**, a **by-team** budget rollup, and a **per-key
+  budget** table ranked closest-to-cap first. Backed by `GET /api/budgets` (per-key
+  `spent`/`budget`/burn/days-to-cap/projected/status) and `GET /api/spend/series`
+  (`bucket_spend` → day/month buckets + per-year rollup). Optional per-key budgets
+  via `MONITOR_KEY_BUDGETS`; real `max_budget` from LiteLLM `/key/info` is the
+  production source.
+- **Real (external) vs reference (internal) cost split.** Self-hosted models
+  (Ollama / llama.cpp / vLLM / open-weights) carry only an imputed **reference**
+  cost — no real cash — while external hosted APIs are **real spend**.
+  `classify_model()` detects this from the model's provider prefix / name
+  (configurable via `MONITOR_INTERNAL_PROVIDERS`). Budgets cap **real** cash only;
+  reference cost is shown alongside but never consumes budget. The split runs
+  through the whole page (summary, teams, per-key, the stacked spend chart, and the
+  per-year tiles) and reconciles exactly (reference = total − real).
+
+### Fixed
+- **Per-year total covered only the window, not the year.** On the 30-day view the
+  “2026 total” summed just the 30-day slice; per-year totals now always cover the
+  full year (`window_and_years`), while chart points still follow the selected
+  window.
+- **Per-key budget table spilled out of its card** on narrow widths; it now scrolls
+  inside its own `overflow-x:auto` container with non-wrapping headers.
+
 ## [1.4.3] — 2026-07-09
+
+### Hardening
+- **Last-admin guard is now atomic (defense-in-depth).** The "you can't remove the
+  last admin" rail in `POST /api/admin/users/action` previously read the admin
+  count and then mutated in separate steps. It is not exploitable on the current
+  single-threaded event loop (the count read and the write are synchronous with no
+  `await` between them, so concurrent requests are serialized) — but the invariant
+  is now enforced *inside* the write via `db.user_{update,disable,delete}_guarded`
+  (`… WHERE … AND (SELECT COUNT(*) FROM users WHERE role='admin') > 1`), so it holds
+  regardless of the concurrency model (e.g. if a mutation is ever moved to
+  `asyncio.to_thread` or run under multiple workers). No behavioural change; adds
+  `test_last_admin_guard_is_live_counted_not_stale` +
+  `test_last_admin_guard_survives_concurrent_demote`.
 
 ### Fixed
 - **Ollama dashboard was missing the 12-month window.** It only offered

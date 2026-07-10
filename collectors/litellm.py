@@ -355,13 +355,216 @@ async def per_model_range(session: aiohttp.ClientSession,
         headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
     if err is not None or not isinstance(pm, list):
         return None
-    rows = [{
-        "model": m.get("model", "?"),
-        "reqs": int(m.get("sum_api_requests") or 0),
-        "tokens": int(m.get("sum_total_tokens") or 0),
-    } for m in pm]
+    rows = []
+    for m in pm:
+        name = m.get("model") or ""
+        cls = classify_model(name)
+        rows.append({
+            "model": name or "(unattributed)",
+            "reqs": int(m.get("sum_api_requests") or 0),
+            "tokens": int(m.get("sum_total_tokens") or 0),
+            "internal": cls["internal"], "cost_kind": cls["cost_kind"],
+        })
     rows.sort(key=lambda r: r["reqs"], reverse=True)
     return rows[:50]
+
+
+def classify_model(model: str | None) -> dict:
+    """Classify a model as self-hosted (REFERENCE cost, no real cash), external paid
+    (REAL spend), or UNKNOWN (no model name reported — must not be counted as either).
+    Internal when: the provider prefix (before '/') is in MONITOR_INTERNAL_PROVIDERS,
+    one of those tokens appears in the name, OR the name matches a self-hosted
+    open-weight FAMILY (gemma/qwen/mistral/…). A blank/absent model is 'unknown'."""
+    m = (model or "").strip().lower()
+    if not m:
+        return {"internal": None, "provider": "unattributed", "cost_kind": "unknown"}
+    provider = m.split("/", 1)[0] if "/" in m else ""
+    internal = (provider in config.INTERNAL_PROVIDERS
+                or any(tok in m for tok in config.INTERNAL_PROVIDERS)
+                or any(fam in m for fam in config.INTERNAL_MODEL_FAMILIES))
+    return {"internal": internal,
+            "provider": provider or ("internal" if internal else "external"),
+            "cost_kind": "reference" if internal else "real"}
+
+
+# LiteLLM's daily aggregates vary by version: /global/activity nests its rows under
+# `daily_data`, other endpoints use `data`/`results`, and field names differ. Parse
+# tolerantly rather than assuming one shape.
+_DATE_KEYS = ("date", "day", "group_by_day", "spend_date", "start_date")
+_SPEND_KEYS = ("spend", "total_spend", "sum_spend")
+_REQ_KEYS = ("api_requests", "sum_api_requests", "total_requests", "requests")
+_TOK_KEYS = ("total_tokens", "sum_total_tokens", "tokens")
+
+
+def _pick(r: dict, keys):
+    for k in keys:
+        if r.get(k) is not None:
+            return r[k]
+    return None
+
+
+def _rows_of(d):
+    """The list of daily rows, wherever this LiteLLM version put it."""
+    if isinstance(d, list):
+        return d
+    if isinstance(d, dict):
+        for k in ("daily_data", "data", "results", "rows"):
+            if isinstance(d.get(k), list):
+                return d[k]
+    return None
+
+
+def _parse_daily(rows) -> tuple[list[dict], bool]:
+    """(parsed rows, whether any row actually carried a spend value)."""
+    out: list[dict] = []
+    has_spend = False
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        dt = _pick(r, _DATE_KEYS)
+        if not dt:
+            continue
+        sp = _pick(r, _SPEND_KEYS)
+        if sp is not None:
+            has_spend = True
+        out.append({"date": str(dt)[:10], "spend": float(sp or 0),
+                    "requests": int(_pick(r, _REQ_KEYS) or 0),
+                    "tokens": int(_pick(r, _TOK_KEYS) or 0)})
+    return out, has_spend
+
+
+async def spend_activity(session: aiohttp.ClientSession,
+                         start_date: str, end_date: str) -> list[dict] | None:
+    """Daily spend / requests / tokens over a date range from LiteLLM's cheap daily
+    aggregates (never /spend/logs). Reads `/global/activity`; when that carries no
+    spend figures (common — it reports requests + tokens only), daily spend is
+    merged in from `/global/spend/report`. Returns [{date, spend, requests, tokens}]
+    sorted by date, or None when unconfigured / nothing usable came back."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    rng = f"start_date={start_date}&end_date={end_date}"
+    daily: list[dict] = []
+    has_spend = False
+
+    d, err = await fetch_json(session, f"{base}/global/activity?{rng}",
+                              headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is None:
+        daily, has_spend = _parse_daily(_rows_of(d))
+    _dbg(f"/global/activity err={err} rows={len(daily)} has_spend={has_spend}")
+
+    if not daily or not has_spend:
+        d2, err2 = await fetch_json(session, f"{base}/global/spend/report?{rng}",
+                                    headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+        rep, rep_spend = ([], False) if err2 is not None else _parse_daily(_rows_of(d2))
+        _dbg(f"/global/spend/report err={err2} rows={len(rep)} has_spend={rep_spend}")
+        if rep and daily:                       # merge report spend into activity rows
+            by_date = {r["date"]: r["spend"] for r in rep}
+            for r in daily:
+                r["spend"] = by_date.get(r["date"], r["spend"])
+            has_spend = has_spend or rep_spend
+        elif rep:
+            daily, has_spend = rep, rep_spend
+
+    if not daily:
+        return None
+    daily.sort(key=lambda r: str(r["date"]))
+    return daily
+
+
+async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
+    """Per-key `max_budget` + `spend` straight from LiteLLM's key-management API
+    (`/key/list`, master-key only). Returns {alias: {budget, spend, team}} — budget
+    is 0 when the key has no `max_budget` set. None when LiteLLM is unconfigured or
+    the endpoint is unavailable (older LiteLLM), so the caller can fall back."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    d, err = await fetch_json(
+        session, f"{base}/key/list?return_full_object=true&size=200",
+        headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None:
+        _dbg(f"/key/list err={err} -> budgets fall back to MONITOR_KEY_BUDGETS")
+        return None
+    rows = d.get("keys") or d.get("data") if isinstance(d, dict) else d
+    if not isinstance(rows, list):
+        return None
+    out: dict = {}
+    for k in rows:
+        if not isinstance(k, dict):
+            continue
+        alias = (k.get("key_alias") or k.get("key_name") or k.get("token") or "")
+        if not alias:
+            continue
+        out[str(alias)] = {
+            "budget": float(k.get("max_budget") or 0),
+            "spend": float(k.get("spend") or 0),
+            "team": str(k.get("team_alias") or k.get("team_id") or ""),
+        }
+    _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])}")
+    return out or None
+
+
+def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[dict]:
+    """Per-key budget rows from the snapshot's top_keys + a {alias: max_budget} map.
+    Computes % used, $/day burn, days-to-cap, projected month-end spend, and a
+    good/warn/critical status, ranked closest-to-cap first. A key with no budget in
+    the map is skipped (real max_budget comes from LiteLLM /key/info)."""
+    rows = []
+    day = max(1, int(month_day))
+    for k in top_keys or []:
+        alias = (k.get("alias") or k.get("key_alias") or k.get("key_name")
+                 or k.get("key") or "?")
+        total = float(k.get("cost") or k.get("total_spend") or k.get("spend") or 0)
+        # Budgets cap REAL cash. A key can mix external (real) + self-hosted
+        # (reference) usage; only the real portion counts against the budget.
+        if "real" in k:
+            real = float(k.get("real") or 0)
+            ref = float(k["reference"] if k.get("reference") is not None
+                        else total - real)
+        else:
+            real, ref = total, 0.0
+        budget = float((budget_map or {}).get(alias) or k.get("budget") or 0)
+        burn = real / day                                    # real $/day so far
+        projected = burn * month_len
+        pct: float | None = None
+        days: float | None = None
+        status = "none"      # NO budget defined — still listed, just no cap maths
+        if budget > 0:
+            pct = real / budget * 100
+            remaining = budget - real
+            days = (remaining / burn) if burn > 0 else 999.0
+            # near/over the cap now = critical; merely on pace to exceed = warning
+            status = ("bad" if pct >= 90
+                      else "warn" if pct >= 70 or projected > budget else "ok")
+        rows.append({
+            "key": str(alias), "role": k.get("role", "viewer"),
+            "team": k.get("team") or "",
+            "spent": round(real, 2),            # real cash — counts against budget
+            "reference": round(ref, 2),         # self-hosted — informational only
+            "total": round(real + ref, 2),
+            "budget": round(budget, 2) if budget > 0 else None,
+            "pct": round(pct, 1) if pct is not None else None,
+            "burn": round(burn, 2),
+            "days_to_cap": round(days, 1) if days is not None else None,
+            "projected": round(projected, 2),
+            "status": status,
+        })
+    # A key with no budget gets an IMPLIED baseline = the month's TOP SPENDER, purely
+    # so its bar renders and is comparable to the others. It is NOT a budget: status
+    # stays "none", there is no cap maths, and it never triggers an alert.
+    top_spend = max((r["spent"] for r in rows), default=0.0)
+    if top_spend > 0:
+        for r in rows:
+            if r["status"] == "none":
+                r["implied_budget"] = round(top_spend, 2)
+                r["implied_pct"] = round(r["spent"] / top_spend * 100, 1)
+    # critical → watch → on-track → unbudgeted (those ranked by spend)
+    order = {"bad": 0, "warn": 1, "ok": 2, "none": 3}
+    rows.sort(key=lambda r: (order[r["status"]], -(r["pct"] or 0), -r["spent"]))
+    return rows
 
 
 async def _heavy_sample(session: aiohttp.ClientSession, base: str,

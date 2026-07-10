@@ -873,6 +873,60 @@ def user_delete(name: str) -> bool:
         return False
 
 
+# ── last-admin-safe mutations (atomic guard) ──────────────────────────────────
+# The "you can't remove the last admin" rail must be enforced INSIDE the write,
+# not as a separate count-then-mutate in the handler: two concurrent demote/
+# disable/delete requests could each read admin_count == 2 and both proceed,
+# leaving zero admins (TOCTOU). SQLite serialises writers, so a conditional
+# statement whose WHERE re-counts admins is atomic — the second writer sees the
+# first's committed effect and its guard fails. Each returns True iff it applied.
+_ADMIN_LEFT = "(SELECT COUNT(*) FROM users WHERE role = 'admin') > 1"
+
+
+def user_delete_guarded(name: str) -> bool:
+    """DELETE the user unless it is the last admin. Cascades tokens only if the
+    delete applied. Atomic (see note above)."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM users WHERE name = ? AND (role != 'admin' OR {_ADMIN_LEFT})",
+                (name,))
+            deleted = (cur.rowcount or 0) > 0
+            if deleted:
+                conn.execute("DELETE FROM api_tokens WHERE owner = ?", (name,))
+        return deleted
+    except Exception:
+        return False
+
+
+def user_disable_guarded(name: str) -> bool:
+    """Set disabled=1 unless it is the last admin. Atomic."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                f"UPDATE users SET disabled = 1 WHERE name = ? "
+                f"AND (role != 'admin' OR {_ADMIN_LEFT})", (name,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def user_update_guarded(name: str, email: str, role: str) -> bool:
+    """Edit email + role, but refuse to demote the last admin. Allowed when the
+    new role is admin, or the current row is not an admin, or another admin
+    remains. Atomic — replaces the handler's count-then-check. Returns True iff
+    the row was updated."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                "UPDATE users SET email = ?, role = ? WHERE name = ? "
+                f"AND (? = 'admin' OR role != 'admin' OR {_ADMIN_LEFT})",
+                (email, role, name, role))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
 # ── per-user API tokens ───────────────────────────────────────────────────────
 def api_token_create(tid: str, owner: str, role: str, label: str,
                      token_hash: str, prefix: str, created: float) -> bool:

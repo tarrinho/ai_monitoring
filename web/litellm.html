@@ -146,12 +146,13 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.4.3</div>
+      <div id="sidebar-brand-ver">v1.5.2</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">Overview</a>
+    <a href="/spend">Spend &amp; Quota</a>
     <a href="/gpu">GPU</a>
     <a href="/litellm">LiteLLM</a>
     <a href="/ollama">Ollama</a>
@@ -180,6 +181,25 @@
     style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
 </header>
 <main>
+  <style>
+    #card-budgets .bsum{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:14px}
+    #card-budgets .bstat{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:9px 11px;display:flex;flex-direction:column;gap:3px;min-width:0}
+    #card-budgets .bstat .bk{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+    #card-budgets .bstat .bv{font-size:19px;font-weight:650;font-variant-numeric:tabular-nums}
+    #card-budgets .bstat .bs{font-size:11px;color:var(--muted)}
+    #card-budgets .btrack{height:9px;border-radius:6px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+    #card-budgets .bfill{height:100%;border-radius:6px}
+    #card-budgets .bmeta{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px}
+    #card-budgets .bpill{font-size:11px;font-weight:600;border-radius:20px;padding:2px 9px;border:1px solid currentColor;white-space:nowrap}
+    #card-budgets td{vertical-align:middle}
+    #card-budgets .c-bad{color:var(--bad)} #card-budgets .c-warn{color:var(--warn)} #card-budgets .c-ok{color:var(--ok)}
+    @media(max-width:720px){#card-budgets .bsum{grid-template-columns:repeat(2,1fr)}}
+  </style>
+  <section class="card span-2" id="card-budgets">
+    <h2>Spend &amp; Quota — per-key budgets <span class="badge" id="bud-badge">this month</span></h2>
+    <div id="bud-body"><div class="unavail">loading…</div></div>
+  </section>
+
   <section class="card span-2" id="card-kpi">
     <h2>Live <span class="badge" id="ll-badge"></span></h2>
     <div class="kpis" id="ll-kpis"></div>
@@ -419,22 +439,84 @@ async function loadModels(){
     setHtml(el,`<div class="unavail">LiteLLM not configured</div>`); return; }
   const pm=d.per_model||[];
   if(!pm.length){ setHtml(el,`<div class="unavail">no requests in this window</div>`); return; }
+  // internal / external / unattributed tag per model
+  const kind=m=>m.internal===true?["self-hosted","var(--ok)"]
+    :m.internal===false?["external","var(--accent)"]:["unattributed","var(--muted)"];
   const rows=pm.map(m=>{
     const sb=servedBy(m.model);
     const svc=svcProc(sb);   // serving-process CPU%/RSS (from procs collector) — live
+    const [kl,kc]=kind(m);
     return `<tr><td>${escapeHtml(m.model||"(unnamed)")}`
-      +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")+`</td>`
+      +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")
+      +` <span class="srv" style="color:${kc};border-color:${kc}">${kl}</span></td>`
       +`<td class="num">${(m.reqs||0).toLocaleString()}</td>`
       +`<td class="num">${(m.tokens||0).toLocaleString()}</td>`
       +`<td class="num">${svc.cpu!=null?svc.cpu+'%':'—'}</td>`
       +`<td class="num">${svc.ram!=null?bytes(svc.ram):'—'}</td></tr>`;}).join("");
-  setHtml(el,`<div class="unavail" style="margin-bottom:6px">reqs + tokens are totals `
+  // usage mix (works in lite mode: split by tokens/requests, cost not needed)
+  const u=d.usage||{}; let mix="";
+  if(u.tokens_total){
+    const refPct=u.reference_token_pct||0, realPct=u.real_token_pct||0;
+    const unk=(u.unknown&&u.unknown.reqs)||0;
+    mix=`<div style="display:flex;height:8px;border-radius:5px;overflow:hidden;`
+      +`box-shadow:inset 0 0 0 1px var(--line);margin:2px 0 8px">`
+      +`<span style="width:${refPct}%;background:var(--ok)"></span>`
+      +`<span style="width:${realPct}%;background:var(--accent)"></span>`
+      +`<span style="flex:1;background:var(--panel2)"></span></div>`
+      +`<div class="unavail" style="margin:0 0 8px">`
+      +`<b style="color:var(--ok)">${refPct}% of tokens self-hosted</b> (reference cost) · `
+      +`<b style="color:var(--accent)">${realPct}% external</b> (real spend)`
+      +(unk?` · <span style="color:var(--muted)">${unk.toLocaleString()} requests unattributed (no model tag)</span>`:"")
+      +`</div>`;
+  }
+  setHtml(el, mix+`<div class="unavail" style="margin-bottom:6px">reqs + tokens are totals `
     +`over the selected window (${escapeHtml(d.start_date)} → today, day-granular); `
     +`svc CPU / RAM are the live serving-process cost. Latency / cost per model need `
     +`spend_mode=full (shown in the KPI tiles above).</div>`
     +`<table><tr><th>Model</th><th class="num">reqs</th><th class="num">tokens</th>`
     +`<th class="num">svc CPU</th><th class="num">svc RAM</th>`
     +`</tr>${rows}</table>`);
+}
+
+// Spend & Quota — per-key budgets (budget vs spent, % used, days-to-cap, status),
+// ranked closest-to-cap first. Backed by /api/budgets.
+function _bstat(k,v,cls,sub){
+  const cv=(cls==="bad"||cls==="warn"||cls==="ok")?` class="c-${cls}"`:"";
+  return `<div class="bstat"><div class="bk">${k}</div>`
+    +`<div class="bv"${cv}>${escapeHtml(String(v))}</div>`
+    +(sub?`<div class="bs">${escapeHtml(sub)}</div>`:"")+`</div>`;
+}
+async function loadBudgets(){
+  const d=await api("/api/budgets");
+  const el=document.getElementById("bud-body"); if(!d) return;
+  if(!d.available||!(d.keys&&d.keys.length)){
+    setHtml(el,`<div class="unavail">No key budgets configured — set per-key `
+      +`max_budget in LiteLLM (or MONITOR_KEY_BUDGETS) to track spend vs quota.</div>`); return; }
+  const s=d.summary, L={bad:"Critical",warn:"Watch",ok:"On track"};
+  const money=v=>"$"+Math.round(v||0).toLocaleString();
+  const sum=`<div class="bsum">`
+    +_bstat("Spend · month",money(s.spent),"","of "+money(s.budget))
+    +_bstat("Budget used",s.pct+"%",(s.pct>=90?"bad":s.pct>=70?"warn":"ok"),s.keys+" keys")
+    +_bstat("Burn / day",money(s.burn),"","month-to-date")
+    +_bstat("Projected",money(s.projected),(s.over?"bad":"ok"),(s.over?"over budget":"on track"))
+    +_bstat("Days to cap",(s.days_to_cap==null?"—":s.days_to_cap),"","before month-end")
+    +`</div>`;
+  const rows=d.keys.map(r=>{
+    const pct=Math.max(0,Math.min(100,r.pct));
+    const dc=(r.days_to_cap==null)?"—":(r.days_to_cap<0?"over":r.days_to_cap+"d");
+    const dcCls=(r.days_to_cap!=null&&r.days_to_cap<3)?"c-bad":"";
+    return `<tr>`
+      +`<td><b>${escapeHtml(r.key)}</b><span class="srv">${escapeHtml(r.role)}</span></td>`
+      +`<td style="min-width:190px">`
+        +`<div class="btrack"><div class="bfill" style="width:${pct}%;background:var(--${r.status==="bad"?"bad":r.status==="warn"?"warn":"ok"})"></div></div>`
+        +`<div class="bmeta"><span class="num">${money(r.spent)} / ${money(r.budget)}</span><span>${r.pct}%</span></div></td>`
+      +`<td class="num" style="text-align:right">${money(r.burn)}</td>`
+      +`<td class="num ${dcCls}" style="text-align:right">${dc}</td>`
+      +`<td style="text-align:right"><span class="bpill c-${r.status}">${L[r.status]}</span></td>`
+      +`</tr>`;}).join("");
+  setHtml(el, sum+`<table><tr><th>Key / team</th><th>Budget consumed</th>`
+    +`<th style="text-align:right">Burn/day</th><th style="text-align:right">Days to cap</th>`
+    +`<th style="text-align:right">Status</th></tr>${rows}</table>`);
 }
 
 // Top-10 API keys — horizontal bar chart (categorical, updates each tick).
@@ -750,6 +832,7 @@ async function tick(){
   await loadImpact();
   await loadAnomalies();
   await loadModels();     // cheap pre-aggregated endpoint (NOT /spend/logs)
+  await loadBudgets();    // per-key spend vs budget
 }
 updateRangeUI();
 tick();

@@ -2105,6 +2105,253 @@ async def test_litellm_models_window_endpoint(monkeypatch):
         await c.close()
 
 
+def test_spend_daily_parser_accepts_litellm_shapes():
+    """LiteLLM nests daily rows under `daily_data` (not `data`) and field names vary
+    by version. `_rows_of` + `_parse_daily` must handle every shape, and report
+    whether a spend figure was actually present (it often is NOT on /global/activity)."""
+    # /global/activity — rows under daily_data, requests+tokens but NO spend
+    act = {"sum_api_requests": 10,
+           "daily_data": [{"date": "2026-01-01", "api_requests": 5, "total_tokens": 90}]}
+    rows = litellm._rows_of(act)
+    assert rows and len(rows) == 1
+    parsed, has_spend = litellm._parse_daily(rows)
+    assert has_spend is False and parsed[0]["requests"] == 5 and parsed[0]["spend"] == 0
+    # /global/spend/report — group_by_day + spend
+    rep = [{"group_by_day": "2026-01-01T00:00:00", "spend": 12.5}]
+    parsed2, has_spend2 = litellm._parse_daily(litellm._rows_of(rep))
+    assert has_spend2 is True
+    assert parsed2[0]["date"] == "2026-01-01" and parsed2[0]["spend"] == 12.5
+    # legacy `data` key + total_spend/sum_* aliases still work
+    legacy = {"data": [{"day": "2026-02-03", "total_spend": 4.0,
+                        "sum_api_requests": 2, "sum_total_tokens": 7}]}
+    parsed3, has_spend3 = litellm._parse_daily(litellm._rows_of(legacy))
+    assert has_spend3 and parsed3[0]["spend"] == 4.0 and parsed3[0]["tokens"] == 7
+    # unusable payloads
+    assert litellm._rows_of({"nothing": 1}) is None
+
+
+def test_classify_model_internal_vs_external():
+    """Self-hosted providers/open-weight families = reference; external hosted APIs =
+    real; a blank/absent model is UNKNOWN (must never count as real external spend)."""
+    for m in ("gpt-4o", "anthropic/claude-sonnet", "glm-4.7-flash",
+              "azure_ai/gpt-5-mini", "gemini/gemini-2.0"):
+        c = litellm.classify_model(m)
+        assert c["internal"] is False and c["cost_kind"] == "real", m
+    for m in ("ollama/qwen3", "llama-cpp/qwen", "gpt-oss:20b", "vllm/mixtral",
+              "huggingface/x", "gemma4", "qwen2.5", "mistral-small"):
+        c = litellm.classify_model(m)
+        assert c["internal"] is True and c["cost_kind"] == "reference", m
+    # blank / whitespace model → unknown, NOT real
+    for m in ("", "  ", None):
+        c = litellm.classify_model(m)
+        assert c["internal"] is None and c["cost_kind"] == "unknown", repr(m)
+
+
+def test_usage_split_by_tokens_and_requests():
+    """The usage split (real/reference/unknown by tokens+requests) works without
+    per-model cost — the lite-mode 'X% self-hosted' story. Unknown (blank model) is
+    kept separate, never folded into real."""
+    rows = [{"reqs": 3930, "tokens": 554_000_000, "internal": True},
+            {"reqs": 258, "tokens": 500, "internal": None},
+            {"reqs": 109, "tokens": 8_700_000, "internal": False}]
+    u = appmod._usage_split(rows)
+    assert u["reference"]["tokens"] == 554_000_000 and u["reference"]["reqs"] == 3930
+    assert u["real"]["tokens"] == 8_700_000
+    assert u["unknown"]["reqs"] == 258 and u["unknown"]["tokens"] == 500
+    assert u["reference_token_pct"] > 98 and u["real_token_pct"] < 2
+    assert u["tokens_total"] == 554_000_000 + 500 + 8_700_000
+
+
+def test_bucket_spend_splits_real_vs_reference():
+    """When daily rows carry a real/reference split, bucket_spend sums it per bucket
+    + per year and reports totals; without it, split_available is False."""
+    daily = [{"date": "2026-01-01", "spend": 100.0, "real": 60.0, "reference": 40.0,
+              "requests": 1, "tokens": 1},
+             {"date": "2026-01-02", "spend": 50.0, "real": 30.0, "reference": 20.0,
+              "requests": 1, "tokens": 1}]
+    out = appmod.bucket_spend(daily, "30d")
+    assert out["split_available"] is True
+    assert out["real_total"] == 90.0 and out["reference_total"] == 60.0
+    assert out["points"][0]["real"] == 60.0 and out["points"][0]["reference"] == 40.0
+    assert out["years"][0]["real"] == 90.0 and out["years"][0]["reference"] == 60.0
+    # real + reference must ALWAYS add up to the total (reference = total − real)
+    for p in out["points"]:
+        assert round(p["real"] + p["reference"], 2) == p["spend"]
+    for y in out["years"]:
+        assert round(y["real"] + y["reference"], 2) == y["spend"]
+    assert round(out["real_total"] + out["reference_total"], 2) == \
+        round(sum(r["spend"] for r in daily), 2)
+    # no split in the source → split_available False, no real/reference keys
+    plain = appmod.bucket_spend([{"date": "2026-01-01", "spend": 10.0,
+                                  "requests": 1, "tokens": 1}], "30d")
+    assert plain["split_available"] is False and "real_total" not in plain
+
+
+def test_window_and_years_totals_cover_full_year_not_window():
+    """Regression: the per-year total must be year-to-date, NOT just the 30-day
+    window's slice (the '2026 total was only 35 days' bug). Chart points still
+    follow the window."""
+    import time as _t
+    now = _t.time()
+    daily = []
+    for i in range(400, 0, -1):                       # a full year of $10/day
+        daily.append({"date": _t.strftime("%Y-%m-%d", _t.gmtime(now - i * 86400)),
+                      "spend": 10.0, "requests": 1, "tokens": 1})
+    out = appmod.window_and_years(daily, "30d", now)
+    assert len(out["points"]) <= 31                    # chart = last ~30 days
+    this_year = _t.strftime("%Y", _t.gmtime(now))
+    yr = {str(y["year"]): y["spend"] for y in out["years"]}
+    # the current year's total is far bigger than a 30-day slice ($300)
+    assert yr[this_year] > 300
+
+
+def test_bucket_spend_day_month_and_years():
+    """bucket_spend folds daily rows to day (30d) / month (12mo) and rolls up a
+    per-calendar-year total for the 'spending per year' view."""
+    daily = [{"date": "2025-12-30", "spend": 10.0, "requests": 1, "tokens": 5},
+             {"date": "2025-12-31", "spend": 20.0, "requests": 2, "tokens": 6},
+             {"date": "2026-01-01", "spend": 30.0, "requests": 3, "tokens": 7}]
+    day = appmod.bucket_spend(daily, "30d")
+    assert day["granularity"] == "day" and len(day["points"]) == 3
+    mon = appmod.bucket_spend(daily, "12mo")
+    assert mon["granularity"] == "month" and len(mon["points"]) == 2   # Dec + Jan
+    assert mon["points"][0]["spend"] == 30.0                           # Dec = 10+20
+    years = {y["year"]: y["spend"] for y in mon["years"]}
+    assert years == {2025: 30.0, 2026: 30.0}
+
+
+async def test_spend_series_endpoint(monkeypatch):
+    """/api/spend/series is auth-gated, validates the window, and degrades cleanly
+    when LiteLLM is unconfigured."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-tok-123456")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    hdr = {"Authorization": "Bearer sp-tok-123456"}
+    c = await _client()
+    try:
+        assert (await c.get("/api/spend/series")).status == 401      # gated
+        d = await (await c.get("/api/spend/series?window=12mo", headers=hdr)).json()
+        assert d["window"] == "12mo" and d["available"] is False
+        assert d["points"] == [] and d["years"] == []
+        # bad window falls back to 30d
+        d2 = await (await c.get("/api/spend/series?window=nope", headers=hdr)).json()
+        assert d2["window"] == "30d"
+    finally:
+        await c.close()
+
+
+async def test_spend_page_served_and_gated(monkeypatch):
+    """The Spend & Quota page renders open and is auth-gated once a token is set."""
+    c = await _client()
+    try:
+        r = await c.get("/spend")
+        assert r.status == 200
+        html = await r.text()
+        assert "Spend &amp; Quota" in html and "/api/budgets" in html
+        assert 'href="/spend"' in html            # sidebar self-link
+    finally:
+        await c.close()
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-spend-1")
+    c2 = await _client()
+    try:
+        r2 = await c2.get("/spend", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
+    finally:
+        await c2.close()
+
+
+def test_budget_rows_ranks_and_flags():
+    """budget_rows computes % / burn / days-to-cap / projected and ranks
+    critical → watch → on-track → unbudgeted (closest-to-cap first)."""
+    top = [{"alias": "a", "cost": 950}, {"alias": "b", "cost": 700},
+           {"alias": "c", "cost": 100}, {"alias": "d", "cost": 50}]
+    bmap = {"a": 1000, "b": 1000, "c": 1000}   # d has NO budget
+    rows = litellm.budget_rows(top, bmap, 15, 30)
+    assert [r["key"] for r in rows] == ["a", "b", "c", "d"]   # d listed, ranked last
+    assert [r["status"] for r in rows] == ["bad", "warn", "ok", "none"]
+    assert rows[0]["pct"] == 95.0 and rows[0]["projected"] > 0
+    assert rows[0]["days_to_cap"] >= 0
+
+
+def test_budget_rows_presents_keys_with_no_budget():
+    """A key with no budget defined is NEVER dropped — its spend/burn are shown,
+    with no cap maths (budget/pct/days_to_cap are None, status 'none')."""
+    rows = litellm.budget_rows([{"alias": "nobudget", "cost": 500}], {}, 10, 30)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["key"] == "nobudget" and r["status"] == "none"
+    assert r["budget"] is None and r["pct"] is None and r["days_to_cap"] is None
+    assert r["spent"] == 500 and r["burn"] == 50.0      # spend + burn still reported
+    # summary counts the gap so it can be surfaced, not hidden
+    s = appmod._budget_summary(rows)
+    assert s["unbudgeted"] == 1 and s["unbudgeted_spend"] == 500
+    assert s["budgeted"] == 0 and s["budget"] == 0 and s["pct"] == 0
+
+
+def test_unbudgeted_keys_get_implied_baseline_from_top_spender():
+    """A key with no budget is drawn against the month's TOP SPENDER as a reference
+    baseline (so its bar renders), but that baseline is NOT a budget: budget/pct/
+    days_to_cap stay None and the status stays 'none'."""
+    top = [{"alias": "big", "cost": 1000}, {"alias": "small", "cost": 250},
+           {"alias": "capped", "cost": 100}]
+    rows = litellm.budget_rows(top, {"capped": 500}, 10, 30)
+    by = {r["key"]: r for r in rows}
+    # baseline = top spender across ALL keys
+    assert by["big"]["implied_budget"] == 1000 and by["big"]["implied_pct"] == 100.0
+    assert by["small"]["implied_budget"] == 1000 and by["small"]["implied_pct"] == 25.0
+    # implied baseline never becomes a real budget / cap
+    for k in ("big", "small"):
+        assert by[k]["budget"] is None and by[k]["pct"] is None
+        assert by[k]["days_to_cap"] is None and by[k]["status"] == "none"
+    # a budgeted key is untouched by the baseline
+    assert "implied_budget" not in by["capped"] and by["capped"]["pct"] == 20.0
+    s = appmod._budget_summary(rows)
+    assert s["top_spend"] == 1000 and s["unbudgeted"] == 2
+
+
+def test_merge_key_budgets_litellm_then_env_override():
+    """Budgets come from LiteLLM /key/list; MONITOR_KEY_BUDGETS overrides it.
+    Without LiteLLM key data, fall back to the collector snapshot for spend."""
+    live = {"k1": {"budget": 100.0, "spend": 40.0, "team": "T"},
+            "k2": {"budget": 0.0, "spend": 10.0, "team": ""}}
+    merged = appmod.merge_key_budgets(live, [], {"k1": 250.0})
+    by = {m["alias"]: m for m in merged}
+    assert by["k1"]["budget"] == 250.0 and by["k1"]["cost"] == 40.0   # env wins
+    assert by["k2"]["budget"] == 0.0                                   # unbudgeted kept
+    # no live key data → snapshot top_keys carry the spend
+    snap = [{"alias": "s1", "cost": 7.0}]
+    merged2 = appmod.merge_key_budgets(None, snap, {"s1": 50.0})
+    assert merged2[0]["alias"] == "s1" and merged2[0]["budget"] == 50.0
+
+
+def test_budget_rows_split_real_vs_reference():
+    """Budgets cap REAL cash: only the real portion counts against the budget;
+    self-hosted reference cost is carried alongside but doesn't drive %/status."""
+    top = [{"alias": "k", "cost": 1000, "real": 400, "reference": 600}]
+    rows = litellm.budget_rows(top, {"k": 1000}, 15, 30)
+    r = rows[0]
+    assert r["spent"] == 400 and r["reference"] == 600 and r["total"] == 1000
+    assert r["pct"] == 40.0                       # 400/1000 real — NOT 1000/1000
+    assert r["status"] == "ok"                    # real is well under cap
+    # a key with no split treats all spend as real (back-compat)
+    r2 = litellm.budget_rows([{"alias": "x", "cost": 900}], {"x": 1000}, 15, 30)[0]
+    assert r2["spent"] == 900 and r2["reference"] == 0 and r2["pct"] == 90.0
+
+
+async def test_budgets_endpoint(monkeypatch):
+    """/api/budgets is auth-gated and degrades cleanly with no budgets configured."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "budgtok-123456")
+    monkeypatch.setattr(config, "KEY_BUDGETS_JSON", "")
+    hdr = {"Authorization": "Bearer budgtok-123456"}
+    c = await _client()
+    try:
+        assert (await c.get("/api/budgets")).status == 401      # gated
+        d = await (await c.get("/api/budgets", headers=hdr)).json()
+        assert d["available"] is False and d["keys"] == []      # none configured
+        assert "summary" in d
+    finally:
+        await c.close()
+
+
 async def test_alerts_test_fire_reports_webhook(monkeypatch):
     # a configured webhook that succeeds
     srv = TestServer(_hook_app())
@@ -2914,6 +3161,44 @@ async def test_last_admin_cannot_be_demoted(monkeypatch):
         assert db.user_get("solo2")["role"] == "admin"
     finally:
         await c.close()
+
+
+def test_last_admin_guard_is_live_counted_not_stale():
+    # F1 regression: the last-admin rail must re-count admins INSIDE each mutation
+    # (atomic), not from a value read earlier. With two admins, demoting the first
+    # is allowed; demoting the second must be refused because only one admin then
+    # remains — even though a count taken before either call would have said "2".
+    db.user_create("gr1", "gr1@x.io", auth.hash_password("gr1pw123"), "admin", time.time())
+    db.user_create("gr2", "gr2@x.io", auth.hash_password("gr2pw123"), "admin", time.time())
+    assert db.user_count("admin") >= 2
+    assert db.user_update_guarded("gr1", "gr1@x.io", "viewer") is True     # one admin left
+    assert db.user_update_guarded("gr2", "gr2@x.io", "viewer") is False    # rail blocks
+    assert db.user_get("gr2")["role"] == "admin"
+    assert db.user_count("admin") == 1
+    # delete + disable guards enforce the same invariant on the survivor
+    assert db.user_delete_guarded("gr2") is False
+    assert db.user_disable_guarded("gr2") is False
+    assert db.user_count("admin") == 1
+
+
+def test_last_admin_guard_survives_concurrent_demote():
+    # F1 (TOCTOU): two demotions fired at once must never leave zero admins. The
+    # pre-fix handler read admin_count once and both requests passed a stale "2".
+    # The guard now lives in the atomic write, so SQLite serialises the two and the
+    # loser's WHERE (re-count > 1) fails — at least one admin always remains.
+    import threading
+    db.user_create("cc1", "cc1@x.io", auth.hash_password("cc1pw123"), "admin", time.time())
+    db.user_create("cc2", "cc2@x.io", auth.hash_password("cc2pw123"), "admin", time.time())
+    start = threading.Barrier(2)
+
+    def demote(u):
+        start.wait()                                  # maximise overlap
+        db.user_update_guarded(u, u + "@x.io", "viewer")
+
+    t1 = threading.Thread(target=demote, args=("cc1",))
+    t2 = threading.Thread(target=demote, args=("cc2",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert db.user_count("admin") >= 1, "TOCTOU: concurrent demotes removed all admins"
 
 
 async def test_legacy_token_reaches_admin(monkeypatch):

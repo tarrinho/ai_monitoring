@@ -557,7 +557,7 @@ def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
 
 
 # HTML pages that require auth (static assets + /healthz + /login stay open).
-_PAGES = ("/", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
+_PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
           "/admin/users", "/account")
 # Reachable without a session: the login page/handlers and public assets.
 _OPEN = ("/healthz", "/login", "/logout", "/metrics")
@@ -823,6 +823,10 @@ async def index_handler(request: web.Request) -> web.Response:
 
 async def litellm_page_handler(request: web.Request) -> web.Response:
     return _page(request, _WEB / "litellm.html", "/litellm")
+
+
+async def spend_page_handler(request: web.Request) -> web.Response:
+    return _page(request, _WEB / "spend.html", "/spend")
 
 
 async def gpu_page_handler(request: web.Request) -> web.Response:
@@ -1173,17 +1177,19 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
     target = db.user_get(name)
     if not target:
         return web.json_response({"error": "no such user"}, status=404)
-    # never remove/disable/lock out the last remaining admin
-    last_admin = target["role"] == "admin" and db.user_count("admin") <= 1
-    if action in ("disable", "delete") and last_admin:
-        return web.json_response({"error": "cannot disable/delete the last admin"}, status=400)
+    # Never remove/disable/demote the last remaining admin. The guard lives INSIDE
+    # each mutation (atomic conditional write) rather than as a count-then-act here,
+    # so two concurrent requests can't both pass a stale count and drop admins to
+    # zero (TOCTOU). A guarded call returning False means the rail blocked it.
     if action == "disable":
-        db.user_set_disabled(name, True)
+        if not db.user_disable_guarded(name):
+            return web.json_response({"error": "cannot disable the last admin"}, status=400)
         auth.sessions_drop_user(name)
     elif action == "enable":
         db.user_set_disabled(name, False)
     elif action == "delete":
-        db.user_delete(name)
+        if not db.user_delete_guarded(name):
+            return web.json_response({"error": "cannot delete the last admin"}, status=400)
         auth.sessions_drop_user(name)
         _mark_users_changed()
     elif action == "reset":
@@ -1207,9 +1213,8 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
             return web.json_response({"error": "invalid email"}, status=400)
         if role not in auth.ROLES:
             return web.json_response({"error": "invalid role"}, status=400)
-        if last_admin and role != "admin":     # don't demote the last admin
+        if not db.user_update_guarded(name, email, role):   # atomic last-admin guard
             return web.json_response({"error": "cannot demote the last admin"}, status=400)
-        db.user_update(name, email, role)
     else:
         return web.json_response({"error": "unknown action"}, status=400)
     _audit(request, actor, "user." + action, target=name)
@@ -1351,7 +1356,213 @@ async def litellm_models_handler(request: web.Request) -> web.Response:
     rows = await litellm.per_model_range(request.app[_SESSION], start, end)
     return web.json_response({"window": window, "start_date": start,
                               "end_date": end, "per_model": rows or [],
+                              "usage": _usage_split(rows or []),
                               "available": rows is not None})
+
+
+def _usage_split(rows: list) -> dict:
+    """Real (external) vs reference (self-hosted) vs unknown split by TOKENS and
+    REQUESTS — works even in lite mode, where per-model *cost* is unavailable but
+    per-model usage is not. Lets the page say '98% of tokens are self-hosted'."""
+    buckets = {True: "reference", False: "real", None: "unknown"}
+    agg: dict = {"real": {"reqs": 0, "tokens": 0},
+                 "reference": {"reqs": 0, "tokens": 0},
+                 "unknown": {"reqs": 0, "tokens": 0}}
+    for r in rows:
+        b = agg[buckets.get(r.get("internal"), "unknown")]
+        b["reqs"] += int(r.get("reqs") or 0)
+        b["tokens"] += int(r.get("tokens") or 0)
+    tok = sum(v["tokens"] for v in agg.values())
+    req = sum(v["reqs"] for v in agg.values())
+    agg["tokens_total"] = tok
+    agg["reqs_total"] = req
+    agg["reference_token_pct"] = round(agg["reference"]["tokens"] / tok * 100, 1) if tok else 0
+    agg["real_token_pct"] = round(agg["real"]["tokens"] / tok * 100, 1) if tok else 0
+    return agg
+
+
+# Demo/override hook: a callable fn(now) -> {"keys":[...],"summary":{...}}. The
+# demo server sets this to synthesized budgets; production leaves it None and the
+# handler derives rows from the live LiteLLM snapshot + MONITOR_KEY_BUDGETS.
+_budgets_source = None
+
+
+def _key_budget_map() -> dict:
+    raw = config.KEY_BUDGETS_JSON
+    if not raw:
+        return {}
+    try:
+        return {str(k): float(v) for k, v in json.loads(raw).items()}
+    except Exception:
+        return {}
+
+
+def _budget_summary(rows: list) -> dict:
+    spent = sum(r["spent"] for r in rows)                     # real cash, all keys
+    reference = sum(r.get("reference", 0.0) for r in rows)    # self-hosted
+    budgeted = [r for r in rows if r.get("budget")]
+    unbudgeted = [r for r in rows if not r.get("budget")]
+    # cap maths only over keys that actually HAVE a budget
+    budget = sum(r["budget"] for r in budgeted)
+    b_spent = sum(r["spent"] for r in budgeted)
+    b_burn = sum(r["burn"] for r in budgeted)
+    b_projected = sum(r["projected"] for r in budgeted)
+    remaining = budget - b_spent
+    return {
+        "spent": round(spent, 2), "reference": round(reference, 2),
+        "total": round(spent + reference, 2), "budget": round(budget, 2),
+        "pct": round(b_spent / budget * 100, 1) if budget > 0 else 0,
+        "projected": round(b_projected, 2),
+        "burn": round(sum(r["burn"] for r in rows), 2),
+        "remaining": round(remaining, 2),
+        "days_to_cap": round(remaining / b_burn, 1) if b_burn > 0 else None,
+        "over": b_projected > budget if budget > 0 else False,
+        "keys": len(rows), "budgeted": len(budgeted),
+        "unbudgeted": len(unbudgeted),
+        "unbudgeted_spend": round(sum(r["spent"] for r in unbudgeted), 2),
+        # reference baseline used to draw bars for keys with no budget
+        "top_spend": round(max((r["spent"] for r in rows), default=0.0), 2),
+    }
+
+
+def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> list:
+    """Build the key list for budget_rows. Prefer LiteLLM's own key API (real spend
+    + max_budget); fall back to the collector snapshot's top_keys for spend. The
+    MONITOR_KEY_BUDGETS env map always OVERRIDES whatever LiteLLM reports."""
+    keys: list = []
+    if live:
+        for alias, info in live.items():
+            keys.append({"alias": alias, "cost": info.get("spend", 0.0),
+                         "team": info.get("team", ""), "budget": info.get("budget", 0.0)})
+    else:
+        keys = [dict(k) for k in (snapshot_keys or [])]
+    for k in keys:                       # env override wins over LiteLLM max_budget
+        alias = (k.get("alias") or k.get("key_alias") or k.get("key") or "")
+        if alias in env_map:
+            k["budget"] = env_map[alias]
+    return keys
+
+
+async def budgets_handler(request: web.Request) -> web.Response:
+    """Per-key spend vs budget (the Spend & Quota panel): % used, $/day burn,
+    days-to-cap, projected month-end, ranked closest-to-cap first. Budgets come from
+    LiteLLM's own per-key `max_budget` (/key/list), overridable by MONITOR_KEY_BUDGETS.
+    A key with NO budget is still listed (status 'none') — its spend is shown, just
+    without cap maths, so an undefined budget is visible instead of hidden."""
+    now = time.time()
+    if _budgets_source is not None:
+        return web.json_response(_budgets_source(now))
+    import calendar
+    lt = time.gmtime(now)
+    mlen = calendar.monthrange(lt.tm_year, lt.tm_mon)[1]
+    live = await litellm.key_budgets(request.app[_SESSION])
+    snap = _backend_latest.get("litellm", {})
+    keys = merge_key_budgets(live, snap.get("top_keys") or [], _key_budget_map())
+    rows = litellm.budget_rows(keys, {}, lt.tm_mday, mlen)
+    return web.json_response({"keys": rows, "summary": _budget_summary(rows),
+                              "available": bool(rows),
+                              "budget_source": "litellm" if live else
+                                               ("env" if _key_budget_map() else "none")})
+
+
+# Demo/override hook for the spend timeline: fn(now, window) -> {...}.
+_spend_series_source = None
+
+
+def _date_epoch(date: str) -> float:
+    import calendar
+    return float(calendar.timegm(time.strptime(date[:10], "%Y-%m-%d")))
+
+
+def bucket_spend(daily: list, window: str) -> dict:
+    """Fold daily spend rows into the window's granularity (day for 30d, month for
+    12mo) and roll up a per-calendar-year total. When the rows carry a real/reference
+    split (external paid spend vs self-hosted reference cost), it is summed per
+    bucket + per year and `split_available` is set."""
+    gran = "month" if window == "12mo" else "day"
+    split = any("real" in r for r in daily)
+
+    def _blank():
+        return {"spend": 0.0, "real": 0.0, "reference": 0.0, "requests": 0, "tokens": 0}
+
+    def _acc(b, r):
+        b["spend"] += r["spend"]
+        b["real"] += r.get("real", 0.0)
+        b["reference"] += r.get("reference", 0.0)
+        b["requests"] += r["requests"]
+        b["tokens"] += r["tokens"]
+
+    buckets: dict = {}
+    for r in daily:
+        key = r["date"] if gran == "day" else r["date"][:7]
+        _acc(buckets.setdefault(key, _blank()), r)
+    pts = []
+    for k in sorted(buckets):
+        b = buckets[k]
+        t = _date_epoch(k if gran == "day" else k + "-01")
+        sp = round(b["spend"], 2)
+        pt = {"t": t, "spend": sp, "requests": b["requests"], "tokens": b["tokens"]}
+        if split:                      # reference = total − real, so it always adds up
+            real = round(b["real"], 2)
+            pt["real"] = real
+            pt["reference"] = round(sp - real, 2)
+        pts.append(pt)
+    years: dict = {}
+    for r in daily:
+        y = r["date"][:4]
+        if y.isdigit():
+            _acc(years.setdefault(y, _blank()), r)
+    year_rows = []
+    for y in sorted(years):
+        sp = round(years[y]["spend"], 2)
+        row: dict = {"year": int(y), "spend": sp}
+        if split:
+            real = round(years[y]["real"], 2)
+            row["real"] = real
+            row["reference"] = round(sp - real, 2)
+        year_rows.append(row)
+    out = {"granularity": gran, "points": pts, "years": year_rows,
+           "split_available": split}
+    if split:
+        sp_total = round(sum(r["spend"] for r in daily), 2)
+        real_total = round(sum(r.get("real", 0.0) for r in daily), 2)
+        out["real_total"] = real_total
+        out["reference_total"] = round(sp_total - real_total, 2)
+    return out
+
+
+def window_and_years(daily_full: list, window: str, now: float) -> dict:
+    """Chart points respect the selected window (last 30 days daily, or 12 months
+    monthly), but the per-year totals ALWAYS reflect the full year — so '2026 total'
+    is year-to-date, not just the 30-day window's slice."""
+    if window == "30d":
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - 2592000))
+        wdaily = [r for r in daily_full if r["date"] >= cutoff]
+    else:
+        wdaily = daily_full
+    out = bucket_spend(wdaily, window)              # points + real/ref split
+    out["years"] = bucket_spend(daily_full, "12mo")["years"]   # full-year totals
+    return out
+
+
+async def spend_series_handler(request: web.Request) -> web.Response:
+    """Spend over time: daily buckets for 30d, monthly for 12mo, plus per-year
+    year-to-date totals. Backed by LiteLLM /global/activity."""
+    window = request.query.get("window", "30d")
+    if window not in ("30d", "12mo"):
+        window = "30d"
+    now = time.time()
+    if _spend_series_source is not None:
+        return web.json_response(_spend_series_source(now, window))
+    # always pull a full year so the per-year rollup is complete, regardless of window
+    start = time.strftime("%Y-%m-%d", time.gmtime(now - 31536000))
+    end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    daily = await litellm.spend_activity(request.app[_SESSION], start, end)
+    if daily is None:
+        return web.json_response({"window": window, "available": False,
+                                  "points": [], "years": []})
+    return web.json_response({"window": window, "available": True,
+                              **window_and_years(daily, window, now)})
 
 
 async def alerts_handler(request: web.Request) -> web.Response:
@@ -1563,6 +1774,7 @@ def build_app() -> web.Application:
     app = web.Application(middlewares=[_log_mw, _sechdr_mw, _auth_mw])
     app.router.add_get("/", index_handler)
     app.router.add_get("/litellm", litellm_page_handler)
+    app.router.add_get("/spend", spend_page_handler)
     app.router.add_get("/gpu", gpu_page_handler)
     app.router.add_get("/ollama", ollama_page_handler)
     app.router.add_get("/llamacpp", llamacpp_page_handler)
@@ -1596,6 +1808,8 @@ def build_app() -> web.Application:
     app.router.add_get("/api/anomalies", anomalies_handler)
     app.router.add_get("/api/nav", nav_handler)
     app.router.add_get("/api/litellm/models", litellm_models_handler)
+    app.router.add_get("/api/budgets", budgets_handler)
+    app.router.add_get("/api/spend/series", spend_series_handler)
     app.router.add_get("/api/alerts", alerts_handler)
     app.router.add_post("/api/alerts/test", alerts_test_handler)
     app.router.add_get("/api/export", export_handler)
@@ -1631,11 +1845,11 @@ def startup_selfcheck() -> list[str]:
     # routes wired
     paths = {r.resource.canonical for r in build_app().router.routes()
              if r.resource}
-    for need in ("/", "/litellm", "/gpu", "/ollama", "/alerts", "/api/data",
+    for need in ("/", "/spend", "/litellm", "/gpu", "/ollama", "/alerts", "/api/data",
                  "/api/series", "/api/uptime", "/api/keyseries",
                  "/api/keydelta",
                  "/api/procseries", "/api/anomalies", "/api/nav",
-                 "/api/litellm/models",
+                 "/api/litellm/models", "/api/budgets", "/api/spend/series",
                  "/api/alerts", "/api/export", "/healthz"):
         if need not in paths:
             problems.append(f"route not registered: {need}")

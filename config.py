@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.4.3"
+VERSION = "AI-Monitoring_1.5.2"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -114,6 +114,30 @@ MONITOR_DEBUG = (_str("MONITOR_DEBUG", "0") or "0").lower() in ("1", "true", "ye
 LITELLM_BASE_URL   = _str("LITELLM_BASE_URL")           # e.g. http://host:4000
 LITELLM_MASTER_KEY = _str("LITELLM_MASTER_KEY")         # Bearer for /spend,/health
 LITELLM_SPEND_WINDOW_MIN = _int("LITELLM_SPEND_WINDOW_MIN", 15)  # latency window
+# Optional per-key monthly budgets as JSON {"key-alias": 2000, ...} — drives the
+# Spend & Quota panel until real max_budget is read from LiteLLM /key/info.
+KEY_BUDGETS_JSON   = _str("MONITOR_KEY_BUDGETS", "")
+# Self-hosted / internal model providers: their cost is a REFERENCE (imputed
+# electricity/amortization), not real cash. Only external providers spend money.
+# Matched against the model's provider prefix (before '/') or as a name substring.
+INTERNAL_PROVIDERS = {
+    p.strip().lower() for p in (_str(
+        "MONITOR_INTERNAL_PROVIDERS",
+        "ollama,llama-cpp,llama_cpp,llamacpp,vllm,huggingface,hf,"
+        "gpt-oss,local,self-hosted,text-completion-openai",
+    ) or "").split(",") if p.strip()
+}
+# Open-weight model FAMILIES that are self-hosted here even without a provider
+# prefix (e.g. a bare "gemma4" or "qwen2.5"). Matched as a substring of the model
+# name. Set MONITOR_INTERNAL_MODEL_FAMILIES="" to disable (rely on the provider
+# prefix only) if you route open weights through a paid API.
+INTERNAL_MODEL_FAMILIES = {
+    p.strip().lower() for p in (_str(
+        "MONITOR_INTERNAL_MODEL_FAMILIES",
+        "gemma,qwen,mistral,mixtral,deepseek,starcoder,codellama,command-r,"
+        "granite,phi-,phi3,phi4,yi-,llama",
+    ) or "").split(",") if p.strip()
+}
 SLO_LATENCY_MS      = _float("SLO_LATENCY_MS", 2000.0)  # SLO target; % under this
 # Verbose per-call logging for the LiteLLM collector (diagnose empty dashboards).
 LITELLM_DEBUG = (_str("LITELLM_DEBUG", "0") or "0").lower() in ("1", "true", "yes", "on")

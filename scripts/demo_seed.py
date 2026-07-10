@@ -219,9 +219,61 @@ def _serve_with_theme(path, prefix="", **kw):
     return resp
 
 
+def _demo_budgets(now):
+    """Synthetic per-key budgets for the demo Spend & Quota panel — a realistic
+    spread of on-track / watch / critical / over-cap keys. Fixed to 'day 16 / 31'
+    so the showcase numbers are stable regardless of the real date."""
+    from collectors import litellm as _ll
+    # (alias, role, real$, reference$ (self-hosted), budget, team) — budget caps
+    # real cash; reference is imputed cost of self-hosted models (no real spend).
+    # budget 0 = no budget defined → the key is still listed (status "none")
+    keys = [("prod-agents", "admin", 1840, 260, 2000, "AI Platform"),
+            ("research-lab", "admin", 487, 90, 500, "AI Platform"),
+            ("qa-testing", "viewer", 190, 180, 200, "Engineering"),
+            ("customer-bot", "viewer", 640, 110, 1000, "Engineering"),
+            ("data-pipeline", "viewer", 470, 700, 1500, "Data"),
+            ("eng-copilot", "viewer", 412, 70, 800, "Engineering"),
+            ("batch-embeddings", "viewer", 40, 260, 300, "Data"),
+            ("adhoc-experiments", "viewer", 318, 95, 0, "AI Platform"),
+            ("legacy-scripts", "viewer", 74, 20, 0, "Engineering")]
+    top = [{"alias": a, "role": r, "cost": real + ref, "real": real,
+            "reference": ref, "team": t} for a, r, real, ref, _, t in keys]
+    bmap = {a: b for a, r, real, ref, b, t in keys if b}
+    rows = _ll.budget_rows(top, bmap, 16, 31)
+    return {"keys": rows, "summary": A._budget_summary(rows), "available": True,
+            "budget_source": "litellm"}
+
+
+def _demo_spend_series(now, window):
+    """Synthetic daily spend: always a full year+ so the per-year totals are complete;
+    the chart points are then sliced to the selected window. Gentle upward trend,
+    weekly rhythm, monthly waves; ~60% external real cash + ~40% self-hosted reference."""
+    n = 400
+    daily = []
+    for i in range(n, 0, -1):
+        ts = now - i * 86400
+        date = time.strftime("%Y-%m-%d", time.gmtime(ts))
+        base = (150 + 55 * math.sin(i / 7.0) + 45 * math.sin(i / 30.0)
+                + (n - i) * 0.35)                       # weekly + monthly + slow rise
+        spend = max(20.0, base)
+        real = spend * (0.58 + 0.05 * math.sin(i / 45.0))
+        daily.append({"date": date, "spend": round(spend, 2),
+                      "real": round(real, 2), "reference": round(spend - real, 2),
+                      "requests": int(spend * 8), "tokens": int(spend * 9000)})
+    return {"window": window, "available": True, **A.window_and_years(daily, window, now)}
+
+
 if __name__ == "__main__":
     seed_history()
+    # optional admin login for the demo: seed from MONITOR_ADMIN_USER/PASSWORD so
+    # the Users page / login flow can be shown (build_app bypasses main()'s bootstrap)
+    import auth  # noqa: E402
+    _seeded = auth.bootstrap_admin()
+    if _seeded:
+        print(f"seeded admin user '{_seeded}'")
     A._sample_once = _fake_sample
+    A._budgets_source = _demo_budgets
+    A._spend_series_source = _demo_spend_series
     A._serve_page = _serve_with_theme
     # keep ?token=&theme= in the URL (no cookie-strip redirect) so screenshots
     # can pin the theme and the page JS can read the token from the query.

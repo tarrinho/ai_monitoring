@@ -263,7 +263,7 @@ def test_overview_charts_grouped_collapsible():
 def test_all_pages_have_alert_dot():
     # live alert dot + unconfigured-backend nav filter on every authenticated page,
     # incl. admin + account (parity with the dashboards)
-    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts",
+    for name in ("index", "spend", "litellm", "gpu", "ollama", "llamacpp", "alerts",
                  "admin", "account"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert "has-alert" in html and "_alertDot" in html, name
@@ -277,7 +277,7 @@ def test_all_pages_have_collapsible_sidebar():
     # lateral collapsible sidebar (AntiBot GW pattern) on EVERY authenticated page —
     # the dashboards AND the admin (/admin/users) + account pages. Only /login is
     # exempt (pre-auth, no menu). The main content sits in #main-area beside it.
-    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts",
+    for name in ("index", "spend", "litellm", "gpu", "ollama", "llamacpp", "alerts",
                  "admin", "account"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert 'id="sidebar-nav"' in html, f"{name}: no sidebar"
@@ -285,7 +285,7 @@ def test_all_pages_have_collapsible_sidebar():
         assert 'id="main-area"' in html, f"{name}: content not wrapped in #main-area"
         assert "sb-collapsed" in html and "aimon_sb" in html, name   # collapse + persist
         # all six sections reachable from the sidebar
-        for href in ('href="/"', 'href="/litellm"', 'href="/gpu"',
+        for href in ('href="/"', 'href="/spend"', 'href="/litellm"', 'href="/gpu"',
                      'href="/ollama"', 'href="/llamacpp"', 'href="/alerts"'):
             assert href in html, f"{name}: sidebar missing {href}"
 
@@ -298,7 +298,7 @@ def test_login_page_has_no_sidebar():
 
 def test_all_pages_have_theme_toggle():
     # day/night toggle present on every dashboard + shared via localStorage
-    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
+    for name in ("index", "spend", "litellm", "gpu", "ollama", "llamacpp", "alerts"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert 'id="theme-btn"' in html, f"{name}: no theme button"
         assert 'data-theme="light"' in html, f"{name}: no light palette"
@@ -369,7 +369,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.4.3"
+    assert config.VERSION == "AI-Monitoring_1.5.2"
 
 
 def test_ux_improvements_present():

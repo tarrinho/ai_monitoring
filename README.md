@@ -70,6 +70,7 @@ standalone, and the LLM/GPU dashboard links hide until their backend is set.
 
 | Path | Shows |
 |------|-------|
+| `/spend` (Spend & Quota) | LLM-cost landing: real-cash summary, **spend-over-time** (30d daily / 12mo monthly) with **per-year year-to-date** totals, **by-team** rollup, and a **per-key budget** table ranked closest-to-cap. **Real (external) vs reference (self-hosted)** cost split throughout — budgets cap real cash, reference is shown but never consumes budget |
 | `/` (Overview) | Host CPU/mem/disk/load, **top-5 apps by CPU & RAM** + per-app evolution, uptime, and all metrics as time-series grouped into collapsible **Host / GPU / LLM** sections |
 | `/litellm` | wait avg + **p50/p95/p99 + SLO**, req/s, prompt/completion tok/s, error %, cost/h, **backlog** (in-flight), TTFT, cache hit; per-model table (with p95/SLO); **top-10 keys** (bar + cumulative-over-time + **requests-in-window timeline** = net requests per interval, colored); **failed-request viewer**; **key anomalies**; concurrency-vs-latency |
 | `/gpu` | util, VRAM used/%/total, power, temp, throttle, per-GPU table, tokens/watt — local `nvidia-smi`/`rocm-smi` **or a remote GPU box over SSH / HTTP agent** |
