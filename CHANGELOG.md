@@ -97,6 +97,14 @@ Versioning: [SemVer](https://semver.org/).
   returns `cost_models: {real:[…], reference:[…]}`, biggest-usage first).
 
 ### Fixed
+### Changed
+- **Settings → Teams: per-key ⟳ now lets LiteLLM win.** The **⟳** button re-detects a
+  key's team from LiteLLM and **overwrites any saved override** with the freshly detected
+  team (the endpoint drops the override so the detected value shows; the board reloads).
+  This matches the operator expectation that clicking refresh overwrites the
+  previously-defined name. To *set* a manual team, type it and click **✓** (save); to
+  revert a key to what LiteLLM reports, click **⟳**. The per-key budget override is left
+  untouched by ⟳.
 - **Teams rendered as raw UUIDs ("strange numbers").** When `/team/list` couldn't resolve
   a key's `team_id` to a human alias (a transient failure, or a team with no alias),
   `key_budgets()` fell back to the raw `team_id` UUID as the team NAME — and the new

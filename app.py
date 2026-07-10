@@ -1570,7 +1570,8 @@ def _apply_team_overrides(keys: list) -> None:
 _TEAMS_DETECT_CACHE: dict[str, dict] = {}
 
 
-def _merge_team(kid: str, team: str, user: str, budget: float, spent: float) -> None:
+def _merge_team(kid: str, team: str, user: str, budget: float, spent: float,
+                user_name: str = "") -> None:
     """Fold one key's detection into the sticky cache, filling each field from whichever
     source HAS it (first non-empty wins per field; spend refreshes when non-zero). A key
     blank in /key/list gets its team from the snapshot and vice-versa — never overwritten
@@ -1581,15 +1582,18 @@ def _merge_team(kid: str, team: str, user: str, budget: float, spent: float) -> 
         return
     if litellm._is_team_id(team):        # a raw team_id UUID is not a team NAME → ignore
         team = ""
+    if litellm._is_team_id(user_name):   # a user_id UUID is not a username → ignore
+        user_name = ""
     cur = _TEAMS_DETECT_CACHE.setdefault(
-        kid, {"detected": "", "user": "", "budget": 0.0, "spent": 0.0})
+        kid, {"detected": "", "user": "", "user_name": "", "budget": 0.0, "spent": 0.0})
     before = dict(cur)
     cur["detected"] = cur["detected"] or (team or "")
     cur["user"] = cur["user"] or (user or "")
+    cur["user_name"] = cur.get("user_name") or (user_name or "")
     cur["budget"] = cur["budget"] or (budget or 0.0)
     cur["spent"] = (spent or 0.0) or cur["spent"]
     if cur != before:                       # persist only real changes (not every re-fold)
-        db.team_detect_set(kid, cur["detected"], cur["user"],
+        db.team_detect_set(kid, cur["detected"], cur["user"], cur.get("user_name", ""),
                            cur["budget"], cur["spent"], time.time())
 
 
@@ -1614,8 +1618,8 @@ async def _detect_teams(session, force: bool) -> tuple[dict, str]:
                 if litellm._is_team_id(info.get("detected", "")):
                     info["detected"] = ""
                     db.team_detect_set(kid, "", info.get("user", ""),
-                                       info.get("budget", 0.0), info.get("spent", 0.0),
-                                       time.time())
+                                       info.get("user_name", ""), info.get("budget", 0.0),
+                                       info.get("spent", 0.0), time.time())
             _TEAMS_DETECT_CACHE = saved
         _TEAMS_LOADED = True
     hit_litellm = force or not _TEAMS_DETECT_CACHE
@@ -1623,7 +1627,8 @@ async def _detect_teams(session, force: bool) -> tuple[dict, str]:
         live = await litellm.key_budgets(session)
         for alias, info in (live or {}).items():
             _merge_team(alias, str(info.get("team", "") or ""), str(info.get("user", "") or ""),
-                        float(info.get("budget", 0) or 0), float(info.get("spend", 0) or 0))
+                        float(info.get("budget", 0) or 0), float(info.get("spend", 0) or 0),
+                        str(info.get("user_name", "") or ""))
     for k in (_backend_latest.get("litellm", {}) or {}).get("top_keys", []):
         _merge_team(_team_key_id(k), str(k.get("team", "") or ""), str(k.get("user", "") or ""),
                     0.0, float(k.get("cost", 0) or 0))
@@ -1642,13 +1647,14 @@ async def api_admin_teams_get(request: web.Request) -> web.Response:
     detected, source = await _detect_teams(request.app[_SESSION], force)
 
     def add(key_id: str, detected: str, user: str = "", budget: float = 0.0,
-            spent: float = 0.0):
+            spent: float = 0.0, user_name: str = ""):
         key_id = str(key_id or "").strip()
         if not key_id or key_id in seen:
             return
         det = str(detected or "")
         tmn = ov.get(key_id, det)
-        seen[key_id] = {"key": key_id, "user": str(user or ""), "detected": det,
+        seen[key_id] = {"key": key_id, "user": str(user or ""),
+                        "user_name": str(user_name or ""), "detected": det,
                         "team": tmn, "overridden": key_id in ov,
                         "budget": bov.get(key_id, float(budget or 0)),
                         "budget_overridden": key_id in bov,
@@ -1657,11 +1663,11 @@ async def api_admin_teams_get(request: web.Request) -> web.Response:
 
     for kid, info in detected.items():
         add(kid, info.get("detected", ""), info.get("user", ""),
-            info.get("budget", 0), info.get("spent", 0))
+            info.get("budget", 0), info.get("spent", 0), info.get("user_name", ""))
     for key_id in set(ov) | set(bov):       # any key with a team OR budget override
         if key_id not in seen:
             _tm = ov.get(key_id, "")
-            seen[key_id] = {"key": key_id, "user": "", "detected": "",
+            seen[key_id] = {"key": key_id, "user": "", "user_name": "", "detected": "",
                             "team": _tm, "overridden": key_id in ov,
                             "budget": bov.get(key_id, 0.0),
                             "budget_overridden": key_id in bov,
@@ -1693,6 +1699,7 @@ async def api_admin_team_sync(request: web.Request) -> web.Response:
     to re-render the whole board. Admin + CSRF. (LiteLLM's key API is list-based, so the
     poll itself covers all keys, but only the requested row is returned/updated in the UI.)"""
     _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
     if not _require_csrf(request, sess):
         return web.json_response({"error": "bad csrf"}, status=403)
     data = await request.post()
@@ -1701,12 +1708,18 @@ async def api_admin_team_sync(request: web.Request) -> web.Response:
         return web.json_response({"error": "key required"}, status=400)
     detected, _src = await _detect_teams(request.app[_SESSION], True)   # re-poll + persist
     info = detected.get(kid, {})
-    ov = db.team_overrides()
+    det = str(info.get("detected", "") or "")
+    # ⟳ means "re-pull from LiteLLM and let it WIN": drop any admin TEAM override so the
+    # freshly detected team is what shows (the operator asked refresh to overwrite the
+    # previously-defined name). The per-key BUDGET override is left untouched.
+    if kid in db.team_overrides():
+        db.team_delete(kid)
+        _audit(request, actor, "team.sync_overwrite", target=kid, detail=det)
     return web.json_response({"ok": True, "key": kid,
-                              "detected": info.get("detected", ""),
+                              "detected": det,
                               "user": info.get("user", ""),
-                              "team": ov.get(kid, info.get("detected", "")),
-                              "overridden": kid in ov})
+                              "user_name": info.get("user_name", ""),
+                              "team": det, "overridden": False})
 
 
 async def api_admin_teams_set(request: web.Request) -> web.Response:

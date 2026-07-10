@@ -887,6 +887,16 @@ def test_settings_page_exists_with_tunables_and_teams():
     # manual team refresh: detected teams are cached (LiteLLM lookup is flaky) and only
     # re-fetched on the Refresh button, which calls the endpoint with ?refresh=1.
     assert 'id="teams-refresh"' in html and "refresh=1" in html
+    # the per-row ⟳ re-detects from LiteLLM and lets it WIN — drops the override and
+    # reloads the board, overwriting the previously-defined team.
+    assert "/api/admin/teams/sync" in html and "LiteLLM wins" in html
+    # Teams board is grouped by USER → team → keys (user-centric view), with a per-key
+    # sync endpoint and an "Unassigned" bucket for keys LiteLLM reports no owner for.
+    # (DOM is built in JS, so match the className strings, not rendered HTML attributes.)
+    assert '"ugroup"' in html and "By user" in html and '"uhead"' in html
+    assert "/api/admin/teams/sync" in html and "__unassigned__" in html
+    # config groups + Teams/Models rows use the compact one-line .srow style
+    assert '"grid2"' in html and "srow tteam" in html and "srow tmodel" in html
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 

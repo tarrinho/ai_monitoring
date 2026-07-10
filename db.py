@@ -176,7 +176,7 @@ CREATE TABLE IF NOT EXISTS model_cost_kind (model TEXT PRIMARY KEY, kind TEXT NO
 -- the board shows teams immediately without re-polling LiteLLM every boot. Distinct from
 -- key_teams (admin OVERRIDES); this is what LiteLLM reported.
 CREATE TABLE IF NOT EXISTS team_detect (key TEXT PRIMARY KEY, team TEXT, "user" TEXT,
-    budget REAL, spent REAL, updated REAL);
+    user_name TEXT, budget REAL, spent REAL, updated REAL);
 """
 
 # Columns charted over time (order must match _METRIC_COLS in queries).
@@ -253,6 +253,13 @@ def init() -> None:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
                 except Exception:
                     pass
+        # team_detect.user_name (Settings → Teams, user-grouped view): resolved
+        # LiteLLM username persisted so the board groups by user without a re-poll.
+        if "user_name" not in {r[1] for r in conn.execute("PRAGMA table_info(team_detect)")}:
+            try:
+                conn.execute("ALTER TABLE team_detect ADD COLUMN user_name TEXT")
+            except Exception:
+                pass
 
 
 def insert(ts: float, payload: dict[str, Any]) -> None:
@@ -1029,29 +1036,32 @@ def team_delete(key: str) -> bool:
 
 
 def team_detect_all() -> dict[str, dict]:
-    """Persisted LiteLLM team detection, {key: {detected, user, budget, spent}} — loaded
-    into the in-memory cache on startup so the Teams board is populated without a refresh."""
+    """Persisted LiteLLM team detection, {key: {detected, user, user_name, budget, spent}}
+    — loaded into the in-memory cache on startup so the board is populated without a refresh."""
     try:
         with _connect() as conn:
             return {r[0]: {"detected": r[1] or "", "user": r[2] or "",
-                           "budget": float(r[3] or 0), "spent": float(r[4] or 0)}
+                           "user_name": r[3] or "",
+                           "budget": float(r[4] or 0), "spent": float(r[5] or 0)}
                     for r in conn.execute(
-                        'SELECT key, team, "user", budget, spent FROM team_detect').fetchall()}
+                        'SELECT key, team, "user", user_name, budget, spent '
+                        "FROM team_detect").fetchall()}
     except Exception:
         return {}
 
 
-def team_detect_set(key: str, team: str, user: str, budget: float,
+def team_detect_set(key: str, team: str, user: str, user_name: str, budget: float,
                     spent: float, now: float) -> bool:
-    """Persist one key's detected team/user/budget/spend (upsert)."""
+    """Persist one key's detected team/user/user_name/budget/spend (upsert)."""
     try:
         with _connect() as conn:
             conn.execute(
-                'INSERT INTO team_detect(key, team, "user", budget, spent, updated) '
-                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
-                'team = excluded.team, "user" = excluded."user", budget = excluded.budget, '
+                'INSERT INTO team_detect(key, team, "user", user_name, budget, spent, updated) '
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+                'team = excluded.team, "user" = excluded."user", '
+                "user_name = excluded.user_name, budget = excluded.budget, "
                 "spent = excluded.spent, updated = excluded.updated",
-                (str(key), str(team or ""), str(user or ""),
+                (str(key), str(team or ""), str(user or ""), str(user_name or ""),
                  float(budget or 0), float(spent or 0), now))
         return True
     except Exception:

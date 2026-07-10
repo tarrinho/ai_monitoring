@@ -86,6 +86,15 @@
   .srow .tin{width:104px;flex:0 0 auto} .srow .bin{width:56px;flex:0 0 auto}
   .srow .min{width:auto;max-width:130px;flex:0 0 auto}
   .srow .ksync{margin-left:0;font-size:13px}
+  /* Teams grouped by user: username (primary) · team · keys area */
+  .ugroup{border:1px solid var(--line);border-radius:9px;margin-top:9px;overflow:hidden}
+  .uhead{display:flex;align-items:center;gap:9px;padding:6px 11px;background:var(--panel2);
+    border-bottom:1px solid var(--line)}
+  .uhead .uname{font-weight:650;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .uhead .uteam{font-size:10.5px;color:var(--accent);border:1px solid var(--line);
+    border-radius:20px;padding:1px 9px;flex-shrink:0}
+  .uhead .ukcount{margin-left:auto;font-size:11px;color:var(--muted);flex-shrink:0}
+  .ukeys{padding:0 11px 4px}
   .save{background:var(--accent);color:#fff} .save:hover{filter:brightness(1.08)}
   .reset{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .reset:hover{color:var(--fg)}
@@ -191,7 +200,9 @@
         <button id="teams-refresh" type="button" class="btn-refresh">Refresh from LiteLLM</button>
       </h2>
       <div class="gsub">Assign each key a <b>team</b> + monthly <b>budget ($/mo)</b> for the
-        <a href="/spend">Spend</a> by-team rollup.
+        <a href="/spend">Spend</a> by-team rollup. Type a team and click <b>✓</b> to save an
+        override; <b>⟳</b> re-detects from LiteLLM and lets it win — overwriting any saved
+        override for that key.
         <span class="ttip" tabindex="0" title="Team budgets are a LiteLLM Enterprise feature, so both are managed here. The values override what LiteLLM reports (team) and its max_budget (budget); Reset clears both for that key. Detected teams are cached (LiteLLM's lookup is flaky) — the board no longer re-fetches on every load; use Refresh to re-detect.">ⓘ</span></div>
       <div id="teams-src" class="gsub" style="margin-top:-2px;font-style:italic"></div>
       <div id="teams"></div>
@@ -311,7 +322,7 @@
     function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
       save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
     var sync=document.createElement("button"); sync.type="button"; sync.className="ksync";
-    sync.textContent="⟳"; sync.title="Sync this key's team from LiteLLM";
+    sync.textContent="⟳"; sync.title="Re-detect this key's team from LiteLLM and use it — LiteLLM wins, overwriting any saved override (and anything typed here)";
     var inp=document.createElement("input"); inp.type="text"; inp.className="tin"; inp.value=k.team||"";
     inp.placeholder="team"; inp.maxLength=64; inp.setAttribute("list","team-names"); inp.title=tip(k.user,k.detected);
     var bud=document.createElement("input"); bud.type="number"; bud.className="bin"; bud.min="0"; bud.step="any";
@@ -325,9 +336,10 @@
         .then(function(r){return r.ok?r.json():null;}).then(function(j){
           sync.disabled=false; sync.classList.remove("spin");
           if(!j||!j.ok){say("sync failed",false);return;}
-          lbl.title=tip(j.user,j.detected); inp.title=lbl.title;
-          if(!k.overridden && j.detected) inp.value=j.detected;
-          say("synced",true);
+          // ⟳ = LiteLLM wins: the endpoint drops any override, so reload the board to show
+          // the freshly detected team (overwriting the previously-defined name).
+          say(j.detected?("→ "+j.detected):"no team reported",true);
+          setTimeout(loadTeams,700);
         }).catch(function(){sync.disabled=false;sync.classList.remove("spin");say("sync failed",false);});
     });
     var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset team + budget";
@@ -406,12 +418,44 @@
         hd.textContent=ts.length+" team"+(ts.length>1?"s":"")+" · monthly budget per member (each key inherits it)";
         el.appendChild(hd); el.appendChild(teamSummaryStrip(ts));
       }
-      var asn=document.createElement("div"); asn.className="tsumhd"; asn.textContent="Assign keys to teams";
+      var asn=document.createElement("div"); asn.className="tsumhd"; asn.textContent="By user · team · keys";
       el.appendChild(asn);
       var dl=document.createElement("datalist"); dl.id="team-names";
       (d.teams||[]).forEach(function(t){var o=document.createElement("option");o.value=t;dl.appendChild(o);});
       el.appendChild(dl);
-      d.keys.forEach(function(k){ el.appendChild(teamRow(k, d.teams||[])); });
+      // group keys by LiteLLM user: username (primary) → team → its keys. Keys with no
+      // user fall into one "Unassigned" group at the bottom.
+      var groups={}, order=[];
+      (d.keys||[]).forEach(function(k){
+        var gid=k.user||"__unassigned__";
+        if(!groups[gid]){ groups[gid]={uid:k.user||"",name:k.user_name||"",team:"",keys:[]}; order.push(gid); }
+        var g=groups[gid]; g.keys.push(k);
+        if(!g.name && k.user_name) g.name=k.user_name;
+        if(!g.team && k.team) g.team=k.team;
+      });
+      order.sort(function(a,b){
+        if(a==="__unassigned__") return 1; if(b==="__unassigned__") return -1;
+        var na=(groups[a].name||groups[a].uid).toLowerCase(), nb=(groups[b].name||groups[b].uid).toLowerCase();
+        return na<nb?-1:(na>nb?1:0);
+      });
+      order.forEach(function(gid){
+        var g=groups[gid];
+        var block=document.createElement("div"); block.className="ugroup";
+        var head=document.createElement("div"); head.className="uhead";
+        var uname=document.createElement("span"); uname.className="uname";
+        uname.textContent = gid==="__unassigned__" ? "Unassigned"
+          : (g.name || ("user "+g.uid.slice(0,8)+"…"));
+        if(gid!=="__unassigned__" && g.uid) uname.title="user_id "+g.uid;
+        head.appendChild(uname);
+        if(g.team){ var ut=document.createElement("span"); ut.className="uteam"; ut.textContent=g.team; head.appendChild(ut); }
+        var kc=document.createElement("span"); kc.className="ukcount";
+        kc.textContent=g.keys.length+" key"+(g.keys.length>1?"s":""); head.appendChild(kc);
+        block.appendChild(head);
+        var keysbox=document.createElement("div"); keysbox.className="ukeys";
+        g.keys.forEach(function(k){ keysbox.appendChild(teamRow(k, d.teams||[])); });
+        block.appendChild(keysbox);
+        el.appendChild(block);
+      });
     }).catch(function(){});
   }
 

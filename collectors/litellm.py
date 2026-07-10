@@ -793,7 +793,8 @@ async def spend_activity(session: aiohttp.ClientSession,
 
 _KEY_LIST_ERR: str | None = None
 _KEY_BUDGETS_CACHE: dict | None = None  # last good /key/list result
-_TEAM_DIR_CACHE: tuple[dict, dict] = ({}, {})  # last good (by_team_id, by_user_id) alias maps
+# last good (by_team_id→alias, by_user_id→team_alias, by_user_id→user_name) maps
+_TEAM_DIR_CACHE: tuple[dict, dict, dict] = ({}, {}, {})
 
 
 async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,
@@ -850,7 +851,8 @@ async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,
     return out
 
 
-async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[dict, dict]:
+async def _team_directory(session: aiohttp.ClientSession,
+                          base: str) -> tuple[dict, dict, dict]:
     """Team lookups so a key's team can be resolved via its USER when the key
     itself carries no team (LiteLLM often attaches the team to the user, not the
     key). Returns (by_team_id, by_user_id) → {id: team_alias}. Best-effort: empty
@@ -858,6 +860,7 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
     key's own team."""
     by_id: dict[str, str] = {}
     by_user: dict[str, str] = {}
+    by_user_name: dict[str, str] = {}       # user_id → human name (email/alias) for the board
     tl, err = await fetch_json(session, f"{base}/team/list",
                                headers=_headers(), timeout_s=max(config.HTTP_TIMEOUT, config.LITELLM_SPEND_TIMEOUT))
     teams = (tl.get("teams") if isinstance(tl, dict) else tl) if err is None else None
@@ -886,7 +889,12 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
         if not isinstance(u, dict):
             continue
         uid = str(u.get("user_id") or "")
-        if not uid or uid in by_user:
+        if not uid:
+            continue
+        name = str(u.get("user_email") or u.get("user_alias") or "").strip()
+        if name:                              # user_id → human name for the board grouping
+            by_user_name[uid] = name
+        if uid in by_user:
             continue
         tms = u.get("teams") or []
         first = tms[0] if isinstance(tms, list) and tms else None
@@ -901,15 +909,18 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
     # Reuse the last-good directory when /team/list (or /user/list) momentarily fails —
     # otherwise a transient blip empties the alias map and every team renders as a UUID.
     global _TEAM_DIR_CACHE
-    cid, cuser = _TEAM_DIR_CACHE
+    cid, cuser, cname = _TEAM_DIR_CACHE
     if not by_id and cid:
         by_id = dict(cid)
     if not by_user and cuser:
         by_user = dict(cuser)
-    if by_id or by_user:
-        _TEAM_DIR_CACHE = (dict(by_id), dict(by_user))
-    _dbg(f"/team directory: teams={len(by_id)} users_mapped={len(by_user)}")
-    return by_id, by_user
+    if not by_user_name and cname:
+        by_user_name = dict(cname)
+    if by_id or by_user or by_user_name:
+        _TEAM_DIR_CACHE = (dict(by_id), dict(by_user), dict(by_user_name))
+    _dbg(f"/team directory: teams={len(by_id)} users_mapped={len(by_user)} "
+         f"names={len(by_user_name)}")
+    return by_id, by_user, by_user_name
 
 
 async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
@@ -991,7 +1002,7 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     # Resolve a key's team through team_id and (if the key has none) its user,
     # since LiteLLM commonly attaches the team to the user, and /key/list may carry
     # only a team_id UUID rather than the human alias shown in the LiteLLM UI.
-    by_id, by_user = await _team_directory(session, base)
+    by_id, by_user, by_user_name = await _team_directory(session, base)
     out: dict = {}
     for k in rows:
         if not isinstance(k, dict):
@@ -1008,11 +1019,15 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
             team = by_user.get(uid, "")                    # else via the user's team
         if _is_team_id(team):                              # never surface a raw UUID as a name
             team = ""
+        uname = by_user_name.get(uid, "")
+        if _is_team_id(uname):                             # user_id-looking name → not a name
+            uname = ""
         out[str(alias)] = {
             "budget": float(k.get("max_budget") or 0),
             "spend": float(k.get("spend") or 0),
             "team": team,
             "user": uid,
+            "user_name": uname,                            # user_id → email/alias for grouping
         }
     _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])} "
          f"teamed={sum(1 for v in out.values() if v['team'])}")

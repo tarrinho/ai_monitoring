@@ -3578,6 +3578,31 @@ async def test_settings_and_teams_are_admin_only(monkeypatch):
         await c.close()
 
 
+async def test_team_sync_overwrites_override_with_detected(monkeypatch):
+    """⟳ (per-key sync) re-detects from LiteLLM and lets it WIN: it drops any admin team
+    override so the freshly detected team is what shows (overwrites the defined name)."""
+    c, csrf = await _admin_client(monkeypatch, user="syncadm", pw="syncadm1")
+    try:
+        r = await c.post("/api/admin/teams", data={"key": "kSync", "team": "AI team"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and db.team_overrides().get("kSync") == "AI team"
+
+        async def _fake_detect(session, force):
+            appmod._TEAMS_DETECT_CACHE["kSync"] = {
+                "detected": "Platform", "user": "", "budget": 0.0, "spent": 0.0}
+            return appmod._TEAMS_DETECT_CACHE, "litellm"
+        monkeypatch.setattr(appmod, "_detect_teams", _fake_detect)
+        r = await c.post("/api/admin/teams/sync", data={"key": "kSync"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        j = await r.json()
+        assert j["team"] == "Platform" and j["overridden"] is False
+        assert "kSync" not in db.team_overrides()      # override dropped — LiteLLM wins
+    finally:
+        appmod._TEAMS_DETECT_CACHE.pop("kSync", None)
+        await c.close()
+
+
 async def test_team_override_get_set_reset(monkeypatch):
     c, csrf = await _admin_client(monkeypatch, user="tadm", pw="tadmpw12")
     try:
@@ -3916,7 +3941,7 @@ def test_is_team_id_recognizes_uuids():
 async def test_key_budgets_never_surfaces_raw_team_id(monkeypatch):
     """When /team/list can't resolve a key's team_id to an alias, the team is BLANK —
     never the raw UUID (which would render as a 'strange number' on the board)."""
-    litellm._TEAM_DIR_CACHE = ({}, {})            # no cached aliases
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})            # no cached aliases
 
     async def fake_fetch(session, url, headers=None, timeout_s=None):
         if "/key/list" in url:
@@ -3934,21 +3959,21 @@ async def test_key_budgets_never_surfaces_raw_team_id(monkeypatch):
     litellm._KEY_BUDGETS_CACHE = None
     out = await litellm.key_budgets(None)
     assert out["kX"]["team"] == ""                # BLANK, not the UUID
-    litellm._TEAM_DIR_CACHE = ({}, {})
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
 
 
 async def test_team_directory_reuses_cache_when_team_list_fails(monkeypatch):
     """A transient /team/list failure reuses the last-good alias map instead of emptying
     it (which would make every team resolve to a UUID)."""
-    litellm._TEAM_DIR_CACHE = ({"t1": "AppSec"}, {"u9": "AppSec"})
+    litellm._TEAM_DIR_CACHE = ({"t1": "AppSec"}, {"u9": "AppSec"}, {})
 
     async def fake_fetch(session, url, headers=None, timeout_s=None):
         return (None, "Timeout")                  # /team/list AND /user/list fail
     monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
-    by_id, by_user = await litellm._team_directory(None, "http://litellm:4000")
+    by_id, by_user, _names = await litellm._team_directory(None, "http://litellm:4000")
     assert by_id.get("t1") == "AppSec" and by_user.get("u9") == "AppSec"
-    litellm._TEAM_DIR_CACHE = ({}, {})
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
 
 
 def test_merge_team_ignores_raw_team_id():
@@ -3959,6 +3984,139 @@ def test_merge_team_ignores_raw_team_id():
     appmod._merge_team("kZ", "AppSec", "u1", 0.0, 5.0)
     assert appmod._TEAMS_DETECT_CACHE["kZ"]["detected"] == "AppSec"  # real alias kept
     appmod._TEAMS_DETECT_CACHE.pop("kZ", None)
+
+
+# ---------------------------------------------- teams: username resolution ----
+async def test_team_directory_resolves_user_name(monkeypatch):
+    """`_team_directory` maps user_id → a human name (user_email preferred, then
+    user_alias) so the Teams board can group by user instead of raw UUIDs."""
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/team/list" in url:
+            return ({"teams": [{"team_id": "t1", "team_alias": "AppSec"}]}, None)
+        if "/user/list" in url:
+            return ({"users": [{"user_id": "u1", "user_email": "ric@example.com"},
+                               {"user_id": "u2", "user_alias": "mariana"},
+                               {"user_id": "u3"}]}, None)   # u3 has no name
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    _by_id, _by_user, by_name = await litellm._team_directory(None, "http://litellm:4000")
+    assert by_name.get("u1") == "ric@example.com"      # email preferred
+    assert by_name.get("u2") == "mariana"               # alias fallback
+    assert "u3" not in by_name                           # no name → not mapped
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
+
+
+async def test_key_budgets_attaches_resolved_user_name(monkeypatch):
+    """Each key from /key/list carries a resolved `user_name` (via the directory), so
+    the board groups keys under their user's email/alias, not the user_id UUID."""
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
+    litellm._KEY_BUDGETS_CACHE = None
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            return ({"keys": [{"key_alias": "kA", "user_id": "u1", "team_id": "t1",
+                               "spend": 3.0, "max_budget": 0}]}, None)
+        if "/team/list" in url:
+            return ({"teams": [{"team_id": "t1", "team_alias": "AppSec"}]}, None)
+        if "/user/list" in url:
+            return ({"users": [{"user_id": "u1", "user_email": "ric@example.com"}]}, None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    out = await litellm.key_budgets(None)
+    assert out["kA"]["user_name"] == "ric@example.com"
+    assert out["kA"]["team"] == "AppSec" and out["kA"]["user"] == "u1"
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
+
+
+def test_team_detect_persists_user_name_roundtrip(tmp_path, monkeypatch):
+    """db.team_detect_set/all round-trips the resolved username so the user-grouped
+    board survives a restart without a LiteLLM re-poll."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "td.db"))
+    db.init()
+    assert db.team_detect_set("kA", "AppSec", "u1", "ric@example.com", 200.0, 3.0, 1_700_000_000.0)
+    row = db.team_detect_all()["kA"]
+    assert row["detected"] == "AppSec" and row["user"] == "u1"
+    assert row["user_name"] == "ric@example.com" and row["budget"] == 200.0
+
+
+async def test_teams_board_returns_user_name_and_sync(tmp_path, monkeypatch):
+    """The admin Teams API returns `user_name` per key (for grouping), and the per-key
+    /api/admin/teams/sync endpoint re-detects one key and echoes its resolved row."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "board.db"))  # isolate DB state
+    db.init()
+    async def kb(session):
+        return {"kA": {"team": "AppSec", "user": "u1", "user_name": "ric@example.com",
+                       "budget": 0.0, "spend": 3.0}}
+    monkeypatch.setattr(litellm, "key_budgets", kb)
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE", {}, raising=False)
+    monkeypatch.setattr(appmod, "_TEAMS_LOADED", False, raising=False)
+    # setitem (not setattr) so the running collector's other backends stay intact
+    monkeypatch.setitem(appmod._backend_latest, "litellm", {"top_keys": []})
+    c, csrf = await _admin_client(monkeypatch, user="ugadm", pw="ugadmpw1")
+    try:
+        rows = (await (await c.get("/api/admin/teams?refresh=1")).json())["keys"]
+        row = next(k for k in rows if k["key"] == "kA")
+        assert row["user_name"] == "ric@example.com" and row["team"] == "AppSec"
+        r = await c.post("/api/admin/teams/sync", data={"key": "kA"},
+                         headers={"X-CSRF-Token": csrf})
+        j = await r.json()
+        assert r.status == 200 and j["ok"] and j["user_name"] == "ric@example.com"
+        # sync without CSRF is rejected
+        r2 = await c.post("/api/admin/teams/sync", data={"key": "kA"})
+        assert r2.status == 403
+    finally:
+        await c.close()
+
+
+# ---------------------------------------------- spend: estimated cost split ---
+def test_cost_rates_prices_real_and_reference_separately():
+    """cost_rates returns per-token $ for REAL (external) and REFERENCE (self-hosted)
+    models separately, from windowed per-model tokens × LiteLLM prices."""
+    per_model = [{"model": "azure_ai/gpt-5-mini", "tokens": 1_000_000, "cost_kind": "real"},
+                 {"model": "llama-cpp/Qwen3", "tokens": 1_000_000, "cost_kind": "reference"},
+                 {"model": "(unattributed)", "tokens": 0, "cost_kind": "unknown"}]
+    prices = {"azure_ai/gpt-5-mini": 2e-06, "llama-cpp/Qwen3": 1e-05}
+    real_cpt, ref_cpt = appmod.cost_rates(per_model, prices)
+    # real cost = 1M×2e-6 = $2 over 2M total tokens → $1e-6/token; ref = 1M×1e-5/2M = 5e-6
+    assert round(real_cpt, 9) == 1e-06 and round(ref_cpt, 9) == 5e-06
+    assert appmod.cost_rates([], prices) == (0.0, 0.0)      # nothing priced
+
+
+def test_add_estimated_cost_splits_and_totals():
+    """add_estimated_cost attaches real_cost/est_cost per point + year and totals, and
+    flags cost_available only when a rate exists."""
+    series = {"points": [{"tokens": 1_000_000}, {"tokens": 2_000_000}],
+              "years": [{"tokens": 3_000_000}]}
+    out = appmod.add_estimated_cost(series, 1e-06, 5e-06)
+    assert out["cost_available"] is True
+    assert out["points"][0]["real_cost"] == 1.0 and out["points"][0]["est_cost"] == 5.0
+    assert out["real_cost_total"] == 3.0 and out["est_cost_total"] == 15.0
+    # no rate → not available
+    assert appmod.add_estimated_cost({"points": [{"tokens": 5}], "years": []},
+                                     0.0, 0.0)["cost_available"] is False
+
+
+async def test_model_prices_parses_model_info(monkeypatch):
+    """litellm.model_prices reads input+output cost per token from /model/info and only
+    keeps models with a non-zero price."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        return ({"data": [
+            {"model_name": "azure_ai/gpt-5-mini",
+             "litellm_params": {"input_cost_per_token": 1e-06, "output_cost_per_token": 1.25e-06}},
+            {"model_name": "free-local", "litellm_params": {}},
+        ]}, None)
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    pr = await litellm.model_prices(None)
+    assert round(pr["azure_ai/gpt-5-mini"], 12) == 2.25e-06   # in + out
+    assert "free-local" not in pr                             # 0-priced dropped
+    assert litellm.price_for("gpt-5-mini", pr) == pr["azure_ai/gpt-5-mini"]   # prefix-tolerant
 
 
 async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
