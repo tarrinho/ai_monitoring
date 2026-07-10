@@ -711,13 +711,13 @@ async def spend_report_probe(session: aiohttp.ClientSession,
         except Exception as e:      # noqa: BLE001 — diagnostics must never raise
             return f"{type(e).__name__}"
 
-    attempts = []
+    attempts: list[dict[str, object]] = []
     for label, url in list(_spend_report_variants(base, start_date, end_date)) + extra:
         d, err = await fetch_json(session, url, headers=_headers(),
                                   timeout_s=config.HTTP_TIMEOUT)
         path = url.split("?", 1)[0].split("/global/", 1)[-1]
         if err is not None:
-            row = {"try": label, "path": path, "error": err}
+            row: dict[str, object] = {"try": label, "path": path, "error": err}
             if err.startswith("HTTP 4"):        # capture the body that explains the 4xx
                 row["body"] = await _err_body(url)
             attempts.append(row)
@@ -905,6 +905,8 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     rows: list = []
     page = 1
     eff_size: int | None = None   # server's ACTUAL page size (LiteLLM caps ~10, ignoring size=)
+    truncated = False             # a later page failed → rows is only a PARTIAL set
+    expected = 0                  # server-reported total_count, if any (completeness check)
     while page <= 50:
         q = f"return_full_object=true&page={page}&size=100"
         d, err = await fetch_json(session, f"{base}/key/list?{q}",
@@ -928,7 +930,8 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
                     _dbg(f"/key/list err={err} -> reuse cached{scope}" if _KEY_BUDGETS_CACHE
                          else f"/key/list err={err} -> budgets use MONITOR_KEY_BUDGETS{scope}")
                 return _KEY_BUDGETS_CACHE
-            break                               # got some pages already; use them
+            truncated = True                    # page>1 failed → we have only a partial set
+            break
         pg = (d.get("keys") or d.get("data")) if isinstance(d, dict) else d
         if not isinstance(pg, list) or not pg:
             break
@@ -940,6 +943,7 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         # past the first page to the team-less spend snapshot.
         total_pages = (d.get("total_pages") if isinstance(d, dict) else 0) or 0
         total_count = ((d.get("total_count") or d.get("total")) if isinstance(d, dict) else 0) or 0
+        expected = max(expected, int(total_count or 0))
         if eff_size is None:
             eff_size = len(pg)
         if total_pages:
@@ -980,7 +984,18 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         }
     _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])} "
          f"teamed={sum(1 for v in out.values() if v['team'])}")
-    if out:
+    # A PARTIAL walk (a later page timed out, or we got fewer keys than the server's
+    # reported total) must NOT shrink the board or poison the cache — that's the
+    # "top spenders sometimes disappear" flicker. Keep the fuller last-good set instead.
+    cache = _KEY_BUDGETS_CACHE or {}
+    incomplete = truncated or (expected and len(out) < expected)
+    if out and incomplete and len(out) < len(cache):
+        _KEY_LIST_ERR = (f"/key/list partial: {len(out)} keys"
+                         + (f"/{expected}" if expected else "")
+                         + f" (page failed mid-walk) — reused {len(cache)}-key cache")
+        _dbg(_KEY_LIST_ERR)
+        return cache
+    if out and not (incomplete and len(out) < len(cache)):
         _KEY_BUDGETS_CACHE = out
     return out or _KEY_BUDGETS_CACHE
 

@@ -18,10 +18,42 @@
   header h1{font-size:16px;margin:0}
   header .sp{margin-left:auto;display:flex;gap:12px;align-items:center}
   a{color:var(--accent);text-decoration:none}
-  main{padding:22px;max-width:760px;margin:0 auto;width:100%}
-  .intro{color:var(--muted);font-size:12.5px;margin:0 0 16px}
+  main{padding:18px 22px;width:100%}          /* full page width (was capped at 760px) */
+  .intro{color:var(--muted);font-size:12px;margin:0 0 10px;max-width:1000px}
+  /* inline help chip — full text in the native title tooltip */
+  .ttip{display:inline-block;cursor:help;color:var(--accent);font-size:11px;
+    border:1px solid var(--line);border-radius:50%;width:15px;height:15px;line-height:13px;
+    text-align:center;margin-left:2px;vertical-align:middle}
+  .card .gsub{margin-bottom:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:16px 18px;margin-bottom:16px}
+    padding:14px 16px;margin-bottom:16px}
+  /* dense masonry-ish grid of config groups across the full width */
+  #groups{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
+    gap:12px;align-items:start;margin-bottom:14px}
+  #groups .card{margin-bottom:0;padding:12px 14px}
+  #groups .card h2{margin-bottom:6px}
+  /* two compact settings per row inside each card (auto-fits to card width) */
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+    gap:2px 14px;margin-top:2px}
+  /* one setting on a single tight line: label (help on hover) · small field · ✓ · ↺ */
+  .srow{display:flex;align-items:center;gap:5px;padding:3px 0;min-width:0}
+  .srow .lbl{flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;cursor:help;border-bottom:1px dotted var(--line)}
+  .srow .lbl.mod{color:var(--warn)}
+  .srow .lbl .dot{color:var(--warn);margin-left:3px;border:0}
+  .srow input,.srow select{flex:0 0 auto;width:60px;padding:3px 6px;font-size:12px}
+  .srow select{width:auto;max-width:96px}
+  .srow .ib{flex:0 0 auto;border:1px solid var(--line);background:var(--panel2);
+    color:var(--muted);border-radius:5px;padding:2px 6px;font-size:12.5px;line-height:1;
+    cursor:pointer;font-weight:700}
+  .srow .ib.save:hover{border-color:var(--accent);color:var(--accent)}
+  .srow .ib.reset:hover{color:var(--fg)}
+  .srow .ib.ok{border-color:var(--ok);color:var(--ok)}
+  .srow .ib.bad{border-color:var(--bad);color:var(--bad)}
+  /* Teams + Model costs side-by-side below the config grid, collapsing on narrow screens */
+  .litellm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));
+    gap:16px;align-items:start}
+  .litellm-grid .card{margin-bottom:0}
   .card h2{margin:0 0 2px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
   .card .gsub{color:var(--muted);font-size:12px;margin:0 0 12px}
   .row{display:grid;grid-template-columns:1fr 150px auto auto;gap:10px;align-items:center;
@@ -39,17 +71,28 @@
     border-radius:6px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
   .btn-refresh:hover:not(:disabled){background:var(--accent);color:#fff}
   .btn-refresh:disabled{opacity:.6;cursor:default}
+  .trow button{padding:4px 9px;font-size:11px}          /* compact Teams/Models buttons */
+  .trow input,.trow select{padding:5px 7px;font-size:12px}
+  /* per-key team sync icon (inside the label cell) */
+  .ksync{border:0;background:none;color:var(--muted);cursor:pointer;font-size:12px;
+    padding:0 4px;margin-left:6px;line-height:1;vertical-align:middle}
+  .ksync:hover{color:var(--accent)} .ksync:disabled{cursor:default;opacity:.6}
+  .ksync.spin{display:inline-block;animation:kspin .7s linear infinite}
+  @keyframes kspin{to{transform:rotate(360deg)}}
   .save{background:var(--accent);color:#fff} .save:hover{filter:brightness(1.08)}
   .reset{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .reset:hover{color:var(--fg)}
   .dflt{font-size:11px;color:var(--muted);white-space:nowrap}
   .msg{font-size:12px;min-height:16px;margin-top:2px} .msg.ok{color:var(--ok)} .msg.bad{color:var(--bad)}
   @media(max-width:560px){.row{grid-template-columns:1fr 1fr}}
-  /* section quick-nav */
-  .secnav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px}
+  /* section quick-nav — sticks to the top of the scroll area so it's always reachable */
+  .secnav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px;position:sticky;top:0;z-index:40;
+    background:var(--bg);padding:10px 0;border-bottom:1px solid var(--line)}
   .secnav a{font-size:11.5px;color:var(--muted);background:var(--panel);border:1px solid var(--line);
     border-radius:20px;padding:4px 11px;text-decoration:none}
   .secnav a:hover{color:var(--fg);border-color:var(--accent)}
+  /* offset anchor jumps so a sticky-nav click lands the heading below the sticky bar */
+  #groups .card h2,#teams-card h2,#models-card h2{scroll-margin-top:56px}
   .card h2{scroll-margin-top:14px}
   /* team summary strip (top of Teams card) */
   .tsumhd{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
@@ -105,7 +148,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.5</div>
+      <div id="sidebar-brand-ver">v1.5.6</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -130,37 +173,30 @@
     </div>
   </header>
   <main>
-    <p class="intro">Operator tuning applied live (no restart), persisted across restarts, and overriding
-      the <code>.env</code> defaults. Only non-secret operational settings are here — secrets, ports,
-      backend URLs and security switches stay in <code>.env</code>. <b>Reset</b> returns a setting to its
-      environment/default value. Changes are admin-only and audited.</p>
+    <p class="intro">Operator tuning — applied live, persisted, admin-only &amp; audited. Hover a label for help; <b>✓</b> saves, <b>↺</b> resets to default.
+      <span class="ttip" tabindex="0" title="Changes apply live (no restart) and persist across restarts, overriding the .env defaults. Only non-secret operational settings are here — secrets, ports, backend URLs and security switches stay in .env. Reset returns a setting to its environment/default value.">ⓘ</span></p>
     <div class="secnav" id="secnav"></div>
     <div id="groups"></div>
+    <div class="litellm-grid">
     <section class="card" id="teams-card">
       <h2 id="sec-teams" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <span>Teams</span>
         <button id="teams-refresh" type="button" class="btn-refresh">Refresh from LiteLLM</button>
       </h2>
-      <div class="gsub">Assign each LiteLLM key to a <b>team</b> and set its monthly
-        <b>budget ($/mo)</b> for the <a href="/spend">Spend &amp; Quota</a> by-team rollup.
-        LiteLLM reports a key's team, but <b>team budgets are a LiteLLM Enterprise
-        feature</b> — so both are managed here. The values below override what LiteLLM
-        reports (team) and its <code>max_budget</code> (budget); <b>Reset</b> clears both
-        for that key. Detected teams are <b>cached</b> (LiteLLM's lookup is flaky) —
-        the board no longer re-fetches on every load; use <b>Refresh</b> to re-detect.</div>
+      <div class="gsub">Assign each key a <b>team</b> + monthly <b>budget ($/mo)</b> for the
+        <a href="/spend">Spend</a> by-team rollup.
+        <span class="ttip" tabindex="0" title="Team budgets are a LiteLLM Enterprise feature, so both are managed here. The values override what LiteLLM reports (team) and its max_budget (budget); Reset clears both for that key. Detected teams are cached (LiteLLM's lookup is flaky) — the board no longer re-fetches on every load; use Refresh to re-detect.">ⓘ</span></div>
       <div id="teams-src" class="gsub" style="margin-top:-2px;font-style:italic"></div>
       <div id="teams"></div>
     </section>
     <section class="card" id="models-card">
       <h2 id="sec-models">Model costs</h2>
-      <div class="gsub">Each model's cost is either <b>real</b> (external paid API — a
-        market price LiteLLM tracks) or <b>estimated</b> (self-hosted / reference rate).
-        This drives the real-vs-estimated split on <a href="/spend">Spend &amp; Quota</a>.
-        The kind is auto-detected from the model name — <b>override</b> it here when the
-        guess is wrong (e.g. an open-weight model you route through a paid API).
-        <b>Reset</b> returns a model to auto-detect.</div>
+      <div class="gsub">Mark each model <b>real</b> (external paid) or <b>estimated</b>
+        (self-hosted) — drives the split on <a href="/spend">Spend</a>.
+        <span class="ttip" tabindex="0" title="The kind is auto-detected from the model name; override it here when the guess is wrong (e.g. an open-weight model you route through a paid API). Reset returns a model to auto-detect.">ⓘ</span></div>
       <div id="models"></div>
     </section>
+    </div>
   </main>
 </div>
 <script>
@@ -196,17 +232,23 @@
     order.forEach(function(g){
       var card=document.createElement("section"); card.className="card";
       var h=document.createElement("h2"); h.id=slug(g); h.textContent=g; card.appendChild(h);
-      groups[g].forEach(function(s){ card.appendChild(rowFor(s)); });
+      var grid=document.createElement("div"); grid.className="grid2";
+      groups[g].forEach(function(s){ grid.appendChild(rowFor(s)); });
+      card.appendChild(grid);
       root.appendChild(card);
     });
   }
+  // One compact line per setting: label (help + default in a hover tooltip) · small field
+  // · ✓ save · ↺ reset. Status is a brief colour flash on ✓ (title carries the message).
   function rowFor(s){
-    var row=document.createElement("div"); row.className="row";
-    var lbl=document.createElement("div"); lbl.className="lbl";
-    lbl.appendChild(document.createTextNode(s.label));
-    var mod=document.createElement("span"); mod.className="mod"; mod.textContent=s.overridden?"modified":"";
-    lbl.appendChild(mod);
-    if(s.help){var hh=document.createElement("span"); hh.className="h"; hh.textContent=s.help; lbl.appendChild(hh);}
+    var row=document.createElement("div"); row.className="srow";
+    var lbl=document.createElement("span"); lbl.className="lbl"; lbl.textContent=s.label;
+    var tip=s.help||s.label;
+    if(s.default!=null) tip+=" · default "+fmt(s.default);
+    lbl.title=tip;                                   // help + default → tooltip
+    if(s.overridden){ lbl.className="lbl mod";
+      var dot=document.createElement("span"); dot.className="dot"; dot.textContent=" •";
+      dot.title="modified from default"; lbl.appendChild(dot); }
     row.appendChild(lbl);
     var field;
     if(s.type==="choice"){
@@ -219,30 +261,28 @@
       if(s.min!=null)field.min=s.min; if(s.max!=null)field.max=s.max;
       if(s.type==="float")field.step="any"; else field.step="1";
     }
+    field.title=tip;
     row.appendChild(field);
-    var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
-    var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
-    var msg=document.createElement("div"); msg.className="msg";
-    function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
+    var save=document.createElement("button"); save.className="ib save"; save.type="button";
+    save.textContent="✓"; save.title="Save";
+    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button";
+    reset.textContent="↺"; reset.title="Reset to default";
+    function flash(cls,txt){ save.classList.remove("ok","bad"); if(cls)save.classList.add(cls);
+      save.title=txt||"Save"; setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
     save.addEventListener("click",function(){
-      say("saving…",true);
       post({action:"set",name:s.name,value:field.value}).then(function(res){
-        if(!res.ok){say(res.j.error||"save failed",false);return;}
-        say("saved",true); mod.textContent="modified"; setTimeout(function(){say("");},1500);
-      }).catch(function(){say("save failed",false);});
+        if(!res.ok){flash("bad",res.j.error||"save failed");return;}
+        flash("ok","saved"); lbl.className="lbl mod";
+      }).catch(function(){flash("bad","save failed");});
     });
     reset.addEventListener("click",function(){
       post({action:"reset",name:s.name}).then(function(res){
-        if(!res.ok){say(res.j.error||"reset failed",false);return;}
-        field.value=fmt(res.j.value); mod.textContent=""; say("reset to default",true);
-        setTimeout(function(){say("");},1500);
-      }).catch(function(){say("reset failed",false);});
+        if(!res.ok){flash("bad",res.j.error||"reset failed");return;}
+        field.value=fmt(res.j.value); lbl.className="lbl"; flash("ok","reset to default");
+      }).catch(function(){flash("bad","reset failed");});
     });
     row.appendChild(save); row.appendChild(reset);
-    var wrap=document.createElement("div"); wrap.style.gridColumn="1/-1"; wrap.appendChild(msg);
-    // keep msg on its own line under the row
-    var frag=document.createDocumentFragment(); frag.appendChild(row); frag.appendChild(wrap);
-    var holder=document.createElement("div"); holder.appendChild(frag); return holder;
+    return row;
   }
   function load(){
     fetch("/api/admin/settings").then(function(r){return r.ok?r.json():null;}).then(function(d){
@@ -260,8 +300,28 @@
     mod.textContent=(k.overridden?"team":"")+(k.budget_overridden?(k.overridden?"+budget":"budget"):"");
     lbl.appendChild(mod);
     var det=document.createElement("span"); det.className="h";
-    det.textContent=(k.user?("user "+k.user+" · "):"")+"LiteLLM team: "+(k.detected||"— (none reported)");
-    lbl.appendChild(det); row.appendChild(lbl);
+    function setDet(u,d){det.textContent=(u?("user "+u+" · "):"")+"LiteLLM team: "+(d||"— (none reported)");}
+    setDet(k.user,k.detected);
+    lbl.appendChild(det);
+    // per-key sync icon: re-detect just THIS key's team from LiteLLM (instead of the
+    // board-wide Refresh). Updates the detected label + team field (if not overridden).
+    var sync=document.createElement("button"); sync.type="button"; sync.className="ksync";
+    sync.textContent="⟳"; sync.title="Sync this key's team from LiteLLM";
+    sync.addEventListener("click",function(){
+      sync.disabled=true; sync.classList.add("spin");
+      fetch("/api/admin/teams/sync",{method:"POST",
+        headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+        body:new URLSearchParams({key:k.key}).toString()})
+        .then(function(r){return r.ok?r.json():null;}).then(function(j){
+          sync.disabled=false; sync.classList.remove("spin");
+          if(!j||!j.ok){say("sync failed",false);return;}
+          setDet(j.user,j.detected);
+          if(!k.overridden && j.detected) inp.value=j.detected;
+          say("synced",true); setTimeout(function(){say("");},900);
+        }).catch(function(){sync.disabled=false;sync.classList.remove("spin");say("sync failed",false);});
+    });
+    lbl.appendChild(sync);
+    row.appendChild(lbl);
     var inp=document.createElement("input"); inp.type="text"; inp.value=k.team||"";
     inp.placeholder="unassigned"; inp.maxLength=64; inp.setAttribute("list","team-names");
     row.appendChild(inp);

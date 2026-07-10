@@ -2185,6 +2185,104 @@ def test_classify_model_admin_override_wins():
     assert litellm.classify_model("gpt-4o", {})["cost_kind"] == "real"
 
 
+async def test_per_model_daily_cost_attributes_by_actual_day(monkeypatch):
+    """The accurate cost path: per-day per-model tokens × price, so an external model's
+    cost lands ONLY on the days it ran — not smeared across the window."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        # gpt-4o (external/real) ran only Jul 08-09; qwen (self-hosted) ran Jul 07-08
+        return ([
+            {"model": "gpt-4o", "daily_data": [
+                {"date": "2026-07-08", "total_tokens": 1000},
+                {"date": "2026-07-09", "total_tokens": 500}]},
+            {"model": "ollama/qwen", "daily_data": [
+                {"date": "2026-07-07", "total_tokens": 2000},
+                {"date": "2026-07-08", "total_tokens": 3000}]},
+        ], None)
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    prices = {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
+    dc = await litellm.per_model_daily_cost(None, "2026-07-01", "2026-07-10", prices)
+    assert dc is not None
+    # Jul 07: only self-hosted → real is ZERO (the whole point of the fix)
+    assert dc["2026-07-07"]["real"] == 0.0
+    assert round(dc["2026-07-07"]["est"], 4) == round(2000 * 0.0001, 4)
+    # Jul 08: both ran
+    assert round(dc["2026-07-08"]["real"], 4) == round(1000 * 0.001, 4)
+    assert round(dc["2026-07-08"]["est"], 4) == round(3000 * 0.0001, 4)
+    # Jul 09: only gpt-4o
+    assert round(dc["2026-07-09"]["real"], 4) == round(500 * 0.001, 4)
+    assert dc["2026-07-09"].get("est", 0.0) == 0.0
+
+
+async def test_per_model_daily_cost_none_without_daily_breakdown(monkeypatch):
+    """Falls back (None) when /global/activity/model gives only range totals, no daily_data."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        return ([{"model": "gpt-4o", "sum_total_tokens": 1500}], None)   # no daily_data
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    dc = await litellm.per_model_daily_cost(None, "2026-07-01", "2026-07-10", {"gpt-4o": 0.001})
+    assert dc is None
+
+
+def test_apply_daily_cost_folds_onto_points_and_years():
+    """apply_daily_cost maps accurate per-day costs onto day points + year totals, and a
+    day with no real cost keeps real_cost 0 (the external model didn't run that day)."""
+    t7 = appmod._date_epoch("2026-07-07")
+    t8 = appmod._date_epoch("2026-07-08")
+    series = {"granularity": "day",
+              "points": [{"t": t7, "tokens": 2000}, {"t": t8, "tokens": 4000}],
+              "years": [{"year": 2026, "tokens": 6000}]}
+    daily_cost = {"2026-07-07": {"real": 0.0, "est": 0.20},
+                  "2026-07-08": {"real": 1.00, "est": 0.30}}
+    appmod.apply_daily_cost(series, daily_cost)
+    assert series["points"][0]["real_cost"] == 0.0 and series["points"][0]["est_cost"] == 0.20
+    assert series["points"][1]["real_cost"] == 1.00 and series["points"][1]["est_cost"] == 0.30
+    assert series["years"][0]["real_cost"] == 1.00 and series["years"][0]["est_cost"] == 0.50
+    assert series["real_cost_total"] == 1.00 and series["est_cost_total"] == 0.50
+    assert series["cost_available"] is True
+
+
+def test_apply_daily_cost_month_granularity():
+    """12mo view: a point's `t` is a MONTH-start epoch, so every day in that month must
+    sum into it (not just an exact-date match)."""
+    tjun = appmod._date_epoch("2026-06-01")
+    tjul = appmod._date_epoch("2026-07-01")
+    series = {"granularity": "month",
+              "points": [{"t": tjun, "tokens": 0}, {"t": tjul, "tokens": 0}],
+              "years": [{"year": 2026}]}
+    dc = {"2026-06-15": {"real": 1.0, "est": 2.0},
+          "2026-07-03": {"real": 0.5, "est": 1.0},
+          "2026-07-20": {"real": 0.25, "est": 0.5}}
+    appmod.apply_daily_cost(series, dc)
+    assert series["points"][0]["real_cost"] == 1.0 and series["points"][0]["est_cost"] == 2.0
+    assert series["points"][1]["real_cost"] == 0.75 and series["points"][1]["est_cost"] == 1.5
+    assert series["years"][0]["real_cost"] == 1.75 and series["years"][0]["est_cost"] == 3.5
+
+
+async def test_per_model_daily_cost_honors_override_and_normalizes_dates(monkeypatch):
+    """per_model_daily_cost normalizes LiteLLM's `Jul 08` display date to canonical form
+    and respects the admin cost-kind override (self-hosted → real moves it to the real
+    bucket)."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        return ([{"model": "ollama/qwen",
+                  "daily_data": [{"date": "Jul 08", "total_tokens": 1000}]}], None)
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    prices = {"ollama/qwen": 0.002}
+    dc = await litellm.per_model_daily_cost(None, "2026-07-01", "2026-07-10", prices)
+    key = next(iter(dc))
+    assert key.endswith("-07-08")                       # "Jul 08" → canonical YYYY-07-08
+    assert dc[key]["est"] == 1000 * 0.002 and dc[key]["real"] == 0.0   # self-hosted default
+    # override qwen → real: same tokens now land in the REAL bucket
+    dc2 = await litellm.per_model_daily_cost(None, "2026-07-01", "2026-07-10", prices,
+                                             {"ollama/qwen": "real"})
+    key2 = next(iter(dc2))
+    assert dc2[key2]["real"] == 1000 * 0.002 and dc2[key2]["est"] == 0.0
+
+
 def test_cost_model_split_groups_by_kind():
     """cost_model_split buckets models by their (override-adjusted) cost_kind, biggest
     first, skipping zero-usage + unattributed — feeds the cost-over-time legend tooltip."""
@@ -2393,6 +2491,47 @@ async def test_spend_series_attaches_cost_models(monkeypatch):
         await c.close()
 
 
+async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
+    """When LiteLLM gives a per-day per-model breakdown, the series uses it (cost_basis
+    'per-day') so an external model's cost lands ONLY on days it ran — Jul 07 (self-hosted
+    only) shows real_cost 0, which the old blended estimate wrongly smeared > 0."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-tok-pd1")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def _daily(session, s, e):
+        return [{"date": "2026-07-07", "requests": 5, "tokens": 2000, "spend": 0.0},
+                {"date": "2026-07-08", "requests": 9, "tokens": 4000, "spend": 0.0}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
+
+    async def _pm(session, s, e, ov=None):
+        return [{"model": "gpt-4o", "tokens": 1000, "reqs": 4,
+                 "internal": False, "cost_kind": "real"},
+                {"model": "ollama/qwen", "tokens": 5000, "reqs": 10,
+                 "internal": True, "cost_kind": "reference"}]
+
+    async def _pmd(session, s, e, prices, ov=None):
+        return {"2026-07-07": {"real": 0.0, "est": 0.20},
+                "2026-07-08": {"real": 1.00, "est": 0.30}}
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _pm)
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _pmd)
+    hdr = {"Authorization": "Bearer sp-tok-pd1"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
+        assert d.get("cost_basis") == "per-day"
+        pts = {time.strftime("%Y-%m-%d", time.gmtime(p["t"])): p for p in d["points"]}
+        assert pts["2026-07-07"]["real_cost"] == 0.0      # external model didn't run → 0
+        assert pts["2026-07-08"]["real_cost"] == 1.00
+        assert d["real_cost_total"] == 1.00
+    finally:
+        await c.close()
+
+
 async def test_spend_page_served_and_gated(monkeypatch):
     """The Spend & Quota page renders open and is auth-gated once a token is set."""
     c = await _client()
@@ -2412,6 +2551,10 @@ async def test_spend_page_served_and_gated(monkeypatch):
         assert "Cost over time" in html and "cost-time-chart" in html and "renderCostTime" in html
         # top-right card: current-year estimated cost (real + estimated + total)
         assert "cost-time-year" in html and "renderYearCost" in html
+        # custom HTML legend (model-list tooltip) + estimated series is GREY (--muted)
+        assert "cost-time-legend" in html and "legendItem" in html
+        assert '{label:"Estimated (self-hosted)"' in html
+        assert 'estCol=cssv("--muted")' in html
     finally:
         await c.close()
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-spend-1")
@@ -3487,6 +3630,27 @@ async def test_teams_detection_cached_and_sticky(monkeypatch):
         await c.close()
 
 
+async def test_teams_detection_persists_and_reloads_from_db(monkeypatch):
+    """Detected teams are written to db.team_detect and reloaded into the cache on a cold
+    start — so after a restart the board shows teams WITHOUT re-polling LiteLLM."""
+    async def kb(session):
+        return {"Rodolfo": {"team": "AppSec", "user": "u1", "budget": 200.0, "spend": 728.0}}
+    monkeypatch.setattr(litellm, "key_budgets", kb)
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE", {}, raising=False)
+    monkeypatch.setattr(appmod, "_TEAMS_LOADED", False, raising=False)
+    monkeypatch.setattr(appmod, "_backend_latest", {"litellm": {"top_keys": []}})
+    await appmod._detect_teams(None, True)                     # detect → persists to DB
+    assert db.team_detect_all().get("Rodolfo", {}).get("detected") == "AppSec"
+    # simulate a restart: empty cache, LiteLLM must NOT be polled
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE", {}, raising=False)
+    monkeypatch.setattr(appmod, "_TEAMS_LOADED", False, raising=False)
+    async def boom(session):
+        raise AssertionError("must not poll LiteLLM on restart when DB has teams")
+    monkeypatch.setattr(litellm, "key_budgets", boom)
+    detected, src = await appmod._detect_teams(None, False)
+    assert src == "cache" and detected["Rodolfo"]["detected"] == "AppSec"
+
+
 async def test_teams_empty_keylist_team_filled_from_snapshot(monkeypatch):
     """A key whose /key/list row has an EMPTY team must be filled from the spend
     snapshot (which resolved it) — not left blank because /key/list was seen first.
@@ -3635,6 +3799,25 @@ async def test_litellm_auth_failure_reported_clearly(monkeypatch, capsys):
     litellm._AUTH_BAD = False                  # reset shared state for other tests
 
 
+def test_note_auth_one_shot_and_recovery(capsys):
+    """_note_auth logs the failure ONCE (not every poll), stays quiet while still bad,
+    then logs a single AUTH OK on recovery and clears the flag."""
+    litellm._AUTH_BAD = False
+    assert litellm._note_auth("http://litellm:4000", "HTTP 401") is True   # bad → log
+    assert litellm._AUTH_BAD is True
+    assert litellm._note_auth("http://litellm:4000", "HTTP 403") is True   # still bad → quiet
+    err1 = capsys.readouterr().err
+    assert err1.count("AUTH FAILED") == 1 and "AUTH OK" not in err1
+    assert litellm._note_auth("http://litellm:4000", None) is False        # recovered
+    assert litellm._AUTH_BAD is False
+    err2 = capsys.readouterr().err
+    assert err2.count("AUTH OK") == 1
+    # a clean tick while already-good logs nothing
+    assert litellm._note_auth("http://litellm:4000", None) is False
+    assert capsys.readouterr().err == ""
+    litellm._AUTH_BAD = False
+
+
 async def test_key_team_resolved_via_team_id_and_user(monkeypatch):
     # Regression: a key's team must resolve key -> team_id -> USER. LiteLLM often
     # carries only a team_id UUID on the key, or attaches the team to the user, not
@@ -3690,6 +3873,39 @@ async def test_key_budgets_walks_all_pages_when_server_caps_page_size(monkeypatc
     assert all(v["team"] == "AppSec" for v in out.values())
 
 
+async def test_key_budgets_partial_walk_keeps_last_good(monkeypatch):
+    """Regression ('top spenders sometimes disappear'): when a LATER /key/list page
+    times out mid-walk, the partial page-1 set must NOT shrink the board or poison the
+    cache — the fuller last-good result is reused instead."""
+    import re
+    state = {"fail_page2": False}
+    full = [{"key_alias": f"k{i:02d}", "team_alias": "T", "user_id": f"u{i}",
+             "max_budget": 0, "spend": float(i)} for i in range(16)]
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            m = re.search(r"[?&]page=(\d+)", url)
+            p = int(m.group(1)) if m else 1
+            if p == 2 and state["fail_page2"]:
+                return (None, "Timeout")               # a later page fails mid-walk
+            return ({"keys": full[(p - 1) * 10:(p - 1) * 10 + 10]}, None)  # cap 10, no totals
+        if "/team/list" in url:
+            return ({"teams": []}, None)
+        if "/user/list" in url:
+            return ({"users": []}, None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    litellm._KEY_BUDGETS_CACHE = None
+    assert len(await litellm.key_budgets(None)) == 16      # healthy walk primes the cache
+    state["fail_page2"] = True
+    out2 = await litellm.key_budgets(None)
+    assert len(out2) == 16                                 # NOT 10 — reused last-good set
+    assert len(litellm._KEY_BUDGETS_CACHE) == 16           # cache not poisoned by the partial
+    litellm._KEY_BUDGETS_CACHE = None
+
+
 async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
     """_paginate must not loop when an endpoint ignores page= and returns the same rows
     every time — it de-dupes by id and stops as soon as a page adds nothing new."""
@@ -3703,6 +3919,23 @@ async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
     out = await litellm._paginate(None, "http://x/user/list", ("users", "data"),
                                   "user_id", 5.0)
     assert len(out) == 2 and calls["n"] <= 3        # deduped, did not walk 50 pages
+
+
+async def test_paginate_walks_via_total_pages(monkeypatch):
+    """_paginate follows the server's total_pages across all pages and stops at the last."""
+    import re
+    pages = {1: {"users": [{"user_id": "a"}, {"user_id": "b"}], "total_pages": 2},
+             2: {"users": [{"user_id": "c"}], "total_pages": 2}}
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        m = re.search(r"[?&]page=(\d+)", url)
+        p = int(m.group(1)) if m else 1
+        return (pages.get(p, {"users": []}), None)
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    out = await litellm._paginate(None, "http://x/user/list", ("users", "data"),
+                                  "user_id", 5.0)
+    assert [u["user_id"] for u in out] == ["a", "b", "c"]
 
 
 async def test_legacy_token_reaches_admin(monkeypatch):

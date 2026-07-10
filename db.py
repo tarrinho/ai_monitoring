@@ -170,6 +170,13 @@ CREATE TABLE IF NOT EXISTS team_budgets (team TEXT PRIMARY KEY, budget REAL NOT 
 -- pin a model to either here; the override wins on the Spend real-vs-estimated split.
 CREATE TABLE IF NOT EXISTS model_cost_kind (model TEXT PRIMARY KEY, kind TEXT NOT NULL,
     updated REAL);
+
+-- Persisted LiteLLM team DETECTION (Settings → Teams). LiteLLM's team lookup is flaky
+-- and slow, so the last good detection per key is cached here and reloaded on startup —
+-- the board shows teams immediately without re-polling LiteLLM every boot. Distinct from
+-- key_teams (admin OVERRIDES); this is what LiteLLM reported.
+CREATE TABLE IF NOT EXISTS team_detect (key TEXT PRIMARY KEY, team TEXT, "user" TEXT,
+    budget REAL, spent REAL, updated REAL);
 """
 
 # Columns charted over time (order must match _METRIC_COLS in queries).
@@ -1017,6 +1024,36 @@ def team_delete(key: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM key_teams WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def team_detect_all() -> dict[str, dict]:
+    """Persisted LiteLLM team detection, {key: {detected, user, budget, spent}} — loaded
+    into the in-memory cache on startup so the Teams board is populated without a refresh."""
+    try:
+        with _connect() as conn:
+            return {r[0]: {"detected": r[1] or "", "user": r[2] or "",
+                           "budget": float(r[3] or 0), "spent": float(r[4] or 0)}
+                    for r in conn.execute(
+                        'SELECT key, team, "user", budget, spent FROM team_detect').fetchall()}
+    except Exception:
+        return {}
+
+
+def team_detect_set(key: str, team: str, user: str, budget: float,
+                    spent: float, now: float) -> bool:
+    """Persist one key's detected team/user/budget/spend (upsert)."""
+    try:
+        with _connect() as conn:
+            conn.execute(
+                'INSERT INTO team_detect(key, team, "user", budget, spent, updated) '
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+                'team = excluded.team, "user" = excluded."user", budget = excluded.budget, '
+                "spent = excluded.spent, updated = excluded.updated",
+                (str(key), str(team or ""), str(user or ""),
+                 float(budget or 0), float(spent or 0), now))
+        return True
     except Exception:
         return False
 

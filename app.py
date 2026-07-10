@@ -1581,10 +1581,17 @@ def _merge_team(kid: str, team: str, user: str, budget: float, spent: float) -> 
         return
     cur = _TEAMS_DETECT_CACHE.setdefault(
         kid, {"detected": "", "user": "", "budget": 0.0, "spent": 0.0})
+    before = dict(cur)
     cur["detected"] = cur["detected"] or (team or "")
     cur["user"] = cur["user"] or (user or "")
     cur["budget"] = cur["budget"] or (budget or 0.0)
     cur["spent"] = (spent or 0.0) or cur["spent"]
+    if cur != before:                       # persist only real changes (not every re-fold)
+        db.team_detect_set(kid, cur["detected"], cur["user"],
+                           cur["budget"], cur["spent"], time.time())
+
+
+_TEAMS_LOADED = False
 
 
 async def _detect_teams(session, force: bool) -> tuple[dict, str]:
@@ -1592,8 +1599,15 @@ async def _detect_teams(session, force: bool) -> tuple[dict, str]:
     only hit on `force` (Refresh) or a cold start; the local spend snapshot (free, always
     fresh, and it carries resolved teams) is folded in on EVERY call. That fills any team
     left blank by an early cold-start detection WITHOUT re-polling LiteLLM each load — so
-    the board self-heals within a poll or two instead of staying blank until Refresh."""
-    global _TEAMS_DETECT_CACHE
+    the board self-heals within a poll or two instead of staying blank until Refresh.
+    On first use the cache is seeded from the DB (db.team_detect) so a restart shows the
+    last known teams immediately, without a LiteLLM refresh."""
+    global _TEAMS_DETECT_CACHE, _TEAMS_LOADED
+    if not _TEAMS_LOADED:                    # seed from DB once (survives restarts)
+        saved = db.team_detect_all()
+        if saved:
+            _TEAMS_DETECT_CACHE = saved
+        _TEAMS_LOADED = True
     hit_litellm = force or not _TEAMS_DETECT_CACHE
     if hit_litellm:
         live = await litellm.key_budgets(session)
@@ -1661,6 +1675,28 @@ async def api_admin_teams_get(request: web.Request) -> web.Response:
                               "source": source, "cached": source == "cache",
                               "error": None if source != "snapshot"
                               else litellm.last_key_list_error()})
+
+
+async def api_admin_team_sync(request: web.Request) -> web.Response:
+    """Per-row sync icon: re-detect from LiteLLM and return the ONE requested key's row,
+    so a single stale key can be refreshed (and re-persisted) without the operator having
+    to re-render the whole board. Admin + CSRF. (LiteLLM's key API is list-based, so the
+    poll itself covers all keys, but only the requested row is returned/updated in the UI.)"""
+    _, _role, sess = _auth_ctx(request)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    kid = str(data.get("key") or "").strip()
+    if not kid:
+        return web.json_response({"error": "key required"}, status=400)
+    detected, _src = await _detect_teams(request.app[_SESSION], True)   # re-poll + persist
+    info = detected.get(kid, {})
+    ov = db.team_overrides()
+    return web.json_response({"ok": True, "key": kid,
+                              "detected": info.get("detected", ""),
+                              "user": info.get("user", ""),
+                              "team": ov.get(kid, info.get("detected", "")),
+                              "overridden": kid in ov})
 
 
 async def api_admin_teams_set(request: web.Request) -> web.Response:
@@ -2336,6 +2372,7 @@ def build_app() -> web.Application:
     app.router.add_post("/api/admin/settings", api_admin_settings_set)
     app.router.add_get("/api/admin/teams", api_admin_teams_get)
     app.router.add_post("/api/admin/teams", api_admin_teams_set)
+    app.router.add_post("/api/admin/teams/sync", api_admin_team_sync)
     app.router.add_post("/api/admin/team-budget", api_admin_team_budget_set)
     app.router.add_get("/api/admin/model-kinds", api_admin_model_kinds_get)
     app.router.add_post("/api/admin/model-kinds", api_admin_model_kinds_set)

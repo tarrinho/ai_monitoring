@@ -369,7 +369,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.5.5"
+    assert config.VERSION == "AI-Monitoring_1.5.6"
 
 
 def test_ux_improvements_present():
@@ -798,10 +798,19 @@ def test_ci_actions_pinned_to_current_majors():
     }
     for rel, pins in want.items():
         text = (ROOT / rel).read_text(encoding="utf-8")
+        lines = text.splitlines()
         for pin in pins:
-            assert pin in text, f"{rel} must pin {pin}"
-        # no stale predecessor left behind
-        assert "actions/checkout@v5" not in text, f"{rel} has a stale checkout pin"
+            action, _, ver = pin.rpartition("@")     # "actions/checkout", "v7"
+            # Accept the bare tag (action@v7) OR the hardened SHA-pin form with the
+            # version in a comment (action@<sha> # v7.0.0) — SHA pinning is the
+            # supply-chain best practice and must not trip this test.
+            tag_form = pin in text
+            sha_form = any(action in ln and f"# {ver}" in ln for ln in lines)
+            assert tag_form or sha_form, f"{rel} must pin {action} to {ver}"
+        # no stale predecessor left behind (neither a v5 tag nor a '# v5' SHA comment)
+        assert "actions/checkout@v5" not in text and "checkout@" in text \
+            and not any("actions/checkout" in ln and "# v5" in ln for ln in lines), \
+            f"{rel} has a stale checkout pin"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

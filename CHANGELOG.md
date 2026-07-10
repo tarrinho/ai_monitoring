@@ -4,6 +4,59 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.5.6] — 2026-07-10
+
+### Changed
+- **CI supply-chain hardening.** Every GitHub Action pinned to a full 40-char
+  commit SHA (was major-tag `@vN` / branch `@main`). The `trufflesecurity/trufflehog@main`
+  branch pin — the highest-risk mutable ref — is now `@27b0417c…` (v3.95.9).
+  `.github/workflows/{ci,release}.yml` cover 9 action pins in total. Dependabot's
+  `github-actions` ecosystem opens PRs against SHA pins so update visibility is
+  preserved. Aligns with GitHub's security-hardening guide for workflows.
+- **Release pipeline provenance.** `docker/build-push-action` now emits
+  `provenance: mode=max` (SLSA-level attestation) and `sbom: true`
+  (CycloneDX SBOM) alongside the multi-arch image push. Consumers can
+  `cosign verify-attestation …` without extra CI.
+
+### Added
+- **Cosign keyless signing of the release image.** Sigstore/Fulcio OIDC
+  identity — no long-lived key material. The release workflow signs by the
+  immutable digest (not the mutable tag). Release notes now embed the
+  `cosign verify --certificate-identity-regexp … --certificate-oidc-issuer …`
+  command a consumer runs to check the signature. New `cosign` badge in
+  README next to `dependabot`. Required `id-token: write` permission added
+  at workflow level.
+- **"Require CI green on this SHA" release gate.** New first step in
+  `release.yml` looks up the CI workflow's most-recent conclusion for the
+  tag's HEAD SHA and aborts unless it is `success` — a tag pushed straight
+  to `main`, or a `workflow_dispatch` on a stale tag, no longer ships a
+  build that CI never signed off on. Override via the new `skip_ci_check`
+  boolean `workflow_dispatch` input for re-tag scenarios where CI was
+  cancelled/expired but the operator has verified locally.
+
+### Fixed
+- **`collectors/litellm.py::spend_report_debug` mypy dict-item errors** — the
+  `attempts` list and its intermediate `row` were inferred as
+  `list[dict[str, str]]` from the first-branch append, so later mixed-type
+  entries (list/int/bool/list-of-dict) failed mypy. Explicit
+  `list[dict[str, object]]` / `dict[str, object]` annotations resolve.
+- **`tests/test_static_qa.py::test_ci_actions_pinned_to_current_majors`
+  now accepts SHA-pinned actions.** Previously required literal `@vN` tag
+  strings in workflow files; broke as soon as the workflows switched to the
+  hardened `action@<sha> # vN` form. Test rewrites: pass when either the bare
+  tag OR the SHA-pin-plus-tag-comment form is present. Same fix removes the
+  in-image test-gate failure in `docker build --build-arg RUN_TESTS=1`
+  (both jobs run the same pytest).
+
+### Awk / release-notes housekeeping
+- `release.yml` CHANGELOG-section extraction switched from a regex-based awk
+  match (`$0 ~ "^## \\[" ver "\\]"`) to a literal-string match — semver tags
+  are safe today, but a future non-semver tag containing a regex metachar
+  would break the older form.
+- `docs/img/banner.svg` a11y upgrade: `<title>` + `<desc>` elements + `aria-labelledby`
+  (was `aria-label` only). Screen readers now get both a short label and
+  the fuller description including sample KPI values.
+
 ## [1.5.5] — 2026-07-10
 
 ### Changed
@@ -44,6 +97,24 @@ Versioning: [SemVer](https://semver.org/).
   returns `cost_models: {real:[…], reference:[…]}`, biggest-usage first).
 
 ### Fixed
+- **Spend & Quota "top spenders" intermittently vanished.** When a *later* `/key/list`
+  page timed out mid-walk, `key_budgets()` served only the pages fetched so far (e.g. the
+  first 10 of 16 keys) AND overwrote its last-good cache with that partial set — so the
+  by-key board flickered from 16 keys/12 spenders down to 10/7 and back on the next poll.
+  Now a partial walk (a page failing mid-walk, or fewer keys than the server's reported
+  `total_count`) is detected and the fuller last-good cache is reused instead of shrinking
+  the board or poisoning the cache.
+- **Cost-over-time smeared an external model's cost across days it never ran.** The daily
+  estimate was `(that day's TOTAL tokens) × (a window-blended real $/token)`, so a single
+  external model (e.g. `azure_ai/gpt-5-mini`, used only 3 days) showed "real (external)"
+  cost on *every* day with traffic — because the blended rate was applied to each day's
+  total token count (dominated by self-hosted usage). Now, when LiteLLM's
+  `/global/activity/model` returns a per-model `daily_data` breakdown, the series computes
+  each day's cost from THAT day's actual model mix (`per_model_daily_cost` →
+  `apply_daily_cost`), so an external model's cost lands only on the days it ran. Falls
+  back to the blended estimate when no daily breakdown is available; the response carries
+  `cost_basis: "per-day" | "blended"` so the basis is visible. Applies to the chart, the
+  per-year rollup, and the current-year cost card alike.
 - **Teams not 100% assigned — `/key/list` pagination stopped after page 1.** LiteLLM
   caps `/key/list` at ~10 keys per page and (on some versions) returns no `total_pages`,
   ignoring our `size=100`. The walker's stop test was `len(page) < 100`, which is true for
