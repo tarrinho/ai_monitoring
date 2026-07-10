@@ -34,6 +34,37 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.LITELLM_MASTER_KEY}"}
 
 
+# Track LiteLLM auth so a rejected master key is reported CLEARLY and ONCE (not a
+# wall of "HTTP 401" debug lines), and so a dead key doesn't get hammered every tick.
+_AUTH_BAD = False
+
+
+def _auth_err(err) -> bool:
+    """A 401/403 from LiteLLM means the master key is invalid/expired — an auth
+    failure, not a transient outage."""
+    return bool(err) and ("401" in str(err) or "403" in str(err))
+
+
+def _note_auth(base: str, err) -> bool:
+    """One-shot, always-on (non-debug) logging on the auth-state transition.
+    Returns True while auth is BAD so callers can skip the key-gated calls."""
+    global _AUTH_BAD
+    if _auth_err(err):
+        if not _AUTH_BAD:
+            print(f"[litellm] AUTH FAILED: LiteLLM rejected the master key ({err}) at "
+                  f"{base} for the admin/spend endpoints — LITELLM_MASTER_KEY is invalid, "
+                  f"expired, or not an admin/master key (proxy calls like /v1/models may "
+                  f"still work). Spend / budgets / teams stay empty until a valid master "
+                  f"key is set.", file=sys.stderr, flush=True)
+            _AUTH_BAD = True
+        return True
+    if _AUTH_BAD and err is None:
+        print(f"[litellm] AUTH OK: LiteLLM accepted the master key again ({base}).",
+              file=sys.stderr, flush=True)
+        _AUTH_BAD = False
+    return False
+
+
 def _parse_ts(v) -> float | None:
     """LiteLLM timestamps are ISO-8601 strings or epoch seconds/ms."""
     if v is None:
@@ -166,6 +197,16 @@ async def sample(session: aiohttp.ClientSession) -> dict:
     if merr is None and models:
         out["models"] = [m.get("id") for m in models.get("data", []) if m.get("id")]
     _dbg(f"/v1/models err={merr} models={len(out['models'])}")
+
+    # A rejected master key (401/403) is an operator problem, not a transient one:
+    # log it clearly ONCE and skip the key-gated /spend calls so we stop hammering
+    # a proxy that's refusing us.
+    if config.LITELLM_MASTER_KEY and _note_auth(base, merr):
+        out["error"] = f"master key rejected ({merr}) — check LITELLM_MASTER_KEY"
+        out["auth_error"] = True
+        return out
+    if config.LITELLM_MASTER_KEY and merr is None:
+        _note_auth(base, None)          # recovered → clear the bad-auth banner
 
     if not config.LITELLM_MASTER_KEY:
         out["error"] = "no master key: /spend skipped"
@@ -333,11 +374,15 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
     _dbg(f"/spend lite: requests={out.get('requests_window')} "
          f"per_model={len(out.get('per_model', []))} top_keys={len(out.get('top_keys', []))} "
          f"errs=({e1},{e2},{e3})")
+    # If every admin/spend call was rejected, say so CLEARLY (once) — a key that
+    # lists models but is refused here is not a valid master/admin key.
+    _note_auth(base, next((e for e in (e1, e2, e3) if _auth_err(e)), None))
     return out
 
 
 async def per_model_range(session: aiohttp.ClientSession,
-                          start_date: str, end_date: str) -> list[dict] | None:
+                          start_date: str, end_date: str,
+                          kind_overrides: dict | None = None) -> list[dict] | None:
     """Per-model requests + tokens over a [start_date, end_date] day range, via the
     pre-aggregated `/global/activity/model` endpoint (day-granular, ~0 CPU — NOT the
     heavy /spend/logs). This lets the dashboard's Per-model table honor the time
@@ -358,33 +403,149 @@ async def per_model_range(session: aiohttp.ClientSession,
     rows = []
     for m in pm:
         name = m.get("model") or ""
-        cls = classify_model(name)
+        cls = classify_model(name, kind_overrides)
         rows.append({
             "model": name or "(unattributed)",
             "reqs": int(m.get("sum_api_requests") or 0),
             "tokens": int(m.get("sum_total_tokens") or 0),
             "internal": cls["internal"], "cost_kind": cls["cost_kind"],
+            "kind_overridden": cls.get("overridden", False),
         })
     rows.sort(key=lambda r: r["reqs"], reverse=True)
     return rows[:50]
 
 
-def classify_model(model: str | None) -> dict:
+async def per_model_daily_cost(session: aiohttp.ClientSession, start_date: str,
+                               end_date: str, prices: dict,
+                               kind_overrides: dict | None = None) -> dict | None:
+    """Per-DAY real vs reference COST from `/global/activity/model`'s per-model
+    `daily_data` — each day's cost uses THAT day's actual model mix × per-model price,
+    so an external model's cost lands only on the days it actually ran (not smeared
+    across the window by a blended rate). Returns {canonical_date: {"real": $, "est": $}},
+    or None when the endpoint gives no per-model daily breakdown (caller then falls back
+    to the window-blended estimate)."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    pm, err = await fetch_json(
+        session,
+        f"{base}/global/activity/model?start_date={start_date}&end_date={end_date}",
+        headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None or not isinstance(pm, list):
+        return None
+    out: dict = {}
+    saw_daily = False
+    for m in pm:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("model") or ""
+        rate = price_for(name, prices)
+        kind = classify_model(name, kind_overrides)["cost_kind"]
+        if rate <= 0 or kind not in ("real", "reference"):
+            continue                       # unpriced or unattributed → contributes no $
+        daily = m.get("daily_data") or m.get("daily") or m.get("data") or []
+        if not isinstance(daily, list):
+            continue
+        for dd in daily:
+            if not isinstance(dd, dict):
+                continue
+            date = _norm_date(dd.get("date") or dd.get("day") or dd.get("start_date") or "")
+            toks = int(dd.get("total_tokens") or dd.get("sum_total_tokens")
+                       or dd.get("tokens") or 0)
+            if not date or toks <= 0:
+                continue
+            saw_daily = True
+            b = out.setdefault(date, {"real": 0.0, "est": 0.0})
+            b["real" if kind == "real" else "est"] += toks * rate
+    return out if saw_daily else None
+
+
+async def model_prices(session: aiohttp.ClientSession) -> dict:
+    """{model_name: $/token} from LiteLLM `/model/info` (input+output cost). LiteLLM
+    already knows external model prices (that's how it tracks real spend); self-hosted
+    models are $0 until the operator sets `input/output_cost_per_token` in model_list.
+    Used to ESTIMATE cost from token counts (free tier gives no per-day $)."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return {}
+    d, err = await fetch_json(session, f"{base.rstrip('/')}/model/info",
+                              headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None:
+        return {}
+    rows = (d.get("data") or d.get("model_list")) if isinstance(d, dict) else d
+    out: dict = {}
+    for m in rows if isinstance(rows, list) else []:
+        if not isinstance(m, dict):
+            continue
+        lp = m.get("litellm_params") or {}
+        info = m.get("model_info") or {}
+        name = m.get("model_name") or lp.get("model") or ""
+        ic = _fnum(lp.get("input_cost_per_token") or info.get("input_cost_per_token") or 0)
+        oc = _fnum(lp.get("output_cost_per_token") or info.get("output_cost_per_token") or 0)
+        rate = ic + oc                    # per-token blended (in+out) — a rough estimate
+        if name and rate > 0:
+            out[name] = rate
+    return out
+
+
+def price_for(model: str, prices: dict) -> float:
+    """$/token for a model name, tolerant of `provider/model` prefixes on either side
+    (LiteLLM activity reports `azure_ai/gpt-5-mini`; model_list may key it either way)."""
+    if not prices:
+        return 0.0
+    if model in prices:
+        return prices[model]
+    bare = model.split("/", 1)[1] if "/" in model else model
+    for k, v in prices.items():
+        kb = k.split("/", 1)[1] if "/" in k else k
+        if k == model or kb == bare or kb == model or k == bare:
+            return v
+    return 0.0
+
+
+def _override_kind(model: str, m: str, overrides: dict | None) -> str | None:
+    """An admin per-model cost-kind override ('real'|'reference'), matched tolerant of
+    `provider/model` prefixes (exact name, lower-case, or bare model). None if unset."""
+    if not overrides:
+        return None
+    bare = m.split("/", 1)[1] if "/" in m else m
+    for cand in (model, m, bare):
+        k = overrides.get(cand)
+        if k in ("real", "reference"):
+            return k
+    # also match an override key that differs only by provider prefix
+    for ok, kind in overrides.items():
+        ol = str(ok).strip().lower()
+        if kind in ("real", "reference") and (ol == m or ol == bare
+                or (ol.split("/", 1)[1] if "/" in ol else ol) == bare):
+            return kind
+    return None
+
+
+def classify_model(model: str | None, overrides: dict | None = None) -> dict:
     """Classify a model as self-hosted (REFERENCE cost, no real cash), external paid
     (REAL spend), or UNKNOWN (no model name reported — must not be counted as either).
-    Internal when: the provider prefix (before '/') is in MONITOR_INTERNAL_PROVIDERS,
-    one of those tokens appears in the name, OR the name matches a self-hosted
-    open-weight FAMILY (gemma/qwen/mistral/…). A blank/absent model is 'unknown'."""
+    An admin per-model override (Settings page) WINS when present. Otherwise internal
+    when: the provider prefix (before '/') is in MONITOR_INTERNAL_PROVIDERS, one of those
+    tokens appears in the name, OR the name matches a self-hosted open-weight FAMILY
+    (gemma/qwen/mistral/…). A blank/absent model is 'unknown'."""
     m = (model or "").strip().lower()
     if not m:
-        return {"internal": None, "provider": "unattributed", "cost_kind": "unknown"}
+        return {"internal": None, "provider": "unattributed",
+                "cost_kind": "unknown", "overridden": False}
     provider = m.split("/", 1)[0] if "/" in m else ""
+    ov = _override_kind(model or "", m, overrides)
+    if ov is not None:
+        return {"internal": ov == "reference",
+                "provider": provider or ("internal" if ov == "reference" else "external"),
+                "cost_kind": ov, "overridden": True}
     internal = (provider in config.INTERNAL_PROVIDERS
                 or any(tok in m for tok in config.INTERNAL_PROVIDERS)
                 or any(fam in m for fam in config.INTERNAL_MODEL_FAMILIES))
     return {"internal": internal,
             "provider": provider or ("internal" if internal else "external"),
-            "cost_kind": "reference" if internal else "real"}
+            "cost_kind": "reference" if internal else "real", "overridden": False}
 
 
 # LiteLLM's daily aggregates vary by version: /global/activity nests its rows under
@@ -491,24 +652,91 @@ def _parse_daily(rows) -> tuple[list[dict], bool]:
     return out, has_spend
 
 
+def _spend_report_variants(base: str, start_date: str,
+                           end_date: str) -> list[tuple[str, str]]:
+    """(label, url) candidates for daily spend. LiteLLM's `/global/spend/report`
+    400s on a FUTURE end_date (we pull start..tomorrow for the activity rollup), so
+    the primary variant caps end_date to today; the others cover version drift."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    d30 = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400))
+    end = min(end_date, today)      # report rejects a future end_date → HTTP 400
+    return [
+        ("report_capped", f"{base}/global/spend/report?start_date={start_date}&end_date={end}"),
+        ("report_30d", f"{base}/global/spend/report?start_date={d30}&end_date={today}"),
+        ("report_raw", f"{base}/global/spend/report?start_date={start_date}&end_date={end_date}"),
+        ("spend_report", f"{base}/spend/report?start_date={start_date}&end_date={end}"),
+    ]
+
+
+async def _daily_spend_by_date(session: aiohttp.ClientSession, base: str,
+                               start_date: str, end_date: str) -> tuple[dict, str]:
+    """First spend-report variant that actually yields spend, as {canonical-date:
+    spend}. Returns ({}, "") when none work (e.g. report 400s on this LiteLLM)."""
+    for label, url in _spend_report_variants(base, start_date, end_date):
+        d, err = await fetch_json(session, url, headers=_headers(),
+                                  timeout_s=config.HTTP_TIMEOUT)
+        if err is not None:
+            continue
+        rep, rep_spend = _parse_daily(_rows_of(d) or [])
+        if rep_spend:
+            return {r["date"]: r["spend"] for r in rep}, label
+    return {}, ""
+
+
 async def spend_report_probe(session: aiohttp.ClientSession,
                              start_date: str, end_date: str) -> dict:
-    """Diagnostics only: raw shape of `/global/spend/report` so an all-zero Spend
-    chart is explainable from the browser (does report even return spend, and in
-    what date format?). Viewer-safe: it's the operator's own aggregate spend."""
+    """Diagnostics only: try each spend-report variant and report status/shape, so an
+    all-zero Spend chart is explainable from the browser (does ANY variant return
+    spend, and in what date format?). Viewer-safe: the operator's own aggregate spend."""
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
         return {"configured": False}
-    rng = f"start_date={start_date}&end_date={end_date}"
-    d, err = await fetch_json(session, f"{base.rstrip('/')}/global/spend/report?{rng}",
-                              headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
-    if err is not None:
-        return {"configured": True, "error": err}
-    rows = _rows_of(d) or []
-    parsed, has_spend = _parse_daily(rows)
-    return {"configured": True, "raw_rows": len(rows),
-            "sample_raw": rows[:3] if isinstance(rows, list) else str(rows)[:200],
-            "parsed_has_spend": has_spend, "sample_parsed": parsed[:3]}
+    base = base.rstrip("/")
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    # runtime variants + extra diagnostic endpoints: is ANY daily-spend source alive?
+    extra = [
+        ("activity_model", f"{base}/global/activity/model?start_date={start_date}&end_date={today}"),
+        ("spend_tags", f"{base}/global/spend/tags?start_date={start_date}&end_date={today}"),
+        ("report_nodate", f"{base}/global/spend/report"),
+        ("spend_keys", f"{base}/global/spend/keys?start_date={start_date}&end_date={today}"),
+    ]
+    async def _err_body(url: str) -> str:
+        """Raw status + body snippet for a failing endpoint — fetch_json hides the
+        body behind 'HTTP 400', but LiteLLM's 400 body says WHY (missing param vs
+        spend-logs-disabled), which decides if the empty chart is fixable."""
+        try:
+            async with session.get(url, headers=_headers(), allow_redirects=False,
+                                   timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)) as r:
+                return f"HTTP {r.status}: {(await r.text())[:280]}"
+        except Exception as e:      # noqa: BLE001 — diagnostics must never raise
+            return f"{type(e).__name__}"
+
+    attempts = []
+    for label, url in list(_spend_report_variants(base, start_date, end_date)) + extra:
+        d, err = await fetch_json(session, url, headers=_headers(),
+                                  timeout_s=config.HTTP_TIMEOUT)
+        path = url.split("?", 1)[0].split("/global/", 1)[-1]
+        if err is not None:
+            row = {"try": label, "path": path, "error": err}
+            if err.startswith("HTTP 4"):        # capture the body that explains the 4xx
+                row["body"] = await _err_body(url)
+            attempts.append(row)
+            continue
+        rows = _rows_of(d) or []
+        parsed, has_spend = _parse_daily(rows if isinstance(rows, list) else [])
+        attempts.append({"try": label, "path": path,
+                         "top_keys": list(d.keys())[:8] if isinstance(d, dict) else type(d).__name__,
+                         "rows": len(rows) if isinstance(rows, list) else 0,
+                         "has_spend": has_spend, "sample": parsed[:2]})
+    # Raw /global/activity first row — reveals whether a spend field is present under a
+    # key our parser doesn't cover (some LiteLLM versions ship spend on activity itself).
+    act, aerr = await fetch_json(session, f"{base}/global/activity?start_date={start_date}"
+                                 f"&end_date={today}", headers=_headers(),
+                                 timeout_s=config.HTTP_TIMEOUT)
+    raw = _rows_of(act) if aerr is None else None
+    activity_raw = (raw[0] if isinstance(raw, list) and raw
+                    else {"error": aerr} if aerr else {"shape": type(act).__name__})
+    return {"configured": True, "attempts": attempts, "activity_first_row": activity_raw}
 
 
 async def spend_activity(session: aiohttp.ClientSession,
@@ -533,22 +761,80 @@ async def spend_activity(session: aiohttp.ClientSession,
     _dbg(f"/global/activity err={err} rows={len(daily)} has_spend={has_spend}")
 
     if not daily or not has_spend:
-        d2, err2 = await fetch_json(session, f"{base}/global/spend/report?{rng}",
-                                    headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
-        rep, rep_spend = ([], False) if err2 is not None else _parse_daily(_rows_of(d2))
-        _dbg(f"/global/spend/report err={err2} rows={len(rep)} has_spend={rep_spend}")
-        if rep and daily:                       # merge report spend into activity rows
-            by_date = {r["date"]: r["spend"] for r in rep}
+        by_date, src = await _daily_spend_by_date(session, base, start_date, end_date)
+        _dbg(f"daily spend via={src or 'none'} dates={len(by_date)}")
+        if by_date and daily:                   # merge report spend into activity rows
             for r in daily:
-                r["spend"] = by_date.get(r["date"], r["spend"])
-            has_spend = has_spend or rep_spend
-        elif rep:
-            daily, has_spend = rep, rep_spend
+                if r["date"] in by_date:
+                    r["spend"] = by_date[r["date"]]
+            has_spend = True
+        elif by_date:                           # no activity rows — synthesize from spend
+            daily = [{"date": d0, "spend": s, "requests": 0, "tokens": 0}
+                     for d0, s in by_date.items()]
+            has_spend = True
 
     if not daily:
         return None
     daily.sort(key=lambda r: str(r["date"]))
     return daily
+
+
+_KEY_LIST_ERR: str | None = None
+_KEY_BUDGETS_CACHE: dict | None = None  # last good /key/list result
+
+
+async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,
+                    id_key: str, timeout_s: float) -> list:
+    """Walk a paginated LiteLLM list endpoint, tolerant of the server capping the page
+    BELOW the requested size (its default is small — a full small page is NOT the last
+    page). Prefers the server's total_pages/total_count; else walks until a short page.
+    De-dupes by `id_key` and STOPS when a page adds nothing new, so an endpoint that
+    ignores `page=` (returns the same list every time) can't loop. [] on error."""
+    out: list = []
+    seen: set = set()
+    page = 1
+    eff: int | None = None
+    while page <= 50:
+        sep = "&" if "?" in url else "?"
+        d, err = await fetch_json(session, f"{url}{sep}page={page}&size=500&page_size=500",
+                                  headers=_headers(), timeout_s=timeout_s)
+        if err is not None:
+            break
+        rows = None
+        if isinstance(d, dict):
+            for rk in root_keys:
+                if isinstance(d.get(rk), list):
+                    rows = d[rk]
+                    break
+        elif isinstance(d, list):
+            rows = d
+        if not rows:
+            break
+        added = 0
+        for r in rows:
+            rid = str(r.get(id_key)) if isinstance(r, dict) else str(r)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            out.append(r)
+            added += 1
+        if added == 0:                     # page brought nothing new → endpoint ignores page=
+            break
+        total_pages = (d.get("total_pages") if isinstance(d, dict) else 0) or 0
+        total_count = ((d.get("total_count") or d.get("total"))
+                       if isinstance(d, dict) else 0) or 0
+        if eff is None:
+            eff = len(rows)
+        if total_pages:
+            if page >= total_pages:
+                break
+        elif total_count:
+            if len(out) >= total_count:
+                break
+        elif len(rows) < (eff or 1):
+            break
+        page += 1
+    return out
 
 
 async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[dict, dict]:
@@ -560,7 +846,7 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
     by_id: dict[str, str] = {}
     by_user: dict[str, str] = {}
     tl, err = await fetch_json(session, f"{base}/team/list",
-                               headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+                               headers=_headers(), timeout_s=max(config.HTTP_TIMEOUT, config.LITELLM_SPEND_TIMEOUT))
     teams = (tl.get("teams") if isinstance(tl, dict) else tl) if err is None else None
     if isinstance(teams, list):
         for t in teams:
@@ -575,23 +861,23 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
                 uid = (m.get("user_id") if isinstance(m, dict) else m) or ""
                 if uid:
                     by_user.setdefault(str(uid), alias)
-    # /user/list as a secondary source (a user's own team membership)
-    ul, err2 = await fetch_json(session, f"{base}/user/list?page_size=500",
-                                headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
-    users = (ul.get("users") if isinstance(ul, dict) else ul) if err2 is None else None
-    if isinstance(users, list):
-        for u in users:
-            if not isinstance(u, dict):
-                continue
-            uid = str(u.get("user_id") or "")
-            if not uid or uid in by_user:
-                continue
-            tms = u.get("teams") or []
-            first = tms[0] if isinstance(tms, list) and tms else None
-            if isinstance(first, dict):
-                by_user[uid] = str(first.get("team_alias") or first.get("team_id") or "")
-            elif first:
-                by_user[uid] = by_id.get(str(first), str(first))
+    # /user/list as a secondary source (a user's own team membership). Paginated — a
+    # single page silently drops every user past the server's page cap, so keys owned
+    # by those users can't resolve their team.
+    to = max(config.HTTP_TIMEOUT, config.LITELLM_SPEND_TIMEOUT)
+    users = await _paginate(session, f"{base}/user/list", ("users", "data"), "user_id", to)
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        uid = str(u.get("user_id") or "")
+        if not uid or uid in by_user:
+            continue
+        tms = u.get("teams") or []
+        first = tms[0] if isinstance(tms, list) and tms else None
+        if isinstance(first, dict):
+            by_user[uid] = str(first.get("team_alias") or first.get("team_id") or "")
+        elif first:
+            by_user[uid] = by_id.get(str(first), str(first))
     _dbg(f"/team directory: teams={len(by_id)} users_mapped={len(by_user)}")
     return by_id, by_user
 
@@ -602,19 +888,72 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     budget is 0 when the key has no `max_budget`. The team is resolved key →
     team_id → USER (LiteLLM often puts the team on the user, not the key). None when
     LiteLLM is unconfigured or the endpoint is unavailable, so the caller can fall back."""
+    global _KEY_LIST_ERR, _KEY_BUDGETS_CACHE
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
+        _KEY_LIST_ERR = "LiteLLM base URL or master key not set"
         return None
     base = base.rstrip("/")
-    d, err = await fetch_json(
-        session, f"{base}/key/list?return_full_object=true&size=200",
-        headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
-    if err is not None:
-        _dbg(f"/key/list err={err} -> budgets fall back to MONITOR_KEY_BUDGETS")
-        return None
-    rows = d.get("keys") or d.get("data") if isinstance(d, dict) else d
-    if not isinstance(rows, list):
-        return None
+    # /key/list?return_full_object=true is a HEAVY management call — give it the
+    # spend timeout, not the 4s per-collector one, or a busy LiteLLM (why
+    # spend_mode=lite is common) times it out and every key silently loses its
+    # team/budget. Retry with page_size= for older LiteLLM.
+    to = max(config.HTTP_TIMEOUT, config.LITELLM_SPEND_TIMEOUT)
+    # Paginate /key/list — LiteLLM caps each page (often ~10-50), so a single call
+    # returns only the first page and every other key falls back to the spend
+    # snapshot WITHOUT a team. Walk all pages so every key keeps its team/budget.
+    rows: list = []
+    page = 1
+    eff_size: int | None = None   # server's ACTUAL page size (LiteLLM caps ~10, ignoring size=)
+    while page <= 50:
+        q = f"return_full_object=true&page={page}&size=100"
+        d, err = await fetch_json(session, f"{base}/key/list?{q}",
+                                  headers=_headers(), timeout_s=to)
+        if err is not None and page == 1:      # older LiteLLM uses page_size
+            d, err = await fetch_json(
+                session, f"{base}/key/list?return_full_object=true&page={page}&page_size=100",
+                headers=_headers(), timeout_s=to)
+        if err is not None:
+            if page == 1:
+                prev = _KEY_LIST_ERR
+                _KEY_LIST_ERR = f"/key/list failed: {err}"
+                # A 403/401 HERE is a SCOPE limit on LiteLLM's key-management API, NOT a
+                # dead master key: /v1/models, /global/spend/keys and /global/activity all
+                # still work with the same key (so spend, teams and cost keep flowing).
+                # Do NOT flag global auth as failed — only per-key budget CAPS fall back
+                # to MONITOR_KEY_BUDGETS. Log once per error-state change, not every poll.
+                if prev != _KEY_LIST_ERR:
+                    scope = " (key lacks key-management scope; spend/teams/cost unaffected)" \
+                        if _auth_err(err) else ""
+                    _dbg(f"/key/list err={err} -> reuse cached{scope}" if _KEY_BUDGETS_CACHE
+                         else f"/key/list err={err} -> budgets use MONITOR_KEY_BUDGETS{scope}")
+                return _KEY_BUDGETS_CACHE
+            break                               # got some pages already; use them
+        pg = (d.get("keys") or d.get("data")) if isinstance(d, dict) else d
+        if not isinstance(pg, list) or not pg:
+            break
+        rows.extend(pg)
+        # Stop tolerant of LiteLLM capping the page BELOW our size= (its default is ~10,
+        # so a page of 10 is FULL, not the last page). Prefer the server's own totals;
+        # else walk until a page shorter than the observed page size. The old `len<100`
+        # test broke after page 1 whenever the server capped <100 — dropping every key
+        # past the first page to the team-less spend snapshot.
+        total_pages = (d.get("total_pages") if isinstance(d, dict) else 0) or 0
+        total_count = ((d.get("total_count") or d.get("total")) if isinstance(d, dict) else 0) or 0
+        if eff_size is None:
+            eff_size = len(pg)
+        if total_pages:
+            if page >= total_pages:
+                break
+        elif total_count:
+            if len(rows) >= total_count:
+                break
+        elif len(pg) < (eff_size or 1):         # short page = last page
+            break
+        page += 1
+    _KEY_LIST_ERR = None
+    if not rows:
+        return _KEY_BUDGETS_CACHE
     # Resolve a key's team through team_id and (if the key has none) its user,
     # since LiteLLM commonly attaches the team to the user, and /key/list may carry
     # only a team_id UUID rather than the human alias shown in the LiteLLM UI.
@@ -641,7 +980,9 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         }
     _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])} "
          f"teamed={sum(1 for v in out.values() if v['team'])}")
-    return out or None
+    if out:
+        _KEY_BUDGETS_CACHE = out
+    return out or _KEY_BUDGETS_CACHE
 
 
 def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[dict]:
@@ -902,3 +1243,8 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
                               key=lambda x: -x["reqs"])[:10]]
 
     return res, _kept, total
+
+
+def last_key_list_error() -> str | None:
+    """Why the last key_budgets() /key/list call failed (for the UI to surface)."""
+    return _KEY_LIST_ERR

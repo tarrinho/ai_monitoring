@@ -2163,6 +2163,83 @@ def test_classify_model_internal_vs_external():
         assert c["internal"] is None and c["cost_kind"] == "unknown", repr(m)
 
 
+def test_classify_model_admin_override_wins():
+    """An admin per-model override flips the auto-detected kind, both directions, and
+    is matched tolerant of a provider/model prefix."""
+    # self-hosted model FORCED to real (e.g. an open weight served via a paid API)
+    ov = {"gemma4": "real"}
+    c = litellm.classify_model("gemma4", ov)
+    assert c["cost_kind"] == "real" and c["internal"] is False and c["overridden"] is True
+    # external model FORCED to reference (estimated)
+    ov = {"gpt-4o": "reference"}
+    c = litellm.classify_model("gpt-4o", ov)
+    assert c["cost_kind"] == "reference" and c["internal"] is True and c["overridden"] is True
+    # prefix-tolerant: override keyed bare, model reported with a provider prefix
+    ov = {"qwen2.5": "real"}
+    c = litellm.classify_model("ollama/qwen2.5", ov)
+    assert c["cost_kind"] == "real" and c["overridden"] is True
+    # a blank model is never overridden into a cost bucket
+    assert litellm.classify_model("", {"": "real"})["cost_kind"] == "unknown"
+    # no/empty override → heuristic default, overridden=False
+    assert litellm.classify_model("gpt-4o")["overridden"] is False
+    assert litellm.classify_model("gpt-4o", {})["cost_kind"] == "real"
+
+
+def test_cost_model_split_groups_by_kind():
+    """cost_model_split buckets models by their (override-adjusted) cost_kind, biggest
+    first, skipping zero-usage + unattributed — feeds the cost-over-time legend tooltip."""
+    rows = [{"model": "gpt-4o", "tokens": 500, "cost_kind": "real"},
+            {"model": "ollama/qwen", "tokens": 900, "cost_kind": "reference"},
+            {"model": "claude", "tokens": 100, "cost_kind": "real"},
+            {"model": "idle-model", "tokens": 0, "cost_kind": "real"},      # no usage → skip
+            {"model": "(unattributed)", "tokens": 50, "cost_kind": "real"}]  # skip
+    split = appmod.cost_model_split(rows)
+    assert split["real"] == ["gpt-4o", "claude"]        # 500 before 100
+    assert split["reference"] == ["ollama/qwen"]
+    # an override that flips qwen → real lands it in the real bucket
+    rows2 = [{"model": "ollama/qwen", "tokens": 900, "cost_kind": "real"}]
+    assert appmod.cost_model_split(rows2)["real"] == ["ollama/qwen"]
+    assert appmod.cost_model_split([]) == {"real": [], "reference": []}
+
+
+def test_model_kind_db_roundtrip():
+    """db.model_kind_set/overrides/delete round-trip; invalid kind refused."""
+    now = time.time()
+    assert db.model_kind_set("gpt-4o", "reference", now) is True
+    assert db.model_kind_overrides().get("gpt-4o") == "reference"
+    assert db.model_kind_set("gpt-4o", "real", now) is True        # upsert
+    assert db.model_kind_overrides().get("gpt-4o") == "real"
+    assert db.model_kind_set("gpt-4o", "bogus", now) is False      # invalid kind
+    assert db.model_kind_set("", "real", now) is False            # empty model
+    assert db.model_kind_delete("gpt-4o") is True
+    assert "gpt-4o" not in db.model_kind_overrides()
+    assert db.model_kind_delete("gpt-4o") is False                # already gone
+
+
+async def test_per_model_range_applies_kind_override(monkeypatch):
+    """per_model_range honours the admin override: each row's cost_kind flips and is
+    flagged kind_overridden, so the Spend real-vs-estimated split follows the override."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        return ([{"model": "gpt-4o", "sum_api_requests": 10, "sum_total_tokens": 100},
+                 {"model": "ollama/qwen", "sum_api_requests": 5, "sum_total_tokens": 50}],
+                None)
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    # no override: gpt-4o=real (external), ollama/qwen=reference (self-hosted)
+    rows = await litellm.per_model_range(None, "2026-07-01", "2026-07-02")
+    byname = {r["model"]: r for r in rows}
+    assert byname["gpt-4o"]["cost_kind"] == "real"
+    assert byname["ollama/qwen"]["cost_kind"] == "reference"
+    assert byname["gpt-4o"]["kind_overridden"] is False
+    # override flips both directions
+    rows = await litellm.per_model_range(None, "2026-07-01", "2026-07-02",
+                                         {"gpt-4o": "reference", "ollama/qwen": "real"})
+    byname = {r["model"]: r for r in rows}
+    assert byname["gpt-4o"]["cost_kind"] == "reference" and byname["gpt-4o"]["kind_overridden"] is True
+    assert byname["ollama/qwen"]["cost_kind"] == "real" and byname["ollama/qwen"]["kind_overridden"] is True
+
+
 def test_usage_split_by_tokens_and_requests():
     """The usage split (real/reference/unknown by tokens+requests) works without
     per-model cost — the lite-mode 'X% self-hosted' story. Unknown (blank model) is
@@ -2281,6 +2358,41 @@ async def test_spend_series_endpoint(monkeypatch):
         await c.close()
 
 
+async def test_spend_series_attaches_cost_models(monkeypatch):
+    """/api/spend/series attaches cost_models {real:[…],reference:[…]} so the
+    cost-over-time legend can tooltip the models in each bucket."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-tok-654321")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def _daily(session, s, e):
+        return [{"date": "2026-07-01", "requests": 10, "tokens": 1000, "spend": 0.0}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
+
+    async def _permodel(session, s, e, ov=None):
+        return [{"model": "gpt-4o", "tokens": 600, "reqs": 6,
+                 "internal": False, "cost_kind": "real"},
+                {"model": "ollama/qwen", "tokens": 400, "reqs": 4,
+                 "internal": True, "cost_kind": "reference"}]
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _permodel)
+    hdr = {"Authorization": "Bearer sp-tok-654321"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
+        assert d["available"] is True and d.get("cost_available") is True
+        cm = d.get("cost_models")
+        assert cm and cm["real"] == ["gpt-4o"] and cm["reference"] == ["ollama/qwen"]
+        # per-year rollup carries real_cost + est_cost — the top-right year card's source
+        yrs = d.get("years") or []
+        assert yrs and all("real_cost" in y and "est_cost" in y for y in yrs)
+    finally:
+        await c.close()
+
+
 async def test_spend_page_served_and_gated(monkeypatch):
     """The Spend & Quota page renders open and is auth-gated once a token is set."""
     c = await _client()
@@ -2290,6 +2402,16 @@ async def test_spend_page_served_and_gated(monkeypatch):
         html = await r.text()
         assert "Spend &amp; Quota" in html and "/api/budgets" in html
         assert 'href="/spend"' in html            # sidebar self-link
+        # Free-tier LiteLLM has no daily $ (that's Enterprise /global/spend/report), so
+        # the timeline is a USAGE chart (requests + tokens), not an empty $ chart.
+        assert "Usage over time" in html and "requests &amp; tokens per day" in html
+        # cumulative cost still visualised — "Cost by key" horizontal bar chart (the $
+        # that DOES exist, from /global/spend/keys), with a key/team toggle.
+        assert "Cost by key" in html and "cost-chart" in html and "renderCostChart" in html
+        # estimated cost over time — daily tokens × per-model price, real vs estimated.
+        assert "Cost over time" in html and "cost-time-chart" in html and "renderCostTime" in html
+        # top-right card: current-year estimated cost (real + estimated + total)
+        assert "cost-time-year" in html and "renderYearCost" in html
     finally:
         await c.close()
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-spend-1")
@@ -3336,6 +3458,183 @@ async def test_team_override_get_set_reset(monkeypatch):
         await c.close()
 
 
+async def test_teams_detection_cached_and_sticky(monkeypatch):
+    """The Teams board caches LiteLLM's flaky team detection: a normal load serves the
+    cache (no re-fetch), ?refresh=1 re-polls, and a team already detected STAYS even if
+    a later poll returns empty — fixing the 'team shows, then blank' flicker."""
+    calls = {"n": 0}
+
+    async def flaky_kb(session):
+        calls["n"] += 1
+        team = "AppSec" if calls["n"] == 1 else ""   # detected once, then flaky-empty
+        return {"k1": {"team": team, "user": "u1", "budget": 0.0, "spend": 5.0}}
+
+    monkeypatch.setattr(litellm, "key_budgets", flaky_kb)
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE", {}, raising=False)
+    monkeypatch.setattr(appmod, "_backend_latest", {"litellm": {"top_keys": []}})
+    c, csrf = await _admin_client(monkeypatch, user="tcadm", pw="tcadmpw1")
+    try:
+        r1 = await (await c.get("/api/admin/teams?refresh=1")).json()   # forced fetch
+        assert r1["source"] == "litellm"
+        assert any(k["key"] == "k1" and k["detected"] == "AppSec" for k in r1["keys"])
+        n_after_first = calls["n"]
+        r2 = await (await c.get("/api/admin/teams")).json()             # cached: no fetch
+        assert r2["cached"] is True and calls["n"] == n_after_first     # did NOT re-poll
+        r3 = await (await c.get("/api/admin/teams?refresh=1")).json()   # re-poll (now empty)
+        assert calls["n"] == n_after_first + 1
+        assert any(k["key"] == "k1" and k["detected"] == "AppSec" for k in r3["keys"])  # sticky
+    finally:
+        await c.close()
+
+
+async def test_teams_empty_keylist_team_filled_from_snapshot(monkeypatch):
+    """A key whose /key/list row has an EMPTY team must be filled from the spend
+    snapshot (which resolved it) — not left blank because /key/list was seen first.
+    This is why big-spender keys showed no team on the board but were teamed elsewhere."""
+    async def kb(session):        # /key/list: key present but team blank
+        return {"BigSpender": {"team": "", "user": "", "budget": 200.0, "spend": 728.0}}
+    monkeypatch.setattr(litellm, "key_budgets", kb)
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE", {}, raising=False)
+    monkeypatch.setattr(appmod, "_backend_latest",
+                        {"litellm": {"top_keys": [{"key": "BigSpender",
+                                                   "team": "AppSec", "cost": 728.0}]}})
+    detected, _src = await appmod._detect_teams(None, True)
+    assert detected["BigSpender"]["detected"] == "AppSec"    # filled from snapshot, not blank
+    assert detected["BigSpender"]["budget"] == 200.0 and detected["BigSpender"]["spent"] == 728.0
+
+
+async def test_model_kinds_get_set_reset(monkeypatch):
+    c, csrf = await _admin_client(monkeypatch, user="mkadm", pw="mkadmpw1")
+    try:
+        # set an override → the model appears on the board as 'real', overridden, while
+        # its auto-detected default stays 'reference' (gemma family = self-hosted).
+        r = await c.post("/api/admin/model-kinds",
+                         data={"action": "set", "model": "gemma-self", "kind": "real"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is True
+        assert db.model_kind_overrides().get("gemma-self") == "real"
+        j = await (await c.get("/api/admin/model-kinds")).json()
+        row = next(m for m in j["models"] if m["model"] == "gemma-self")
+        assert row["kind"] == "real" and row["overridden"] is True
+        assert row["default_kind"] == "reference"
+        # invalid kind refused
+        r = await c.post("/api/admin/model-kinds",
+                         data={"action": "set", "model": "gemma-self", "kind": "nope"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400
+        # missing CSRF refused
+        r = await c.post("/api/admin/model-kinds",
+                         data={"action": "set", "model": "gemma-self", "kind": "real"})
+        assert r.status == 403
+        # reset → override cleared, auto-detect restored
+        r = await c.post("/api/admin/model-kinds",
+                         data={"action": "reset", "model": "gemma-self"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is False
+        assert "gemma-self" not in db.model_kind_overrides()
+    finally:
+        db.model_kind_delete("gemma-self")
+        await c.close()
+
+
+async def test_model_kinds_admin_only(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("mkv", "mkv@x.io", auth.hash_password("mkvpw123"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "mkv", "password": "mkvpw123"})
+        assert (await c.get("/api/admin/model-kinds")).status == 403
+        assert (await c.post("/api/admin/model-kinds",
+                data={"action": "set", "model": "x", "kind": "real"})).status == 403
+    finally:
+        await c.close()
+
+
+async def test_key_budget_override_set_reset(monkeypatch):
+    c, csrf = await _admin_client(monkeypatch, user="badm", pw="badmpw12")
+    try:
+        # set a monthly budget for a key (with a team in the same save)
+        r = await c.post("/api/admin/teams",
+                         data={"key": "coder-ide", "team": "Platform", "budget": "250"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        body = await r.json()
+        assert body["budget"] == 250.0 and body["budget_overridden"] is True
+        assert db.key_budget_overrides().get("coder-ide") == 250.0
+        # the override feeds the budget map used by the Spend rollup
+        assert appmod._key_budget_map().get("coder-ide") == 250.0
+        # it shows on the board with the flag
+        rows = (await (await c.get("/api/admin/teams")).json())["keys"]
+        row = next(k for k in rows if k["key"] == "coder-ide")
+        assert row["budget"] == 250.0 and row["budget_overridden"] is True
+        # negative rejected
+        r = await c.post("/api/admin/teams",
+                         data={"key": "coder-ide", "budget": "-5"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400
+        # reset clears BOTH team + budget
+        r = await c.post("/api/admin/teams",
+                         data={"action": "reset", "key": "coder-ide"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        assert "coder-ide" not in db.key_budget_overrides()
+        assert "coder-ide" not in db.team_overrides()
+    finally:
+        await c.close()
+
+
+async def test_team_budget_inherited_by_members(monkeypatch):
+    c, csrf = await _admin_client(monkeypatch, user="tbadm", pw="tbadmpw1")
+    try:
+        # set a team budget every member inherits
+        r = await c.post("/api/admin/team-budget",
+                         data={"team": "AppSec", "budget": "200"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["budget"] == 200.0
+        assert db.team_budgets().get("AppSec") == 200.0
+        # a key in AppSec with no per-key override inherits 200; an override wins
+        keys = [{"alias": "alice", "team": "AppSec", "budget": 0.0},
+                {"alias": "bob", "team": "AppSec", "budget": 0.0},
+                {"alias": "carol", "team": "Other", "budget": 0.0}]
+        db.key_budget_set("bob", 500.0, time.time())          # bob bumped above team
+        bmap = appmod._resolve_budget_map(keys)
+        assert bmap["alice"] == 200.0                          # inherits team budget
+        assert bmap["bob"] == 500.0                            # per-key override wins
+        assert "carol" not in bmap                             # no team budget, no override
+        # negative team budget rejected; reset clears
+        assert (await c.post("/api/admin/team-budget",
+                             data={"team": "AppSec", "budget": "-1"},
+                             headers={"X-CSRF-Token": csrf})).status == 400
+        r = await c.post("/api/admin/team-budget",
+                         data={"action": "reset", "team": "AppSec"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and "AppSec" not in db.team_budgets()
+    finally:
+        db.key_budget_delete("bob")
+        await c.close()
+
+
+async def test_litellm_auth_failure_reported_clearly(monkeypatch, capsys):
+    # A rejected master key (401/403) must be reported CLEARLY in the log ("the
+    # token is invalid/expired") and set an auth_error on the collector — not just a
+    # bare "HTTP 401", and it must short-circuit the key-gated /spend calls.
+    litellm._AUTH_BAD = False
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "liveliness" in url:
+            return ("I'm alive!", None)
+        return (None, "HTTP 401")             # models / spend / everything → 401
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-wrong")
+    out = await litellm.sample(None)
+    assert out.get("auth_error") is True
+    assert "master key rejected" in (out.get("error") or "")
+    log = capsys.readouterr().err
+    assert "AUTH FAILED" in log and ("invalid" in log and "expired" in log)
+    litellm._AUTH_BAD = False                  # reset shared state for other tests
+
+
 async def test_key_team_resolved_via_team_id_and_user(monkeypatch):
     # Regression: a key's team must resolve key -> team_id -> USER. LiteLLM often
     # carries only a team_id UUID on the key, or attaches the team to the user, not
@@ -3361,6 +3660,49 @@ async def test_key_team_resolved_via_team_id_and_user(monkeypatch):
     assert out["kB"]["team"] == "AppSec"        # no key team -> resolved via user
     assert out["kB"]["user"] == "u9"
     assert out["kC"]["team"] == "Direct"        # explicit key team wins
+
+
+async def test_key_budgets_walks_all_pages_when_server_caps_page_size(monkeypatch):
+    """Regression (the '10 teamed / 6 not' bug): LiteLLM caps /key/list at ~10 per page
+    and returns NO total_pages, ignoring our size=100. The walker must keep paging — a
+    full small page is not the last page — or every key past page 1 silently loses its
+    team/budget and falls back to the team-less spend snapshot."""
+    import re
+    all_keys = [{"key_alias": f"k{i:02d}", "team_alias": "AppSec", "user_id": f"u{i}",
+                 "max_budget": 0, "spend": 0.0} for i in range(16)]
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            m = re.search(r"[?&]page=(\d+)", url)
+            p = int(m.group(1)) if m else 1
+            return ({"keys": all_keys[(p - 1) * 10:(p - 1) * 10 + 10]}, None)  # cap 10, no totals
+        if "/team/list" in url:
+            return ({"teams": []}, None)
+        if "/user/list" in url:
+            return ({"users": []}, None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-master")
+    litellm._KEY_BUDGETS_CACHE = None
+    out = await litellm.key_budgets(None)
+    assert out is not None and len(out) == 16       # ALL 16 keys, not just page 1's 10
+    assert all(v["team"] == "AppSec" for v in out.values())
+
+
+async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
+    """_paginate must not loop when an endpoint ignores page= and returns the same rows
+    every time — it de-dupes by id and stops as soon as a page adds nothing new."""
+    calls = {"n": 0}
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        calls["n"] += 1
+        return ({"users": [{"user_id": "a"}, {"user_id": "b"}]}, None)  # same, no totals
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    out = await litellm._paginate(None, "http://x/user/list", ("users", "data"),
+                                  "user_id", 5.0)
+    assert len(out) == 2 and calls["n"] <= 3        # deduped, did not walk 50 pages
 
 
 async def test_legacy_token_reaches_admin(monkeypatch):

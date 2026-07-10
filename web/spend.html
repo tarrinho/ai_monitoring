@@ -78,6 +78,23 @@
     border-radius:6px;padding:4px 11px;font-size:12px;cursor:pointer}
   .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
   .chart-wrap{height:230px;margin-top:10px}
+  /* custom cost-over-time legend — hover a label to list its models (title tooltip) */
+  .ctlegend{display:flex;flex-wrap:wrap;gap:16px;font-size:11.5px;color:var(--muted)}
+  .ctlegend .li{display:inline-flex;align-items:center;gap:6px;cursor:help;
+    text-decoration:underline dotted;text-underline-offset:2px}
+  .ctlegend .sw{width:11px;height:11px;border-radius:2px;flex-shrink:0}
+  .ctlegend .li b{font-weight:600}
+  /* cost-over-time header row: title/hint on the left, current-year cost card top-right */
+  .ct-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}
+  .ct-head-l{min-width:0;flex:1}
+  .ctyear{flex-shrink:0;border:1px solid var(--line);border-radius:10px;background:var(--panel2);
+    padding:9px 13px;min-width:172px}
+  .ctyear .yh{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:5px}
+  .ctyear .yl{display:flex;justify-content:space-between;align-items:center;gap:16px;
+    font-size:12px;font-variant-numeric:tabular-nums;padding:1px 0}
+  .ctyear .yl .v{font-weight:600}
+  .ctyear .yl.tot{border-top:1px solid var(--line);margin-top:5px;padding-top:5px;font-weight:600}
+  .ctyear .yl .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:middle}
   /* wide tables scroll inside their own container instead of spilling the card */
   .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
   #card-keys table{min-width:660px}
@@ -181,7 +198,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.4</div>
+      <div id="sidebar-brand-ver">v1.5.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -193,7 +210,7 @@
     <a href="/ollama">Ollama</a>
     <a href="/llamacpp">llama.cpp</a>
     <a href="/alerts">Alerts</a>
-    <a href="/settings" id="nav-settings" style="display:none">Settings</a>
+    <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
   </nav>
 </div>
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
@@ -213,15 +230,39 @@
     <div class="unavail">loading…</div>
   </section>
 
-  <section class="card" id="card-spend-time" aria-label="Spend over time">
-    <h2>Spend over time
+  <section class="card" id="card-spend-time" aria-label="Usage over time">
+    <h2>Usage over time
       <span class="windows" id="sp-windows">
         <button data-w="30d" class="active">30 days</button>
         <button data-w="12mo">12 months</button>
       </span></h2>
+    <div class="hint" style="margin-top:2px">requests &amp; tokens per day — daily cost needs LiteLLM Enterprise; per-key spend is below</div>
     <div id="split-note" class="hint" style="margin-top:6px"></div>
     <div class="chart-wrap"><canvas id="spend-chart"></canvas></div>
     <div class="years" id="years"></div>
+  </section>
+
+  <section class="card" id="card-cost-time" aria-label="Cost over time" style="display:none">
+    <div class="ct-head">
+      <div class="ct-head-l">
+        <h2>Cost over time <span class="badge">estimated</span></h2>
+        <div class="hint" style="margin-top:2px">daily tokens &times; per-model price (LiteLLM) — real (external) vs estimated (self-hosted). Click a legend label to hide that series.</div>
+      </div>
+      <div id="cost-time-year" class="ctyear" aria-label="Estimated cost this year"></div>
+    </div>
+    <div id="cost-time-legend" class="ctlegend" style="margin-top:6px"></div>
+    <div id="cost-time-note" class="hint" style="margin-top:6px"></div>
+    <div class="chart-wrap"><canvas id="cost-time-chart"></canvas></div>
+  </section>
+
+  <section class="card" id="card-cost" aria-label="Cost by key">
+    <h2>Cost by key
+      <span class="windows" id="cost-by">
+        <button data-by="key" class="active">by key</button>
+        <button data-by="team">by team</button>
+      </span></h2>
+    <div class="hint" style="margin-top:2px">cumulative spend to date (LiteLLM per-key totals) — real cash, all-time</div>
+    <div class="chart-wrap"><canvas id="cost-chart"></canvas></div>
   </section>
 
   <div class="teamhd" id="teamhd" style="display:none">
@@ -277,84 +318,200 @@ function axisSp(t,gran){
   return gran==="month" ? d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)
                         : d.toLocaleDateString([],{month:"short",day:"numeric"});
 }
+const tokFmt=v=>v>=1e9?(v/1e9).toFixed(1)+"B":v>=1e6?(v/1e6).toFixed(1)+"M"
+      :v>=1e3?(v/1e3).toFixed(0)+"k":String(Math.round(v||0));
+// Usage over time — free-tier LiteLLM (/global/activity) gives daily requests + tokens
+// but NO daily cost (that's Enterprise-only /global/spend/report). So this is a usage
+// chart: tokens as bars (left axis), requests as a line (right axis).
 const spendChart=new Chart(document.getElementById("spend-chart"),{
   type:"bar",
   data:{labels:[],datasets:[
-    {label:"Real spend (external)",data:[],borderRadius:3,stack:"s",backgroundColor:cssv("--accent")},
-    {label:"Reference cost (internal)",data:[],borderRadius:3,stack:"s",backgroundColor:cssv("--muted")}
+    {label:"Tokens",data:[],borderRadius:3,yAxisID:"y",backgroundColor:cssv("--accent"),order:2},
+    {label:"Requests",data:[],type:"line",yAxisID:"y1",borderColor:cssv("--muted"),
+     backgroundColor:cssv("--muted"),tension:.3,pointRadius:2,borderWidth:2,order:1}
   ]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     plugins:{legend:{display:true,position:"top",align:"end",
         labels:{color:"#8b949e",boxWidth:10,boxHeight:10,font:{size:11}}},
-      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": $"+Math.round(c.parsed.y).toLocaleString()}}},
+      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "+Number(c.parsed.y).toLocaleString()}}},
+    scales:{
+      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:10}},grid:{display:false}},
+      y:{position:"left",ticks:{color:"#8b949e",font:{size:10},callback:v=>tokFmt(v)},
+         grid:{color:"#30363d55"},beginAtZero:true,
+         title:{display:true,text:"tokens",color:"#8b949e",font:{size:10}}},
+      y1:{position:"right",ticks:{color:"#8b949e",font:{size:10}},grid:{display:false},
+         beginAtZero:true,title:{display:true,text:"requests",color:"#8b949e",font:{size:10}}}}}
+});
+// Cost over time (estimated) — stacked real (external, tracked-price) vs estimated
+// (self-hosted, tokens × per-model price). Free-tier LiteLLM gives no per-day $.
+const costTimeChart=new Chart(document.getElementById("cost-time-chart"),{
+  type:"bar",
+  data:{labels:[],datasets:[
+    {label:"Real (external)",data:[],borderRadius:3,stack:"c",backgroundColor:cssv("--accent")},
+    {label:"Estimated (self-hosted)",data:[],borderRadius:3,stack:"c",backgroundColor:cssv("--muted")}
+  ]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:"index",intersect:false},   // hover anywhere on a day shows the tooltip
+    plugins:{legend:{display:false},   // replaced by a custom HTML legend (click to toggle, hover for models)
+      tooltip:{enabled:true,callbacks:{label:c=>" "+c.dataset.label+": $"+Number(c.parsed.y).toLocaleString(undefined,{maximumFractionDigits:2})}}},
     scales:{
       x:{stacked:true,ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:10}},grid:{display:false}},
       y:{stacked:true,ticks:{color:"#8b949e",font:{size:10},callback:v=>"$"+v},
          grid:{color:"#30363d55"},beginAtZero:true}}}
 });
-function renderYears(years,split){
+function renderCostTime(d){
+  const card=document.getElementById("card-cost-time"), pts=d.points||[];
+  const has=d.cost_available && pts.some(p=>(p.real_cost||0)+(p.est_cost||0)>0);
+  if(!has){ card.style.display="none"; return; }
+  card.style.display="";
+  costTimeChart.data.labels=pts.map(p=>axisSp(p.t,d.granularity));
+  costTimeChart.data.datasets[0].data=pts.map(p=>p.real_cost||0);
+  costTimeChart.data.datasets[1].data=pts.map(p=>p.est_cost||0);
+  const realCol=cssv("--accent"), estCol=cssv("--muted");
+  costTimeChart.data.datasets[0].backgroundColor=realCol;
+  costTimeChart.data.datasets[1].backgroundColor=estCol;
+  costTimeChart.update("none");
+  const rt=d.real_cost_total||0, et=d.est_cost_total||0;
+  const cm=d.cost_models||{real:[],reference:[]};
+  function modelsTitle(list){
+    list=list||[];
+    if(!list.length) return "No models with usage in this window";
+    return "Models ("+list.length+"):\n• "+list.join("\n• ");
+  }
+  // Custom HTML legend built with the DOM API. CLICK a label to toggle that series on
+  // the chart (like Chart.js's built-in legend); HOVER shows its models via a native
+  // title attribute (never touched by the HTML sanitizer).
+  function legendItem(idx, color, label, dollars, models){
+    var li=document.createElement("span"); li.className="li"; li.setAttribute("role","button");
+    li.style.cursor="pointer";
+    li.title=modelsTitle(models)+"\n(click to show/hide on the chart)";
+    var sw=document.createElement("span"); sw.className="sw"; sw.style.background=color;
+    var tx=document.createElement("span");
+    var b=document.createElement("b"); b.textContent="$"+Number(dollars||0).toFixed(2);
+    tx.appendChild(b); tx.appendChild(document.createTextNode(" "+label
+      +" · "+((models||[]).length)+" model"+((models||[]).length===1?"":"s")));
+    li.appendChild(sw); li.appendChild(tx);
+    function paint(){ var hidden=!costTimeChart.isDatasetVisible(idx);
+      li.style.opacity=hidden?".4":"1"; li.style.textDecoration=hidden?"line-through":"none"; }
+    paint();
+    li.addEventListener("click",function(){
+      costTimeChart.setDatasetVisibility(idx,!costTimeChart.isDatasetVisible(idx));
+      costTimeChart.update(); paint();
+    });
+    return li;
+  }
+  var leg=document.getElementById("cost-time-legend"); leg.textContent="";
+  leg.appendChild(legendItem(0, realCol, "real (external)", rt, cm.real));
+  leg.appendChild(legendItem(1, estCol, "estimated (self-hosted)", et, cm.reference));
+  document.getElementById("cost-time-note").textContent=
+    "Estimated over this window (tokens × per-model price). Hover a label above for its models.";
+  renderYearCost(d, realCol, estCol);
+}
+// Top-right card: the current year's estimated cost (real + estimated + total). Values
+// come from the same per-year rollup that backs the chart (tokens × per-model price).
+function renderYearCost(d, realCol, estCol){
+  var box=document.getElementById("cost-time-year"); box.textContent="";
+  var years=d.years||[];
+  var cy=new Date().getFullYear();
+  var y=years.filter(function(v){return Number(v.year)===cy;})[0];
+  if(!y) y=years.slice().sort(function(a,b){return Number(b.year)-Number(a.year);})[0];
+  if(!y){ box.style.display="none"; return; }
+  box.style.display="";
+  var real=Number(y.real_cost||0), est=Number(y.est_cost||0);
+  var money2=function(v){return "$"+Number(v||0).toLocaleString(undefined,
+    {minimumFractionDigits:2,maximumFractionDigits:2});};
+  var hd=document.createElement("div"); hd.className="yh";
+  hd.textContent=y.year+" · estimated cost";
+  box.appendChild(hd);
+  function line(cls,color,label,val){
+    var r=document.createElement("div"); r.className="yl"+(cls?" "+cls:"");
+    var l=document.createElement("span");
+    if(color){var sw=document.createElement("span");sw.className="sw";sw.style.background=color;l.appendChild(sw);}
+    l.appendChild(document.createTextNode(label));
+    var v=document.createElement("span"); v.className="v"; v.textContent=money2(val);
+    r.appendChild(l); r.appendChild(v); return r;
+  }
+  box.appendChild(line("", realCol, "real (external)", real));
+  box.appendChild(line("", estCol, "estimated (self-hosted)", est));
+  box.appendChild(line("tot", "", "total", real+est));
+}
+// Cost by key/team — cumulative $ spend (LiteLLM per-key totals). Horizontal bars so
+// long key names stay readable; real cash, all-time (not a time series).
+let COSTBY="key", _lastKeys=[];
+const costChart=new Chart(document.getElementById("cost-chart"),{
+  type:"bar",
+  data:{labels:[],datasets:[{label:"Spend",data:[],borderRadius:3,backgroundColor:cssv("--accent")}]},
+  options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
+    plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:c=>" $"+Number(c.parsed.x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}}},
+    scales:{
+      x:{ticks:{color:"#8b949e",font:{size:10},callback:v=>"$"+v},grid:{color:"#30363d55"},beginAtZero:true},
+      y:{ticks:{color:"#8b949e",font:{size:11},autoSkip:false},grid:{display:false}}}}
+});
+function renderCostChart(keys){
+  let rows;
+  if(COSTBY==="team"){
+    const t={};
+    keys.forEach(k=>{ const n=k.team||"—"; t[n]=(t[n]||0)+(k.spent||0); });
+    rows=Object.entries(t).map(([name,spent])=>({name,spent}));
+  } else {
+    rows=keys.map(k=>({name:k.key,spent:k.spent||0}));
+  }
+  rows=rows.filter(r=>r.spent>0).sort((a,b)=>b.spent-a.spent).slice(0,12);
+  const card=document.getElementById("card-cost");
+  if(!rows.length){ card.style.display="none"; return; }
+  card.style.display="";
+  costChart.data.labels=rows.map(r=>r.name);
+  costChart.data.datasets[0].data=rows.map(r=>Math.round(r.spent*100)/100);
+  costChart.data.datasets[0].backgroundColor=cssv("--accent");
+  costChart.update("none");
+}
+document.querySelectorAll("#cost-by button[data-by]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#cost-by button").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); COSTBY=b.dataset.by; renderCostChart(_lastKeys);
+  });
+});
+function renderYears(years){
   const el=document.getElementById("years");
   if(!years||!years.length){ setHtml(el,""); return; }
-  const max=Math.max(...years.map(y=>y.spend))||1;
-  setHtml(el, years.map(y=>{
-    const sub=split&&y.real!=null
-      ? `<div class="bs" style="margin-top:6px;display:flex;justify-content:space-between">`
-        +`<span class="c-ok">real ${money(y.real)}</span><span style="color:var(--muted)">ref ${money(y.reference)}</span></div>`
-      : "";
-    return `<div class="yr"><div class="yk">${escapeHtml(String(y.year))} · total</div>`
-      +`<div class="yv num">${money(y.spend)}</div>`
-      +`<div class="yb"><i style="width:${Math.round(y.spend/max*100)}%"></i></div>${sub}</div>`;
-  }).join(""));
+  const max=Math.max(...years.map(y=>y.tokens||0))||1;
+  setHtml(el, years.map(y=>
+    `<div class="yr"><div class="yk">${escapeHtml(String(y.year))} · tokens</div>`
+    +`<div class="yv num">${tokFmt(y.tokens||0)}</div>`
+    +`<div class="yb"><i style="width:${Math.round((y.tokens||0)/max*100)}%"></i></div>`
+    +`<div class="bs" style="margin-top:6px;color:var(--muted)">${(y.requests||0).toLocaleString()} requests</div></div>`
+  ).join(""));
 }
 async function loadSpendSeries(){
   const d=await api("/api/spend/series?window="+SPWIN);
   if(!d) return;
-  const pts=d.points||[], split=!!d.split_available;
+  const pts=d.points||[];
   const note=document.getElementById("split-note");
-  if(!pts.length){                 // no data at all — say WHY, not "no split"
+  if(!pts.length){                 // no usage data at all — say WHY
     spendChart.data.labels=[]; spendChart.data.datasets.forEach(ds=>ds.data=[]);
     spendChart.update("none");
-    renderYears([], false);
+    renderYears([]); renderCostTime({points:[]});
     setHtml(note, d.available===false
-      ? `<span style="color:var(--warn)">No spend data from LiteLLM.</span> `
+      ? `<span style="color:var(--warn)">No usage data from LiteLLM.</span> `
         +`<span style="color:var(--muted)">Check <b>LITELLM_BASE_URL</b> / `
         +`<b>LITELLM_MASTER_KEY</b>, and that the master key can read `
-        +`<code>/global/activity</code> or <code>/global/spend/report</code>. `
-        +`Set <code>LITELLM_DEBUG=1</code> to log what each call returned.</span>`
-      : `<span style="color:var(--muted)">No spend recorded in this window.</span>`);
+        +`<code>/global/activity</code>. Set <code>LITELLM_DEBUG=1</code> to log `
+        +`what each call returned.</span>`
+      : `<span style="color:var(--muted)">No usage recorded in this window.</span>`);
     return;
   }
   spendChart.data.labels=pts.map(p=>axisSp(p.t,d.granularity));
-  if(split){
-    spendChart.data.datasets[0].data=pts.map(p=>p.real);
-    spendChart.data.datasets[1].data=pts.map(p=>p.reference);
-    spendChart.data.datasets[0].hidden=false; spendChart.data.datasets[1].hidden=false;
-  } else {
-    spendChart.data.datasets[0].data=pts.map(p=>p.spend);
-    spendChart.data.datasets[0].label="Spend";
-    spendChart.data.datasets[1].data=[]; spendChart.data.datasets[1].hidden=true;
-  }
-  spendChart.data.datasets[0].backgroundColor=cssv("--accent");
-  spendChart.data.datasets[1].backgroundColor=cssv("--muted");
+  spendChart.data.datasets[0].data=pts.map(p=>p.tokens);
+  spendChart.data.datasets[1].data=pts.map(p=>p.requests);
   spendChart.update("none");
-  if(split){
-    const real=d.real_total||0, ref=d.reference_total||0, tot=real+ref||1;
-    let html = `<b class="c-ok">Real spend ${money(real)}</b> `
-      +`<span style="color:var(--muted)">(${Math.round(real/tot*100)}% — external paid providers)</span>`
-      +` &nbsp;·&nbsp; <b>Reference cost ${money(ref)}</b> `
-      +`<span style="color:var(--muted)">(self-hosted models — no real cash)</span>`;
-    // All spend is self-hosted (assigned/estimated prices) — explain why "Real" is
-    // $0 and how to make those prices count as real, budgetable spend if wanted.
-    if(real===0 && ref>0)
-      html += `<br><span style="color:var(--muted)">All spend is <b>reference</b> `
-        +`(self-hosted, estimated value). To count your assigned prices as real, `
-        +`budgetable spend, set <code>MONITOR_INTERNAL_PROVIDERS=</code> (empty).</span>`;
-    setHtml(note, html);
-  } else {
-    setHtml(note, `<span style="color:var(--muted)">Connect per-model spend to split real `
-      +`(external) vs reference (self-hosted) cost.</span>`);
-  }
-  renderYears(d.years, split);
+  const tok=pts.reduce((a,p)=>a+(p.tokens||0),0), req=pts.reduce((a,p)=>a+(p.requests||0),0);
+  setHtml(note,`<span style="color:var(--muted)"><b>${req.toLocaleString()}</b> requests · `
+    +`<b>${tokFmt(tok)}</b> tokens in this window. Per-day $ cost needs LiteLLM `
+    +`Enterprise (<code>/global/spend/report</code>); the estimated cost below is `
+    +`derived from tokens × per-model price.</span>`);
+  renderYears(d.years);
+  renderCostTime(d);
 }
 document.querySelectorAll("#sp-windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
@@ -479,12 +636,14 @@ async function tick(){
       +`(override with <b>MONITOR_KEY_BUDGETS</b>); keys without one still show their spend.</div>`);
     document.getElementById("teamhd").style.display="none";
     setHtml(document.getElementById("budget-gap"),"");
-    renderKeys([]); loadSpendSeries(); return;
+    renderKeys([]); renderCostChart([]); loadSpendSeries(); return;
   }
   renderSummary(d.summary||{});
   renderGap(d.summary||{}, d.budget_source);
   renderTeams(d.keys);
   renderKeys(d.keys);
+  _lastKeys=d.keys||[];
+  renderCostChart(_lastKeys);
   loadSpendSeries();
 }
 tick();

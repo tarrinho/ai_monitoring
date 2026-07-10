@@ -369,7 +369,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.5.4"
+    assert config.VERSION == "AI-Monitoring_1.5.5"
 
 
 def test_ux_improvements_present():
@@ -875,6 +875,9 @@ def test_settings_page_exists_with_tunables_and_teams():
     assert "/api/admin/settings" in html and "/api/admin/teams" in html
     # admin-only note + LiteLLM-enterprise team-budgets documentation on the page
     assert "Enterprise" in html and "team budgets" in html.lower()
+    # manual team refresh: detected teams are cached (LiteLLM lookup is flaky) and only
+    # re-fetched on the Refresh button, which calls the endpoint with ?refresh=1.
+    assert 'id="teams-refresh"' in html and "refresh=1" in html
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 

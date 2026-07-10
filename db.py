@@ -153,6 +153,23 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
 -- a key to a team here and the Spend & Quota by-team rollup honours this override.
 CREATE TABLE IF NOT EXISTS key_teams (key TEXT PRIMARY KEY, team TEXT NOT NULL,
     updated REAL);
+
+-- Admin-set per-key monthly budget override (Settings page). Overrides LiteLLM's
+-- max_budget / MONITOR_KEY_BUDGETS on the Spend & Quota rollup.
+CREATE TABLE IF NOT EXISTS key_budgets_ovr (key TEXT PRIMARY KEY, budget REAL NOT NULL,
+    updated REAL);
+
+-- Per-TEAM monthly budget (Settings page). Every key in the team inherits this
+-- budget; a per-key override (key_budgets_ovr) bumps a specific member above it.
+CREATE TABLE IF NOT EXISTS team_budgets (team TEXT PRIMARY KEY, budget REAL NOT NULL,
+    updated REAL);
+
+-- Admin-set per-model cost classification (Settings page). The model name heuristic
+-- (collectors/litellm.classify_model) tags each model 'real' (external paid API — a
+-- market price) or 'reference' (self-hosted — an ESTIMATED/imputed rate). An admin can
+-- pin a model to either here; the override wins on the Spend real-vs-estimated split.
+CREATE TABLE IF NOT EXISTS model_cost_kind (model TEXT PRIMARY KEY, kind TEXT NOT NULL,
+    updated REAL);
 """
 
 # Columns charted over time (order must match _METRIC_COLS in queries).
@@ -999,6 +1016,116 @@ def team_delete(key: str) -> bool:
     try:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM key_teams WHERE key = ?", (key,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+# ── per-key monthly budget overrides (Settings page) ──────────────────────────
+def key_budget_overrides() -> dict[str, float]:
+    """Admin-set per-key monthly budgets {key: budget}. These override LiteLLM's
+    reported max_budget and MONITOR_KEY_BUDGETS on the Spend & Quota rollup."""
+    try:
+        with _connect() as conn:
+            return {r[0]: float(r[1]) for r in
+                    conn.execute("SELECT key, budget FROM key_budgets_ovr").fetchall()}
+    except Exception:
+        return {}
+
+
+def key_budget_set(key: str, budget: float, now: float) -> bool:
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO key_budgets_ovr(key, budget, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET budget = excluded.budget, "
+                "updated = excluded.updated", (key, float(budget), now))
+        return True
+    except Exception:
+        return False
+
+
+def key_budget_delete(key: str) -> bool:
+    """Drop a budget override so the key falls back to LiteLLM / env."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM key_budgets_ovr WHERE key = ?", (key,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+# ── per-team monthly budget (inherited by every key in the team) ──────────────
+def team_budgets() -> dict[str, float]:
+    """Admin-set per-team monthly budgets {team: budget}. Each key in a team
+    inherits its budget unless it has a per-key override."""
+    try:
+        with _connect() as conn:
+            return {r[0]: float(r[1]) for r in
+                    conn.execute("SELECT team, budget FROM team_budgets").fetchall()}
+    except Exception:
+        return {}
+
+
+def team_budget_set(team: str, budget: float, now: float) -> bool:
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO team_budgets(team, budget, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(team) DO UPDATE SET budget = excluded.budget, "
+                "updated = excluded.updated", (team, float(budget), now))
+        return True
+    except Exception:
+        return False
+
+
+def team_budget_delete(team: str) -> bool:
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM team_budgets WHERE team = ?", (team,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+# ── per-model cost classification override (real vs reference/estimated) ──────
+MODEL_KINDS = ("real", "reference")
+
+
+def model_kind_overrides() -> dict[str, str]:
+    """Admin-set per-model cost classification {model: 'real'|'reference'}. Overrides
+    the name-based classify_model heuristic on the Spend real-vs-estimated split."""
+    try:
+        with _connect() as conn:
+            return {r[0]: r[1] for r in
+                    conn.execute("SELECT model, kind FROM model_cost_kind").fetchall()}
+    except Exception:
+        return {}
+
+
+def model_kind_set(model: str, kind: str, now: float) -> bool:
+    """Pin a model to 'real' or 'reference'. False on an invalid kind or DB error."""
+    if kind not in MODEL_KINDS:
+        return False
+    model = str(model or "").strip()
+    if not model:
+        return False
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO model_cost_kind(model, kind, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(model) DO UPDATE SET kind = excluded.kind, "
+                "updated = excluded.updated", (model, kind, now))
+        return True
+    except Exception:
+        return False
+
+
+def model_kind_delete(model: str) -> bool:
+    """Drop an override so the model falls back to name-based classification."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM model_cost_kind WHERE model = ?", (model,))
         return (cur.rowcount or 0) > 0
     except Exception:
         return False

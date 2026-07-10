@@ -6,6 +6,7 @@
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-ai__monitoring-2496ED?logo=github&logoColor=white)](https://github.com/tarrinho/ai_monitoring/pkgs/container/ai_monitoring)
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot&logoColor=white)](.github/dependabot.yml)
+[![cosign](https://img.shields.io/badge/cosign-keyless%20signed-2496ED?logo=sigstore&logoColor=white)](https://github.com/tarrinho/ai_monitoring/pkgs/container/ai_monitoring)
 
 <!-- Per-control status from the single CI workflow, published to the `badges` branch. -->
 [![CI](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)

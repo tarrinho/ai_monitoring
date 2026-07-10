@@ -146,7 +146,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.4</div>
+      <div id="sidebar-brand-ver">v1.5.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -158,7 +158,7 @@
     <a href="/ollama">Ollama</a>
     <a href="/llamacpp">llama.cpp</a>
     <a href="/alerts">Alerts</a>
-    <a href="/settings" id="nav-settings" style="display:none">Settings</a>
+    <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
   </nav>
 </div>
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
@@ -196,11 +196,6 @@
     #card-budgets .c-bad{color:var(--bad)} #card-budgets .c-warn{color:var(--warn)} #card-budgets .c-ok{color:var(--ok)}
     @media(max-width:720px){#card-budgets .bsum{grid-template-columns:repeat(2,1fr)}}
   </style>
-  <section class="card span-2" id="card-budgets">
-    <h2>Spend &amp; Quota — per-key budgets <span class="badge" id="bud-badge">this month</span></h2>
-    <div id="bud-body"><div class="unavail">loading…</div></div>
-  </section>
-
   <section class="card span-2" id="card-kpi">
     <h2>Live <span class="badge" id="ll-badge"></span></h2>
     <div class="kpis" id="ll-kpis"></div>
@@ -266,6 +261,11 @@
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>
     <div class="chart-grid" id="chart-grid"></div>
+  </section>
+
+  <section class="card span-2" id="card-budgets">
+    <h2>Spend &amp; Quota — per-key budgets <span class="badge" id="bud-badge">this month</span></h2>
+    <div id="bud-body"><div class="unavail">loading…</div></div>
   </section>
 </main>
 

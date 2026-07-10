@@ -27,18 +27,47 @@
   .row{display:grid;grid-template-columns:1fr 150px auto auto;gap:10px;align-items:center;
     padding:9px 0;border-top:1px solid var(--line)}
   .row:first-of-type{border-top:0}
+  .trow{grid-template-columns:1fr 130px 96px auto auto}   /* key | team | budget | save | reset */
+  @media(max-width:560px){.trow{grid-template-columns:1fr 1fr}}
   .lbl{font-size:13px} .lbl .h{display:block;color:var(--muted);font-size:11.5px;font-weight:400}
   .lbl .mod{color:var(--warn);font-size:10px;margin-left:6px;text-transform:uppercase;letter-spacing:.04em}
   input,select{width:100%;padding:7px 9px;border-radius:6px;border:1px solid var(--line);
     background:var(--panel2);color:var(--fg);font-size:13px;font-variant-numeric:tabular-nums}
   input:focus,select:focus{outline:none;border-color:var(--accent)}
   .row button{border:0;border-radius:6px;padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .btn-refresh{border:1px solid var(--accent);background:transparent;color:var(--accent);
+    border-radius:6px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .btn-refresh:hover:not(:disabled){background:var(--accent);color:#fff}
+  .btn-refresh:disabled{opacity:.6;cursor:default}
   .save{background:var(--accent);color:#fff} .save:hover{filter:brightness(1.08)}
   .reset{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .reset:hover{color:var(--fg)}
   .dflt{font-size:11px;color:var(--muted);white-space:nowrap}
   .msg{font-size:12px;min-height:16px;margin-top:2px} .msg.ok{color:var(--ok)} .msg.bad{color:var(--bad)}
   @media(max-width:560px){.row{grid-template-columns:1fr 1fr}}
+  /* section quick-nav */
+  .secnav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px}
+  .secnav a{font-size:11.5px;color:var(--muted);background:var(--panel);border:1px solid var(--line);
+    border-radius:20px;padding:4px 11px;text-decoration:none}
+  .secnav a:hover{color:var(--fg);border-color:var(--accent)}
+  .card h2{scroll-margin-top:14px}
+  /* team summary strip (top of Teams card) */
+  .tsumhd{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+    margin:10px 0 8px;font-weight:600}
+  .tsumhd:first-child{margin-top:0}
+  .teamsum{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-bottom:6px}
+  .tchip{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:8px;padding:9px 11px}
+  .tchip b{font-size:13px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tchip .tmeta{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .tbrow{display:flex;gap:5px;align-items:center;margin-top:8px}
+  .tbrow input{width:96px;padding:5px 7px;font-size:12px}
+  .tbrow button{padding:5px 10px;font-size:11px;margin:0}
+  .tbmsg{font-size:12px;color:var(--muted)}
+  /* truncate long key names so they don't blow out the row */
+  .lbl{min-width:0}
+  .kname{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;vertical-align:bottom;font-variant-numeric:tabular-nums}
   /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
   #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
     display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
@@ -76,7 +105,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.4</div>
+      <div id="sidebar-brand-ver">v1.5.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -88,7 +117,7 @@
     <a href="/ollama">Ollama</a>
     <a href="/llamacpp">llama.cpp</a>
     <a href="/alerts">Alerts</a>
-    <a href="/settings">Settings</a>
+    <a href="/settings">⚙️ Settings</a>
   </nav>
 </div>
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
@@ -105,14 +134,32 @@
       the <code>.env</code> defaults. Only non-secret operational settings are here — secrets, ports,
       backend URLs and security switches stay in <code>.env</code>. <b>Reset</b> returns a setting to its
       environment/default value. Changes are admin-only and audited.</p>
+    <div class="secnav" id="secnav"></div>
     <div id="groups"></div>
     <section class="card" id="teams-card">
-      <h2>Teams</h2>
-      <div class="gsub">Assign each LiteLLM key to a team for the <a href="/spend">Spend &amp; Quota</a>
-        by-team rollup. LiteLLM reports a key's team, but <b>team budgets are a LiteLLM
-        Enterprise feature</b> — so team grouping is managed here. An admin override
-        below wins over the team LiteLLM reports; <b>Reset</b> falls back to it.</div>
+      <h2 id="sec-teams" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <span>Teams</span>
+        <button id="teams-refresh" type="button" class="btn-refresh">Refresh from LiteLLM</button>
+      </h2>
+      <div class="gsub">Assign each LiteLLM key to a <b>team</b> and set its monthly
+        <b>budget ($/mo)</b> for the <a href="/spend">Spend &amp; Quota</a> by-team rollup.
+        LiteLLM reports a key's team, but <b>team budgets are a LiteLLM Enterprise
+        feature</b> — so both are managed here. The values below override what LiteLLM
+        reports (team) and its <code>max_budget</code> (budget); <b>Reset</b> clears both
+        for that key. Detected teams are <b>cached</b> (LiteLLM's lookup is flaky) —
+        the board no longer re-fetches on every load; use <b>Refresh</b> to re-detect.</div>
+      <div id="teams-src" class="gsub" style="margin-top:-2px;font-style:italic"></div>
       <div id="teams"></div>
+    </section>
+    <section class="card" id="models-card">
+      <h2 id="sec-models">Model costs</h2>
+      <div class="gsub">Each model's cost is either <b>real</b> (external paid API — a
+        market price LiteLLM tracks) or <b>estimated</b> (self-hosted / reference rate).
+        This drives the real-vs-estimated split on <a href="/spend">Spend &amp; Quota</a>.
+        The kind is auto-detected from the model name — <b>override</b> it here when the
+        guess is wrong (e.g. an open-weight model you route through a paid API).
+        <b>Reset</b> returns a model to auto-detect.</div>
+      <div id="models"></div>
     </section>
   </main>
 </div>
@@ -136,13 +183,19 @@
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
   }
   // Build one editable row per tunable, grouped by section. DOM API only (no innerHTML).
+  function slug(s){ return "sec-"+String(s).toLowerCase().replace(/[^a-z0-9]+/g,"-"); }
   function render(list){
     var groups={},order=[];
     list.forEach(function(s){ if(!groups[s.group]){groups[s.group]=[];order.push(s.group);} groups[s.group].push(s); });
     var root=document.getElementById("groups"); root.textContent="";
+    // quick-nav across the setting sections + Teams (better on-page organization)
+    var nav=document.getElementById("secnav"); nav.textContent="";
+    order.concat(["Teams","Models"]).forEach(function(g){
+      var a=document.createElement("a"); a.href="#"+slug(g); a.textContent=g; nav.appendChild(a);
+    });
     order.forEach(function(g){
       var card=document.createElement("section"); card.className="card";
-      var h=document.createElement("h2"); h.textContent=g; card.appendChild(h);
+      var h=document.createElement("h2"); h.id=slug(g); h.textContent=g; card.appendChild(h);
       groups[g].forEach(function(s){ card.appendChild(rowFor(s)); });
       root.appendChild(card);
     });
@@ -199,10 +252,12 @@
   }
   // ── Teams board ──
   function teamRow(k, teams){
-    var row=document.createElement("div"); row.className="row";
+    var row=document.createElement("div"); row.className="row trow";
     var lbl=document.createElement("div"); lbl.className="lbl";
-    lbl.appendChild(document.createTextNode(k.key));
-    var mod=document.createElement("span"); mod.className="mod"; mod.textContent=k.overridden?"override":"";
+    var kn=document.createElement("span"); kn.className="kname"; kn.textContent=k.key; kn.title=k.key;
+    lbl.appendChild(kn);
+    var mod=document.createElement("span"); mod.className="mod";
+    mod.textContent=(k.overridden?"team":"")+(k.budget_overridden?(k.overridden?"+budget":"budget"):"");
     lbl.appendChild(mod);
     var det=document.createElement("span"); det.className="h";
     det.textContent=(k.user?("user "+k.user+" · "):"")+"LiteLLM team: "+(k.detected||"— (none reported)");
@@ -210,22 +265,27 @@
     var inp=document.createElement("input"); inp.type="text"; inp.value=k.team||"";
     inp.placeholder="unassigned"; inp.maxLength=64; inp.setAttribute("list","team-names");
     row.appendChild(inp);
+    var bud=document.createElement("input"); bud.type="number"; bud.min="0"; bud.step="any";
+    // per-key budget = an override that bumps this member above the team budget;
+    // empty inherits the team's budget (shown as the placeholder).
+    bud.placeholder=(k.team_budget>0?("team "+money(k.team_budget)):"$/mo");
+    bud.value=(k.budget_overridden&&k.budget?k.budget:""); bud.title="Override this key's monthly budget ($)";
+    row.appendChild(bud);
     var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
     var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
     var msg=document.createElement("div"); msg.className="msg";
     function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
     save.addEventListener("click",function(){
       say("saving…",true);
-      post2({action:"set",key:k.key,team:inp.value.trim()}).then(function(res){
+      post2({action:"set",key:k.key,team:inp.value.trim(),budget:bud.value.trim()}).then(function(res){
         if(!res.ok){say(res.j.error||"save failed",false);return;}
-        mod.textContent=res.j.overridden?"override":""; say("saved",true);
-        setTimeout(function(){say("");loadTeams();},900);
+        say("saved",true); setTimeout(function(){say("");loadTeams();},900);
       }).catch(function(){say("save failed",false);});
     });
     reset.addEventListener("click",function(){
       post2({action:"reset",key:k.key}).then(function(res){
         if(!res.ok){say(res.j.error||"reset failed",false);return;}
-        mod.textContent=""; say("reset",true); setTimeout(function(){say("");loadTeams();},900);
+        say("reset",true); setTimeout(function(){say("");loadTeams();},900);
       }).catch(function(){say("reset failed",false);});
     });
     row.appendChild(save); row.appendChild(reset);
@@ -239,11 +299,61 @@
       body:new URLSearchParams(params).toString()})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
   }
-  function loadTeams(){
-    fetch("/api/admin/teams").then(function(r){return r.ok?r.json():null;}).then(function(d){
+  function money(n){ n=Number(n)||0; return n>=100?("$"+Math.round(n)):("$"+n.toFixed(2)); }
+  function postTeamBudget(params){
+    return fetch("/api/admin/team-budget",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams(params).toString()})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
+  }
+  function teamSummaryStrip(ts){
+    // Each team: an EDITABLE monthly budget every member inherits, + key count/spend.
+    var wrap=document.createElement("div"); wrap.className="teamsum";
+    ts.forEach(function(t){
+      var chip=document.createElement("div"); chip.className="tchip";
+      var nm=document.createElement("b"); nm.textContent=t.team; chip.appendChild(nm);
+      var meta=document.createElement("span"); meta.className="tmeta";
+      meta.textContent=t.keys+" key"+(t.keys>1?"s":"")+(t.spent>0?(" · "+money(t.spent)+" spent"):"");
+      chip.appendChild(meta);
+      var brow=document.createElement("div"); brow.className="tbrow";
+      var bud=document.createElement("input"); bud.type="number"; bud.min="0"; bud.step="any";
+      bud.placeholder="$/mo per member"; bud.value=(t.budget>0?t.budget:"");
+      bud.title="Monthly budget every member of "+t.team+" inherits";
+      var set=document.createElement("button"); set.className="save"; set.type="button"; set.textContent="Set";
+      var msg=document.createElement("span"); msg.className="tbmsg";
+      set.addEventListener("click",function(){
+        msg.textContent="…";
+        postTeamBudget({team:t.team,budget:bud.value.trim()}).then(function(res){
+          msg.textContent=res.ok?"✓":(res.j.error||"err");
+          if(res.ok) setTimeout(loadTeams,700);
+        }).catch(function(){msg.textContent="err";});
+      });
+      brow.appendChild(bud); brow.appendChild(set); brow.appendChild(msg);
+      chip.appendChild(brow); wrap.appendChild(chip);
+    });
+    return wrap;
+  }
+  function loadTeams(force){
+    var rb=document.getElementById("teams-refresh");
+    if(force&&rb){rb.disabled=true;rb.textContent="Refreshing…";}
+    fetch("/api/admin/teams"+(force?"?refresh=1":"")).then(function(r){return r.ok?r.json():null;}).then(function(d){
+      if(rb){rb.disabled=false;rb.textContent="Refresh from LiteLLM";}
       var el=document.getElementById("teams"); el.textContent="";
       if(!d){el.textContent="Teams are admin-only.";return;}
+      var note=document.getElementById("teams-src");
+      if(note) note.textContent = d.cached
+        ? "teams cached — click Refresh to re-detect from LiteLLM"
+        : (d.source==="litellm" ? "just refreshed from LiteLLM"
+           : "LiteLLM team lookup unavailable — showing last known"+(d.error?(" ("+d.error+")"):""));
       if(!(d.keys||[]).length){el.textContent="No LiteLLM keys seen yet — configure LITELLM_MASTER_KEY and send some traffic.";return;}
+      var ts=d.team_summary||[];
+      if(ts.length){
+        var hd=document.createElement("div"); hd.className="tsumhd";
+        hd.textContent=ts.length+" team"+(ts.length>1?"s":"")+" · monthly budget per member (each key inherits it)";
+        el.appendChild(hd); el.appendChild(teamSummaryStrip(ts));
+      }
+      var asn=document.createElement("div"); asn.className="tsumhd"; asn.textContent="Assign keys to teams";
+      el.appendChild(asn);
       var dl=document.createElement("datalist"); dl.id="team-names";
       (d.teams||[]).forEach(function(t){var o=document.createElement("option");o.value=t;dl.appendChild(o);});
       el.appendChild(dl);
@@ -251,10 +361,80 @@
     }).catch(function(){});
   }
 
+  // ── Model cost classification (real vs estimated) ──
+  function kindLabel(k){ return k==="reference"?"estimated":(k==="real"?"real":k||"—"); }
+  function postModel(params){
+    return fetch("/api/admin/model-kinds",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams(params).toString()})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
+  }
+  function modelRow(m){
+    var row=document.createElement("div"); row.className="row trow";
+    var lbl=document.createElement("div"); lbl.className="lbl";
+    var kn=document.createElement("span"); kn.className="kname"; kn.textContent=m.model; kn.title=m.model;
+    lbl.appendChild(kn);
+    var mod=document.createElement("span"); mod.className="mod";
+    if(m.overridden) mod.textContent="override";
+    lbl.appendChild(mod);
+    var det=document.createElement("span"); det.className="h";
+    det.textContent="auto: "+kindLabel(m.default_kind)+
+      (m.priced?(" · LiteLLM priced"):" · no LiteLLM price");
+    lbl.appendChild(det); row.appendChild(lbl);
+    var sel=document.createElement("select");
+    [["real","Real (paid)"],["reference","Estimated (self-hosted)"]].forEach(function(o){
+      var op=document.createElement("option"); op.value=o[0]; op.textContent=o[1]; sel.appendChild(op);
+    });
+    sel.value=m.kind;
+    // occupy the budget column so the grid lines up with the Teams rows
+    var spacer=document.createElement("span");
+    var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
+    var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
+    var msg=document.createElement("div"); msg.className="msg";
+    function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
+    save.addEventListener("click",function(){
+      say("saving…",true);
+      postModel({action:"set",model:m.model,kind:sel.value}).then(function(res){
+        if(!res.ok){say((res.j&&res.j.error)||"save failed",false);return;}
+        say("saved",true); setTimeout(function(){say("");loadModels();},900);
+      }).catch(function(){say("save failed",false);});
+    });
+    reset.addEventListener("click",function(){
+      postModel({action:"reset",model:m.model}).then(function(res){
+        if(!res.ok){say((res.j&&res.j.error)||"reset failed",false);return;}
+        say("reset",true); setTimeout(function(){say("");loadModels();},900);
+      }).catch(function(){say("reset failed",false);});
+    });
+    row.appendChild(sel); row.appendChild(spacer);
+    row.appendChild(save); row.appendChild(reset);
+    var holder=document.createElement("div"); holder.appendChild(row);
+    var wrap=document.createElement("div"); wrap.style.gridColumn="1/-1"; wrap.appendChild(msg);
+    holder.appendChild(wrap); return holder;
+  }
+  function loadModels(){
+    fetch("/api/admin/model-kinds").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      var el=document.getElementById("models"); el.textContent="";
+      if(!d){el.textContent="Model costs are admin-only.";return;}
+      var ms=d.models||[];
+      if(!ms.length){
+        el.textContent=d.error?("No models — "+d.error):"No models seen yet — configure LITELLM_BASE_URL / LITELLM_MASTER_KEY.";
+        return;
+      }
+      var nReal=ms.filter(function(m){return m.kind==="real";}).length;
+      var hd=document.createElement("div"); hd.className="tsumhd";
+      hd.textContent=ms.length+" model"+(ms.length>1?"s":"")+" · "+nReal+" real, "+(ms.length-nReal)+" estimated";
+      el.appendChild(hd);
+      ms.forEach(function(m){ el.appendChild(modelRow(m)); });
+    }).catch(function(){});
+  }
+
+  var _rb=document.getElementById("teams-refresh");
+  if(_rb) _rb.addEventListener("click",function(){loadTeams(true);});
+
   fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
     if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}
-    load(); loadTeams();
-  }).catch(function(){load();loadTeams();});
+    load(); loadTeams(); loadModels();
+  }).catch(function(){load();loadTeams();loadModels();});
 })();
 </script>
 <script>

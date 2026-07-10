@@ -1402,10 +1402,22 @@ async def litellm_models_handler(request: web.Request) -> web.Response:
     # finest granularity is a day).
     start = time.strftime("%Y-%m-%d", time.gmtime(now - secs))
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
-    rows = await litellm.per_model_range(request.app[_SESSION], start, end)
+    rows = await litellm.per_model_range(request.app[_SESSION], start, end,
+                                         db.model_kind_overrides())
+    # Estimated $ per model = tokens × LiteLLM per-model price; tagged real/estimated by
+    # cost_kind so the UI can draw a 2-colour cost-by-model breakdown (free tier has no $).
+    prices = await litellm.model_prices(request.app[_SESSION])
+    priced = 0
+    for r in rows or []:
+        # real = external cash; reference = self-hosted imputed (estimated). Both priced
+        # so the Spend page can show them as separate real/estimated cost series.
+        rate = litellm.price_for(r.get("model", ""), prices)
+        r["est_cost"] = round(int(r.get("tokens") or 0) * rate, 4)
+        priced += 1 if rate > 0 else 0
     return web.json_response({"window": window, "start_date": start,
                               "end_date": end, "per_model": rows or [],
                               "usage": _usage_split(rows or []),
+                              "cost_available": priced > 0,
                               "available": rows is not None})
 
 
@@ -1437,13 +1449,15 @@ _budgets_source = None
 
 
 def _key_budget_map() -> dict:
+    m: dict = {}
     raw = config.KEY_BUDGETS_JSON
-    if not raw:
-        return {}
-    try:
-        return {str(k): float(v) for k, v in json.loads(raw).items()}
-    except Exception:
-        return {}
+    if raw:
+        try:
+            m = {str(k): float(v) for k, v in json.loads(raw).items()}
+        except Exception:
+            m = {}
+    m.update(db.key_budget_overrides())     # admin UI override wins over env
+    return m
 
 
 def _budget_summary(rows: list) -> dict:
@@ -1492,6 +1506,20 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
     return keys
 
 
+def _resolve_budget_map(keys: list) -> dict:
+    """Effective monthly budget per key: an explicit per-key budget (UI override or
+    MONITOR_KEY_BUDGETS) wins; otherwise the key inherits its TEAM's budget. LiteLLM's
+    own max_budget stays as budget_rows' final fallback."""
+    tb = db.team_budgets()
+    out = dict(_key_budget_map())          # env + per-key overrides (explicit)
+    for k in keys:
+        kid = _team_key_id(k)
+        team = str(k.get("team") or "")
+        if kid not in out and team and team in tb:
+            out[kid] = tb[team]            # inherit the team budget
+    return out
+
+
 async def budgets_handler(request: web.Request) -> web.Response:
     """Per-key spend vs budget (the Spend & Quota panel): % used, $/day burn,
     days-to-cap, projected month-end, ranked closest-to-cap first. Budgets come from
@@ -1508,11 +1536,12 @@ async def budgets_handler(request: web.Request) -> web.Response:
     snap = _backend_latest.get("litellm", {})
     keys = merge_key_budgets(live, snap.get("top_keys") or [], _key_budget_map())
     _apply_team_overrides(keys)          # admin-assigned team wins over LiteLLM's
-    rows = litellm.budget_rows(keys, {}, lt.tm_mday, mlen)
+    rows = litellm.budget_rows(keys, _resolve_budget_map(keys), lt.tm_mday, mlen)
     return web.json_response({"keys": rows, "summary": _budget_summary(rows),
                               "available": bool(rows),
                               "budget_source": "litellm" if live else
-                                               ("env" if _key_budget_map() else "none")})
+                                               ("env" if _key_budget_map() else "none"),
+                              "budget_error": None if live else litellm.last_key_list_error()})
 
 
 def _team_key_id(k: dict) -> str:
@@ -1533,34 +1562,105 @@ def _apply_team_overrides(keys: list) -> None:
             k["team"] = t
 
 
+# Sticky cache of LiteLLM-detected teams: key_id -> {detected, user, budget, spent}.
+# LiteLLM's team lookup (/key/list + /team/list + /user/list) is flaky — a 403 or a
+# timeout on any tick returns EMPTY teams, which made the board blink between the right
+# team and "none". We cache the last NON-EMPTY detection per key and serve that; a
+# detected team only changes on an explicit Refresh (never re-fetched on every load).
+_TEAMS_DETECT_CACHE: dict[str, dict] = {}
+
+
+def _merge_team(kid: str, team: str, user: str, budget: float, spent: float) -> None:
+    """Fold one key's detection into the sticky cache, filling each field from whichever
+    source HAS it (first non-empty wins per field; spend refreshes when non-zero). A key
+    blank in /key/list gets its team from the snapshot and vice-versa — never overwritten
+    back to blank, which is why big spenders used to show teamed under /budgets but blank
+    on the board."""
+    kid = str(kid or "").strip()
+    if not kid:
+        return
+    cur = _TEAMS_DETECT_CACHE.setdefault(
+        kid, {"detected": "", "user": "", "budget": 0.0, "spent": 0.0})
+    cur["detected"] = cur["detected"] or (team or "")
+    cur["user"] = cur["user"] or (user or "")
+    cur["budget"] = cur["budget"] or (budget or 0.0)
+    cur["spent"] = (spent or 0.0) or cur["spent"]
+
+
+async def _detect_teams(session, force: bool) -> tuple[dict, str]:
+    """Return (key_id -> detected info, source). The flaky/heavy LiteLLM `/key/list` is
+    only hit on `force` (Refresh) or a cold start; the local spend snapshot (free, always
+    fresh, and it carries resolved teams) is folded in on EVERY call. That fills any team
+    left blank by an early cold-start detection WITHOUT re-polling LiteLLM each load — so
+    the board self-heals within a poll or two instead of staying blank until Refresh."""
+    global _TEAMS_DETECT_CACHE
+    hit_litellm = force or not _TEAMS_DETECT_CACHE
+    if hit_litellm:
+        live = await litellm.key_budgets(session)
+        for alias, info in (live or {}).items():
+            _merge_team(alias, str(info.get("team", "") or ""), str(info.get("user", "") or ""),
+                        float(info.get("budget", 0) or 0), float(info.get("spend", 0) or 0))
+    for k in (_backend_latest.get("litellm", {}) or {}).get("top_keys", []):
+        _merge_team(_team_key_id(k), str(k.get("team", "") or ""), str(k.get("user", "") or ""),
+                    0.0, float(k.get("cost", 0) or 0))
+    return _TEAMS_DETECT_CACHE, ("litellm" if hit_litellm else "cache")
+
+
 async def api_admin_teams_get(request: web.Request) -> web.Response:
     """Team board for the Settings page: every known key, its LiteLLM-detected team,
-    the resolved team (override wins), and whether it is overridden. Admin-only."""
+    the resolved team (override wins), and whether it is overridden. Admin-only.
+    Serves cached team detection; pass ?refresh=1 (the Refresh button) to re-poll LiteLLM."""
     ov = db.team_overrides()
+    bov = db.key_budget_overrides()          # admin per-key budget overrides
+    tb = db.team_budgets()                   # per-team monthly budgets
     seen: dict[str, dict] = {}
+    force = request.query.get("refresh") in ("1", "true", "yes")
+    detected, source = await _detect_teams(request.app[_SESSION], force)
 
-    def add(key_id: str, detected: str, user: str = ""):
+    def add(key_id: str, detected: str, user: str = "", budget: float = 0.0,
+            spent: float = 0.0):
         key_id = str(key_id or "").strip()
         if not key_id or key_id in seen:
             return
         det = str(detected or "")
+        tmn = ov.get(key_id, det)
         seen[key_id] = {"key": key_id, "user": str(user or ""), "detected": det,
-                        "team": ov.get(key_id, det), "overridden": key_id in ov}
+                        "team": tmn, "overridden": key_id in ov,
+                        "budget": bov.get(key_id, float(budget or 0)),
+                        "budget_overridden": key_id in bov,
+                        "team_budget": tb.get(tmn, 0.0) if tmn else 0.0,
+                        "spent": float(spent or 0)}
 
-    live = await litellm.key_budgets(request.app[_SESSION])
-    if live:
-        for alias, info in live.items():
-            add(alias, info.get("team", ""), info.get("user", ""))
-    for k in (_backend_latest.get("litellm", {}) or {}).get("top_keys", []):
-        add(_team_key_id(k), k.get("team", ""), k.get("user", ""))
-    for key_id, team in ov.items():         # overrides for keys not currently seen
+    for kid, info in detected.items():
+        add(kid, info.get("detected", ""), info.get("user", ""),
+            info.get("budget", 0), info.get("spent", 0))
+    for key_id in set(ov) | set(bov):       # any key with a team OR budget override
         if key_id not in seen:
+            _tm = ov.get(key_id, "")
             seen[key_id] = {"key": key_id, "user": "", "detected": "",
-                            "team": team, "overridden": True}
+                            "team": _tm, "overridden": key_id in ov,
+                            "budget": bov.get(key_id, 0.0),
+                            "budget_overridden": key_id in bov,
+                            "team_budget": tb.get(_tm, 0.0) if _tm else 0.0, "spent": 0.0}
     rows = sorted(seen.values(), key=lambda r: r["key"].lower())
     teams = sorted({r["team"] for r in rows if r["team"]})
+    # per-team rollup for the board header: monthly budget (sum of key max_budgets),
+    # spend, and key count. Budgets are the LiteLLM per-key caps summed per team.
+    agg: dict[str, dict] = {}
+    for r in rows:
+        tm = r["team"]
+        if not tm:
+            continue
+        a = agg.setdefault(tm, {"team": tm, "budget": tb.get(tm, 0.0),
+                                "budget_set": tm in tb, "spent": 0.0, "keys": 0})
+        a["spent"] += r["spent"]
+        a["keys"] += 1
+    team_summary = sorted(agg.values(), key=lambda a: (-a["budget"], -a["spent"]))
     return web.json_response({"keys": rows, "teams": teams,
-                              "source": "litellm" if live else "snapshot"})
+                              "team_summary": team_summary,
+                              "source": source, "cached": source == "cache",
+                              "error": None if source != "snapshot"
+                              else litellm.last_key_list_error()})
 
 
 async def api_admin_teams_set(request: web.Request) -> web.Response:
@@ -1575,20 +1675,154 @@ async def api_admin_teams_set(request: web.Request) -> web.Response:
     if not key:
         return web.json_response({"error": "key required"}, status=400)
     action = str(data.get("action") or "set").strip()
-    team = str(data.get("team") or "").strip()
-    if action == "reset" or not team:
+    now = time.time()
+    if action == "reset":                    # clear BOTH team + budget for the key
         db.team_delete(key)
-        _audit(request, actor, "team.reset", target=key)
-        return web.json_response({"ok": True, "key": key, "team": "", "overridden": False})
-    if len(team) > 64:
-        return web.json_response({"error": "team name too long (max 64)"}, status=400)
-    db.team_set(key, team, time.time())
-    _audit(request, actor, "team.set", target=key, detail=team)
-    return web.json_response({"ok": True, "key": key, "team": team, "overridden": True})
+        db.key_budget_delete(key)
+        _audit(request, actor, "key.reset", target=key)
+        return web.json_response({"ok": True, "key": key, "team": "", "overridden": False,
+                                  "budget": None, "budget_overridden": False})
+    # set: apply whichever fields the form sent
+    if "team" in data:
+        team = str(data.get("team") or "").strip()
+        if not team:
+            db.team_delete(key)
+        elif len(team) > 64:
+            return web.json_response({"error": "team name too long (max 64)"}, status=400)
+        else:
+            db.team_set(key, team, now)
+            _audit(request, actor, "team.set", target=key, detail=team)
+    if "budget" in data:
+        bval = str(data.get("budget") or "").strip()
+        if bval == "":
+            db.key_budget_delete(key)
+        else:
+            try:
+                b = float(bval)
+            except ValueError:
+                return web.json_response({"error": "budget must be a number"}, status=400)
+            if b < 0:
+                return web.json_response({"error": "budget must be >= 0"}, status=400)
+            db.key_budget_set(key, b, now)
+            _audit(request, actor, "budget.set", target=key, detail=str(b))
+    ovn = db.team_overrides()
+    bovn = db.key_budget_overrides()
+    return web.json_response({"ok": True, "key": key,
+                              "team": ovn.get(key, ""), "overridden": key in ovn,
+                              "budget": bovn.get(key), "budget_overridden": key in bovn})
+
+
+async def api_admin_team_budget_set(request: web.Request) -> web.Response:
+    """Set (or reset) a TEAM's monthly budget — inherited by every key in the team.
+    Body: team=&budget=  |  action=reset&team=. Admin-only (gate) + CSRF; audited."""
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    team = str(data.get("team") or "").strip()
+    if not team:
+        return web.json_response({"error": "team required"}, status=400)
+    action = str(data.get("action") or "set").strip()
+    bval = str(data.get("budget") or "").strip()
+    if action == "reset" or bval == "":
+        db.team_budget_delete(team)
+        _audit(request, actor, "team_budget.reset", target=team)
+        return web.json_response({"ok": True, "team": team, "budget": None})
+    try:
+        b = float(bval)
+    except ValueError:
+        return web.json_response({"error": "budget must be a number"}, status=400)
+    if b < 0:
+        return web.json_response({"error": "budget must be >= 0"}, status=400)
+    db.team_budget_set(team, b, time.time())
+    _audit(request, actor, "team_budget.set", target=team, detail=str(b))
+    return web.json_response({"ok": True, "team": team, "budget": b})
+
+
+async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
+    """Model cost-classification board for the Settings page: every known model, its
+    auto-detected cost kind (real=external paid / reference=self-hosted estimated),
+    the admin override (if any), the effective kind, and whether LiteLLM prices it.
+    Admin-only (via the /api/admin/* gate)."""
+    ov = db.model_kind_overrides()
+    prices = {}
+    try:
+        prices = await litellm.model_prices(request.app[_SESSION])
+    except Exception:
+        prices = {}
+    # Union of every model we can name: LiteLLM-priced models, the models the proxy
+    # currently serves (/v1/models — works even without an admin key), the recent
+    # per-model activity, and any model that already carries an override. This keeps
+    # the board populated even when the master key can't reach the spend endpoints.
+    names: set[str] = set(prices.keys())
+    for mid in (_backend_latest.get("litellm", {}) or {}).get("models", []) or []:
+        if mid:
+            names.add(mid)
+    now = time.time()
+    start = time.strftime("%Y-%m-%d", time.gmtime(now - 30 * 86400))
+    end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    try:
+        recent = await litellm.per_model_range(request.app[_SESSION], start, end, ov)
+        for r in recent or []:
+            nm = r.get("model")
+            if nm and nm != "(unattributed)":
+                names.add(nm)
+    except Exception:
+        pass
+    names.update(k for k in ov if k)
+    models = []
+    for name in sorted(names, key=lambda s: str(s).lower()):
+        default = litellm.classify_model(name)          # heuristic, no override
+        eff = litellm.classify_model(name, ov)          # override wins
+        rate = litellm.price_for(name, prices)
+        models.append({"model": name,
+                       "default_kind": default["cost_kind"],
+                       "kind": eff["cost_kind"],
+                       "overridden": bool(eff.get("overridden")),
+                       "priced": rate > 0,
+                       "rate": rate})
+    return web.json_response({"models": models,
+                              "error": None if prices or models
+                              else litellm.last_key_list_error()})
+
+
+async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
+    """Pin (or reset) a model's cost classification. Body: model=&kind=real|reference
+    | action=reset&model=. Admin-only (gate) + CSRF; audited."""
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    model = str(data.get("model") or "").strip()
+    if not model:
+        return web.json_response({"error": "model required"}, status=400)
+    if len(model) > 200:
+        return web.json_response({"error": "model name too long (max 200)"}, status=400)
+    action = str(data.get("action") or "set").strip()
+    if action == "reset":
+        db.model_kind_delete(model)
+        _audit(request, actor, "model_kind.reset", target=model)
+        default = litellm.classify_model(model)
+        return web.json_response({"ok": True, "model": model,
+                                  "kind": default["cost_kind"], "overridden": False})
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind not in db.MODEL_KINDS:
+        return web.json_response({"error": "kind must be 'real' or 'reference'"},
+                                 status=400)
+    if not db.model_kind_set(model, kind, time.time()):
+        return web.json_response({"error": "could not save override"}, status=400)
+    _audit(request, actor, "model_kind.set", target=model, detail=kind)
+    return web.json_response({"ok": True, "model": model, "kind": kind,
+                              "overridden": True})
 
 
 # Demo/override hook for the spend timeline: fn(now, window) -> {...}.
 _spend_series_source = None
+# Last non-zero (real $/token, reference $/token) — reused when /global/activity/model
+# momentarily returns empty so the estimated-cost chart stays put instead of blinking.
+_COST_RATES: tuple[float, float] | None = None
 
 
 def _date_epoch(date) -> float | None:
@@ -1670,7 +1904,8 @@ def bucket_spend(daily: list, window: str) -> dict:
     year_rows = []
     for y in sorted(years):
         sp = round(years[y]["spend"], 2)
-        row: dict = {"year": int(y), "spend": sp}
+        row: dict = {"year": int(y), "spend": sp,
+                     "tokens": years[y]["tokens"], "requests": years[y]["requests"]}
         if split:
             real = round(years[y]["real"], 2)
             row["real"] = real
@@ -1683,6 +1918,97 @@ def bucket_spend(daily: list, window: str) -> dict:
         real_total = round(sum(r.get("real", 0.0) for r in daily), 2)
         out["real_total"] = real_total
         out["reference_total"] = round(sp_total - real_total, 2)
+    return out
+
+
+def cost_rates(per_model: list, prices: dict) -> tuple[float, float]:
+    """($/token attributable to REAL external models, $/token to REFERENCE self-hosted
+    models), from windowed per-model tokens × LiteLLM per-model prices. Free-tier LiteLLM
+    exposes no per-day $, so cost over time is ESTIMATED = daily tokens × these rates.
+
+    REAL is external cash spend; ESTIMATED is the imputed value of self-hosted usage
+    (tokens × LiteLLM's per-model price — real hardware runs it for free, but the price
+    lets you see what that volume WOULD cost on a hosted API). They are two separate
+    series in the chart so the estimated one can be toggled off in the legend. Returns
+    (0, 0) when nothing is priced."""
+    real_c = ref_c = 0.0
+    tot = 0
+    for r in per_model or []:
+        toks = int(r.get("tokens") or 0)
+        tot += toks
+        rate = litellm.price_for(r.get("model", ""), prices)
+        if r.get("cost_kind") == "real":
+            real_c += rate * toks
+        elif r.get("cost_kind") == "reference":     # self-hosted → estimated (imputed)
+            ref_c += rate * toks
+    if not tot:
+        return 0.0, 0.0
+    return real_c / tot, ref_c / tot
+
+
+def add_estimated_cost(series: dict, real_cpt: float, ref_cpt: float) -> dict:
+    """Attach estimated real/estimated $ to each point + year of a usage series, from
+    that bucket's token count × the per-token cost rates. `cost_available` is True only
+    when at least one model is priced, so the UI can hide the $ chart otherwise."""
+    avail = (real_cpt > 0 or ref_cpt > 0)
+    series["cost_available"] = avail
+    rt = et = 0.0
+    for p in series.get("points", []):
+        tk = int(p.get("tokens") or 0)
+        p["real_cost"] = round(tk * real_cpt, 2)
+        p["est_cost"] = round(tk * ref_cpt, 2)
+        rt += p["real_cost"]
+        et += p["est_cost"]
+    for yr in series.get("years", []):
+        tk = int(yr.get("tokens") or 0)
+        yr["real_cost"] = round(tk * real_cpt, 2)
+        yr["est_cost"] = round(tk * ref_cpt, 2)
+    series["real_cost_total"] = round(rt, 2)
+    series["est_cost_total"] = round(et, 2)
+    return series
+
+
+def apply_daily_cost(series: dict, daily_cost: dict) -> dict:
+    """Fold ACCURATE per-day per-model costs (daily_cost: {canonical_date: {real,est}})
+    onto each chart point (day or month bucket) and per-year. Unlike add_estimated_cost's
+    window-blended rate × each day's TOTAL tokens, this attributes an external model's
+    cost only to the days it actually ran — the days its own tokens are non-zero."""
+    gran = series.get("granularity", "day")
+    rt = et = 0.0
+    for p in series.get("points", []):
+        pref = time.strftime("%Y-%m-%d" if gran == "day" else "%Y-%m",
+                             time.gmtime(p.get("t", 0)))
+        n = len(pref)
+        r = sum(c["real"] for dt, c in daily_cost.items() if dt[:n] == pref)
+        e = sum(c["est"] for dt, c in daily_cost.items() if dt[:n] == pref)
+        p["real_cost"] = round(r, 2)
+        p["est_cost"] = round(e, 2)
+        rt += r
+        et += e
+    for yr in series.get("years", []):
+        ys = str(yr.get("year"))
+        yr["real_cost"] = round(sum(c["real"] for dt, c in daily_cost.items()
+                                    if dt[:4] == ys), 2)
+        yr["est_cost"] = round(sum(c["est"] for dt, c in daily_cost.items()
+                                   if dt[:4] == ys), 2)
+    series["real_cost_total"] = round(rt, 2)
+    series["est_cost_total"] = round(et, 2)
+    series["cost_available"] = (rt > 0 or et > 0)
+    return series
+
+
+def cost_model_split(per_model: list) -> dict:
+    """Model names grouped by effective cost bucket (real external vs reference
+    self-hosted), for the cost-over-time legend tooltip. Only models with usage in the
+    window, biggest first; the override-adjusted cost_kind decides the bucket."""
+    out: dict = {"real": [], "reference": []}
+    for r in sorted(per_model or [], key=lambda x: int(x.get("tokens") or 0),
+                    reverse=True):
+        kind = r.get("cost_kind")
+        name = r.get("model") or ""
+        if kind in out and name and name != "(unattributed)" \
+                and int(r.get("tokens") or 0) > 0:
+            out[kind].append(name)
     return out
 
 
@@ -1719,13 +2045,48 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                                       "points": [], "years": []})
         out = {"window": window, "available": True,
                **window_and_years(daily, window, now)}
+        # Estimated cost over time: free-tier LiteLLM has no per-day $, so multiply each
+        # day's tokens by per-model prices (real external vs reference self-hosted rates).
+        try:
+            global _COST_RATES
+            overrides = db.model_kind_overrides()
+            prices = await litellm.model_prices(request.app[_SESSION])
+            per_model = await litellm.per_model_range(request.app[_SESSION], start, end,
+                                                      overrides)
+            # ACCURATE path: per-day per-model tokens → each day's cost from its own model
+            # mix, so an external model's cost lands only on the days it actually ran.
+            daily_cost = await litellm.per_model_daily_cost(
+                request.app[_SESSION], start, end, prices, overrides)
+            if daily_cost:
+                apply_daily_cost(out, daily_cost)
+                out["cost_basis"] = "per-day"
+            else:
+                # Fallback: no per-model daily breakdown — window-blended rate × each day's
+                # tokens (smears an external model's cost across the window, but keeps the
+                # chart populated). /global/activity/model intermittently returns empty on a
+                # busy proxy → rates 0 → reuse the last non-zero rates so it doesn't blink.
+                real_cpt, ref_cpt = cost_rates(per_model or [], prices)
+                if real_cpt or ref_cpt:
+                    _COST_RATES = (real_cpt, ref_cpt)
+                elif _COST_RATES:
+                    real_cpt, ref_cpt = _COST_RATES
+                add_estimated_cost(out, real_cpt, ref_cpt)
+                out["cost_basis"] = "blended"
+            out["cost_models"] = cost_model_split(per_model or [])
+        except Exception as ce:     # cost is best-effort; usage chart must still render
+            print(f"[warn] spend/series cost estimate: {type(ce).__name__}: {ce}",
+                  file=sys.stderr)
+            out["cost_available"] = False
         # ?diag=1: surface what the collector actually got + why rows drop, so an
         # empty chart is diagnosable from the browser (viewer-safe: own spend data).
         if request.query.get("diag"):
+            _pr = await litellm.model_prices(request.app[_SESSION])
             out["diag"] = {"raw_daily_rows": len(daily), "sample_rows": daily[:3],
                            "unparseable_dates": [r.get("date") for r in daily
                                                  if _date_epoch(r.get("date")) is None][:5],
                            "any_spend": any((r.get("spend") or 0) for r in daily),
+                           "priced_models": len(_pr), "prices_sample": dict(list(_pr.items())[:5]),
+                           "cost_available": out.get("cost_available"),
                            "report": await litellm.spend_report_probe(
                                request.app[_SESSION], start, end),
                            "points_built": len(out.get("points", []))}
@@ -1975,6 +2336,9 @@ def build_app() -> web.Application:
     app.router.add_post("/api/admin/settings", api_admin_settings_set)
     app.router.add_get("/api/admin/teams", api_admin_teams_get)
     app.router.add_post("/api/admin/teams", api_admin_teams_set)
+    app.router.add_post("/api/admin/team-budget", api_admin_team_budget_set)
+    app.router.add_get("/api/admin/model-kinds", api_admin_model_kinds_get)
+    app.router.add_post("/api/admin/model-kinds", api_admin_model_kinds_set)
     app.router.add_get("/api/data", data_handler)
     app.router.add_get("/api/series", series_handler)
     app.router.add_get("/api/uptime", uptime_handler)

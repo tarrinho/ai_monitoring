@@ -22,11 +22,16 @@ jobs:
     name: secret scan (TruffleHog + gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Actions pinned to full commit SHA (was major-tag / @main). GitHub's
+      # security-hardening guide requires SHA-pinning for third-party actions;
+      # Dependabot's github-actions ecosystem opens PRs against pinned SHAs.
+      # Bump deliberately by replacing SHA + trailing tag comment.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0          # full history so both scanners see past commits
       - name: TruffleHog
-        uses: trufflesecurity/trufflehog@main
+        # Was @main (mutable branch — supply-chain risk).
+        uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55 # v3.95.9
         with:
           path: ./
           extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude
@@ -53,8 +58,8 @@ jobs:
     name: lint + type (ruff / bandit / semgrep / mypy / vulture)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Install tools
@@ -77,8 +82,8 @@ jobs:
     name: pytest (static + dynamic)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt -r requirements-dev.txt
@@ -88,9 +93,9 @@ jobs:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Trivy fs (HIGH/CRITICAL → fail)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -104,11 +109,11 @@ jobs:
     name: build (test gate) + Trivy image scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build image (in-image test gate)
         run: docker build --build-arg RUN_TESTS=1 -t ai-monitoring:ci .
       - name: Trivy image (HIGH/CRITICAL → fail)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           image-ref: ai-monitoring:ci

@@ -4,6 +4,82 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.5.5] — 2026-07-10
+
+### Changed
+- **Spend page timeline is now "Usage over time" (requests + tokens), not "Spend over
+  time".** Daily dollar cost comes from LiteLLM's `/global/spend/report`, which is
+  **Enterprise-licensed only** — a free/OSS proxy answers `400 "You must be a LiteLLM
+  Enterprise user…"`, and `/global/activity` (the free daily endpoint) carries no spend
+  field. So there is no daily-$ series to draw on the free tier. The timeline now plots
+  what the free tier does provide — daily tokens (bars) and requests (line) — with a
+  note that per-day cost needs Enterprise and that cumulative per-key spend is below.
+  Year tiles show token/request totals. Cost data (per-key/team cumulative spend, from
+  `/global/spend/keys`) is unchanged and still shown.
+
+### Added
+- **Settings → Model costs card.** A per-model board showing each model's cost
+  classification — **real** (external paid API, a market price LiteLLM tracks) vs
+  **estimated** (self-hosted / reference rate) — with the auto-detected default, whether
+  LiteLLM prices it, and an admin-editable override (Save/Reset). The override wins on the
+  Spend & Quota real-vs-estimated split for both the cost-by-model breakdown and the
+  cost-over-time estimate. Backed by a new `model_cost_kind` table + `/api/admin/model-kinds`
+  (GET board / POST set|reset), admin-only via the `/api/admin/*` gate, CSRF-guarded and
+  audited (`model_kind.set` / `model_kind.reset`). `classify_model()` and `per_model_range()`
+  now accept an override map; the board stays populated from `/v1/models` even when the
+  master key can't reach the spend endpoints. The override flows straight into the
+  **cost-over-time** estimate (`cost_rates` reads each row's override-adjusted `cost_kind`),
+  so reclassifying a model shifts its tokens×price between the real and estimated series.
+
+### Added
+- **Current-year cost card (top-right of "Cost over time").** A compact card shows this
+  year's estimated cost broken into **real (external)**, **estimated (self-hosted)**, and
+  **total**, from the same per-year rollup that backs the chart (tokens × per-model price).
+  Falls back to the most recent year if the current one has no data.
+
+### Changed
+- **Spend cost-over-time legend.** The *Estimated (self-hosted)* series is now **grey**
+  (was amber) to read as "not real cash". Hovering *Real (external)* / *Estimated
+  (self-hosted)* in the note line lists the models in each bucket (`/api/spend/series` now
+  returns `cost_models: {real:[…], reference:[…]}`, biggest-usage first).
+
+### Fixed
+- **Teams not 100% assigned — `/key/list` pagination stopped after page 1.** LiteLLM
+  caps `/key/list` at ~10 keys per page and (on some versions) returns no `total_pages`,
+  ignoring our `size=100`. The walker's stop test was `len(page) < 100`, which is true for
+  every capped 10-key page — so it broke after the first page and every key past #10 fell
+  back to the team-less `/global/spend/keys` snapshot (`team=""`, `user=""`). Now it walks
+  by the server's *actual* page size (prefers `total_pages`/`total_count`, else pages until
+  a short page). `/user/list` in the team directory is likewise paginated via a new
+  `_paginate` helper that de-dupes and stops if an endpoint ignores `page=`. A **Refresh**
+  on the Settings Teams board re-detects and heals keys the cache had stuck at "no team".
+- **Clear log on a rejected LiteLLM master key.** When the proxy answers `401/403` on
+  the admin/spend endpoints (`/spend`, `/key/list`, `/global/activity`) the collector now
+  emits a single, plain-language line — `[litellm] AUTH FAILED: LiteLLM rejected the
+  master key … LITELLM_MASTER_KEY is invalid, expired, or not an admin/master key` — the
+  first time auth flips bad (and an `AUTH OK` line when it recovers), instead of a wall of
+  bare `HTTP 401` debug lines that only show under `LITELLM_DEBUG`. `collectors/litellm.sample()`
+  also surfaces `auth_error: true` + a human `error` string so the dashboard/status can say
+  *why* spend and teams are empty. This is the case where a key still lists `/v1/models`
+  but is refused the admin endpoints — it authenticates as a proxy key yet is not a valid
+  master key.
+- **Spend date parsing.** LiteLLM's `/global/activity` daily rows use the display date
+  `Jul 02` (month-abbrev, no year); `collectors/litellm._norm_date` now normalizes it
+  (plus ISO, `YYYY/MM/DD`, epoch) to canonical `YYYY-MM-DD` so daily rows are no longer
+  dropped. Spend-report calls cap `end_date` to today and fall back across variants for
+  the (Enterprise) case where the endpoint is available.
+
+### Changed
+- **`/api/spend/series?diag=1`** returns a per-variant attempt matrix for the spend
+  report (status, top-level keys, row count, has-spend, sample), and also probes
+  `/global/activity/model`, `/global/spend/tags`, `/global/spend/report` (no dates),
+  and `/global/spend/keys` — so it reports whether ANY daily-spend source is alive on
+  a given LiteLLM.
+
+### Packaging
+- Added `web/spend.html` and `web/settings.html` to the `deploy/publish-github.sh`
+  ALLOW-list — they were omitted, so the published tree lacked them and CI failed
+  (`/spend` 500 + `FileNotFoundError` in the static page tests).
 ## [1.5.4] — 2026-07-10
 
 ### Fixed

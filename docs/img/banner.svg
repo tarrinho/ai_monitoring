@@ -1,4 +1,6 @@
-<svg width="1200" height="300" viewBox="0 0 1200 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI-Monitoring — read-only observability for a local LLM stack">
+<svg width="1200" height="300" viewBox="0 0 1200 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="banner-title banner-desc">
+  <title id="banner-title">AI-Monitoring</title>
+  <desc id="banner-desc">Read-only observability for a local LLM stack — no agents, no external deps. Backends: Host, GPU, Ollama, llama.cpp, LiteLLM, Containers. Sample KPIs shown: 57 tokens/s, 262k context, 96% GPU util, 0 backlog.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="300" gradientUnits="userSpaceOnUse">
       <stop stop-color="#0d1117"/>
