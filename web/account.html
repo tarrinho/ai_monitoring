@@ -69,7 +69,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.2</div>
+      <div id="sidebar-brand-ver">v1.5.4</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -81,6 +81,7 @@
     <a href="/ollama">Ollama</a>
     <a href="/llamacpp">llama.cpp</a>
     <a href="/alerts">Alerts</a>
+    <a href="/settings" id="nav-settings" style="display:none">Settings</a>
   </nav>
 </div>
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
@@ -305,10 +306,17 @@
     if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
     var p=location.pathname;
     document.querySelectorAll("#sidebar-nav a").forEach(function(a){
-      if(a.getAttribute("href")===p)a.classList.add("active");});
+      if((a.getAttribute("href")||"").split("?")[0]===p)a.classList.add("active");});
+    // When the page was opened with ?token=, carry it on every internal link so
+    // navigation stays authenticated; with a session cookie (no token) links stay clean.
+    var _tk=new URLSearchParams(location.search).get("token");
+    if(_tk){document.querySelectorAll('a[href^="/"]').forEach(function(a){
+      var h=a.getAttribute("href");
+      if(h&&h.indexOf("token=")<0)a.setAttribute("href",h+(h.indexOf("?")<0?"?":"&")+"token="+encodeURIComponent(_tk));
+    });}
     /* hide nav links for unconfigured backends (same as the dashboards) */
     fetch("/api/nav").then(function(r){return r.ok?r.json():null;}).then(function(n){
-      if(!n)return;
+      if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
       [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
         if(!x[1])document.querySelectorAll('#sidebar-nav a[href="/'+x[0]+'"]').forEach(function(a){a.style.display="none";});
       });

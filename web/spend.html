@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Spend &amp; Quota</title>
+<link rel="icon" href="/assets/favicon.svg">
+<script src="/assets/chart.umd.min.js"></script>
+<script src="/assets/purify.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149;
+  }
+  html[data-theme="light"]{
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eaeef2; --line:#d0d7de;
+    --fg:#1f2328; --muted:#59636e; --accent:#0969da; --ok:#1a7f37;
+    --warn:#9a6700; --bad:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body,.card,#sidebar,header{transition:background-color .2s ease,border-color .2s ease,color .2s ease}
+  .card:hover{border-color:var(--muted)}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .sub{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  #updated{margin-left:auto;color:var(--muted);font-size:12px}
+  .num{font-variant-numeric:tabular-nums}
+  main{padding:18px;display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h2{margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--muted);display:flex;align-items:center;justify-content:space-between;font-weight:600}
+  .card .hint{font-size:11.5px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--muted);font-weight:500}
+  td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
+  .badge{font-size:11px;padding:2px 9px;border-radius:20px;background:var(--panel2);color:var(--muted)}
+  .unavail{color:var(--muted);font-style:italic;padding:8px 0}
+  a{color:var(--accent)}
+  .srv{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;
+    padding:0 6px;margin-left:6px;vertical-align:middle}
+
+  /* summary strip */
+  .bsum{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+  .bstat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 15px;
+    display:flex;flex-direction:column;gap:5px;min-width:0}
+  .bstat.f-bad{box-shadow:inset 3px 0 0 var(--bad)} .bstat.f-warn{box-shadow:inset 3px 0 0 var(--warn)}
+  .bstat .bk{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .bstat .bv{font-size:25px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .bstat .bs{font-size:11.5px;color:var(--muted)}
+  .c-bad{color:var(--bad)} .c-warn{color:var(--warn)} .c-ok{color:var(--ok)} .c-none{color:var(--muted)}
+  /* missing-budget callout */
+  .gap{display:flex;align-items:flex-start;gap:10px;margin:10px 0 2px;padding:10px 12px;
+    border:1px solid var(--warn);border-radius:9px;background:var(--panel2);font-size:12.5px}
+  .gap b{color:var(--warn)}
+  .gap code{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:11.5px}
+
+  /* team rollup */
+  .teamhd{display:flex;align-items:baseline;justify-content:space-between;margin:2px 0 -4px}
+  .teamhd h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+  .teamhd span{font-size:11.5px;color:var(--muted)}
+  .teams{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+  .teamcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px;
+    position:relative;overflow:hidden}
+  .teamcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+  .teamcard.s-bad::before{background:var(--bad)} .teamcard.s-warn::before{background:var(--warn)} .teamcard.s-ok::before{background:var(--ok)}
+  .teamcard .tt{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+  .teamcard .tt b{font-size:14px} .teamcard .tt .pct{font-weight:650;font-variant-numeric:tabular-nums}
+  .teamcard .tsub{font-size:11px;color:var(--muted);margin-top:8px;display:flex;justify-content:space-between;gap:8px}
+
+  /* window toggle */
+  .windows{display:flex;gap:4px}
+  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:4px 11px;font-size:12px;cursor:pointer}
+  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
+  .chart-wrap{height:230px;margin-top:10px}
+  /* wide tables scroll inside their own container instead of spilling the card */
+  .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  #card-keys table{min-width:660px}
+  #card-keys th{white-space:nowrap}
+  /* year tiles — compact + left-aligned (a single year shouldn't stretch full-width) */
+  .years{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,210px));
+    justify-content:start;gap:10px;margin-top:14px}
+  .yr{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+  .yr .yk{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .yr .yv{font-size:21px;font-weight:650;font-variant-numeric:tabular-nums;margin-top:2px}
+  .yr .yb{height:6px;border-radius:4px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line);margin-top:8px;overflow:hidden}
+  .yr .yb i{display:block;height:100%;border-radius:4px;background:var(--accent)}
+  /* budget bars */
+  .btrack{height:9px;border-radius:6px;background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+  .bfill{height:100%;border-radius:6px}
+  /* implied baseline (no budget set) — muted + hatched so it never reads as a real cap */
+  .bfill.implied{opacity:.6;background-image:repeating-linear-gradient(45deg,
+    rgba(255,255,255,.16) 0 3px, transparent 3px 6px)}
+  .bnote{margin-top:10px;font-size:11.5px;color:var(--muted);line-height:1.5}
+  .bnote b{color:var(--fg)}
+  .bmeta{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px}
+  .bpill{font-size:11px;font-weight:600;border-radius:20px;padding:3px 9px;border:1px solid currentColor;white-space:nowrap}
+
+  /* sidebar (shared pattern) */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:900px){.bsum{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:600px){
+    .bsum{grid-template-columns:repeat(2,1fr)}
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
+</style>
+<script>
+/* day/night — applied on every page; choice shared via localStorage */
+(function(){var KEY="aimon-theme";
+  var t=localStorage.getItem(KEY)||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){var b=document.getElementById("theme-btn");
+    if(b)b.textContent=document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  document.addEventListener("DOMContentLoaded",function(){
+    var b=document.getElementById("theme-btn"); if(!b)return; icon();
+    b.addEventListener("click",function(){
+      var cur=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+      document.documentElement.setAttribute("data-theme",cur);
+      localStorage.setItem(KEY,cur); icon();});
+    /* hide dashboard links for unconfigured backends */
+    try{
+      var tok=new URLSearchParams(location.search).get("token");
+      fetch("/api/nav"+(tok?("?token="+encodeURIComponent(tok)):""),
+        {headers:tok?{Authorization:"Bearer "+tok}:{}})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(n){ if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
+          [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+            if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
+              .forEach(function(a){a.style.display="none";});
+          });
+        }).catch(function(){});
+      // live alert indicator on the sidebar "Alerts" item (from any page)
+      function _alertDot(){
+        var tk=new URLSearchParams(location.search).get("token");
+        fetch("/api/alerts"+(tk?("?token="+encodeURIComponent(tk)):""),
+          {headers:tk?{Authorization:"Bearer "+tk}:{}})
+          .then(function(r){return r.ok?r.json():null;})
+          .then(function(d){ if(!d)return;
+            var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+            if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
+          }).catch(function(){});
+      }
+      _alertDot(); setInterval(_alertDot, 10000);
+    }catch(e){}
+  });
+})();
+</script>
+</head>
+<body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.5.4</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/spend">Spend &amp; Quota</a>
+    <a href="/gpu">GPU</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+    <a href="/settings" id="nav-settings" style="display:none">Settings</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
+<header>
+  <div>
+    <h1>Spend &amp; Quota</h1>
+    <div class="sub">LLM cost &amp; usage · per-key budgets</div>
+  </div>
+  <span class="badge" id="period">this month</span>
+  <span id="updated">connecting…</span>
+  <button id="theme-btn" class="badge" title="toggle day / night"
+    style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
+</header>
+<main>
+  <section class="bsum" id="summary" aria-label="Spend summary">
+    <div class="unavail">loading…</div>
+  </section>
+
+  <section class="card" id="card-spend-time" aria-label="Spend over time">
+    <h2>Spend over time
+      <span class="windows" id="sp-windows">
+        <button data-w="30d" class="active">30 days</button>
+        <button data-w="12mo">12 months</button>
+      </span></h2>
+    <div id="split-note" class="hint" style="margin-top:6px"></div>
+    <div class="chart-wrap"><canvas id="spend-chart"></canvas></div>
+    <div class="years" id="years"></div>
+  </section>
+
+  <div class="teamhd" id="teamhd" style="display:none">
+    <h2>By team</h2><span>budget rolled up across each team's keys</span>
+  </div>
+  <section class="teams" id="teams" aria-label="Budget by team"></section>
+
+  <section class="card" id="card-keys" aria-label="Per-key budgets">
+    <h2>Per-key budgets — ranked by risk
+      <span class="hint">budget vs spent · projected exhaustion · closest-to-cap first</span></h2>
+    <div id="budget-gap"></div>
+    <div id="keys-body"><div class="unavail">loading…</div></div>
+  </section>
+
+  <p class="unavail" style="font-size:12px;border-top:1px solid var(--line);padding-top:14px">
+    <b style="color:var(--fg)">Scope:</b> budgets, spend, and token usage come from LiteLLM's own
+    accounting (per-key <span class="num">max_budget</span> / <span class="num">spend</span>).
+    Third-party subscription quotas appear only for providers routed through LiteLLM.
+    Infra health lives on <a href="/">Overview</a>.
+  </p>
+</main>
+
+<script>
+"use strict";
+function escapeHtml(s){
+  if(s===null||s===undefined) return "";
+  return String(s).replace(/[&<>"']/g,c=>(
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function setHtml(el,html){ el.innerHTML = DOMPurify.sanitize(html); }
+const _timers = [];
+window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
+
+const AUTH = new URLSearchParams(location.search).get("token");
+async function api(path){
+  try{
+    const sep=path.includes("?")?"&":"?";
+    const url=path+(AUTH?(sep+"token="+encodeURIComponent(AUTH)):"");
+    const r=await fetch(url,{headers:AUTH?{Authorization:"Bearer "+AUTH}:{}});
+    if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
+    return await r.json();
+  }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
+}
+const money=v=>"$"+Math.round(v||0).toLocaleString();
+const scls=p=>p>=90?"bad":p>=70?"warn":"ok";
+const SLBL={bad:"Critical",warn:"Watch",ok:"On track",none:"No budget"};
+
+// ── spend over time (30d daily / 12mo monthly) + spending per year ──
+let SPWIN="30d";
+function cssv(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n; }
+function axisSp(t,gran){
+  const d=new Date(t*1000);
+  return gran==="month" ? d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)
+                        : d.toLocaleDateString([],{month:"short",day:"numeric"});
+}
+const spendChart=new Chart(document.getElementById("spend-chart"),{
+  type:"bar",
+  data:{labels:[],datasets:[
+    {label:"Real spend (external)",data:[],borderRadius:3,stack:"s",backgroundColor:cssv("--accent")},
+    {label:"Reference cost (internal)",data:[],borderRadius:3,stack:"s",backgroundColor:cssv("--muted")}
+  ]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    plugins:{legend:{display:true,position:"top",align:"end",
+        labels:{color:"#8b949e",boxWidth:10,boxHeight:10,font:{size:11}}},
+      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": $"+Math.round(c.parsed.y).toLocaleString()}}},
+    scales:{
+      x:{stacked:true,ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:10}},grid:{display:false}},
+      y:{stacked:true,ticks:{color:"#8b949e",font:{size:10},callback:v=>"$"+v},
+         grid:{color:"#30363d55"},beginAtZero:true}}}
+});
+function renderYears(years,split){
+  const el=document.getElementById("years");
+  if(!years||!years.length){ setHtml(el,""); return; }
+  const max=Math.max(...years.map(y=>y.spend))||1;
+  setHtml(el, years.map(y=>{
+    const sub=split&&y.real!=null
+      ? `<div class="bs" style="margin-top:6px;display:flex;justify-content:space-between">`
+        +`<span class="c-ok">real ${money(y.real)}</span><span style="color:var(--muted)">ref ${money(y.reference)}</span></div>`
+      : "";
+    return `<div class="yr"><div class="yk">${escapeHtml(String(y.year))} · total</div>`
+      +`<div class="yv num">${money(y.spend)}</div>`
+      +`<div class="yb"><i style="width:${Math.round(y.spend/max*100)}%"></i></div>${sub}</div>`;
+  }).join(""));
+}
+async function loadSpendSeries(){
+  const d=await api("/api/spend/series?window="+SPWIN);
+  if(!d) return;
+  const pts=d.points||[], split=!!d.split_available;
+  const note=document.getElementById("split-note");
+  if(!pts.length){                 // no data at all — say WHY, not "no split"
+    spendChart.data.labels=[]; spendChart.data.datasets.forEach(ds=>ds.data=[]);
+    spendChart.update("none");
+    renderYears([], false);
+    setHtml(note, d.available===false
+      ? `<span style="color:var(--warn)">No spend data from LiteLLM.</span> `
+        +`<span style="color:var(--muted)">Check <b>LITELLM_BASE_URL</b> / `
+        +`<b>LITELLM_MASTER_KEY</b>, and that the master key can read `
+        +`<code>/global/activity</code> or <code>/global/spend/report</code>. `
+        +`Set <code>LITELLM_DEBUG=1</code> to log what each call returned.</span>`
+      : `<span style="color:var(--muted)">No spend recorded in this window.</span>`);
+    return;
+  }
+  spendChart.data.labels=pts.map(p=>axisSp(p.t,d.granularity));
+  if(split){
+    spendChart.data.datasets[0].data=pts.map(p=>p.real);
+    spendChart.data.datasets[1].data=pts.map(p=>p.reference);
+    spendChart.data.datasets[0].hidden=false; spendChart.data.datasets[1].hidden=false;
+  } else {
+    spendChart.data.datasets[0].data=pts.map(p=>p.spend);
+    spendChart.data.datasets[0].label="Spend";
+    spendChart.data.datasets[1].data=[]; spendChart.data.datasets[1].hidden=true;
+  }
+  spendChart.data.datasets[0].backgroundColor=cssv("--accent");
+  spendChart.data.datasets[1].backgroundColor=cssv("--muted");
+  spendChart.update("none");
+  if(split){
+    const real=d.real_total||0, ref=d.reference_total||0, tot=real+ref||1;
+    let html = `<b class="c-ok">Real spend ${money(real)}</b> `
+      +`<span style="color:var(--muted)">(${Math.round(real/tot*100)}% — external paid providers)</span>`
+      +` &nbsp;·&nbsp; <b>Reference cost ${money(ref)}</b> `
+      +`<span style="color:var(--muted)">(self-hosted models — no real cash)</span>`;
+    // All spend is self-hosted (assigned/estimated prices) — explain why "Real" is
+    // $0 and how to make those prices count as real, budgetable spend if wanted.
+    if(real===0 && ref>0)
+      html += `<br><span style="color:var(--muted)">All spend is <b>reference</b> `
+        +`(self-hosted, estimated value). To count your assigned prices as real, `
+        +`budgetable spend, set <code>MONITOR_INTERNAL_PROVIDERS=</code> (empty).</span>`;
+    setHtml(note, html);
+  } else {
+    setHtml(note, `<span style="color:var(--muted)">Connect per-model spend to split real `
+      +`(external) vs reference (self-hosted) cost.</span>`);
+  }
+  renderYears(d.years, split);
+}
+document.querySelectorAll("#sp-windows button[data-w]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#sp-windows button").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); SPWIN=b.dataset.w; loadSpendSeries();
+  });
+});
+
+function stat(k,v,cls,sub,flag){
+  const cv=(cls==="bad"||cls==="warn"||cls==="ok")?` class="bv c-${cls}"`:' class="bv"';
+  const fl=flag?` f-${flag}`:"";
+  return `<div class="bstat${fl}"><div class="bk">${escapeHtml(k)}</div>`
+    +`<div${cv}>${escapeHtml(String(v))}</div>`
+    +(sub?`<div class="bs">${escapeHtml(sub)}</div>`:"")+`</div>`;
+}
+
+function renderSummary(s){
+  const hasRef = s.reference!=null && s.reference>0;
+  const budSub = (s.budgeted!=null) ? `${s.budgeted} of ${s.keys} keys budgeted` : `${s.keys} keys`;
+  setHtml(document.getElementById("summary"),
+     stat("Real spend · month", money(s.spent), "", "of "+money(s.budget)+" budget")
+    +stat("Reference cost", hasRef?money(s.reference):"—", "", "self-hosted · no cash")
+    +stat("Budget used", (s.pct||0)+"%", scls(s.pct), budSub, (s.pct>=90?"bad":s.pct>=70?"warn":""))
+    +stat("Burn / day", money(s.burn), "", "real, month-to-date")
+    +stat("Projected", money(s.projected), s.over?"bad":"ok", s.over?"over budget":"on track", s.over?"bad":"")
+    +stat("Days to cap", (s.days_to_cap==null?"—":s.days_to_cap), "", "before month-end"));
+}
+
+// Surface keys whose budget was never defined — their spend is real and uncapped.
+function renderGap(s, src){
+  const el=document.getElementById("budget-gap");
+  if(!s.unbudgeted){ setHtml(el,""); return; }
+  const many=s.unbudgeted>1;
+  const how = (src==="litellm")
+    ? `set <code>max_budget</code> on the key in LiteLLM`
+    : `set <code>max_budget</code> on the key in LiteLLM, or add it to <code>MONITOR_KEY_BUDGETS</code>`;
+  setHtml(el, `<div class="gap"><span>&#9888;</span><div>`
+    +`<b>${s.unbudgeted} key${many?"s have":" has"} no budget defined</b> — `
+    +`${money(s.unbudgeted_spend)} of real spend this month is uncapped and counts `
+    +`against no quota. To cap ${many?"them":"it"}, ${how}.</div></div>`);
+}
+
+function renderTeams(keys){
+  const by={};
+  keys.forEach(r=>{ const t=r.team||""; if(!t) return;
+    (by[t]=by[t]||{spent:0,reference:0,budget:0,n:0,nb:0});
+    by[t].spent+=r.spent; by[t].reference+=(r.reference||0);
+    by[t].budget+=(r.budget||0); by[t].n++; if(!r.budget) by[t].nb++; });
+  const ORD={bad:0,warn:1,ok:2,none:3};
+  const teams=Object.entries(by).map(([name,t])=>{
+    const pct=t.budget>0?Math.round(t.spent/t.budget*1000)/10:null;
+    return {name,pct,st:(pct==null?"none":scls(pct)),...t};
+  }).sort((a,b)=>(ORD[a.st]-ORD[b.st])||((b.pct||0)-(a.pct||0)));
+  const hd=document.getElementById("teamhd");
+  if(!teams.length){ hd.style.display="none"; setHtml(document.getElementById("teams"),""); return; }
+  hd.style.display="flex";
+  setHtml(document.getElementById("teams"), teams.map(t=>{
+    const nb=(t.pct==null);
+    const bg="var(--"+(t.st==="bad"?"bad":t.st==="warn"?"warn":"ok")+")";
+    const bar=nb?"":`<div class="bfill" style="width:${Math.min(100,t.pct)}%;background:${bg}"></div>`;
+    const cap=nb?`<span style="color:var(--warn)">no budget set</span>`:`${money(t.budget)} real`;
+    const tail=t.nb>0?`<span style="color:var(--warn)">${t.nb} unbudgeted</span>`
+      :(t.reference>0?`<span style="color:var(--muted)">+ ${money(t.reference)} ref</span>`
+                     :`<span>${t.n} key${t.n>1?"s":""}</span>`);
+    return `<div class="teamcard s-${t.st}">`
+      +`<div class="tt"><b>${escapeHtml(t.name)}</b><span class="pct c-${t.st}">${nb?"—":t.pct+"%"}</span></div>`
+      +`<div class="btrack">${bar}</div>`
+      +`<div class="tsub"><span class="num">${money(t.spent)} / ${cap}</span>${tail}</div></div>`;}).join(""));
+}
+
+function renderKeys(keys){
+  if(!keys.length){ setHtml(document.getElementById("keys-body"),
+    `<div class="unavail">No API keys with spend yet. Once LiteLLM reports per-key `
+    +`usage they appear here — a budget is optional (keys without one are listed `
+    +`as “No budget”).</div>`); return; }
+  const nbCount=keys.filter(k=>!k.budget).length;
+  const baseline=keys.reduce((m,k)=>Math.max(m,k.spent||0),0);
+  const rows=keys.map(r=>{
+    const nb=!r.budget;                       // no budget defined for this key
+    const bg="var(--"+(r.status==="bad"?"bad":r.status==="warn"?"warn":"ok")+")";
+    const dc=nb?"—":((r.days_to_cap==null)?"—":(r.days_to_cap<0?"over":r.days_to_cap+"d"));
+    const dcls=(!nb&&r.days_to_cap!=null&&r.days_to_cap<3)?"c-bad":"";
+    const ref=(r.reference!=null&&r.reference>0)?money(r.reference):"—";
+    // no budget → draw against the implied baseline (top spender), muted + dashed
+    const ipct=nb?(r.implied_pct||0):r.pct;
+    const bar=`<div class="bfill${nb?" implied":""}" style="width:${Math.max(0,Math.min(100,ipct))}%;`
+      +`background:${nb?"var(--muted)":bg}"></div>`;
+    const cap=nb
+      ? `<span style="color:var(--muted)">${money(r.implied_budget||baseline)} <span style="color:var(--warn)">ref*</span></span>`
+      : `${money(r.budget)} real`;
+    return `<tr><td><b>${escapeHtml(r.key)}</b>`
+      +(r.team?`<span class="srv">${escapeHtml(r.team)}</span>`:"")+`</td>`
+      +`<td style="min-width:200px"><div class="btrack">${bar}</div>`
+      +`<div class="bmeta"><span class="num">${money(r.spent)} / ${cap}</span>`
+      +`<span${nb?' style="color:var(--muted)"':''}>${ipct}%${nb?"*":""}</span></div></td>`
+      +`<td class="r" style="color:var(--muted)">${ref}</td>`
+      +`<td class="r">${money(r.burn)}</td>`
+      +`<td class="r ${dcls}">${dc}</td>`
+      +`<td class="r"><span class="bpill c-${r.status}">${SLBL[r.status]}</span></td></tr>`;
+  }).join("");
+  const note = nbCount
+    ? `<div class="bnote">* No budget set. The bar is drawn against this month's `
+      +`<b>top spender (${money(baseline)})</b> as a reference baseline so it stays `
+      +`comparable — it is <b>not a budget</b>, consumes no quota, and never triggers `
+      +`a cap alert.</div>`
+    : "";
+  setHtml(document.getElementById("keys-body"),
+    `<div class="tscroll"><table><tr><th>Key / team</th><th>Real spend vs budget</th>`
+    +`<th class="r">Ref cost</th><th class="r">Burn/day</th>`
+    +`<th class="r">Days to cap</th><th class="r">Status</th></tr>${rows}</table></div>${note}`);
+}
+
+async function tick(){
+  const d=await api("/api/budgets");
+  if(!d) return;
+  document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString();
+  if(!d.available || !(d.keys&&d.keys.length)){
+    setHtml(document.getElementById("summary"),
+      `<div class="unavail" style="grid-column:1/-1">No per-key spend yet — point `
+      +`<b>LITELLM_BASE_URL</b> + <b>LITELLM_MASTER_KEY</b> at your proxy and this page `
+      +`fills in. Budgets are read from each key's <b>max_budget</b> in LiteLLM `
+      +`(override with <b>MONITOR_KEY_BUDGETS</b>); keys without one still show their spend.</div>`);
+    document.getElementById("teamhd").style.display="none";
+    setHtml(document.getElementById("budget-gap"),"");
+    renderKeys([]); loadSpendSeries(); return;
+  }
+  renderSummary(d.summary||{});
+  renderGap(d.summary||{}, d.budget_source);
+  renderTeams(d.keys);
+  renderKeys(d.keys);
+  loadSpendSeries();
+}
+tick();
+_timers.push(setInterval(tick, 5000));
+</script>
+</div>
+<script>
+/* collapsible lateral sidebar — state persisted, active link by path */
+(function(){var KEY="aimon_sb";
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if((a.getAttribute("href")||"").split("?")[0]===p)a.classList.add("active");});
+    // When the page was opened with ?token=, carry it on every internal link so
+    // navigation stays authenticated; with a session cookie (no token) links stay clean.
+    var _tk=new URLSearchParams(location.search).get("token");
+    if(_tk){document.querySelectorAll('a[href^="/"]').forEach(function(a){
+      var h=a.getAttribute("href");
+      if(h&&h.indexOf("token=")<0)a.setAttribute("href",h+(h.indexOf("?")<0?"?":"&")+"token="+encodeURIComponent(_tk));
+    });}
+  });
+})();
+</script>
+</body>
+</html>

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.5.2"
+VERSION = "AI-Monitoring_1.5.4"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -304,3 +304,137 @@ def validate(user_count: int = 0) -> list[str]:
                     "MONITOR_ALLOW_OPEN=1 to run open on purpose (loopback / behind "
                     "an authenticating proxy only).")
     return errs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Runtime-tunable settings — a curated, NON-SECRET subset that admins may change
+# from the Settings UI (persisted in the `settings` table, overlaid over the env
+# defaults above). Secrets, bind/infra, and security switches (ALLOW_OPEN,
+# COOKIE_ALLOW_INSECURE, AUTH_TRUSTED_PROXY, tokens, keys, URLs, ports) are NOT
+# here on purpose — they must require host access. Read the LIVE value via
+# tunable(name), never the bare module constant, so a UI change applies without a
+# restart. Keys are the config attribute name; `def` is the env-derived default.
+TUNABLES: dict[str, dict] = {
+    # ── Phase 1: alert thresholds (0 = off) ──
+    "ALERT_CPU_PCT":  {"t": "float", "def": ALERT_CPU_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "CPU % ≥", "help": "Fire when host CPU ≥ this (0 = off)"},
+    "ALERT_MEM_PCT":  {"t": "float", "def": ALERT_MEM_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "Memory % ≥", "help": "Host RAM used ≥ this"},
+    "ALERT_DISK_PCT": {"t": "float", "def": ALERT_DISK_PCT, "min": 0, "max": 100, "group": "Alerts", "label": "Disk % ≥", "help": "Root filesystem ≥ this"},
+    "ALERT_GPU_PCT":  {"t": "float", "def": ALERT_GPU_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "GPU % ≥", "help": "GPU utilisation ≥ this"},
+    "ALERT_VRAM_PCT": {"t": "float", "def": ALERT_VRAM_PCT, "min": 0, "max": 100, "group": "Alerts", "label": "VRAM % ≥", "help": "GPU memory used ≥ this"},
+    "ALERT_LLM_WAIT_MS": {"t": "float", "def": ALERT_LLM_WAIT_MS, "min": 0, "max": 600000, "group": "Alerts", "label": "LLM wait (ms) ≥", "help": "LiteLLM avg response ≥ this"},
+    "ALERT_BACKLOG":  {"t": "float", "def": ALERT_BACKLOG,  "min": 0, "max": 100000, "group": "Alerts", "label": "LLM backlog ≥", "help": "In-flight LiteLLM requests ≥ this"},
+    "ALERT_REPEAT_MIN": {"t": "float", "def": ALERT_REPEAT_MIN, "min": 1, "max": 1440, "group": "Alerts", "label": "Re-notify after (min)", "help": "Cooldown before an alert re-fires"},
+    # ── Phase 2: sampling / retention / LiteLLM tuning ──
+    "SAMPLE_INTERVAL": {"t": "float", "def": SAMPLE_INTERVAL, "min": 1, "max": 3600, "group": "Sampling", "label": "Sample interval (s)", "help": "Seconds between backend samples"},
+    "DB_RETENTION_HOURS": {"t": "int", "def": DB_RETENTION_HOURS, "min": 1, "max": 26280, "group": "Retention", "label": "Raw retention (h)", "help": "Hours of raw samples kept on disk"},
+    "AUDIT_RETENTION_DAYS": {"t": "int", "def": AUDIT_RETENTION_DAYS, "min": 1, "max": 3650, "group": "Retention", "label": "Audit retention (days)", "help": "Days of admin audit trail kept"},
+    "GPU_FILE_MAX_AGE": {"t": "float", "def": GPU_FILE_MAX_AGE, "min": 2, "max": 3600, "group": "GPU", "label": "GPU file stale (s)", "help": "Treat the GPU metrics file as stale past this age"},
+    "SLO_LATENCY_MS": {"t": "float", "def": SLO_LATENCY_MS, "min": 0, "max": 600000, "group": "LiteLLM", "label": "SLO latency (ms)", "help": "Target latency; % under this is the SLO"},
+    "LITELLM_SPEND_WINDOW_MIN": {"t": "int", "def": LITELLM_SPEND_WINDOW_MIN, "min": 1, "max": 1440, "group": "LiteLLM", "label": "Spend window (min)", "help": "Rolling window for latency/rate KPIs"},
+    "LITELLM_HEAVY_INTERVAL": {"t": "float", "def": LITELLM_HEAVY_INTERVAL, "min": 10, "max": 3600, "group": "LiteLLM", "label": "Heavy poll interval (s)", "help": "Min seconds between /spend/logs pulls"},
+    "LITELLM_SPEND_MODE": {"t": "choice", "def": LITELLM_SPEND_MODE, "choices": ["full", "lite"], "group": "LiteLLM", "label": "Spend mode", "help": "full = /spend/logs; lite = /global/activity (cheaper)"},
+    "LITELLM_CB_THRESHOLD": {"t": "int", "def": LITELLM_CB_THRESHOLD, "min": 1, "max": 100, "group": "LiteLLM", "label": "Circuit-breaker fails", "help": "Consecutive fails before the breaker opens"},
+    "LITELLM_CB_COOLDOWN": {"t": "float", "def": LITELLM_CB_COOLDOWN, "min": 10, "max": 3600, "group": "LiteLLM", "label": "Circuit-breaker cooldown (s)", "help": "How long the breaker stays open"},
+}
+
+_overrides: dict[str, str] = {}   # name -> raw string; only keys in TUNABLES
+
+
+def _apply(name: str) -> None:
+    """Write the live value onto the module constant so existing consumers that
+    read `config.<NAME>` directly pick up an override without any code change.
+    When the override is cleared, tunable() returns the default → resets it."""
+    try:
+        globals()[name] = tunable(name)
+    except Exception:
+        pass
+
+
+def load_overrides(items: dict | None) -> None:
+    """Replace the in-memory overlay from the persisted store (startup / reload)
+    and re-apply every tunable onto its module constant."""
+    _overrides.clear()
+    for k, v in (items or {}).items():
+        if k in TUNABLES:
+            _overrides[k] = str(v)
+    for name in TUNABLES:
+        _apply(name)
+
+
+def _coerce(spec: dict, raw):
+    t = spec["t"]
+    if t == "float":
+        return float(raw)
+    if t == "int":
+        return int(float(raw))
+    if t == "bool":
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return str(raw)
+
+
+def tunable(name: str):
+    """Live value for a tunable: the operator override if set + valid, else the
+    env/default. Consumers MUST call this instead of the module constant."""
+    spec = TUNABLES[name]
+    if name in _overrides:
+        try:
+            return _coerce(spec, _overrides[name])
+        except Exception:
+            pass
+    return spec["def"]
+
+
+def validate_tunable(name: str, raw) -> tuple[bool, str, str]:
+    """(ok, normalized_string, error) — type + bounds + choice validation."""
+    spec = TUNABLES.get(name)
+    if not spec:
+        return (False, "", "unknown setting")
+    t = spec["t"]
+    if t == "choice":
+        s = str(raw).strip().lower()
+        return (True, s, "") if s in spec["choices"] \
+            else (False, "", "must be one of " + ", ".join(spec["choices"]))
+    if t == "bool":
+        return (True, "1" if str(raw).strip().lower() in ("1", "true", "yes", "on") else "0", "")
+    try:
+        num = float(raw)
+    except Exception:
+        return (False, "", "must be a number")
+    if t == "int":
+        num = int(num)
+    lo, hi = spec.get("min"), spec.get("max")
+    if lo is not None and num < lo:
+        return (False, "", f"must be ≥ {lo}")
+    if hi is not None and num > hi:
+        return (False, "", f"must be ≤ {hi}")
+    return (True, (str(int(num)) if t == "int" else str(num)), "")
+
+
+def set_override(name: str, raw) -> tuple[bool, str, str]:
+    """Validate + record in the overlay. Caller persists to db and reloads.
+    Returns (ok, normalized_string, error)."""
+    ok, val, err = validate_tunable(name, raw)
+    if ok:
+        _overrides[name] = val
+        _apply(name)
+    return (ok, val, err)
+
+
+def clear_override(name: str) -> None:
+    _overrides.pop(name, None)
+    _apply(name)
+
+
+def tunables_view() -> list[dict]:
+    """UI snapshot: each tunable with its live value, default, and override flag."""
+    out = []
+    for name, spec in TUNABLES.items():
+        out.append({
+            "name": name, "group": spec["group"], "label": spec["label"],
+            "help": spec.get("help", ""), "type": spec["t"],
+            "min": spec.get("min"), "max": spec.get("max"),
+            "choices": spec.get("choices"),
+            "value": tunable(name), "default": spec["def"],
+            "overridden": name in _overrides,
+        })
+    return out

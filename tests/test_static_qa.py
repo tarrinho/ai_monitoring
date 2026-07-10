@@ -369,7 +369,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.5.2"
+    assert config.VERSION == "AI-Monitoring_1.5.4"
 
 
 def test_ux_improvements_present():
@@ -867,6 +867,38 @@ def test_demo_seed_theme_shim_forwards_kwargs():
         "theme shim must accept **kw (else user/role kwargs 500 the page)"
     assert "_orig_serve(path, prefix, **kw)" in src, \
         "theme shim must forward **kw to the real _serve_page"
+
+
+def test_settings_page_exists_with_tunables_and_teams():
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    assert 'id="groups"' in html and 'id="teams"' in html, "settings page missing sections"
+    assert "/api/admin/settings" in html and "/api/admin/teams" in html
+    # admin-only note + LiteLLM-enterprise team-budgets documentation on the page
+    assert "Enterprise" in html and "team budgets" in html.lower()
+    # no raw innerHTML sink — the page is built with DOM APIs
+    assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
+
+
+def test_config_tunables_exclude_secrets_and_switches():
+    import config
+    # Only non-secret operational tuning is runtime-changeable. Secrets, infra and
+    # security switches must NEVER be tunable from the UI.
+    forbidden = {
+        "MONITOR_DASHBOARD_TOKEN", "MONITOR_METRICS_TOKEN", "LITELLM_MASTER_KEY",
+        "LLAMACPP_API_KEY", "GPU_SSH_KEY", "MONITOR_ADMIN_PASSWORD",
+        "MONITOR_ALLOW_OPEN", "MONITOR_COOKIE_ALLOW_INSECURE",
+        "MONITOR_AUTH_TRUSTED_PROXY", "ALLOW_OPEN", "COOKIE_ALLOW_INSECURE",
+        "AUTH_TRUSTED_PROXY", "DASHBOARD_TOKEN", "METRICS_TOKEN",
+        "LITELLM_BASE_URL", "OLLAMA_BASE_URL", "LLAMACPP_BASE_URL",
+        "MONITOR_HOST", "MONITOR_PORT", "DB_PATH",
+    }
+    assert not (forbidden & set(config.TUNABLES)), \
+        "a secret / infra / security switch leaked into config.TUNABLES"
+    assert "ALERT_CPU_PCT" in config.TUNABLES and "SAMPLE_INTERVAL" in config.TUNABLES
+    # every tunable spec is well-formed
+    for spec in config.TUNABLES.values():
+        assert spec["t"] in ("float", "int", "bool", "choice")
+        assert "def" in spec and "group" in spec and "label" in spec
 
 
 # ══════════════════════════════════════════════════════════════════════════════

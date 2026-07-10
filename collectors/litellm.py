@@ -414,8 +414,66 @@ def _rows_of(d):
     return None
 
 
+def _norm_date(raw) -> str:
+    """Normalize any date LiteLLM emits to canonical `YYYY-MM-DD`, or '' if
+    unparseable. Handles `2026-07-02`, `2026/07/02`, ISO datetimes, epoch s/ms, and
+    LiteLLM's display format `Jul 02` / `July 2` (year assumed = most recent that
+    isn't in the future). Normalizing here lets the /global/activity (reqs/tokens)
+    and /global/spend/report (spend) rows MERGE by date even when the two endpoints
+    format dates differently."""
+    import calendar
+    import datetime as _dt
+    if raw is None or raw == "":
+        return ""
+    if isinstance(raw, (int, float)) or (isinstance(raw, str)
+                                         and str(raw).strip().lstrip("-").isdigit()):
+        try:
+            n = float(raw)
+        except (ValueError, TypeError):
+            return ""
+        if n > 1e12:
+            n /= 1000.0
+        return time.strftime("%Y-%m-%d", time.gmtime(n)) if n > 1e8 else ""
+    s = str(raw).strip()
+    iso = s.replace("/", "-").replace("T", " ")[:10]
+    try:
+        time.strptime(iso, "%Y-%m-%d")
+        return iso
+    except ValueError:
+        pass
+    for fmt in ("%b %d", "%B %d"):            # "Jul 02" / "July 2" — no year
+        try:
+            t = time.strptime(s, fmt)
+        except ValueError:
+            continue
+        now = time.gmtime()
+        for y in (now.tm_year, now.tm_year - 1):
+            cand = f"{y:04d}-{t.tm_mon:02d}-{t.tm_mday:02d}"
+            if calendar.timegm(time.strptime(cand, "%Y-%m-%d")) <= time.time() + 86400:
+                return cand
+        return f"{now.tm_year:04d}-{t.tm_mon:02d}-{t.tm_mday:02d}"
+    try:
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _fnum(v) -> float:
+    """Coerce a possibly-string/None/dict spend or count to a float — never raise."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.replace(",", "").strip() or 0)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 def _parse_daily(rows) -> tuple[list[dict], bool]:
-    """(parsed rows, whether any row actually carried a spend value)."""
+    """(parsed rows, whether any row actually carried a spend value). Values are
+    coerced defensively — a stray string/None/nested field must never crash the
+    Spend page (it used to 500 on unexpected LiteLLM response shapes)."""
     out: list[dict] = []
     has_spend = False
     for r in rows or []:
@@ -425,12 +483,32 @@ def _parse_daily(rows) -> tuple[list[dict], bool]:
         if not dt:
             continue
         sp = _pick(r, _SPEND_KEYS)
-        if sp is not None:
+        if isinstance(sp, (int, float)) or (isinstance(sp, str) and sp.strip()):
             has_spend = True
-        out.append({"date": str(dt)[:10], "spend": float(sp or 0),
-                    "requests": int(_pick(r, _REQ_KEYS) or 0),
-                    "tokens": int(_pick(r, _TOK_KEYS) or 0)})
+        out.append({"date": _norm_date(dt) or str(dt)[:10], "spend": _fnum(sp),
+                    "requests": int(_fnum(_pick(r, _REQ_KEYS))),
+                    "tokens": int(_fnum(_pick(r, _TOK_KEYS)))})
     return out, has_spend
+
+
+async def spend_report_probe(session: aiohttp.ClientSession,
+                             start_date: str, end_date: str) -> dict:
+    """Diagnostics only: raw shape of `/global/spend/report` so an all-zero Spend
+    chart is explainable from the browser (does report even return spend, and in
+    what date format?). Viewer-safe: it's the operator's own aggregate spend."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return {"configured": False}
+    rng = f"start_date={start_date}&end_date={end_date}"
+    d, err = await fetch_json(session, f"{base.rstrip('/')}/global/spend/report?{rng}",
+                              headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None:
+        return {"configured": True, "error": err}
+    rows = _rows_of(d) or []
+    parsed, has_spend = _parse_daily(rows)
+    return {"configured": True, "raw_rows": len(rows),
+            "sample_raw": rows[:3] if isinstance(rows, list) else str(rows)[:200],
+            "parsed_has_spend": has_spend, "sample_parsed": parsed[:3]}
 
 
 async def spend_activity(session: aiohttp.ClientSession,
@@ -473,11 +551,57 @@ async def spend_activity(session: aiohttp.ClientSession,
     return daily
 
 
+async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[dict, dict]:
+    """Team lookups so a key's team can be resolved via its USER when the key
+    itself carries no team (LiteLLM often attaches the team to the user, not the
+    key). Returns (by_team_id, by_user_id) → {id: team_alias}. Best-effort: empty
+    on older/OSS LiteLLM or missing master-key scope, so resolution degrades to the
+    key's own team."""
+    by_id: dict[str, str] = {}
+    by_user: dict[str, str] = {}
+    tl, err = await fetch_json(session, f"{base}/team/list",
+                               headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    teams = (tl.get("teams") if isinstance(tl, dict) else tl) if err is None else None
+    if isinstance(teams, list):
+        for t in teams:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("team_id") or "")
+            alias = str(t.get("team_alias") or t.get("team_id") or "")
+            if tid:
+                by_id[tid] = alias
+            members = t.get("members_with_roles") or t.get("members") or []
+            for m in members if isinstance(members, list) else []:
+                uid = (m.get("user_id") if isinstance(m, dict) else m) or ""
+                if uid:
+                    by_user.setdefault(str(uid), alias)
+    # /user/list as a secondary source (a user's own team membership)
+    ul, err2 = await fetch_json(session, f"{base}/user/list?page_size=500",
+                                headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    users = (ul.get("users") if isinstance(ul, dict) else ul) if err2 is None else None
+    if isinstance(users, list):
+        for u in users:
+            if not isinstance(u, dict):
+                continue
+            uid = str(u.get("user_id") or "")
+            if not uid or uid in by_user:
+                continue
+            tms = u.get("teams") or []
+            first = tms[0] if isinstance(tms, list) and tms else None
+            if isinstance(first, dict):
+                by_user[uid] = str(first.get("team_alias") or first.get("team_id") or "")
+            elif first:
+                by_user[uid] = by_id.get(str(first), str(first))
+    _dbg(f"/team directory: teams={len(by_id)} users_mapped={len(by_user)}")
+    return by_id, by_user
+
+
 async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     """Per-key `max_budget` + `spend` straight from LiteLLM's key-management API
-    (`/key/list`, master-key only). Returns {alias: {budget, spend, team}} — budget
-    is 0 when the key has no `max_budget` set. None when LiteLLM is unconfigured or
-    the endpoint is unavailable (older LiteLLM), so the caller can fall back."""
+    (`/key/list`, master-key only). Returns {alias: {budget, spend, team, user}} —
+    budget is 0 when the key has no `max_budget`. The team is resolved key →
+    team_id → USER (LiteLLM often puts the team on the user, not the key). None when
+    LiteLLM is unconfigured or the endpoint is unavailable, so the caller can fall back."""
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
         return None
@@ -491,6 +615,10 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     rows = d.get("keys") or d.get("data") if isinstance(d, dict) else d
     if not isinstance(rows, list):
         return None
+    # Resolve a key's team through team_id and (if the key has none) its user,
+    # since LiteLLM commonly attaches the team to the user, and /key/list may carry
+    # only a team_id UUID rather than the human alias shown in the LiteLLM UI.
+    by_id, by_user = await _team_directory(session, base)
     out: dict = {}
     for k in rows:
         if not isinstance(k, dict):
@@ -498,12 +626,21 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         alias = (k.get("key_alias") or k.get("key_name") or k.get("token") or "")
         if not alias:
             continue
+        uid = str(k.get("user_id") or "")
+        team = str(k.get("team_alias") or "")
+        if not team:
+            tid = str(k.get("team_id") or "")
+            team = by_id.get(tid, tid) if tid else ""     # team_id UUID → alias
+        if not team and uid:
+            team = by_user.get(uid, "")                   # else via the user's team
         out[str(alias)] = {
             "budget": float(k.get("max_budget") or 0),
             "spend": float(k.get("spend") or 0),
-            "team": str(k.get("team_alias") or k.get("team_id") or ""),
+            "team": team,
+            "user": uid,
         }
-    _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])}")
+    _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])} "
+         f"teamed={sum(1 for v in out.values() if v['team'])}")
     return out or None
 
 

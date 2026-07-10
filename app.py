@@ -558,11 +558,12 @@ def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
 
 # HTML pages that require auth (static assets + /healthz + /login stay open).
 _PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
-          "/admin/users", "/account")
+          "/admin/users", "/account", "/settings")
 # Reachable without a session: the login page/handlers and public assets.
 _OPEN = ("/healthz", "/login", "/logout", "/metrics")
-# Admin-only surfaces (role must be 'admin' or the legacy master token).
-_ADMIN_PAGES = ("/admin/users",)
+# Admin-only surfaces (role must be 'admin' — NOT a specific username — or the
+# legacy master token). Enforced at the middleware in addition to each handler.
+_ADMIN_PAGES = ("/admin/users", "/settings")
 _ADMIN_API_PREFIX = "/api/admin/"
 # The only surfaces a must-change-password session may reach before resetting.
 _MUST_CHANGE_OK = ("/account", "/logout", "/api/me", "/api/account/password")
@@ -1234,6 +1235,51 @@ async def api_admin_audit(request: web.Request) -> web.Response:
     return web.json_response({"events": db.audit_list(limit, prefix)})
 
 
+# ── runtime settings (admin-only via the /api/admin/* gate) ───────────────────
+async def api_admin_settings_get(request: web.Request) -> web.Response:
+    """Current tunable settings (live value, default, override flag) for the UI.
+    Non-secret operational tuning only — see config.TUNABLES."""
+    return web.json_response({"settings": config.tunables_view()})
+
+
+async def api_admin_settings_set(request: web.Request) -> web.Response:
+    """Set or reset one tunable. Body: action=set&name=&value=  |  action=reset&name=.
+    Admin-only (gate) + CSRF; validated against config.TUNABLES; persisted; applied
+    live (no restart); audited."""
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    name = str(data.get("name") or "").strip()
+    action = str(data.get("action") or "set").strip()
+    if name not in config.TUNABLES:
+        return web.json_response({"error": "unknown setting"}, status=400)
+    if action == "reset":
+        config.clear_override(name)
+        db.settings_delete(name)
+        _audit(request, actor, "settings.reset", target=name)
+        return web.json_response({"ok": True, "name": name,
+                                  "value": config.tunable(name), "overridden": False})
+    ok, val, err = config.set_override(name, data.get("value"))
+    if not ok:
+        return web.json_response({"error": f"{name}: {err}"}, status=400)
+    db.settings_set(name, val, time.time())
+    _audit(request, actor, "settings.update", target=name, detail=val)
+    return web.json_response({"ok": True, "name": name,
+                             "value": config.tunable(name), "overridden": True})
+
+
+async def settings_page_handler(request: web.Request) -> web.Response:
+    """Admin-only Settings page. Non-admins are redirected (they can't change
+    global config)."""
+    _, role, sess = _auth_ctx(request)
+    if _auth_enabled() and role != "admin":
+        raise web.HTTPFound(_fwd_prefix(request) + "/")
+    user = sess["user"] if sess else None
+    return _serve_page(_WEB / "settings.html", _fwd_prefix(request), user=user, role=role)
+
+
 async def data_handler(request: web.Request) -> web.Response:
     try:
         n = int(request.query.get("history", "180"))
@@ -1328,12 +1374,15 @@ def _configured(name: str, env_ok: bool) -> bool:
 
 
 async def nav_handler(request: web.Request) -> web.Response:
-    """Which backend dashboards are configured — drives nav-link visibility."""
+    """Which backend dashboards are configured — drives nav-link visibility.
+    `admin` reveals admin-only links (Settings) in the sidebar."""
+    _, role, _ = _auth_ctx(request)
     return web.json_response({
         "litellm": _configured("litellm", bool(config.LITELLM_BASE_URL)),
         "ollama": _configured("ollama", bool(config.OLLAMA_BASE_URL)),
         "llamacpp": _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)),
         "gpu": _configured("gpu", bool(config.GPU_SSH or config.GPU_METRICS_URL)),
+        "admin": (role == "admin") or not _auth_enabled(),
     })
 
 
@@ -1458,6 +1507,7 @@ async def budgets_handler(request: web.Request) -> web.Response:
     live = await litellm.key_budgets(request.app[_SESSION])
     snap = _backend_latest.get("litellm", {})
     keys = merge_key_budgets(live, snap.get("top_keys") or [], _key_budget_map())
+    _apply_team_overrides(keys)          # admin-assigned team wins over LiteLLM's
     rows = litellm.budget_rows(keys, {}, lt.tm_mday, mlen)
     return web.json_response({"keys": rows, "summary": _budget_summary(rows),
                               "available": bool(rows),
@@ -1465,13 +1515,114 @@ async def budgets_handler(request: web.Request) -> web.Response:
                                                ("env" if _key_budget_map() else "none")})
 
 
+def _team_key_id(k: dict) -> str:
+    """Stable identity a team override keys on — the key alias, else the raw key."""
+    return str(k.get("alias") or k.get("key_alias") or k.get("key") or "").strip()
+
+
+def _apply_team_overrides(keys: list) -> None:
+    """Overlay admin-assigned teams (db.key_teams) onto the LiteLLM-reported team.
+    Team budgets are a LiteLLM ENTERPRISE feature, so this override is how an OSS
+    LiteLLM gets managed team grouping on the Spend & Quota by-team rollup."""
+    ov = db.team_overrides()
+    if not ov:
+        return
+    for k in keys:
+        t = ov.get(_team_key_id(k))
+        if t:
+            k["team"] = t
+
+
+async def api_admin_teams_get(request: web.Request) -> web.Response:
+    """Team board for the Settings page: every known key, its LiteLLM-detected team,
+    the resolved team (override wins), and whether it is overridden. Admin-only."""
+    ov = db.team_overrides()
+    seen: dict[str, dict] = {}
+
+    def add(key_id: str, detected: str, user: str = ""):
+        key_id = str(key_id or "").strip()
+        if not key_id or key_id in seen:
+            return
+        det = str(detected or "")
+        seen[key_id] = {"key": key_id, "user": str(user or ""), "detected": det,
+                        "team": ov.get(key_id, det), "overridden": key_id in ov}
+
+    live = await litellm.key_budgets(request.app[_SESSION])
+    if live:
+        for alias, info in live.items():
+            add(alias, info.get("team", ""), info.get("user", ""))
+    for k in (_backend_latest.get("litellm", {}) or {}).get("top_keys", []):
+        add(_team_key_id(k), k.get("team", ""), k.get("user", ""))
+    for key_id, team in ov.items():         # overrides for keys not currently seen
+        if key_id not in seen:
+            seen[key_id] = {"key": key_id, "user": "", "detected": "",
+                            "team": team, "overridden": True}
+    rows = sorted(seen.values(), key=lambda r: r["key"].lower())
+    teams = sorted({r["team"] for r in rows if r["team"]})
+    return web.json_response({"keys": rows, "teams": teams,
+                              "source": "litellm" if live else "snapshot"})
+
+
+async def api_admin_teams_set(request: web.Request) -> web.Response:
+    """Assign (or reset) a key's team override. Body: key=&team=  |  action=reset&key=.
+    Admin-only (gate) + CSRF; audited. Empty team clears the override."""
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    key = str(data.get("key") or "").strip()
+    if not key:
+        return web.json_response({"error": "key required"}, status=400)
+    action = str(data.get("action") or "set").strip()
+    team = str(data.get("team") or "").strip()
+    if action == "reset" or not team:
+        db.team_delete(key)
+        _audit(request, actor, "team.reset", target=key)
+        return web.json_response({"ok": True, "key": key, "team": "", "overridden": False})
+    if len(team) > 64:
+        return web.json_response({"error": "team name too long (max 64)"}, status=400)
+    db.team_set(key, team, time.time())
+    _audit(request, actor, "team.set", target=key, detail=team)
+    return web.json_response({"ok": True, "key": key, "team": team, "overridden": True})
+
+
 # Demo/override hook for the spend timeline: fn(now, window) -> {...}.
 _spend_series_source = None
 
 
-def _date_epoch(date: str) -> float:
+def _date_epoch(date) -> float | None:
+    """Day-start epoch for a date, tolerant of the formats LiteLLM emits:
+    `2026-07-10`, `2026/07/10`, `2026-07-10T00:00:00Z`, a full ISO datetime, or a
+    numeric epoch (s or ms). None if unparseable — a bad date skips the row rather
+    than 500-ing the page."""
     import calendar
-    return float(calendar.timegm(time.strptime(date[:10], "%Y-%m-%d")))
+    import datetime as _dt
+    if date is None or date == "":
+        return None
+    # numeric epoch (seconds or milliseconds) → normalise to the day start
+    if isinstance(date, (int, float)) or (isinstance(date, str)
+                                          and date.strip().lstrip("-").isdigit()):
+        try:
+            n = float(date)
+        except (ValueError, TypeError):
+            return None
+        if n > 1e12:                      # milliseconds
+            n /= 1000.0
+        if n > 1e8:                       # plausible epoch (after ~1973)
+            return float(int(n // 86400) * 86400)
+        return None
+    raw = str(date).strip()
+    s = raw.replace("/", "-").replace("T", " ")[:10]
+    try:
+        return float(calendar.timegm(time.strptime(s, "%Y-%m-%d")))
+    except (ValueError, TypeError):
+        pass
+    try:                                  # last resort: full ISO datetime
+        dt = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return float(calendar.timegm(dt.utctimetuple()))
+    except (ValueError, TypeError):
+        return None
 
 
 def bucket_spend(daily: list, window: str) -> dict:
@@ -1479,6 +1630,8 @@ def bucket_spend(daily: list, window: str) -> dict:
     12mo) and roll up a per-calendar-year total. When the rows carry a real/reference
     split (external paid spend vs self-hosted reference cost), it is summed per
     bucket + per year and `split_available` is set."""
+    # drop rows whose date isn't parseable so nothing downstream can raise
+    daily = [r for r in daily if _date_epoch(r.get("date")) is not None]
     gran = "month" if window == "12mo" else "day"
     split = any("real" in r for r in daily)
 
@@ -1500,6 +1653,8 @@ def bucket_spend(daily: list, window: str) -> dict:
     for k in sorted(buckets):
         b = buckets[k]
         t = _date_epoch(k if gran == "day" else k + "-01")
+        if t is None:
+            continue
         sp = round(b["spend"], 2)
         pt = {"t": t, "spend": sp, "requests": b["requests"], "tokens": b["tokens"]}
         if split:                      # reference = total − real, so it always adds up
@@ -1557,12 +1712,28 @@ async def spend_series_handler(request: web.Request) -> web.Response:
     # always pull a full year so the per-year rollup is complete, regardless of window
     start = time.strftime("%Y-%m-%d", time.gmtime(now - 31536000))
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
-    daily = await litellm.spend_activity(request.app[_SESSION], start, end)
-    if daily is None:
+    try:
+        daily = await litellm.spend_activity(request.app[_SESSION], start, end)
+        if not daily:
+            return web.json_response({"window": window, "available": False,
+                                      "points": [], "years": []})
+        out = {"window": window, "available": True,
+               **window_and_years(daily, window, now)}
+        # ?diag=1: surface what the collector actually got + why rows drop, so an
+        # empty chart is diagnosable from the browser (viewer-safe: own spend data).
+        if request.query.get("diag"):
+            out["diag"] = {"raw_daily_rows": len(daily), "sample_rows": daily[:3],
+                           "unparseable_dates": [r.get("date") for r in daily
+                                                 if _date_epoch(r.get("date")) is None][:5],
+                           "any_spend": any((r.get("spend") or 0) for r in daily),
+                           "report": await litellm.spend_report_probe(
+                               request.app[_SESSION], start, end),
+                           "points_built": len(out.get("points", []))}
+        return web.json_response(out)
+    except Exception as e:      # a bad LiteLLM shape must degrade, never 500 the page
+        print(f"[error] /api/spend/series {type(e).__name__}: {e}", file=sys.stderr)
         return web.json_response({"window": window, "available": False,
-                                  "points": [], "years": []})
-    return web.json_response({"window": window, "available": True,
-                              **window_and_years(daily, window, now)})
+                                  "points": [], "years": [], "error": type(e).__name__})
 
 
 async def alerts_handler(request: web.Request) -> web.Response:
@@ -1732,6 +1903,8 @@ async def metrics_handler(request: web.Request) -> web.Response:
 # --------------------------------------------------------------- lifecycle ----
 async def _on_startup(app: web.Application) -> None:
     session = app[_SESSION] = aiohttp.ClientSession()
+    # Apply persisted operator overrides (Settings page) over the env defaults.
+    config.load_overrides(db.settings_all())
     # Warm the ring from sqlite so the dashboard isn't empty on restart.
     for payload in db.recent(180):
         _ring.append({"ts": 0, "collectors": payload})
@@ -1797,6 +1970,11 @@ def build_app() -> web.Application:
     app.router.add_post("/api/admin/users", api_admin_users_create)
     app.router.add_post("/api/admin/users/action", api_admin_users_action)
     app.router.add_get("/api/admin/audit", api_admin_audit)
+    app.router.add_get("/settings", settings_page_handler)
+    app.router.add_get("/api/admin/settings", api_admin_settings_get)
+    app.router.add_post("/api/admin/settings", api_admin_settings_set)
+    app.router.add_get("/api/admin/teams", api_admin_teams_get)
+    app.router.add_post("/api/admin/teams", api_admin_teams_set)
     app.router.add_get("/api/data", data_handler)
     app.router.add_get("/api/series", series_handler)
     app.router.add_get("/api/uptime", uptime_handler)

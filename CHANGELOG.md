@@ -4,6 +4,62 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.5.4] — 2026-07-10
+
+### Fixed
+- **Key teams now resolve via the user.** A LiteLLM key's team is read key →
+  `team_id` → **user**: if the key carries no team but has a `user_id`, its team is
+  taken from that user's team membership, and a bare `team_id` UUID is mapped to its
+  human alias — matching what the LiteLLM UI shows (e.g. `AppSec`). Backed by
+  `/team/list` + `/user/list` (master-key). The Settings → Teams board now shows
+  **key → user → team**, and the Spend & Quota by-team rollup groups on the resolved
+  team. (`LITELLM_DEBUG=1` logs `teams=/users_mapped=` for diagnosis.)
+
+### Fixed
+- **Spend chart empty even after the 500 fix** — the date parser only understood
+  `YYYY-MM-DD`, so any other format from LiteLLM (ISO datetime, `YYYY/MM/DD`, or a
+  numeric epoch) dropped every row → `available:true` but zero points. `_date_epoch`
+  now parses ISO datetimes and epoch seconds/millis too.
+- **Token-in-URL navigation.** When a page is opened with `?token=`, internal links
+  (sidebar + in-page) now carry the token forward so navigation stays authenticated;
+  with a session cookie (no token) links stay clean.
+
+### Added
+- **`/api/spend/series?diag=1`** — a viewer-safe diagnostic that returns the raw
+  daily rows the collector received (count, a 3-row sample, and any dates it couldn't
+  parse), so an empty Spend chart can be diagnosed from the browser without the
+  LiteLLM master key or container logs.
+
+## [1.5.3] — 2026-07-10
+
+### Added
+- **Settings page (`/settings`, admin-only) — runtime-tunable config.** A curated,
+  **non-secret** subset of `.env` (alert thresholds; sample interval; raw/audit
+  retention; GPU file-age; LiteLLM SLO, spend window, heavy-poll interval, spend
+  mode, circuit-breaker) is now editable from the UI, **applied live (no restart)**
+  and **persisted** across restarts, overriding the env defaults. Backed by a
+  `settings` table + `config.tunable()` overlay; validated (type + bounds +
+  choices), CSRF-protected, audited (`settings.update`/`settings.reset`), with a
+  per-key **Reset to default**. Secrets, ports, backend URLs and security switches
+  (`ALLOW_OPEN`, `COOKIE_ALLOW_INSECURE`, `AUTH_TRUSTED_PROXY`) are deliberately
+  **not** exposed. `GET/POST /api/admin/settings`.
+- **Team management (Settings → Teams).** Assign each LiteLLM key to a team for the
+  Spend & Quota by-team rollup. **LiteLLM team *budgets* are a LiteLLM Enterprise
+  feature**, so team grouping is managed here: the board shows each key's
+  LiteLLM-**detected** team and an admin **override** that wins over it (Reset falls
+  back). `key_teams` table + `GET/POST /api/admin/teams` (admin, CSRF, audited);
+  applied in `merge_key_budgets` so the by-team rollup honours it.
+- **Admin-only sidebar link.** `/api/nav` now returns `admin`; the **Settings** link
+  shows only for an admin session.
+
+### Fixed
+- **Spend endpoint returned 500 on real LiteLLM data.** The daily parser assumed
+  `YYYY-MM-DD` dates and numeric spend; a different date format (`/` or ISO
+  datetime) or a string/None value from `/global/spend/report` raised and 500'd the
+  page. Dates are now parsed tolerantly (`-`/`/`/`T` separators), values coerced,
+  unparseable rows dropped, and the handler wrapped so it degrades to an empty
+  chart with a clear message instead of a 500.
+
 ## [1.5.2] — 2026-07-10
 
 ### Fixed

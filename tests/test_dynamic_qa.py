@@ -2052,7 +2052,7 @@ async def test_nav_endpoint_shape():
     c = await _client()
     try:
         d = await (await c.get("/api/nav")).json()
-        assert set(d) == {"litellm", "ollama", "llamacpp", "gpu"}
+        assert set(d) == {"litellm", "ollama", "llamacpp", "gpu", "admin"}
         assert all(isinstance(v, bool) for v in d.values())
     finally:
         await c.close()
@@ -2128,6 +2128,22 @@ def test_spend_daily_parser_accepts_litellm_shapes():
     assert has_spend3 and parsed3[0]["spend"] == 4.0 and parsed3[0]["tokens"] == 7
     # unusable payloads
     assert litellm._rows_of({"nothing": 1}) is None
+    # LiteLLM's /global/activity display format is `Jul 02` (month-abbrev, NO year) —
+    # both the date PARSE and the activity↔report spend MERGE key it, so it must
+    # normalize to canonical YYYY-MM-DD, else every row drops (the live empty-chart bug).
+    assert litellm._norm_date("Jul 02").endswith("-07-02")
+    assert litellm._norm_date("July 2").endswith("-07-02")
+    assert litellm._norm_date("2026-07-02") == "2026-07-02"
+    assert litellm._norm_date("2026/07/02") == "2026-07-02"
+    assert litellm._norm_date("2026-07-02T00:00:00Z") == "2026-07-02"
+    assert litellm._norm_date("bad") == "" and litellm._norm_date("") == ""
+    disp, _ = litellm._parse_daily([{"date": "Jul 02", "api_requests": 147,
+                                     "total_tokens": 20134827}])
+    assert disp[0]["date"].endswith("-07-02")     # not the raw "Jul 02"
+    # activity(no spend, display date) + report(spend, ISO date) MERGE on canonical date
+    a, _ = litellm._parse_daily([{"date": "Jul 02", "api_requests": 5}])
+    r, _ = litellm._parse_daily([{"date": "2026-07-02T00:00:00", "spend": 9.5}])
+    assert a[0]["date"] == r[0]["date"]           # merge key now matches
 
 
 def test_classify_model_internal_vs_external():
@@ -2203,6 +2219,32 @@ def test_window_and_years_totals_cover_full_year_not_window():
     yr = {str(y["year"]): y["spend"] for y in out["years"]}
     # the current year's total is far bigger than a 30-day slice ($300)
     assert yr[this_year] > 300
+
+
+def test_spend_parsing_never_crashes_on_odd_shapes():
+    """Regression: the Spend endpoint 500'd on real LiteLLM data. Odd date formats
+    and non-numeric values must be coerced/skipped, never raise."""
+    # date tolerance
+    day = 1783641600.0     # 2026-07-10 00:00 UTC
+    assert appmod._date_epoch("2026-07-10") == day
+    assert appmod._date_epoch("2026/07/10") == day               # slashes
+    assert appmod._date_epoch("2026-07-10T00:00:00Z") == day     # ISO datetime + Z
+    assert appmod._date_epoch("2026-07-10 12:30:00") == day      # datetime → day start
+    assert appmod._date_epoch(1783641600) == day                 # epoch seconds
+    assert appmod._date_epoch(1783641600000) == day              # epoch millis
+    for bad in ("not-a-date", "", None, "abc"):
+        assert appmod._date_epoch(bad) is None
+    # non-numeric spend/counts are coerced, unparseable rows dropped
+    rows = [{"date": "2026-07-10", "spend": "12.5", "api_requests": "5",
+             "total_tokens": "90"},
+            {"date": "2026-07-11T00:00:00", "spend": 7.0},
+            {"date": "bad-date", "spend": 1.0},        # dropped downstream
+            {"no_date_field": 1}]                        # skipped in parse
+    parsed, has_spend = litellm._parse_daily(rows)
+    assert len(parsed) == 3 and has_spend is True
+    assert parsed[0]["spend"] == 12.5 and parsed[0]["requests"] == 5
+    out = appmod.bucket_spend(parsed, "30d")             # must not raise
+    assert len(out["points"]) == 2                       # bad-date row dropped
 
 
 def test_bucket_spend_day_month_and_years():
@@ -3199,6 +3241,126 @@ def test_last_admin_guard_survives_concurrent_demote():
     t2 = threading.Thread(target=demote, args=("cc2",))
     t1.start(); t2.start(); t1.join(); t2.join()
     assert db.user_count("admin") >= 1, "TOCTOU: concurrent demotes removed all admins"
+
+
+async def _admin_client(monkeypatch, user="sadm", pw="sadmpw12"):
+    """A logged-in admin TestClient + its CSRF token."""
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create(user, f"{user}@x.io", auth.hash_password(pw), "admin", time.time())
+    c = await _client()
+    await c.post("/login", data={"username": user, "password": pw})
+    csrf = (await (await c.get("/api/me")).json())["csrf"]
+    return c, csrf
+
+
+async def test_settings_get_set_reset_live_apply(monkeypatch):
+    c, csrf = await _admin_client(monkeypatch)
+    try:
+        r = await c.get("/api/admin/settings")
+        assert r.status == 200
+        names = {s["name"] for s in (await r.json())["settings"]}
+        assert "ALERT_CPU_PCT" in names and "SAMPLE_INTERVAL" in names
+        # set → applied live (module constant) + persisted
+        r = await c.post("/api/admin/settings",
+                         data={"action": "set", "name": "ALERT_CPU_PCT", "value": "85"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is True
+        assert config.tunable("ALERT_CPU_PCT") == 85.0 and config.ALERT_CPU_PCT == 85.0
+        assert db.settings_all().get("ALERT_CPU_PCT") == "85.0"
+        # reset → back to env default, override cleared
+        r = await c.post("/api/admin/settings",
+                         data={"action": "reset", "name": "ALERT_CPU_PCT"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is False
+        assert config.tunable("ALERT_CPU_PCT") == 0.0
+        assert "ALERT_CPU_PCT" not in db.settings_all()
+    finally:
+        config.clear_override("ALERT_CPU_PCT")
+        await c.close()
+
+
+async def test_settings_validation_and_csrf(monkeypatch):
+    c, csrf = await _admin_client(monkeypatch)
+    try:
+        r = await c.post("/api/admin/settings",
+                         data={"action": "set", "name": "ALERT_CPU_PCT", "value": "999"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400                       # out of range
+        r = await c.post("/api/admin/settings",
+                         data={"action": "set", "name": "MONITOR_DASHBOARD_TOKEN", "value": "x"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400                       # not a tunable (secret) → refused
+        r = await c.post("/api/admin/settings",
+                         data={"action": "set", "name": "ALERT_CPU_PCT", "value": "50"})
+        assert r.status == 403                       # missing CSRF
+    finally:
+        await c.close()
+
+
+async def test_settings_and_teams_are_admin_only(monkeypatch):
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("sad", "sad@x.io", auth.hash_password("sadpw123"), "admin", time.time())
+    db.user_create("svw", "svw@x.io", auth.hash_password("svwpw123"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "svw", "password": "svwpw123"})
+        assert (await c.get("/api/admin/settings")).status == 403
+        assert (await c.get("/api/admin/teams")).status == 403
+        # /settings is a registered admin page → middleware blocks a viewer with a
+        # 403 (same as /admin/users), gated by ROLE not username.
+        assert (await c.get("/settings")).status == 403
+    finally:
+        await c.close()
+
+
+async def test_team_override_get_set_reset(monkeypatch):
+    c, csrf = await _admin_client(monkeypatch, user="tadm", pw="tadmpw12")
+    try:
+        r = await c.post("/api/admin/teams",
+                         data={"key": "langgraph-agent", "team": "Platform"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is True
+        assert db.team_overrides().get("langgraph-agent") == "Platform"
+        rows = (await (await c.get("/api/admin/teams")).json())["keys"]
+        assert any(k["key"] == "langgraph-agent" and k["team"] == "Platform" for k in rows)
+        # the override wins over LiteLLM's reported team in the budget rollup
+        keys = [{"alias": "langgraph-agent", "team": "reported", "cost": 1.0, "budget": 0.0}]
+        appmod._apply_team_overrides(keys)
+        assert keys[0]["team"] == "Platform"
+        r = await c.post("/api/admin/teams",
+                         data={"action": "reset", "key": "langgraph-agent"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is False
+        assert "langgraph-agent" not in db.team_overrides()
+    finally:
+        await c.close()
+
+
+async def test_key_team_resolved_via_team_id_and_user(monkeypatch):
+    # Regression: a key's team must resolve key -> team_id -> USER. LiteLLM often
+    # carries only a team_id UUID on the key, or attaches the team to the user, not
+    # the key. key_budgets() must surface a readable team either way.
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            return ({"keys": [
+                {"key_alias": "kA", "team_id": "t1", "spend": 1.0, "max_budget": 0},
+                {"key_alias": "kB", "user_id": "u9", "spend": 2.0, "max_budget": 0},
+                {"key_alias": "kC", "team_alias": "Direct", "spend": 3.0, "max_budget": 0},
+            ]}, None)
+        if "/team/list" in url:
+            return ([{"team_id": "t1", "team_alias": "AppSec",
+                      "members_with_roles": [{"user_id": "u9"}]}], None)
+        if "/user/list" in url:
+            return ({"users": [{"user_id": "u9", "teams": [{"team_alias": "AppSec"}]}]}, None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-master")
+    out = await litellm.key_budgets(None)
+    assert out["kA"]["team"] == "AppSec"        # team_id UUID -> alias
+    assert out["kB"]["team"] == "AppSec"        # no key team -> resolved via user
+    assert out["kB"]["user"] == "u9"
+    assert out["kC"]["team"] == "Direct"        # explicit key team wins
 
 
 async def test_legacy_token_reaches_admin(monkeypatch):

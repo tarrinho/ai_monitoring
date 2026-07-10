@@ -142,6 +142,17 @@ CREATE TABLE IF NOT EXISTS metrics_1m  (bucket REAL PRIMARY KEY,
 CREATE TABLE IF NOT EXISTS metrics_1h  (bucket REAL PRIMARY KEY,
     cpu REAL, mem REAL, gpu REAL, vram_used REAL, vram_total REAL,
     wait REAL, disk REAL, load1 REAL, tok REAL);
+
+-- Runtime-tunable settings (operator overrides over env defaults). Only keys in
+-- config.TUNABLES are honoured; secrets/infra/security switches are never stored.
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
+    updated REAL);
+
+-- Per-key team override (managed on the Settings page). LiteLLM reports a key's
+-- team, but team BUDGETS are a LiteLLM enterprise feature — so admins can (re)assign
+-- a key to a team here and the Spend & Quota by-team rollup honours this override.
+CREATE TABLE IF NOT EXISTS key_teams (key TEXT PRIMARY KEY, team TEXT NOT NULL,
+    updated REAL);
 """
 
 # Columns charted over time (order must match _METRIC_COLS in queries).
@@ -922,6 +933,72 @@ def user_update_guarded(name: str, email: str, role: str) -> bool:
                 "UPDATE users SET email = ?, role = ? WHERE name = ? "
                 f"AND (? = 'admin' OR role != 'admin' OR {_ADMIN_LEFT})",
                 (email, role, name, role))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+# ── runtime settings (operator overrides persisted across restarts) ───────────
+def settings_all() -> dict[str, str]:
+    """Every stored setting override as {key: raw-value-string}."""
+    try:
+        with _connect() as conn:
+            return {r[0]: r[1] for r in
+                    conn.execute("SELECT key, value FROM settings").fetchall()}
+    except Exception:
+        return {}
+
+
+def settings_set(key: str, value: str, now: float) -> bool:
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO settings(key, value, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated = excluded.updated", (key, str(value), now))
+        return True
+    except Exception:
+        return False
+
+
+def settings_delete(key: str) -> bool:
+    """Remove an override so the key falls back to its env/default value."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+# ── per-key team overrides (Settings page → Teams) ────────────────────────────
+def team_overrides() -> dict[str, str]:
+    """Every admin-assigned key→team override as {key: team}."""
+    try:
+        with _connect() as conn:
+            return {r[0]: r[1] for r in
+                    conn.execute("SELECT key, team FROM key_teams").fetchall()}
+    except Exception:
+        return {}
+
+
+def team_set(key: str, team: str, now: float) -> bool:
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO key_teams(key, team, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET team = excluded.team, "
+                "updated = excluded.updated", (key, str(team), now))
+        return True
+    except Exception:
+        return False
+
+
+def team_delete(key: str) -> bool:
+    """Drop an override so the key falls back to its LiteLLM-reported team."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM key_teams WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
     except Exception:
         return False

@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Monitoring · Settings</title>
+<link rel="icon" href="/assets/favicon.svg">
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#30363d;
+    --fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  html[data-theme="light"]{--bg:#f6f8fa;--panel:#fff;--panel2:#eaeef2;--line:#d0d7de;
+    --fg:#1f2328;--muted:#59636e;--accent:#0969da;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:16px;margin:0}
+  header .sp{margin-left:auto;display:flex;gap:12px;align-items:center}
+  a{color:var(--accent);text-decoration:none}
+  main{padding:22px;max-width:760px;margin:0 auto;width:100%}
+  .intro{color:var(--muted);font-size:12.5px;margin:0 0 16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:16px 18px;margin-bottom:16px}
+  .card h2{margin:0 0 2px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .card .gsub{color:var(--muted);font-size:12px;margin:0 0 12px}
+  .row{display:grid;grid-template-columns:1fr 150px auto auto;gap:10px;align-items:center;
+    padding:9px 0;border-top:1px solid var(--line)}
+  .row:first-of-type{border-top:0}
+  .lbl{font-size:13px} .lbl .h{display:block;color:var(--muted);font-size:11.5px;font-weight:400}
+  .lbl .mod{color:var(--warn);font-size:10px;margin-left:6px;text-transform:uppercase;letter-spacing:.04em}
+  input,select{width:100%;padding:7px 9px;border-radius:6px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--fg);font-size:13px;font-variant-numeric:tabular-nums}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .row button{border:0;border-radius:6px;padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .save{background:var(--accent);color:#fff} .save:hover{filter:brightness(1.08)}
+  .reset{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  .reset:hover{color:var(--fg)}
+  .dflt{font-size:11px;color:var(--muted);white-space:nowrap}
+  .msg{font-size:12px;min-height:16px;margin-top:2px} .msg.ok{color:var(--ok)} .msg.bad{color:var(--bad)}
+  @media(max-width:560px){.row{grid-template-columns:1fr 1fr}}
+  /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
+  #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  #sidebar-brand{padding:0 14px 12px;border-bottom:1px solid var(--line);margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  #sidebar-brand-name{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:.2px}
+  #sidebar-brand-ver{font-size:10px;color:var(--muted);margin-top:2px}
+  #sidebar-toggle{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;
+    font-size:13px;line-height:1;border-radius:5px;padding:1px 7px;flex-shrink:0}
+  #sidebar-toggle:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px;flex:1}
+  #sidebar-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;
+    font-size:13px;border-left:2px solid transparent}
+  #sidebar-nav a:hover{color:var(--fg);background:var(--panel2)}
+  #sidebar-nav a.active{color:var(--fg);background:var(--panel2);font-weight:600;border-left-color:var(--accent)}
+  #sidebar-nav a.has-alert::after{content:"";display:inline-block;width:7px;height:7px;
+    border-radius:50%;background:var(--bad);margin-left:7px;vertical-align:middle;
+    box-shadow:0 0 0 2px var(--panel);animation:aimonpulse 1.6s ease-in-out infinite}
+  @keyframes aimonpulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #main-area{flex:1;min-width:0;display:flex;flex-direction:column}
+  #sidebar-reopen{display:none;position:fixed;top:10px;left:10px;z-index:300;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);cursor:pointer;font-size:16px;line-height:1;
+    border-radius:6px;padding:8px 11px}
+  body.sb-collapsed #sidebar{display:none}
+  body.sb-collapsed #sidebar-reopen{display:flex;align-items:center;justify-content:center}
+  @media(max-width:600px){
+    #sidebar{position:fixed;top:0;left:0;height:100%;z-index:200;transform:translateX(-100%);transition:transform .2s}
+    body:not(.sb-collapsed) #sidebar{transform:none}
+    #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
+  }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <div id="sidebar-brand">
+    <div>
+      <div id="sidebar-brand-name">AI-Monitoring</div>
+      <div id="sidebar-brand-ver">v1.5.4</div>
+    </div>
+    <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
+  </div>
+  <nav id="sidebar-nav" aria-label="Main navigation">
+    <a href="/">Overview</a>
+    <a href="/spend">Spend &amp; Quota</a>
+    <a href="/gpu">GPU</a>
+    <a href="/litellm">LiteLLM</a>
+    <a href="/ollama">Ollama</a>
+    <a href="/llamacpp">llama.cpp</a>
+    <a href="/alerts">Alerts</a>
+    <a href="/settings">Settings</a>
+  </nav>
+</div>
+<button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
+<div id="main-area">
+  <header>
+    <h1>Settings</h1>
+    <div class="sp">
+      <span style="color:var(--muted);font-size:12px" id="whoami"></span>
+      <button id="theme-btn" type="button" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 9px;cursor:pointer" title="Toggle theme">🌙</button>
+    </div>
+  </header>
+  <main>
+    <p class="intro">Operator tuning applied live (no restart), persisted across restarts, and overriding
+      the <code>.env</code> defaults. Only non-secret operational settings are here — secrets, ports,
+      backend URLs and security switches stay in <code>.env</code>. <b>Reset</b> returns a setting to its
+      environment/default value. Changes are admin-only and audited.</p>
+    <div id="groups"></div>
+    <section class="card" id="teams-card">
+      <h2>Teams</h2>
+      <div class="gsub">Assign each LiteLLM key to a team for the <a href="/spend">Spend &amp; Quota</a>
+        by-team rollup. LiteLLM reports a key's team, but <b>team budgets are a LiteLLM
+        Enterprise feature</b> — so team grouping is managed here. An admin override
+        below wins over the team LiteLLM reports; <b>Reset</b> falls back to it.</div>
+      <div id="teams"></div>
+    </section>
+  </main>
+</div>
+<script>
+(function(){
+  var t=localStorage.getItem("aimon-theme")||"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  function icon(){document.getElementById("theme-btn").textContent=
+    document.documentElement.getAttribute("data-theme")==="light"?"☀️":"🌙";}
+  icon();
+  document.getElementById("theme-btn").addEventListener("click",function(){
+    var c=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+    document.documentElement.setAttribute("data-theme",c);localStorage.setItem("aimon-theme",c);icon();});
+
+  var CSRF="";
+  function fmt(v){return (typeof v==="number"&&!Number.isInteger(v))?String(v):String(v);}
+  function post(params){
+    return fetch("/api/admin/settings",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams(params).toString()})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
+  }
+  // Build one editable row per tunable, grouped by section. DOM API only (no innerHTML).
+  function render(list){
+    var groups={},order=[];
+    list.forEach(function(s){ if(!groups[s.group]){groups[s.group]=[];order.push(s.group);} groups[s.group].push(s); });
+    var root=document.getElementById("groups"); root.textContent="";
+    order.forEach(function(g){
+      var card=document.createElement("section"); card.className="card";
+      var h=document.createElement("h2"); h.textContent=g; card.appendChild(h);
+      groups[g].forEach(function(s){ card.appendChild(rowFor(s)); });
+      root.appendChild(card);
+    });
+  }
+  function rowFor(s){
+    var row=document.createElement("div"); row.className="row";
+    var lbl=document.createElement("div"); lbl.className="lbl";
+    lbl.appendChild(document.createTextNode(s.label));
+    var mod=document.createElement("span"); mod.className="mod"; mod.textContent=s.overridden?"modified":"";
+    lbl.appendChild(mod);
+    if(s.help){var hh=document.createElement("span"); hh.className="h"; hh.textContent=s.help; lbl.appendChild(hh);}
+    row.appendChild(lbl);
+    var field;
+    if(s.type==="choice"){
+      field=document.createElement("select");
+      (s.choices||[]).forEach(function(c){var o=document.createElement("option");o.value=c;o.textContent=c;
+        if(String(c)===String(s.value))o.selected=true;field.appendChild(o);});
+    }else{
+      field=document.createElement("input");
+      field.type="number"; field.value=fmt(s.value);
+      if(s.min!=null)field.min=s.min; if(s.max!=null)field.max=s.max;
+      if(s.type==="float")field.step="any"; else field.step="1";
+    }
+    row.appendChild(field);
+    var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
+    var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
+    var msg=document.createElement("div"); msg.className="msg";
+    function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
+    save.addEventListener("click",function(){
+      say("saving…",true);
+      post({action:"set",name:s.name,value:field.value}).then(function(res){
+        if(!res.ok){say(res.j.error||"save failed",false);return;}
+        say("saved",true); mod.textContent="modified"; setTimeout(function(){say("");},1500);
+      }).catch(function(){say("save failed",false);});
+    });
+    reset.addEventListener("click",function(){
+      post({action:"reset",name:s.name}).then(function(res){
+        if(!res.ok){say(res.j.error||"reset failed",false);return;}
+        field.value=fmt(res.j.value); mod.textContent=""; say("reset to default",true);
+        setTimeout(function(){say("");},1500);
+      }).catch(function(){say("reset failed",false);});
+    });
+    row.appendChild(save); row.appendChild(reset);
+    var wrap=document.createElement("div"); wrap.style.gridColumn="1/-1"; wrap.appendChild(msg);
+    // keep msg on its own line under the row
+    var frag=document.createDocumentFragment(); frag.appendChild(row); frag.appendChild(wrap);
+    var holder=document.createElement("div"); holder.appendChild(frag); return holder;
+  }
+  function load(){
+    fetch("/api/admin/settings").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      if(!d){document.getElementById("groups").textContent="Settings are admin-only.";return;}
+      render(d.settings||[]);
+    }).catch(function(){});
+  }
+  // ── Teams board ──
+  function teamRow(k, teams){
+    var row=document.createElement("div"); row.className="row";
+    var lbl=document.createElement("div"); lbl.className="lbl";
+    lbl.appendChild(document.createTextNode(k.key));
+    var mod=document.createElement("span"); mod.className="mod"; mod.textContent=k.overridden?"override":"";
+    lbl.appendChild(mod);
+    var det=document.createElement("span"); det.className="h";
+    det.textContent=(k.user?("user "+k.user+" · "):"")+"LiteLLM team: "+(k.detected||"— (none reported)");
+    lbl.appendChild(det); row.appendChild(lbl);
+    var inp=document.createElement("input"); inp.type="text"; inp.value=k.team||"";
+    inp.placeholder="unassigned"; inp.maxLength=64; inp.setAttribute("list","team-names");
+    row.appendChild(inp);
+    var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
+    var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
+    var msg=document.createElement("div"); msg.className="msg";
+    function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
+    save.addEventListener("click",function(){
+      say("saving…",true);
+      post2({action:"set",key:k.key,team:inp.value.trim()}).then(function(res){
+        if(!res.ok){say(res.j.error||"save failed",false);return;}
+        mod.textContent=res.j.overridden?"override":""; say("saved",true);
+        setTimeout(function(){say("");loadTeams();},900);
+      }).catch(function(){say("save failed",false);});
+    });
+    reset.addEventListener("click",function(){
+      post2({action:"reset",key:k.key}).then(function(res){
+        if(!res.ok){say(res.j.error||"reset failed",false);return;}
+        mod.textContent=""; say("reset",true); setTimeout(function(){say("");loadTeams();},900);
+      }).catch(function(){say("reset failed",false);});
+    });
+    row.appendChild(save); row.appendChild(reset);
+    var holder=document.createElement("div"); holder.appendChild(row);
+    var wrap=document.createElement("div"); wrap.style.gridColumn="1/-1"; wrap.appendChild(msg);
+    holder.appendChild(wrap); return holder;
+  }
+  function post2(params){
+    return fetch("/api/admin/teams",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams(params).toString()})
+      .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
+  }
+  function loadTeams(){
+    fetch("/api/admin/teams").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      var el=document.getElementById("teams"); el.textContent="";
+      if(!d){el.textContent="Teams are admin-only.";return;}
+      if(!(d.keys||[]).length){el.textContent="No LiteLLM keys seen yet — configure LITELLM_MASTER_KEY and send some traffic.";return;}
+      var dl=document.createElement("datalist"); dl.id="team-names";
+      (d.teams||[]).forEach(function(t){var o=document.createElement("option");o.value=t;dl.appendChild(o);});
+      el.appendChild(dl);
+      d.keys.forEach(function(k){ el.appendChild(teamRow(k, d.teams||[])); });
+    }).catch(function(){});
+  }
+
+  fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
+    if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}
+    load(); loadTeams();
+  }).catch(function(){load();loadTeams();});
+})();
+</script>
+<script>
+/* collapsible lateral sidebar + nav-filter + alert-dot — parity with dashboards */
+(function(){var KEY="aimon_sb";var _timers=[];
+  function setC(c){document.body.classList.toggle("sb-collapsed",c);
+    try{localStorage.setItem(KEY,c?"1":"0");}catch(e){}}
+  try{if(localStorage.getItem(KEY)==="1")document.body.classList.add("sb-collapsed");}catch(e){}
+  window.addEventListener("beforeunload",function(){_timers.forEach(clearInterval);});
+  document.addEventListener("DOMContentLoaded",function(){
+    var t=document.getElementById("sidebar-toggle"),r=document.getElementById("sidebar-reopen");
+    if(t)t.addEventListener("click",function(){setC(true);});
+    if(r)r.addEventListener("click",function(){setC(!document.body.classList.contains("sb-collapsed"));});
+    var p=location.pathname;
+    document.querySelectorAll("#sidebar-nav a").forEach(function(a){
+      if(a.getAttribute("href")===p)a.classList.add("active");});
+    fetch("/api/nav").then(function(r){return r.ok?r.json():null;}).then(function(n){
+      if(!n)return;
+      [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+        if(!x[1])document.querySelectorAll('#sidebar-nav a[href="/'+x[0]+'"]').forEach(function(a){a.style.display="none";});
+      });
+    }).catch(function(){});
+    function _alertDot(){fetch("/api/alerts").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      if(!d)return;var a=document.querySelector('#sidebar-nav a[href="/alerts"]');
+      if(a)a.classList.toggle("has-alert",(d.active||[]).length>0);
+    }).catch(function(){});}
+    _alertDot();_timers.push(setInterval(_alertDot,10000));
+  });
+})();
+</script>
+</body>
+</html>

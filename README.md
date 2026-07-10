@@ -107,6 +107,15 @@ any page when an alert is firing.
 All settings are environment variables (git-ignored `.env`). Fail-fast at boot;
 secrets are never logged or persisted. `0` / empty disables a feature.
 
+> **Some settings are also editable in the UI.** Admins can change a curated,
+> non-secret subset (alert thresholds, sample interval, retention, and LiteLLM
+> spend/SLO/circuit-breaker tuning) on the **Settings** page (`/settings`) — applied
+> live and persisted, overriding the `.env` default. Secrets, ports, backend URLs
+> and security switches stay env-only. See also **Settings → Teams**: LiteLLM team
+> *budgets* are a **LiteLLM Enterprise** feature, so AI-Monitoring lets admins group
+> keys into teams (overriding LiteLLM's reported team) for the Spend & Quota
+> by-team rollup.
+
 ### Core
 | Var | Default | Meaning |
 |-----|---------|---------|
