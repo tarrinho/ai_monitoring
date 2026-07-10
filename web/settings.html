@@ -79,6 +79,13 @@
   .ksync:hover{color:var(--accent)} .ksync:disabled{cursor:default;opacity:.6}
   .ksync.spin{display:inline-block;animation:kspin .7s linear infinite}
   @keyframes kspin{to{transform:rotate(360deg)}}
+  /* compact Teams / Model-costs rows — same one-line style as the config .srow cards */
+  .srow.tteam,.srow.tmodel{border-top:1px solid var(--line);padding:5px 0;gap:6px}
+  .srow.tteam:first-of-type,.srow.tmodel:first-of-type{border-top:0}
+  .srow.tteam .lbl,.srow.tmodel .lbl{flex:1 1 90px}
+  .srow .tin{width:104px;flex:0 0 auto} .srow .bin{width:56px;flex:0 0 auto}
+  .srow .min{width:auto;max-width:130px;flex:0 0 auto}
+  .srow .ksync{margin-left:0;font-size:13px}
   .save{background:var(--accent);color:#fff} .save:hover{filter:brightness(1.08)}
   .reset{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .reset:hover{color:var(--fg)}
@@ -292,21 +299,24 @@
   }
   // ── Teams board ──
   function teamRow(k, teams){
-    var row=document.createElement("div"); row.className="row trow";
-    var lbl=document.createElement("div"); lbl.className="lbl";
-    var kn=document.createElement("span"); kn.className="kname"; kn.textContent=k.key; kn.title=k.key;
-    lbl.appendChild(kn);
-    var mod=document.createElement("span"); mod.className="mod";
-    mod.textContent=(k.overridden?"team":"")+(k.budget_overridden?(k.overridden?"+budget":"budget"):"");
-    lbl.appendChild(mod);
-    var det=document.createElement("span"); det.className="h";
-    function setDet(u,d){det.textContent=(u?("user "+u+" · "):"")+"LiteLLM team: "+(d||"— (none reported)");}
-    setDet(k.user,k.detected);
-    lbl.appendChild(det);
-    // per-key sync icon: re-detect just THIS key's team from LiteLLM (instead of the
-    // board-wide Refresh). Updates the detected label + team field (if not overridden).
+    // compact one-line row (matches the config cards): key · ⟳ · team · budget · ✓ · ↺.
+    // The LiteLLM-detected team/user lives in the hover tooltip, not a sub-line.
+    var row=document.createElement("div"); row.className="srow tteam";
+    function tip(u,d){return k.key+"\nLiteLLM: "+(u?("user "+u+" · "):"")+"team "+(d||"none reported");}
+    var lbl=document.createElement("span"); lbl.className="lbl kname"; lbl.textContent=k.key;
+    lbl.title=tip(k.user,k.detected);
+    if(k.overridden||k.budget_overridden) lbl.classList.add("mod");
+    row.appendChild(lbl);
+    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save";
+    function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
+      save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
     var sync=document.createElement("button"); sync.type="button"; sync.className="ksync";
     sync.textContent="⟳"; sync.title="Sync this key's team from LiteLLM";
+    var inp=document.createElement("input"); inp.type="text"; inp.className="tin"; inp.value=k.team||"";
+    inp.placeholder="team"; inp.maxLength=64; inp.setAttribute("list","team-names"); inp.title=tip(k.user,k.detected);
+    var bud=document.createElement("input"); bud.type="number"; bud.className="bin"; bud.min="0"; bud.step="any";
+    bud.placeholder=(k.team_budget>0?("t"+Math.round(k.team_budget)):"$/mo");
+    bud.value=(k.budget_overridden&&k.budget?k.budget:""); bud.title="Override this key's monthly budget ($)";
     sync.addEventListener("click",function(){
       sync.disabled=true; sync.classList.add("spin");
       fetch("/api/admin/teams/sync",{method:"POST",
@@ -315,43 +325,27 @@
         .then(function(r){return r.ok?r.json():null;}).then(function(j){
           sync.disabled=false; sync.classList.remove("spin");
           if(!j||!j.ok){say("sync failed",false);return;}
-          setDet(j.user,j.detected);
+          lbl.title=tip(j.user,j.detected); inp.title=lbl.title;
           if(!k.overridden && j.detected) inp.value=j.detected;
-          say("synced",true); setTimeout(function(){say("");},900);
+          say("synced",true);
         }).catch(function(){sync.disabled=false;sync.classList.remove("spin");say("sync failed",false);});
     });
-    lbl.appendChild(sync);
-    row.appendChild(lbl);
-    var inp=document.createElement("input"); inp.type="text"; inp.value=k.team||"";
-    inp.placeholder="unassigned"; inp.maxLength=64; inp.setAttribute("list","team-names");
-    row.appendChild(inp);
-    var bud=document.createElement("input"); bud.type="number"; bud.min="0"; bud.step="any";
-    // per-key budget = an override that bumps this member above the team budget;
-    // empty inherits the team's budget (shown as the placeholder).
-    bud.placeholder=(k.team_budget>0?("team "+money(k.team_budget)):"$/mo");
-    bud.value=(k.budget_overridden&&k.budget?k.budget:""); bud.title="Override this key's monthly budget ($)";
-    row.appendChild(bud);
-    var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
-    var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
-    var msg=document.createElement("div"); msg.className="msg";
-    function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
+    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset team + budget";
     save.addEventListener("click",function(){
-      say("saving…",true);
       post2({action:"set",key:k.key,team:inp.value.trim(),budget:bud.value.trim()}).then(function(res){
-        if(!res.ok){say(res.j.error||"save failed",false);return;}
-        say("saved",true); setTimeout(function(){say("");loadTeams();},900);
+        if(!res.ok){say((res.j&&res.j.error)||"save failed",false);return;}
+        say("saved",true); setTimeout(loadTeams,900);
       }).catch(function(){say("save failed",false);});
     });
     reset.addEventListener("click",function(){
       post2({action:"reset",key:k.key}).then(function(res){
-        if(!res.ok){say(res.j.error||"reset failed",false);return;}
-        say("reset",true); setTimeout(function(){say("");loadTeams();},900);
+        if(!res.ok){say((res.j&&res.j.error)||"reset failed",false);return;}
+        say("reset",true); setTimeout(loadTeams,900);
       }).catch(function(){say("reset failed",false);});
     });
+    row.appendChild(sync); row.appendChild(inp); row.appendChild(bud);
     row.appendChild(save); row.appendChild(reset);
-    var holder=document.createElement("div"); holder.appendChild(row);
-    var wrap=document.createElement("div"); wrap.style.gridColumn="1/-1"; wrap.appendChild(msg);
-    holder.appendChild(wrap); return holder;
+    return row;
   }
   function post2(params){
     return fetch("/api/admin/teams",{method:"POST",
@@ -430,46 +424,35 @@
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
   }
   function modelRow(m){
-    var row=document.createElement("div"); row.className="row trow";
-    var lbl=document.createElement("div"); lbl.className="lbl";
-    var kn=document.createElement("span"); kn.className="kname"; kn.textContent=m.model; kn.title=m.model;
-    lbl.appendChild(kn);
-    var mod=document.createElement("span"); mod.className="mod";
-    if(m.overridden) mod.textContent="override";
-    lbl.appendChild(mod);
-    var det=document.createElement("span"); det.className="h";
-    det.textContent="auto: "+kindLabel(m.default_kind)+
-      (m.priced?(" · LiteLLM priced"):" · no LiteLLM price");
-    lbl.appendChild(det); row.appendChild(lbl);
-    var sel=document.createElement("select");
-    [["real","Real (paid)"],["reference","Estimated (self-hosted)"]].forEach(function(o){
+    // compact one-line row: model · kind select · ✓ · ↺; auto-detect + priced in tooltip.
+    var row=document.createElement("div"); row.className="srow tmodel";
+    var tip=m.model+"\nauto: "+kindLabel(m.default_kind)+(m.priced?" · LiteLLM priced":" · no LiteLLM price");
+    var lbl=document.createElement("span"); lbl.className="lbl kname"; lbl.textContent=m.model; lbl.title=tip;
+    if(m.overridden) lbl.classList.add("mod");
+    row.appendChild(lbl);
+    var sel=document.createElement("select"); sel.className="min"; sel.title=tip;
+    [["real","Real (paid)"],["reference","Estimated"]].forEach(function(o){
       var op=document.createElement("option"); op.value=o[0]; op.textContent=o[1]; sel.appendChild(op);
     });
     sel.value=m.kind;
-    // occupy the budget column so the grid lines up with the Teams rows
-    var spacer=document.createElement("span");
-    var save=document.createElement("button"); save.className="save"; save.type="button"; save.textContent="Save";
-    var reset=document.createElement("button"); reset.className="reset"; reset.type="button"; reset.textContent="Reset";
-    var msg=document.createElement("div"); msg.className="msg";
-    function say(txt,good){msg.textContent=txt||"";msg.className="msg"+(txt?(good?" ok":" bad"):"");}
+    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save";
+    function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
+      save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
+    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset to auto-detect";
     save.addEventListener("click",function(){
-      say("saving…",true);
       postModel({action:"set",model:m.model,kind:sel.value}).then(function(res){
         if(!res.ok){say((res.j&&res.j.error)||"save failed",false);return;}
-        say("saved",true); setTimeout(function(){say("");loadModels();},900);
+        say("saved",true); setTimeout(loadModels,900);
       }).catch(function(){say("save failed",false);});
     });
     reset.addEventListener("click",function(){
       postModel({action:"reset",model:m.model}).then(function(res){
         if(!res.ok){say((res.j&&res.j.error)||"reset failed",false);return;}
-        say("reset",true); setTimeout(function(){say("");loadModels();},900);
+        say("reset",true); setTimeout(loadModels,900);
       }).catch(function(){say("reset failed",false);});
     });
-    row.appendChild(sel); row.appendChild(spacer);
-    row.appendChild(save); row.appendChild(reset);
-    var holder=document.createElement("div"); holder.appendChild(row);
-    var wrap=document.createElement("div"); wrap.style.gridColumn="1/-1"; wrap.appendChild(msg);
-    holder.appendChild(wrap); return holder;
+    row.appendChild(sel); row.appendChild(save); row.appendChild(reset);
+    return row;
   }
   function loadModels(){
     fetch("/api/admin/model-kinds").then(function(r){return r.ok?r.json():null;}).then(function(d){

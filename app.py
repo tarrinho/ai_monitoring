@@ -1579,6 +1579,8 @@ def _merge_team(kid: str, team: str, user: str, budget: float, spent: float) -> 
     kid = str(kid or "").strip()
     if not kid:
         return
+    if litellm._is_team_id(team):        # a raw team_id UUID is not a team NAME → ignore
+        team = ""
     cur = _TEAMS_DETECT_CACHE.setdefault(
         kid, {"detected": "", "user": "", "budget": 0.0, "spent": 0.0})
     before = dict(cur)
@@ -1606,6 +1608,14 @@ async def _detect_teams(session, force: bool) -> tuple[dict, str]:
     if not _TEAMS_LOADED:                    # seed from DB once (survives restarts)
         saved = db.team_detect_all()
         if saved:
+            # An earlier bug persisted raw team_id UUIDs as team names — scrub them on
+            # load (and from the DB) so the board re-resolves to real aliases, never UUIDs.
+            for kid, info in saved.items():
+                if litellm._is_team_id(info.get("detected", "")):
+                    info["detected"] = ""
+                    db.team_detect_set(kid, "", info.get("user", ""),
+                                       info.get("budget", 0.0), info.get("spent", 0.0),
+                                       time.time())
             _TEAMS_DETECT_CACHE = saved
         _TEAMS_LOADED = True
     hit_litellm = force or not _TEAMS_DETECT_CACHE

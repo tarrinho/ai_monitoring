@@ -97,6 +97,15 @@ Versioning: [SemVer](https://semver.org/).
   returns `cost_models: {real:[…], reference:[…]}`, biggest-usage first).
 
 ### Fixed
+- **Teams rendered as raw UUIDs ("strange numbers").** When `/team/list` couldn't resolve
+  a key's `team_id` to a human alias (a transient failure, or a team with no alias),
+  `key_budgets()` fell back to the raw `team_id` UUID as the team NAME — and the new
+  `team_detect` persistence then saved that UUID, so the board stayed stuck on UUIDs even
+  across restarts. Now: the collector never surfaces a `team_id` as a name (unresolved →
+  blank, so the sticky cache keeps the last real alias); the team directory keeps a
+  last-good `by_id`/`by_user` alias map and reuses it when `/team/list` blips; `_merge_team`
+  rejects any UUID-looking value; and poisoned UUIDs are scrubbed from `team_detect` on load
+  so they re-resolve to real aliases. Added `litellm._is_team_id()` (UUID detector).
 - **Spend & Quota "top spenders" intermittently vanished.** When a *later* `/key/list`
   page timed out mid-walk, `key_budgets()` served only the pages fetched so far (e.g. the
   first 10 of 16 keys) AND overwrote its last-good cache with that partial set — so the

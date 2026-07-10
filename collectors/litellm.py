@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -32,6 +33,17 @@ def _dbg(msg: str) -> None:
 
 def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.LITELLM_MASTER_KEY}"}
+
+
+_TEAM_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _is_team_id(s) -> bool:
+    """True if `s` looks like a raw LiteLLM team_id (UUID) rather than a human team
+    alias. Such values must NEVER be surfaced as a team NAME — callers blank them so the
+    sticky detection cache keeps the last readable alias instead of a UUID."""
+    return bool(s) and bool(_TEAM_ID_RE.match(str(s).strip()))
 
 
 # Track LiteLLM auth so a rejected master key is reported CLEARLY and ONCE (not a
@@ -781,6 +793,7 @@ async def spend_activity(session: aiohttp.ClientSession,
 
 _KEY_LIST_ERR: str | None = None
 _KEY_BUDGETS_CACHE: dict | None = None  # last good /key/list result
+_TEAM_DIR_CACHE: tuple[dict, dict] = ({}, {})  # last good (by_team_id, by_user_id) alias maps
 
 
 async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,
@@ -853,9 +866,12 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("team_id") or "")
-            alias = str(t.get("team_alias") or t.get("team_id") or "")
-            if tid:
+            # ONLY a real human alias — never the team_id itself, or the board shows UUIDs.
+            alias = str(t.get("team_alias") or "").strip()
+            if tid and alias:
                 by_id[tid] = alias
+            if not alias:
+                continue
             members = t.get("members_with_roles") or t.get("members") or []
             for m in members if isinstance(members, list) else []:
                 uid = (m.get("user_id") if isinstance(m, dict) else m) or ""
@@ -875,9 +891,23 @@ async def _team_directory(session: aiohttp.ClientSession, base: str) -> tuple[di
         tms = u.get("teams") or []
         first = tms[0] if isinstance(tms, list) and tms else None
         if isinstance(first, dict):
-            by_user[uid] = str(first.get("team_alias") or first.get("team_id") or "")
+            a = str(first.get("team_alias") or "").strip()   # alias only, never the id
+            if a:
+                by_user[uid] = a
         elif first:
-            by_user[uid] = by_id.get(str(first), str(first))
+            a = by_id.get(str(first), "")                     # resolve id→alias; blank if unknown
+            if a:
+                by_user[uid] = a
+    # Reuse the last-good directory when /team/list (or /user/list) momentarily fails —
+    # otherwise a transient blip empties the alias map and every team renders as a UUID.
+    global _TEAM_DIR_CACHE
+    cid, cuser = _TEAM_DIR_CACHE
+    if not by_id and cid:
+        by_id = dict(cid)
+    if not by_user and cuser:
+        by_user = dict(cuser)
+    if by_id or by_user:
+        _TEAM_DIR_CACHE = (dict(by_id), dict(by_user))
     _dbg(f"/team directory: teams={len(by_id)} users_mapped={len(by_user)}")
     return by_id, by_user
 
@@ -970,12 +1000,14 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         if not alias:
             continue
         uid = str(k.get("user_id") or "")
-        team = str(k.get("team_alias") or "")
+        team = str(k.get("team_alias") or "").strip()
         if not team:
             tid = str(k.get("team_id") or "")
-            team = by_id.get(tid, tid) if tid else ""     # team_id UUID → alias
+            team = by_id.get(tid, "") if tid else ""       # team_id → alias, BLANK if unknown
         if not team and uid:
-            team = by_user.get(uid, "")                   # else via the user's team
+            team = by_user.get(uid, "")                    # else via the user's team
+        if _is_team_id(team):                              # never surface a raw UUID as a name
+            team = ""
         out[str(alias)] = {
             "budget": float(k.get("max_budget") or 0),
             "spend": float(k.get("spend") or 0),

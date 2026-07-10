@@ -3906,6 +3906,61 @@ async def test_key_budgets_partial_walk_keeps_last_good(monkeypatch):
     litellm._KEY_BUDGETS_CACHE = None
 
 
+def test_is_team_id_recognizes_uuids():
+    assert litellm._is_team_id("8b1f7f4a-1ee7-412a-bf89-c7a0f7010532")
+    assert not litellm._is_team_id("AppSec")
+    assert not litellm._is_team_id("Celfocus-general")
+    assert not litellm._is_team_id("") and not litellm._is_team_id(None)
+
+
+async def test_key_budgets_never_surfaces_raw_team_id(monkeypatch):
+    """When /team/list can't resolve a key's team_id to an alias, the team is BLANK —
+    never the raw UUID (which would render as a 'strange number' on the board)."""
+    litellm._TEAM_DIR_CACHE = ({}, {})            # no cached aliases
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            return ({"keys": [{"key_alias": "kX",
+                               "team_id": "8b1f7f4a-1ee7-412a-bf89-c7a0f7010532",
+                               "spend": 1.0, "max_budget": 0}]}, None)
+        if "/team/list" in url:
+            return ({"teams": []}, None)          # no alias resolves
+        if "/user/list" in url:
+            return ({"users": []}, None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    litellm._KEY_BUDGETS_CACHE = None
+    out = await litellm.key_budgets(None)
+    assert out["kX"]["team"] == ""                # BLANK, not the UUID
+    litellm._TEAM_DIR_CACHE = ({}, {})
+
+
+async def test_team_directory_reuses_cache_when_team_list_fails(monkeypatch):
+    """A transient /team/list failure reuses the last-good alias map instead of emptying
+    it (which would make every team resolve to a UUID)."""
+    litellm._TEAM_DIR_CACHE = ({"t1": "AppSec"}, {"u9": "AppSec"})
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        return (None, "Timeout")                  # /team/list AND /user/list fail
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    by_id, by_user = await litellm._team_directory(None, "http://litellm:4000")
+    assert by_id.get("t1") == "AppSec" and by_user.get("u9") == "AppSec"
+    litellm._TEAM_DIR_CACHE = ({}, {})
+
+
+def test_merge_team_ignores_raw_team_id():
+    """The sticky detection cache must never store a raw team_id as the team name."""
+    appmod._TEAMS_DETECT_CACHE.pop("kZ", None)
+    appmod._merge_team("kZ", "8b1f7f4a-1ee7-412a-bf89-c7a0f7010532", "u1", 0.0, 5.0)
+    assert appmod._TEAMS_DETECT_CACHE["kZ"]["detected"] == ""      # UUID rejected
+    appmod._merge_team("kZ", "AppSec", "u1", 0.0, 5.0)
+    assert appmod._TEAMS_DETECT_CACHE["kZ"]["detected"] == "AppSec"  # real alias kept
+    appmod._TEAMS_DETECT_CACHE.pop("kZ", None)
+
+
 async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
     """_paginate must not loop when an endpoint ignores page= and returns the same rows
     every time — it de-dupes by id and stops as soon as a page adds nothing new."""
