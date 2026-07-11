@@ -79,7 +79,7 @@ jobs:
         run: vulture app.py config.py collectors db.py --min-confidence 80
 
   tests:
-    name: pytest (static + dynamic)
+    name: pytest (full suite)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -87,7 +87,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: python -m pytest tests/test_static_qa.py tests/test_dynamic_qa.py -q
+      # Whole tests/ dir — the live test_testenv.py auto-skips when the stack is
+      # absent (it is, in CI). Do NOT name individual files: a new suite would
+      # then silently never run. Mirrors rules.md §2 + the in-image build gate.
+      - run: python -m pytest tests/ -q
 
   trivy-fs:
     name: Trivy filesystem scan

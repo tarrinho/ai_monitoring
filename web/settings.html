@@ -171,14 +171,6 @@
   .dflt{font-size:11px;color:var(--muted);white-space:nowrap}
   .msg{font-size:12px;min-height:16px;margin-top:2px} .msg.ok{color:var(--ok)} .msg.bad{color:var(--bad)}
   @media(max-width:560px){.row{grid-template-columns:1fr 1fr}}
-  /* section quick-nav — sticks to the top of the scroll area so it's always reachable */
-  .secnav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px;position:sticky;top:0;z-index:40;
-    background:var(--bg);padding:10px 0;border-bottom:1px solid var(--line)}
-  .secnav a{font-size:11.5px;color:var(--muted);background:var(--panel);border:1px solid var(--line);
-    border-radius:20px;padding:4px 11px;text-decoration:none}
-  .secnav a:hover{color:var(--fg);border-color:var(--accent)}
-  /* offset anchor jumps so a sticky-nav click lands the heading below the sticky bar */
-  #groups .card h2,#teams-card h2,#models-card h2{scroll-margin-top:56px}
   .card h2{scroll-margin-top:14px}
   /* team summary strip (top of Teams card) */
   .tsumhd{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
@@ -252,17 +244,18 @@
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
 <div id="main-area">
   <header>
-    <h1>Settings</h1>
+    <h1 style="display:flex;align-items:center;gap:6px">
+      <span id="settings-info" class="cardinfo" tabindex="0" role="button"
+            title="Click for info about this page">Settings <span class="ci-i">ⓘ</span></span>
+    </h1>
     <div class="sp">
       <span style="color:var(--muted);font-size:12px" id="whoami"></span>
       <button id="theme-btn" type="button" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 9px;cursor:pointer" title="Toggle theme">🌙</button>
     </div>
   </header>
   <main>
-    <p class="intro">Operator tuning — applied live, persisted, admin-only &amp; audited. Hover a label for help; <b>✓</b> saves, <b>↺</b> resets to default. Drag a card's <b>⠿</b> handle to place it at any position (gaps allowed); drag its right/bottom edge or corner (<b>⌟</b>) to resize width &amp; height; layout is saved in the DB.
-      <span class="ttip" tabindex="0" title="Changes apply live (no restart) and persist across restarts, overriding the .env defaults. Only non-secret operational settings are here — secrets, ports, backend URLs and security switches stay in .env. Reset returns a setting to its environment/default value.">ⓘ</span>
-      <button id="reset-layout" type="button" class="btn-refresh" style="padding:2px 9px;font-size:11px;margin-left:6px">Reset layout</button></p>
-    <div class="secnav" id="secnav"></div>
+    <p class="intro" style="margin:0 0 12px">
+      <button id="reset-layout" type="button" class="btn-refresh" style="padding:2px 9px;font-size:11px">Reset layout</button></p>
     <div id="board">
     <section class="card" id="teams-card" data-card="l:teams">
       <h2 id="sec-teams" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
@@ -400,10 +393,6 @@
     var b=board(); initBoard();
     // remove existing config cards (keep the static Teams / Model-costs cards intact)
     [].slice.call(b.querySelectorAll(":scope > .card.gcard")).forEach(function(c){ c.remove(); });
-    var nav=document.getElementById("secnav"); nav.textContent="";
-    order.concat(["Teams","Models"]).forEach(function(g){
-      var a=document.createElement("a"); a.href="#"+slug(g); a.textContent=g; nav.appendChild(a);
-    });
     var firstStatic=b.querySelector(":scope > .card:not(.gcard)");   // teams-card (or null)
     var frag=document.createDocumentFragment();
     order.forEach(function(g){
@@ -691,6 +680,15 @@
     document.addEventListener("keydown",function esc(e){ if(e.key==="Escape"){shut();document.removeEventListener("keydown",esc);} });
     document.body.appendChild(ov);
   }
+  function openSettingsInfo(){
+    cardInfoModal("Settings — what this page does",[
+      ["Purpose",function(v){ _T(v,"Operator tuning — settings are "); _B(v,"applied live"); _T(v," (no restart), "); _B(v,"persisted"); _T(v," across restarts, "); _B(v,"admin-only"); _T(v," and "); _B(v,"audited"); _T(v,"."); }],
+      ["Persistence",function(v){ _T(v,"Changes persist across restarts and "); _B(v,"override the .env defaults"); _T(v,". Reset returns a setting to its environment/default value."); }],
+      ["Scope",function(v){ _T(v,"Only "); _B(v,"non-secret operational settings"); _T(v," live here — secrets, ports, backend URLs and security switches stay in "); _C(v,".env"); _T(v,"."); }],
+      ["Edit a setting",function(v){ _T(v,"Hover a label for its help + default. "); _B(v,"✓"); _T(v," saves, "); _B(v,"↺"); _T(v," resets to default."); }],
+      ["Arrange cards",function(v){ _T(v,"Drag a card's "); _B(v,"⠿"); _T(v," handle to place it at any position (gaps allowed); drag its right/bottom edge or corner "); _B(v,"⌟"); _T(v," to resize width & height. The layout is saved in the DB — "); _B(v,"Reset layout"); _T(v," restores the default."); }]
+    ]);
+  }
   function openTeamsInfo(){
     cardInfoModal("Teams — what this card does",[
       ["Purpose",function(v){ _T(v,"Group LiteLLM keys by "); _B(v,"user → team"); _T(v,", and set a monthly "); _B(v,"budget ($/mo)"); _T(v," per team. This feeds the by-team rollup on the Spend & Quota page."); }],
@@ -827,6 +825,9 @@
   var _mi=document.getElementById("models-info");
   if(_mi){ _mi.addEventListener("click",openModelsInfo);
     _mi.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){e.preventDefault();openModelsInfo();} }); }
+  var _si=document.getElementById("settings-info");
+  if(_si){ _si.addEventListener("click",openSettingsInfo);
+    _si.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){e.preventDefault();openSettingsInfo();} }); }
   var _rl=document.getElementById("reset-layout");
   if(_rl) _rl.addEventListener("click",function(){
     _grid={};                       // clear saved DB positions + sizes → default arrangement

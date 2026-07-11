@@ -927,6 +927,9 @@ def test_settings_page_exists_with_tunables_and_teams():
     # Model costs card: same treatment — description moved into a click-the-title info popup
     assert "openModelsInfo" in html and 'id="models-info"' in html
     assert "drives the split on Spend" not in html   # old inline description removed
+    # Page header: the intro paragraph + its ⓘ tooltip moved into a click-the-title popup
+    assert "openSettingsInfo" in html and 'id="settings-info"' in html
+    assert 'class="intro">Operator tuning' not in html   # old inline intro removed
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 

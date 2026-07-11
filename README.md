@@ -443,6 +443,9 @@ tests/           full QA suite (static + dynamic + live-integration)
 - **Forced first-login reset**: admin-created / admin-reset accounts must set their
   own password before reaching anything else (see *Multi-user access* above).
 
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md) — please report
+privately (GitHub Security tab → *Report a vulnerability*), never as a public issue.
+
 ---
 
 ## Testing
