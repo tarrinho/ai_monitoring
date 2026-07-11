@@ -25,6 +25,20 @@
     border:1px solid var(--line);border-radius:50%;width:15px;height:15px;line-height:13px;
     text-align:center;margin-left:2px;vertical-align:middle}
   .card .gsub{margin-bottom:8px}
+  /* clickable card title → opens an info popup explaining the card */
+  .cardinfo{cursor:pointer;display:inline-flex;align-items:center;gap:5px;border-radius:5px;
+    padding:1px 4px;margin:-1px -4px}
+  .cardinfo:hover{color:var(--fg);background:var(--panel2)}
+  .cardinfo .ci-i{font-size:11px;color:var(--accent);font-weight:400}
+  /* organized info popup (reuses .modal-ov / .modal) */
+  .infobody{font-size:12.5px;line-height:1.55}
+  .inforow{display:flex;gap:10px;padding:6px 0;border-top:1px solid var(--line)}
+  .inforow:first-child{border-top:0}
+  .infok{flex:0 0 96px;color:var(--muted);font-size:10.5px;text-transform:uppercase;
+    letter-spacing:.05em;padding-top:2px}
+  .infov{flex:1;min-width:0}
+  .infov b{color:var(--fg)} .infov code{background:var(--panel2);border:1px solid var(--line);
+    border-radius:4px;padding:0 4px;font-size:11.5px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
     padding:14px 16px;margin-bottom:16px}
   /* ── free-form dashboard board: 12-col grid, fixed row unit → cards placed at explicit
@@ -252,22 +266,18 @@
     <div id="board">
     <section class="card" id="teams-card" data-card="l:teams">
       <h2 id="sec-teams" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-        <span>Teams</span>
+        <span id="teams-info" class="cardinfo" tabindex="0" role="button"
+              title="Click for info about this card">Teams <span class="ci-i">ⓘ</span></span>
         <button id="teams-refresh" type="button" class="btn-refresh">Refresh from LiteLLM</button>
       </h2>
-      <div class="gsub">Assign each key a <b>team</b> + monthly <b>budget ($/mo)</b> for the
-        <a href="/spend">Spend</a> by-team rollup. Type a team and click <b>✓</b> to save an
-        override; <b>⟳</b> re-detects from LiteLLM and lets it win — overwriting any saved
-        override for that key.
-        <span class="ttip" tabindex="0" title="Team budgets are a LiteLLM Enterprise feature, so both are managed here. The values override what LiteLLM reports (team) and its max_budget (budget); Reset clears both for that key. Detected teams are cached (LiteLLM's lookup is flaky) — the board no longer re-fetches on every load; use Refresh to re-detect.">ⓘ</span></div>
-      <div id="teams-src" class="gsub" style="margin-top:-2px;font-style:italic"></div>
+      <div id="teams-src" class="gsub" style="display:none"></div>
       <div id="teams"></div>
     </section>
     <section class="card" id="models-card" data-card="l:models">
-      <h2 id="sec-models">Model costs</h2>
-      <div class="gsub">Mark each model <b>real</b> (external paid) or <b>estimated</b>
-        (self-hosted) — drives the split on <a href="/spend">Spend</a>.
-        <span class="ttip" tabindex="0" title="The kind is auto-detected from the model name; override it here when the guess is wrong (e.g. an open-weight model you route through a paid API). Reset returns a model to auto-detect.">ⓘ</span></div>
+      <h2 id="sec-models" style="display:flex;align-items:center;gap:6px">
+        <span id="models-info" class="cardinfo" tabindex="0" role="button"
+              title="Click for info about this card">Model costs <span class="ci-i">ⓘ</span></span>
+      </h2>
       <div id="models"></div>
     </section>
     </div>
@@ -657,6 +667,49 @@
     document.addEventListener("keydown",function esc(e){ if(e.key==="Escape"){close();document.removeEventListener("keydown",esc);} });
     document.body.appendChild(ov); inp.focus();
   }
+  // Info popup opened by clicking a card title — organized, structured explanation of
+  // the card. Content is DOM-built (no innerHTML). rows: [ [label, buildValueFn], ... ].
+  function _T(v,s){ v.appendChild(document.createTextNode(s)); }
+  function _B(v,s){ var b=document.createElement("b"); b.textContent=s; v.appendChild(b); }
+  function _C(v,s){ var c=document.createElement("code"); c.textContent=s; v.appendChild(c); }
+  function cardInfoModal(title, rows){
+    var ov=document.createElement("div"); ov.className="modal-ov";
+    var m=document.createElement("div"); m.className="modal"; m.style.width="min(580px,94vw)";
+    var h=document.createElement("h3"); h.textContent=title; m.appendChild(h);
+    var body=document.createElement("div"); body.className="infobody"; m.appendChild(body);
+    rows.forEach(function(row){
+      var r=document.createElement("div"); r.className="inforow";
+      var k=document.createElement("span"); k.className="infok"; k.textContent=row[0];
+      var v=document.createElement("span"); v.className="infov"; row[1](v);
+      r.appendChild(k); r.appendChild(v); body.appendChild(r);
+    });
+    var btns=document.createElement("div"); btns.className="mbtns";
+    var close=document.createElement("button"); close.type="button"; close.className="save"; close.textContent="Got it";
+    function shut(){ if(ov.parentNode) document.body.removeChild(ov); }
+    close.addEventListener("click",shut); btns.appendChild(close); m.appendChild(btns);
+    ov.appendChild(m); ov.addEventListener("click",function(e){ if(e.target===ov) shut(); });
+    document.addEventListener("keydown",function esc(e){ if(e.key==="Escape"){shut();document.removeEventListener("keydown",esc);} });
+    document.body.appendChild(ov);
+  }
+  function openTeamsInfo(){
+    cardInfoModal("Teams — what this card does",[
+      ["Purpose",function(v){ _T(v,"Group LiteLLM keys by "); _B(v,"user → team"); _T(v,", and set a monthly "); _B(v,"budget ($/mo)"); _T(v," per team. This feeds the by-team rollup on the Spend & Quota page."); }],
+      ["Layout",function(v){ _T(v,"One row per "); _B(v,"user"); _T(v," (email/alias). Click a user to expand their "); _B(v,"keys"); _T(v,"; users with no owner fall under "); _B(v,"Unassigned"); _T(v,"."); }],
+      ["Set team",function(v){ _T(v,"Type a team name and click "); _B(v,"✓"); _T(v," to save an override for that user's keys. "); _B(v,"↺"); _T(v," clears the team + budget override."); }],
+      ["Change user",function(v){ _T(v,"Click a "); _B(v,"key chip"); _T(v," to reassign that key's associated "); _B(v,"user / email"); _T(v," (regroups the key)."); }],
+      ["Refresh",function(v){ _B(v,"⟳"); _T(v," re-detects a key's team from LiteLLM and lets LiteLLM "); _B(v,"win"); _T(v," — overwriting any saved override for that key."); }],
+      ["Caching",function(v){ _T(v,"Detected teams are "); _B(v,"cached"); _T(v," (LiteLLM's lookup is flaky), so the board doesn't re-fetch on every load. Use "); _B(v,"Refresh from LiteLLM"); _T(v," to re-detect."); var s=(document.getElementById("teams-src")||{}).textContent; if(s){ _T(v," Status: "); _T(v,s); } }],
+      ["Budgets",function(v){ _T(v,"Team budgets are a LiteLLM "); _B(v,"Enterprise"); _T(v," feature, so they're managed here — overriding LiteLLM's reported team and "); _C(v,"max_budget"); _T(v,"."); }]
+    ]);
+  }
+  function openModelsInfo(){
+    cardInfoModal("Model costs — what this card does",[
+      ["Purpose",function(v){ _T(v,"Mark each model "); _B(v,"real"); _T(v," (external paid API) or "); _B(v,"estimated"); _T(v," (self-hosted). This drives the real-vs-estimated split on the "); _B(v,"Spend & Quota"); _T(v," cost charts."); }],
+      ["Auto-detect",function(v){ _T(v,"The kind is "); _B(v,"auto-detected"); _T(v," from the model name — open-weight families → estimated, hosted providers → real."); }],
+      ["Override",function(v){ _T(v,"Pick "); _B(v,"real"); _T(v," or "); _B(v,"estimated"); _T(v," and click "); _B(v,"✓"); _T(v," when the guess is wrong (e.g. an open-weight model you route through a paid API). "); _B(v,"↺"); _T(v," returns it to auto-detect."); }],
+      ["Cost basis",function(v){ _T(v,"Only "); _B(v,"real"); _T(v," (external) models are billed cash; "); _B(v,"estimated"); _T(v," (self-hosted) cost is imputed from tokens × your LiteLLM per-model price."); }]
+    ]);
+  }
   function loadTeams(force){
     var rb=document.getElementById("teams-refresh");
     if(force&&rb){rb.disabled=true;rb.textContent="Refreshing…";}
@@ -768,6 +821,12 @@
 
   var _rb=document.getElementById("teams-refresh");
   if(_rb) _rb.addEventListener("click",function(){loadTeams(true);});
+  var _ti=document.getElementById("teams-info");
+  if(_ti){ _ti.addEventListener("click",openTeamsInfo);
+    _ti.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){e.preventDefault();openTeamsInfo();} }); }
+  var _mi=document.getElementById("models-info");
+  if(_mi){ _mi.addEventListener("click",openModelsInfo);
+    _mi.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){e.preventDefault();openModelsInfo();} }); }
   var _rl=document.getElementById("reset-layout");
   if(_rl) _rl.addEventListener("click",function(){
     _grid={};                       // clear saved DB positions + sizes → default arrangement

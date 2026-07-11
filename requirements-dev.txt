@@ -1,3 +1,5 @@
 -r requirements.txt
 pytest>=9.1.1,<10
 pytest-asyncio>=1.4.0
+hypothesis>=6.100,<7          # property-based / fuzz tests
+freezegun>=1.5,<2             # time-frozen (deterministic date/window tests)

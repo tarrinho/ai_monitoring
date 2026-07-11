@@ -7,6 +7,14 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.5.6] — 2026-07-10
 
 ### Changed
+- **Settings → Teams and Model costs cards: description moved into a click-the-title
+  info popup.** Both cards dropped their inline explanatory paragraph (and its `ⓘ`
+  hover tooltip), which crowded the compact board. The card title (`Teams`, `Model
+  costs`) is now a button — click (or focus + Enter/Space) it to open an organized,
+  labelled modal: Teams covers Purpose/Layout/Set team/Change user/Refresh/Caching/
+  Budgets; Model costs covers Purpose/Auto-detect/Override/Cost basis. Both render
+  through one DOM-built `cardInfoModal(title, rows)` helper (no `innerHTML`), closed
+  by "Got it", overlay click, or Escape.
 - **CI supply-chain hardening.** Every GitHub Action pinned to a full 40-char
   commit SHA (was major-tag `@vN` / branch `@main`). The `trufflesecurity/trufflehog@main`
   branch pin — the highest-risk mutable ref — is now `@27b0417c…` (v3.95.9).
@@ -68,6 +76,9 @@ Versioning: [SemVer](https://semver.org/).
 - **`GET /api/admin/keys-diag`** — admin diagnostic that reports the raw `/key/list` and
   `/user/list` field names and *which* fields hold an email-like value (values redacted),
   to locate the field carrying the user email when it doesn't surface on the Teams board.
+- **Docs: Spend & Quota and Settings pages** — added a `/settings` row to the Dashboards
+  table, expanded the `/spend` row, and added both screenshots to the README gallery
+  (captured from a running instance with data remapped to placeholders).
 
 ### Fixed
 - **`collectors/litellm.py::spend_report_debug` mypy dict-item errors** — the

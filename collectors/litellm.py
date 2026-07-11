@@ -624,7 +624,10 @@ def _norm_date(raw) -> str:
             return ""
         if n > 1e12:
             n /= 1000.0
-        return time.strftime("%Y-%m-%d", time.gmtime(n)) if n > 1e8 else ""
+        try:
+            return time.strftime("%Y-%m-%d", time.gmtime(n)) if n > 1e8 else ""
+        except (OverflowError, OSError, ValueError):   # out-of-range epoch → treat as junk
+            return ""
     s = str(raw).strip()
     iso = s.replace("/", "-").replace("T", " ")[:10]
     try:

@@ -131,6 +131,11 @@ jobs:
     needs: [secret-scan, lint, tests, trivy-fs, build-scan]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Cosmetic side-channel: never let a failure to publish badges red the CI run.
+    # A 403 here means the repo's GITHUB_TOKEN is read-only (Settings → Actions →
+    # General → Workflow permissions → "Read and write permissions") or a ruleset
+    # blocks the bot on the `badges` branch. Either way it's not a build failure.
+    continue-on-error: true
     permissions:
       contents: write
     steps:
@@ -167,5 +172,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -q -m "badges: ${GITHUB_SHA::7}"
-          git push -q --force \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
+          if git push -q --force \
+               "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
+          then
+            echo "badges: pushed to \`badges\` branch"
+          else
+            echo "::warning title=badges not published::git push to the \`badges\` branch was denied (HTTP 403). Set Settings → Actions → General → Workflow permissions to \"Read and write permissions\", or exclude \`badges\` from any branch ruleset. README badges will show the last successful publish until then."
+          fi

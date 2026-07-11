@@ -921,6 +921,12 @@ def test_settings_page_exists_with_tunables_and_teams():
     assert 'data-card="l:teams"' in html and 'data-card="l:models"' in html       # Teams/Models on board
     # click a key chip → popup to reassign its user/email (per-key user override)
     assert "openKeyUserPopup" in html and "/api/admin/key-user" in html
+    # Teams card: description text moved into a click-the-title info popup (organized)
+    assert "openTeamsInfo" in html and '"cardinfo"' in html
+    assert "Type a team and click" not in html   # old inline description removed
+    # Model costs card: same treatment — description moved into a click-the-title info popup
+    assert "openModelsInfo" in html and 'id="models-info"' in html
+    assert "drives the split on Spend" not in html   # old inline description removed
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 

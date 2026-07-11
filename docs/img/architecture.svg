@@ -1,87 +1,152 @@
-<svg width="1200" height="520" viewBox="0 0 1200 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI-Monitoring architecture: collectors to sampling loop to SQLite to JSON API to dashboards">
+<svg width="1280" height="700" viewBox="0 0 1280 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI-Monitoring architecture: decoupled collectors write to a cache, a 5s tick flattens a snapshot into SQLite, alerts and anomalies fire a webhook, and eight dashboards read the JSON API over SSE and polling.">
   <defs>
-    <linearGradient id="abg" x1="0" y1="0" x2="0" y2="520" gradientUnits="userSpaceOnUse">
+    <linearGradient id="abg" x1="0" y1="0" x2="0" y2="700" gradientUnits="userSpaceOnUse">
       <stop stop-color="#0d1117"/><stop offset="1" stop-color="#12161d"/>
     </linearGradient>
-    <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L8,3 L0,6 Z" fill="#8b949e"/>
+    <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#8b949e"/>
+    </marker>
+    <marker id="arwg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#7ee787"/>
     </marker>
     <style>
       text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;fill:#e6edf3}
-      .h{font-size:15px;font-weight:700}
-      .s{font-size:12.5px;fill:#8b949e}
-      .box{fill:#161b22;stroke:#30363d;rx:10}
-      .lane{fill:#8b949e;font-size:12px;font-weight:600;letter-spacing:.08em}
+      .h{font-size:14.5px;font-weight:700}
+      .s{font-size:12px;fill:#8b949e}
+      .xs{font-size:11px;fill:#768390}
+      .lane{fill:#6e7681;font-size:12px;font-weight:700;letter-spacing:.14em}
       .flow{stroke:#8b949e;stroke-width:2;fill:none}
+      .flowg{stroke:#7ee787;stroke-width:2;fill:none;opacity:.9}
+      .tag{font-size:10.5px;font-weight:700;letter-spacing:.04em}
     </style>
   </defs>
-  <rect width="1200" height="520" rx="16" fill="url(#abg)"/>
-  <rect x="0" y="0" width="1200" height="5" rx="2.5" fill="#58a6ff"/>
-  <text x="40" y="46" font-size="24" font-weight="800">AI-Monitoring — data flow</text>
-  <text x="40" y="72" class="s">A single async loop samples every collector, persists tiered series to SQLite, evaluates alerts, and serves the dashboards.</text>
+
+  <rect width="1280" height="700" rx="16" fill="url(#abg)"/>
+  <rect x="0" y="0" width="1280" height="5" rx="2.5" fill="#58a6ff"/>
+  <text x="40" y="48" font-size="24" font-weight="800">AI-Monitoring — architecture &amp; data flow</text>
+  <text x="40" y="74" class="s">One aiohttp process. Heavy backends poll on their own bounded loops into a cache; a 5s tick flattens a snapshot into SQLite and the dashboards read the JSON API.</text>
 
   <!-- lane labels -->
-  <text x="40" y="120" class="lane">COLLECT</text>
-  <text x="360" y="120" class="lane">PROCESS</text>
-  <text x="620" y="120" class="lane">STORE</text>
-  <text x="870" y="120" class="lane">SERVE</text>
+  <text x="40"  y="112" class="lane">COLLECT</text>
+  <text x="392" y="112" class="lane">PROCESS · every 5s</text>
+  <text x="712" y="112" class="lane">STORE</text>
+  <text x="984" y="112" class="lane">SERVE</text>
 
-  <!-- collectors column -->
-  <g>
-    <rect class="box" x="40" y="135" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="157" class="h">host · procs  <tspan class="s">/proc</tspan></text>
-    <rect class="box" x="40" y="177" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="199" class="h">gpu  <tspan class="s">nvidia-smi / ssh / http</tspan></text>
-    <rect class="box" x="40" y="219" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="241" class="h">ollama  <tspan class="s">/api/ps · tags</tspan></text>
-    <rect class="box" x="40" y="261" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="283" class="h">llama.cpp  <tspan class="s">/health · slots</tspan></text>
-    <rect class="box" x="40" y="303" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="325" class="h">litellm  <tspan class="s">/global/activity</tspan></text>
-    <rect class="box" x="40" y="345" width="240" height="34" rx="10" fill="#161b22" stroke="#30363d"/><text x="56" y="367" class="h">containers  <tspan class="s">docker.sock</tspan></text>
-  </g>
+  <!-- ===================== COLLECT ===================== -->
+  <!-- fast, on-tick collectors -->
+  <text x="40" y="140" class="tag" fill="#7ee787">AWAITED ON THE TICK</text>
+  <rect class="box" x="40" y="150" width="250" height="32" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="171" class="h">host  <tspan class="s">/proc/stat · meminfo</tspan></text>
+  <rect class="box" x="40" y="188" width="250" height="32" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="209" class="h">procs  <tspan class="s">/proc/*/stat → top-N</tspan></text>
 
-  <!-- sampling loop -->
-  <rect class="box" x="340" y="200" width="220" height="120" rx="12" fill="#1c2230" stroke="#3d4657"/>
-  <text x="360" y="228" class="h">sampling loop</text>
-  <text x="360" y="250" class="s">asyncio.gather()</text>
-  <text x="360" y="270" class="s">wait_for watchdog</text>
-  <text x="360" y="290" class="s">→ snapshot{collectors}</text>
-  <text x="360" y="310" class="s">→ _metrics_row()</text>
+  <!-- heavy, own-loop collectors -->
+  <text x="40" y="252" class="tag" fill="#f0883e">OWN LOOP · wait_for-BOUNDED</text>
+  <rect class="box" x="40" y="262" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="282" class="h">gpu  <tspan class="s">nvidia-smi · ssh · http</tspan></text>
+  <rect class="box" x="40" y="296" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="316" class="h">litellm  <tspan class="s">/v1/models · /spend</tspan></text>
+  <rect class="box" x="40" y="330" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="350" class="h">ollama  <tspan class="s">/api/ps · tags</tspan></text>
+  <rect class="box" x="40" y="364" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="384" class="h">llama.cpp  <tspan class="s">/health · /slots</tspan></text>
+  <rect class="box" x="40" y="398" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="418" class="h">containers  <tspan class="s">docker.sock (RO)</tspan></text>
+  <text x="40" y="446" class="xs">each returns {available,…} · never raises</text>
 
-  <!-- alerts/anomaly under loop -->
-  <rect class="box" x="340" y="335" width="220" height="46" rx="10" fill="#161b22" stroke="#30363d"/>
-  <text x="360" y="355" class="h" style="fill:#f0883e">alerts · anomaly</text>
-  <text x="360" y="372" class="s">thresholds · spike/budget → webhook</text>
+  <!-- _backend_latest cache -->
+  <rect class="box" x="306" y="262" width="40" height="166" rx="9" fill="#1c2230" stroke="#3d4657"/>
+  <text x="326" y="345" class="h" fill="#f0883e" transform="rotate(-90 326 345)">_backend_latest</text>
 
-  <!-- SQLite -->
-  <rect class="box" x="600" y="200" width="210" height="120" rx="12" fill="#161b22" stroke="#30363d"/>
-  <text x="620" y="228" class="h" style="fill:#7ee787">SQLite</text>
-  <text x="620" y="250" class="s">metrics + _1m/_1h rollups</text>
-  <text x="620" y="270" class="s">key_series · proc_series</text>
-  <text x="620" y="290" class="s">events · alerts · uptime</text>
-  <text x="620" y="310" class="s">prune · retention (→ years)</text>
+  <!-- ===================== PROCESS ===================== -->
+  <rect class="box" x="392" y="150" width="252" height="150" rx="12" fill="#1c2230" stroke="#3d4657"/>
+  <text x="410" y="176" class="h">sampling loop</text>
+  <text x="410" y="198" class="s">await host, procs</text>
+  <text x="410" y="217" class="s">read _backend_latest (cache)</text>
+  <text x="410" y="236" class="s">→ snapshot{ collectors }</text>
+  <text x="410" y="255" class="s">→ _metrics_row() · ~24 cols</text>
+  <text x="410" y="274" class="s">→ db.insert · insert_metrics</text>
+  <text x="410" y="293" class="s">→ key_series · proc_series</text>
 
-  <!-- API -->
-  <rect class="box" x="850" y="200" width="180" height="120" rx="12" fill="#1c2230" stroke="#3d4657"/>
-  <text x="870" y="228" class="h" style="fill:#58a6ff">JSON API</text>
-  <text x="870" y="250" class="s">/api/data</text>
-  <text x="870" y="270" class="s">/api/series · keyseries</text>
-  <text x="870" y="290" class="s">/api/alerts · nav</text>
-  <text x="870" y="310" class="s">token gate · CSP</text>
+  <rect class="box" x="392" y="312" width="252" height="70" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text x="410" y="333" class="h" fill="#f0883e">derive · alerts · anomaly</text>
+  <text x="410" y="352" class="s">_track_events · anomaly.detect</text>
+  <text x="410" y="371" class="s">→ notifier (debounce) → webhook</text>
 
-  <!-- dashboards -->
-  <rect class="box" x="1050" y="150" width="120" height="220" rx="12" fill="#161b22" stroke="#30363d"/>
-  <text x="1066" y="176" class="h" style="fill:#bc8cff">6 dashboards</text>
-  <text x="1066" y="200" class="s">Overview</text>
-  <text x="1066" y="222" class="s">LiteLLM</text>
-  <text x="1066" y="244" class="s">GPU</text>
-  <text x="1066" y="266" class="s">Ollama</text>
-  <text x="1066" y="288" class="s">llama.cpp</text>
-  <text x="1066" y="310" class="s">Alerts</text>
-  <text x="1066" y="344" class="s" style="fill:#7ee787">poll every 5s</text>
+  <rect class="box" x="392" y="394" width="252" height="52" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text x="410" y="415" class="h" fill="#58a6ff">maintain</text>
+  <text x="410" y="434" class="s">rollup 60s · prune 1h · tiered retention</text>
 
-  <!-- flow arrows -->
-  <path class="flow" d="M285 260 C315 260 315 258 338 258" marker-end="url(#arw)"/>
-  <path class="flow" d="M285 236 C312 236 315 250 338 250" marker-end="url(#arw)"/>
-  <path class="flow" d="M285 320 C312 320 315 270 338 268" marker-end="url(#arw)"/>
-  <path class="flow" d="M562 260 C580 260 582 260 598 260" marker-end="url(#arw)"/>
-  <path class="flow" d="M812 260 C830 260 832 260 848 260" marker-end="url(#arw)"/>
-  <path class="flow" d="M1032 260 C1040 260 1042 260 1048 260" marker-end="url(#arw)"/>
-  <text x="470" y="470" class="s">config.py — env-driven, fail-fast   ·   Dockerfile — Alpine, non-root, in-image pytest gate   ·   arm64 / amd64 / armv7</text>
+  <!-- external webhook -->
+  <rect class="box" x="470" y="474" width="96" height="30" rx="15" fill="#161b22" stroke="#f0883e"/>
+  <text x="518" y="494" class="h" fill="#f0883e" text-anchor="middle" font-size="12.5px">webhook</text>
+
+  <!-- ===================== STORE ===================== -->
+  <rect class="box" x="712" y="150" width="228" height="296" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="730" y="178" class="h" fill="#7ee787">SQLite · WAL · /data</text>
+  <text x="730" y="204" class="s">metrics  (+_1m / _1h)</text>
+  <text x="730" y="226" class="s">key_series  (+_1m / _1h)</text>
+  <text x="730" y="248" class="s">proc_series  (+_1m / _1h)</text>
+  <text x="730" y="270" class="s">samples  (boot warm-load)</text>
+  <text x="730" y="292" class="s">events  (state · model)</text>
+  <text x="730" y="314" class="s">anomalies · alert_log</text>
+  <text x="730" y="336" class="s">ui config: teams · budgets · layout</text>
+  <line x1="730" y1="352" x2="922" y2="352" stroke="#30363d"/>
+  <text x="730" y="376" class="xs">tiered retention</text>
+  <text x="730" y="396" class="h" font-size="13px" fill="#7ee787">24h → 30d → 1y+</text>
+  <text x="730" y="424" class="xs">incremental rollup — constant</text>
+  <text x="730" y="440" class="xs">per-tick cost at any depth</text>
+
+  <!-- ===================== SERVE ===================== -->
+  <rect class="box" x="984" y="150" width="256" height="74" rx="12" fill="#1c2230" stroke="#3d4657"/>
+  <text x="1002" y="176" class="h" fill="#ff7b72">HTTP middleware</text>
+  <text x="1002" y="196" class="s">sechdr → auth (CSP, headers)</text>
+  <text x="1002" y="214" class="s">token gate · per-IP lockout · sessions</text>
+
+  <rect class="box" x="984" y="234" width="256" height="150" rx="12" fill="#1c2230" stroke="#3d4657"/>
+  <text x="1002" y="260" class="h" fill="#58a6ff">JSON API</text>
+  <text x="1002" y="282" class="s">/api/data · /api/series</text>
+  <text x="1002" y="302" class="s">/api/keyseries · /api/procseries</text>
+  <text x="1002" y="322" class="s">/api/uptime · /api/events</text>
+  <text x="1002" y="342" class="s">/api/alerts · /api/anomalies</text>
+  <text x="1002" y="362" class="h" font-size="12.5px" fill="#7ee787">/api/stream · SSE push</text>
+
+  <rect class="box" x="984" y="394" width="256" height="176" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="1002" y="420" class="h" fill="#bc8cff">8 dashboards  <tspan class="xs">(web/)</tspan></text>
+  <text x="1002" y="444" class="s">Overview</text><text x="1130" y="444" class="s">llama.cpp</text>
+  <text x="1002" y="466" class="s">LiteLLM</text><text x="1130" y="466" class="s">Alerts</text>
+  <text x="1002" y="488" class="s">GPU</text><text x="1130" y="488" class="s">Spend &amp; Quota</text>
+  <text x="1002" y="510" class="s">Ollama</text><text x="1130" y="510" class="s">Settings</text>
+  <line x1="1002" y1="524" x2="1222" y2="524" stroke="#30363d"/>
+  <text x="1002" y="547" class="h" font-size="12.5px" fill="#7ee787">SSE push + 5s poll fallback</text>
+  <text x="1002" y="563" class="xs">day / night · windowed 15m…12mo · pan ◀ ▶</text>
+
+  <!-- ===================== FLOW ARROWS ===================== -->
+  <!-- fast collectors → loop (green, on tick) -->
+  <path class="flowg" d="M290 166 C330 166 360 210 390 214" marker-end="url(#arwg)"/>
+  <path class="flowg" d="M290 204 C330 204 360 218 390 222" marker-end="url(#arwg)"/>
+  <!-- heavy collectors → cache -->
+  <path class="flow" d="M290 277 L304 300" marker-end="url(#arw)"/>
+  <path class="flow" d="M290 311 L304 320" marker-end="url(#arw)"/>
+  <path class="flow" d="M290 345 L304 345" marker-end="url(#arw)"/>
+  <path class="flow" d="M290 379 L304 372" marker-end="url(#arw)"/>
+  <path class="flow" d="M290 413 L304 392" marker-end="url(#arw)"/>
+  <!-- cache → loop -->
+  <path class="flow" d="M346 300 C368 290 372 250 390 244" marker-end="url(#arw)"/>
+  <!-- loop → SQLite -->
+  <path class="flow" d="M646 224 C680 224 682 224 710 224" marker-end="url(#arw)"/>
+  <!-- alerts → webhook -->
+  <path class="flow" d="M518 384 L518 472" marker-end="url(#arw)"/>
+  <!-- SQLite → JSON API (history) -->
+  <path class="flow" d="M942 300 C962 300 964 300 982 300" marker-end="url(#arw)"/>
+  <!-- middleware wraps API (down) -->
+  <path class="flow" d="M1112 224 L1112 232" marker-end="url(#arw)"/>
+  <!-- API ↔ dashboards -->
+  <path class="flow" d="M1112 384 L1112 392" marker-end="url(#arw)"/>
+  <text x="960" y="296" class="xs" text-anchor="end" fill="#7ee787">read</text>
+
+  <!-- footer -->
+  <line x1="40" y1="612" x2="1240" y2="612" stroke="#21262d"/>
+  <text x="40" y="640" class="s">config.py — env-driven, fail-fast   ·   startup_selfcheck() verifies routes/assets at boot   ·   in-memory ring for “now”, SQLite for history</text>
+  <text x="40" y="662" class="s">Dockerfile — Alpine, non-root, in-image pytest gate (0 Trivy HIGH/CRITICAL)   ·   arm64 / amd64 / armv7   ·   optional Grafana/Prometheus scrape via /metrics</text>
 </svg>

@@ -7,6 +7,7 @@
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot&logoColor=white)](.github/dependabot.yml)
 [![cosign](https://img.shields.io/badge/cosign-keyless%20signed-2496ED?logo=sigstore&logoColor=white)](https://github.com/tarrinho/ai_monitoring/pkgs/container/ai_monitoring)
+[![AI-assisted](https://img.shields.io/badge/AI--assisted-Claude-8A2BE2?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 
 <!-- Per-control status from the single CI workflow, published to the `badges` branch. -->
 [![CI](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
@@ -39,10 +40,12 @@ numbers**, not just system metrics.
 </p>
 
 - **Zero external deps to monitor** — reads `/proc`, Ollama `/api/*`, LiteLLM
-  `/spend/logs` + `/health/*`, llama.cpp `/slots`, and `nvidia-smi` (local or
-  over SSH). aiohttp + a couple pure-python libs; nothing else.
-- **Six dashboards** — Overview, LiteLLM, GPU, Ollama, llama.cpp, Alerts.
-  Collapsible sidebar, day/night, time-window + pan, CSV export.
+  `/spend/logs` + `/health/*`, llama.cpp `/slots`, `nvidia-smi` (local or over
+  SSH), and the Docker socket (read-only) for container health. aiohttp + a
+  couple pure-python libs; nothing else.
+- **Eight dashboards** — Overview, LiteLLM, GPU, Ollama, llama.cpp, Alerts,
+  Spend & Quota, Settings. Collapsible sidebar, day/night, time-window + pan,
+  CSV export.
 - **Retention up to years** — raw 24h, 1-minute + 1-hour rollups (configurable,
   default 1 year) so charts stay fast and the DB stays bounded.
 - **Alerting + anomaly detection** — thresholds, per-key spike/budget detection,
@@ -71,13 +74,14 @@ standalone, and the LLM/GPU dashboard links hide until their backend is set.
 
 | Path | Shows |
 |------|-------|
-| `/spend` (Spend & Quota) | LLM-cost landing: real-cash summary, **spend-over-time** (30d daily / 12mo monthly) with **per-year year-to-date** totals, **by-team** rollup, and a **per-key budget** table ranked closest-to-cap. **Real (external) vs reference (self-hosted)** cost split throughout — budgets cap real cash, reference is shown but never consumes budget |
+| `/spend` (Spend & Quota) | LLM-cost landing: real-cash summary, **usage-over-time** (30d daily / 12mo monthly) with **per-year** totals, **cost-over-time** (**real external vs estimated self-hosted**, per-day accurate + a **current-year cost card**), **cost-by-key** listing **every** key (no top-N cap), **by-team** rollup, and a **per-key budget** table ranked closest-to-cap. Budgets cap real cash; reference/estimated is shown but never consumes budget |
 | `/` (Overview) | Host CPU/mem/disk/load, **top-5 apps by CPU & RAM** + per-app evolution, uptime, and all metrics as time-series grouped into collapsible **Host / GPU / LLM** sections |
 | `/litellm` | wait avg + **p50/p95/p99 + SLO**, req/s, prompt/completion tok/s, error %, cost/h, **backlog** (in-flight), TTFT, cache hit; per-model table (with p95/SLO); **top-10 keys** (bar + cumulative-over-time + **requests-in-window timeline** = net requests per interval, colored); **failed-request viewer**; **key anomalies**; concurrency-vs-latency |
 | `/gpu` | util, VRAM used/%/total, power, temp, throttle, per-GPU table, tokens/watt — local `nvidia-smi`/`rocm-smi` **or a remote GPU box over SSH / HTTP agent** |
 | `/ollama` | running/installed models, RAM/VRAM, %-on-GPU, per-model params/quant/unload-countdown, over-time charts |
 | `/llamacpp` | tokens/s, active/total slots, busy %, KV-cache %, context size, status, loaded-model card, over-time charts |
 | `/alerts` | configured channel, thresholds, active breaches, **"Send test alert"**, fired-alert history |
+| `/settings` (admin) | Operator tuning applied **live** (no restart): alerts, sampling, retention, LiteLLM/circuit-breaker knobs — drag-to-arrange cards, layout saved in the DB. A **Teams** board — one line per user (**email · team · per-user budget · keys**), ranked by usage, click a name for **ID · username · email · team · keys**; reassign a key's **team** or **user** as a local override (existing users only; LiteLLM untouched). A **Model costs** board — mark each model **real** (external paid) or **estimated** (self-hosted), driving the Spend cost split |
 
 Common controls on every windowed page: **15m / 1h / 24h / 30d / 12mo** buttons, **◀ ▶
 pan** through history, **🌙/☀️ day-night** (persisted), **collapsible sidebar**,
@@ -87,6 +91,10 @@ any page when an alert is firing.
 ### Gallery
 
 <table>
+  <tr>
+    <td width="50%"><img src="docs/img/dash-spend-dark.png" alt="Spend &amp; Quota page"><br><sub><b>Spend &amp; Quota</b> — cost summary, usage + real/estimated cost over time, <b>cost-by-key (all keys)</b>, by-team rollup, per-key budgets ranked by risk.</sub></td>
+    <td width="50%"><img src="docs/img/dash-settings-dark.png" alt="Settings page"><br><sub><b>Settings</b> — live tuning + <b>Teams board</b> (email · team · budget · keys, ranked by usage, click for details) + Model costs. <sub>(demo data)</sub></sub></td>
+  </tr>
   <tr>
     <td width="50%"><img src="docs/img/dash-litellm-dark.png" alt="LiteLLM dashboard"><br><sub><b>LiteLLM</b> — latency p50/p95/p99, req/s, cost, backlog, per-model + top keys.</sub></td>
     <td width="50%"><img src="docs/img/dash-llamacpp-dark.png" alt="llama.cpp dashboard"><br><sub><b>llama.cpp</b> — tokens/s, slots, KV-cache, context, loaded model.</sub></td>
@@ -393,20 +401,24 @@ All gated by the dashboard token when set; `/healthz` is always open.
 
 ![Architecture](docs/img/architecture.svg)
 
-See [ARCHITECTURE.md](ARCHITECTURE.md). In short: a background loop samples all
-collectors every `SAMPLE_INTERVAL`, flattens them into numeric metric columns
-+ per-key/per-app series, writes SQLite (with hourly rollup + prune), evaluates
-alerts + anomalies through a debounced webhook notifier, and serves the
-dashboards which poll the JSON API.
+See [ARCHITECTURE.md](ARCHITECTURE.md). In short: the fast collectors (`host`,
+`procs`) are awaited on a 5s tick, while every heavy backend polls on its own
+`wait_for`-bounded loop into a `_backend_latest` cache — so a wedged backend can
+never stall sampling. The tick flattens a snapshot into numeric metric columns
++ per-key/per-app series, writes SQLite (with incremental rollup + tiered prune),
+evaluates alerts + anomalies through a debounced webhook notifier, and serves
+eight dashboards which read the JSON API over SSE (`/api/stream`) with a 5s poll
+fallback.
 
 ```
-app.py           aiohttp app: routes, sampling loop, auth, security headers
+app.py           aiohttp app: tick + per-backend loops, auth, security headers
 config.py        env-driven config (fail-fast)
 db.py            SQLite: metrics + rollups, key/proc series, events, alerts, uptime
 alerts.py        threshold eval + webhook notifier (debounce + recovery + history)
 anomaly.py       per-key spike / budget detection
-collectors/      host, procs, gpu, litellm, ollama, llamacpp
-web/             six dashboards (index, litellm, gpu, ollama, llamacpp, alerts)
+collectors/      host, procs, gpu, litellm, ollama, llamacpp, containers
+web/             eight dashboards (overview, litellm, gpu, ollama, llamacpp,
+                 alerts, spend & quota, settings)
 deploy/          multi-arch build, tunnel, systemd, server compose
 test-env/        real Ollama + LiteLLM + Postgres for integration
 tests/           full QA suite (static + dynamic + live-integration)
@@ -442,6 +454,13 @@ as a gate** — a failing test aborts `docker build` before an image exists.
 ```bash
 pip install -r requirements-dev.txt && pytest
 ```
+
+## Development
+
+This project was built with AI assistance (Claude Code). All code is human-reviewed and
+gated by an extensive CI pipeline that runs on every push: 400+ tests, ruff / semgrep /
+bandit static analysis, gitleaks + trufflehog secret scanning, Trivy CVE scans
+(filesystem + image), and cosign image signing.
 
 ## License
 
