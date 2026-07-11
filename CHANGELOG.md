@@ -34,6 +34,36 @@ Versioning: [SemVer](https://semver.org/).
   boolean `workflow_dispatch` input for re-tag scenarios where CI was
   cancelled/expired but the operator has verified locally.
 
+### Fixed
+- **Spend "Cost by key" was missing keys — three separate caps.** (1) `merge_key_budgets`
+  used `/key/list` **or** the spend snapshot, never both, so a key with real spend in
+  `/global/spend/keys` but absent from `/key/list` was silently dropped from `/api/budgets`
+  (the chart's source) — it now **unions** the two. (2) The chart sliced to a hardcoded top
+  12 (`.slice(0,12)`) — removed; it shows **every key with spend** and grows taller to fit.
+  (3) The `/spend`-lite snapshot capped keys at 10 — raised to 100. Regression tests added
+  for all three: `merge_key_budgets` unions live+snapshot, `budget_rows` returns every key,
+  `_lite_spend` keeps all keys, and the served page carries no top-12 slice.
+- **No user emails on the Teams board — `/user/list` was 422-rejected.** The `_paginate`
+  helper requested `page_size=500`, which LiteLLM's `/user/list` rejects with **HTTP 422**
+  (it caps the page size). Every `/user/list` call failed, so the `user_id → user_email`
+  map was empty and the board fell back to "Unnamed user" / the key name — even though the
+  email is on the LiteLLM user object. Now `_paginate` uses `page_size=100` (accepted by
+  both `/user/list` and `/key/list`); verified live that all keys then resolve to their
+  owner's email. (The email lives on the *user* object, not the key row — key-row
+  `user_email`/`created_by` are null/UUID on this deployment.)
+
+### Changed
+- **Settings → Teams: reassigning a key's user is restricted to existing users.** The
+  key→user popup is now a **dropdown of the users LiteLLM actually reported** (no free-text),
+  and the server rejects any user it hasn't seen (`unknown user — pick an existing user`).
+  So a key can be moved between real users but never assigned to a made-up one. (This is a
+  local grouping override — LiteLLM's real `user_id` is unchanged.)
+- **Settings → Teams: ranked by usage, click for details, taller card.** Users are now
+  ordered by **total spend (usage)**, top first, and the list is tall enough to show the
+  top ~10 before scrolling. Clicking a user's name opens a **structured details panel** —
+  **User ID · Username · Email · Team · Keys** (each key with its team, budget, spend and
+  override state) — replacing the hover tooltip.
+
 ### Added
 - **`GET /api/admin/keys-diag`** — admin diagnostic that reports the raw `/key/list` and
   `/user/list` field names and *which* fields hold an email-like value (values redacted),

@@ -1489,20 +1489,29 @@ def _budget_summary(rows: list) -> dict:
 
 
 def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> list:
-    """Build the key list for budget_rows. Prefer LiteLLM's own key API (real spend
-    + max_budget); fall back to the collector snapshot's top_keys for spend. The
-    MONITOR_KEY_BUDGETS env map always OVERRIDES whatever LiteLLM reports."""
+    """Build the key list for budget_rows from BOTH LiteLLM's key API (real spend +
+    max_budget) AND the collector's spend snapshot. A key can have real spend in
+    /global/spend/keys yet be absent from /key/list (deleted key, scope, etc.) — the
+    Spend 'Cost by key' chart must still show it, so the two sources are UNIONED (was
+    live-OR-snapshot, which silently dropped those keys). MONITOR_KEY_BUDGETS always wins."""
+    def _alias(k):
+        return str(k.get("alias") or k.get("key_alias") or k.get("key_name")
+                   or k.get("key") or "")
     keys: list = []
+    seen: set = set()
     if live:
         for alias, info in live.items():
             keys.append({"alias": alias, "cost": info.get("spend", 0.0),
                          "team": info.get("team", ""), "budget": info.get("budget", 0.0)})
-    else:
-        keys = [dict(k) for k in (snapshot_keys or [])]
+            seen.add(str(alias))
+    for sk in (snapshot_keys or []):     # fold in snapshot spend keys not already present
+        a = _alias(sk)
+        if a and a not in seen:
+            keys.append(dict(sk))
+            seen.add(a)
     for k in keys:                       # env override wins over LiteLLM max_budget
-        alias = (k.get("alias") or k.get("key_alias") or k.get("key") or "")
-        if alias in env_map:
-            k["budget"] = env_map[alias]
+        if _alias(k) in env_map:
+            k["budget"] = env_map[_alias(k)]
     return keys
 
 
@@ -1648,6 +1657,7 @@ async def api_admin_teams_get(request: web.Request) -> web.Response:
     Serves cached team detection; pass ?refresh=1 (the Refresh button) to re-poll LiteLLM."""
     ov = db.team_overrides()
     bov = db.key_budget_overrides()          # admin per-key budget overrides
+    uov = db.key_user_overrides()            # admin per-key user/email reassignment
     tb = db.team_budgets()                   # per-team monthly budgets
     seen: dict[str, dict] = {}
     force = request.query.get("refresh") in ("1", "true", "yes")
@@ -1660,8 +1670,12 @@ async def api_admin_teams_get(request: web.Request) -> web.Response:
             return
         det = str(detected or "")
         tmn = ov.get(key_id, det)
+        # a user/email override reassigns the key: it wins for display AND grouping
+        eff_name = uov.get(key_id) or str(user_name or "")
         seen[key_id] = {"key": key_id, "user": str(user or ""),
-                        "user_name": str(user_name or ""), "detected": det,
+                        "user_name": eff_name, "detected": det,
+                        "user_grp": uov.get(key_id) or str(user or ""),
+                        "user_overridden": key_id in uov,
                         "team": tmn, "overridden": key_id in ov,
                         "budget": bov.get(key_id, float(budget or 0)),
                         "budget_overridden": key_id in bov,
@@ -1671,11 +1685,12 @@ async def api_admin_teams_get(request: web.Request) -> web.Response:
     for kid, info in detected.items():
         add(kid, info.get("detected", ""), info.get("user", ""),
             info.get("budget", 0), info.get("spent", 0), info.get("user_name", ""))
-    for key_id in set(ov) | set(bov):       # any key with a team OR budget override
+    for key_id in set(ov) | set(bov) | set(uov):   # any key with a team/budget/user override
         if key_id not in seen:
             _tm = ov.get(key_id, "")
-            seen[key_id] = {"key": key_id, "user": "", "user_name": "", "detected": "",
-                            "team": _tm, "overridden": key_id in ov,
+            seen[key_id] = {"key": key_id, "user": "", "user_name": uov.get(key_id, ""),
+                            "user_grp": uov.get(key_id, ""), "user_overridden": key_id in uov,
+                            "detected": "", "team": _tm, "overridden": key_id in ov,
                             "budget": bov.get(key_id, 0.0),
                             "budget_overridden": key_id in bov,
                             "team_budget": tb.get(_tm, 0.0) if _tm else 0.0, "spent": 0.0}
@@ -1727,6 +1742,99 @@ async def api_admin_team_sync(request: web.Request) -> web.Response:
                               "user": info.get("user", ""),
                               "user_name": info.get("user_name", ""),
                               "team": det, "overridden": False})
+
+
+_UI_LAYOUT_NAMES = {"settings_cards"}       # allow-list of persistable layout keys
+
+
+def _clean_grid_layout(raw) -> dict:
+    """Validate a free-form board layout {card_id: {x,y,w,h}} → clamped copy.
+    x/w in 1..12 (12-col grid, x+w ≤ 13), y/h ≥ 1 (rows). Bad entries are dropped."""
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in list(raw.items())[:100]:
+        if not isinstance(v, dict):
+            continue
+        try:
+            x = max(1, min(12, int(v.get("x", 1))))
+            w = max(1, min(12, int(v.get("w", 4))))
+            y = max(1, int(v.get("y", 1)))
+            h = max(1, min(200, int(v.get("h", 6))))
+        except (TypeError, ValueError):
+            continue
+        if x + w > 13:
+            w = 13 - x
+        out[str(k)[:64]] = {"x": x, "y": y, "w": w, "h": h}
+    return out
+
+
+async def api_admin_ui_layout_get(request: web.Request) -> web.Response:
+    """Return the persisted Settings board layout — free-form per-card {x,y,w,h} grid
+    positions. `?name=settings_cards`. Admin-only via the /api/admin/* gate."""
+    name = str(request.query.get("name") or "settings_cards")
+    if name not in _UI_LAYOUT_NAMES:
+        return web.json_response({"error": "unknown layout"}, status=400)
+    saved = db.ui_layout_get(name)
+    grid = {}
+    if isinstance(saved, dict):
+        grid = saved.get("grid") if isinstance(saved.get("grid"), dict) else {}
+    return web.json_response({"name": name, "grid": _clean_grid_layout(grid)})
+
+
+async def api_admin_ui_layout_set(request: web.Request) -> web.Response:
+    """Persist the free-form Settings board layout (per-card x/y/w/h) server-side so the
+    arrangement follows the deployment, not one browser. Body: name=&grid=<json
+    {id:{x,y,w,h}}>. Admin + CSRF. Positions/sizes are clamped to the 12-col grid."""
+    _, _role, sess = _auth_ctx(request)
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    name = str(data.get("name") or "settings_cards")
+    if name not in _UI_LAYOUT_NAMES:
+        return web.json_response({"error": "unknown layout"}, status=400)
+    try:
+        grid = json.loads(str(data.get("grid") or "{}"))
+    except Exception:
+        return web.json_response({"error": "grid must be JSON"}, status=400)
+    if not isinstance(grid, dict) or len(grid) > 100:
+        return web.json_response({"error": "invalid grid"}, status=400)
+    clean = _clean_grid_layout(grid)
+    db.ui_layout_set(name, {"grid": clean}, time.time())
+    return web.json_response({"ok": True, "name": name, "grid": clean})
+
+
+async def api_admin_key_user(request: web.Request) -> web.Response:
+    """Reassign (or reset) a key's user/email — the Teams key popup. Body:
+    key=&user=  |  action=reset&key=. Admin + CSRF; audited. Empty user clears it,
+    so the key falls back to its LiteLLM-reported user on the by-user grouping."""
+    _, _role, sess = _auth_ctx(request)
+    actor = sess["user"] if sess else "token"
+    if not _require_csrf(request, sess):
+        return web.json_response({"error": "bad csrf"}, status=403)
+    data = await request.post()
+    key = str(data.get("key") or "").strip()
+    if not key:
+        return web.json_response({"error": "key required"}, status=400)
+    action = str(data.get("action") or "set").strip()
+    user = str(data.get("user") or "").strip()
+    if action == "reset" or not user:
+        db.key_user_delete(key)
+        _audit(request, actor, "key_user.reset", target=key)
+        return web.json_response({"ok": True, "key": key, "user_name": "", "overridden": False})
+    if len(user) > 120:
+        return web.json_response({"error": "user/email too long (max 120)"}, status=400)
+    # only allow reassigning to an EXISTING user (one already known from LiteLLM) — never
+    # invent a new one. The known set is the emails LiteLLM reported across all keys.
+    known = {str(v.get("user_name") or "").strip().lower()
+             for v in _TEAMS_DETECT_CACHE.values() if str(v.get("user_name") or "").strip()}
+    if known and user.lower() not in known:
+        return web.json_response(
+            {"error": "unknown user — pick an existing user from the list"}, status=400)
+    if not db.key_user_set(key, user, time.time()):
+        return web.json_response({"error": "could not save override"}, status=400)
+    _audit(request, actor, "key_user.set", target=key, detail=user)
+    return web.json_response({"ok": True, "key": key, "user_name": user, "overridden": True})
 
 
 async def api_admin_teams_set(request: web.Request) -> web.Response:
@@ -2404,7 +2512,10 @@ def build_app() -> web.Application:
     app.router.add_get("/api/admin/keys-diag", api_admin_keys_diag)
     app.router.add_post("/api/admin/teams", api_admin_teams_set)
     app.router.add_post("/api/admin/teams/sync", api_admin_team_sync)
+    app.router.add_post("/api/admin/key-user", api_admin_key_user)
     app.router.add_post("/api/admin/team-budget", api_admin_team_budget_set)
+    app.router.add_get("/api/admin/ui-layout", api_admin_ui_layout_get)
+    app.router.add_post("/api/admin/ui-layout", api_admin_ui_layout_set)
     app.router.add_get("/api/admin/model-kinds", api_admin_model_kinds_get)
     app.router.add_post("/api/admin/model-kinds", api_admin_model_kinds_set)
     app.router.add_get("/api/data", data_handler)

@@ -2547,6 +2547,8 @@ async def test_spend_page_served_and_gated(monkeypatch):
         # cumulative cost still visualised — "Cost by key" horizontal bar chart (the $
         # that DOES exist, from /global/spend/keys), with a key/team toggle.
         assert "Cost by key" in html and "cost-chart" in html and "renderCostChart" in html
+        # regression: the cost-by-key chart must show ALL keys, not a hardcoded top-12 slice
+        assert ".slice(0,12)" not in html and "rows.length*24" in html
         # estimated cost over time — daily tokens × per-model price, real vs estimated.
         assert "Cost over time" in html and "cost-time-chart" in html and "renderCostTime" in html
         # top-right card: current-year estimated cost (real + estimated + total)
@@ -2577,6 +2579,35 @@ def test_budget_rows_ranks_and_flags():
     assert [r["status"] for r in rows] == ["bad", "warn", "ok", "none"]
     assert rows[0]["pct"] == 95.0 and rows[0]["projected"] > 0
     assert rows[0]["days_to_cap"] >= 0
+
+
+def test_budget_rows_lists_every_key_no_top_n_cap():
+    """Regression — the Spend 'Cost by key' chart hid keys past the top 12. budget_rows
+    must return EVERY key handed to it (no top-N slice, no silent drop) so the chart can
+    render them all."""
+    keys = [{"alias": f"k{i:02d}", "cost": float(30 - i)} for i in range(20)]  # 20, all spend
+    rows = litellm.budget_rows(keys, {}, 15, 30)
+    assert len(rows) == 20                                  # ALL 20, not a top-N subset
+    assert {r["key"] for r in rows} == {f"k{i:02d}" for i in range(20)}
+    assert all(r["spent"] > 0 for r in rows)
+
+
+async def test_lite_spend_keeps_all_keys_not_top_10(monkeypatch):
+    """Regression — the /spend-lite snapshot capped top_keys at 10, so the fallback path
+    of 'Cost by key' could only ever show 10. It must keep every key /global/spend/keys
+    reports."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/global/activity/model" in url:
+            return ([], None)
+        if "/global/activity" in url:
+            return ({"sum_api_requests": 0, "sum_total_tokens": 0}, None)
+        if "/global/spend/keys" in url:
+            return ([{"api_key": f"h{i}", "key_alias": f"k{i}", "total_spend": float(i + 1)}
+                     for i in range(18)], None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    out = await litellm._lite_spend(None, "http://litellm:4000", {}, 1_700_000_000.0)
+    assert len(out.get("top_keys", [])) == 18               # all 18, not capped at 10
 
 
 def test_budget_rows_presents_keys_with_no_budget():
@@ -2628,6 +2659,20 @@ def test_merge_key_budgets_litellm_then_env_override():
     snap = [{"alias": "s1", "cost": 7.0}]
     merged2 = appmod.merge_key_budgets(None, snap, {"s1": 50.0})
     assert merged2[0]["alias"] == "s1" and merged2[0]["budget"] == 50.0
+
+
+def test_merge_key_budgets_unions_live_and_snapshot():
+    """Regression — 'Cost by key' dropped keys that had spend in the snapshot but were
+    absent from /key/list. merge_key_budgets must UNION the two sources (was live-OR-
+    snapshot, so snapshot-only spenders vanished)."""
+    live = {"kA": {"spend": 100.0, "team": "AppSec", "budget": 0.0},
+            "kB": {"spend": 50.0, "team": "AppSec", "budget": 0.0}}
+    snap = [{"alias": "kB", "cost": 55.0},     # already in live → merged, not duplicated
+            {"alias": "kC", "cost": 30.0},     # snapshot-only spender → MUST appear
+            {"key": "hash1", "cost": 5.0}]     # no alias → identified by its hash
+    keys = appmod.merge_key_budgets(live, snap, {})
+    ids = [(k.get("alias") or k.get("key")) for k in keys]
+    assert set(ids) == {"kA", "kB", "kC", "hash1"} and len(keys) == 4    # all four, kB once
 
 
 def test_budget_rows_split_real_vs_reference():
@@ -4129,6 +4174,104 @@ async def test_teams_board_returns_user_name_and_sync(tmp_path, monkeypatch):
         # sync without CSRF is rejected
         r2 = await c.post("/api/admin/teams/sync", data={"key": "kA"})
         assert r2.status == 403
+    finally:
+        await c.close()
+
+
+async def test_key_user_override_reassigns_and_regroups(tmp_path, monkeypatch):
+    """The Teams key popup sets a per-key user/email override: it wins for display
+    (user_name) AND grouping (user_grp), and reset clears it. Admin + CSRF."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ku.db"))
+    db.init()
+    async def kb(session):
+        return {"kA": {"team": "AppSec", "user": "u1", "user_name": "old@example.com",
+                       "budget": 0.0, "spend": 3.0}}
+    monkeypatch.setattr(litellm, "key_budgets", kb)
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE", {}, raising=False)
+    monkeypatch.setattr(appmod, "_TEAMS_LOADED", False, raising=False)
+    monkeypatch.setitem(appmod._backend_latest, "litellm", {"top_keys": []})
+    c, csrf = await _admin_client(monkeypatch, user="kuadm", pw="kuadmpw1")
+    try:
+        r = await c.post("/api/admin/key-user",
+                         data={"key": "kA", "user": "new@example.com"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is True
+        assert db.key_user_overrides().get("kA") == "new@example.com"
+        row = next(k for k in (await (await c.get("/api/admin/teams")).json())["keys"]
+                   if k["key"] == "kA")
+        assert row["user_name"] == "new@example.com"        # override wins for display
+        assert row["user_grp"] == "new@example.com"         # ...and regroups the key
+        assert row["user_overridden"] is True
+        # reset → back to LiteLLM-detected user
+        r = await c.post("/api/admin/key-user", data={"action": "reset", "key": "kA"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and "kA" not in db.key_user_overrides()
+        # CSRF required
+        assert (await c.post("/api/admin/key-user",
+                             data={"key": "kA", "user": "x@example.com"})).status == 403
+    finally:
+        await c.close()
+
+
+async def test_key_user_reassign_only_existing_users(tmp_path, monkeypatch):
+    """A key can only be reassigned to an EXISTING user — an email LiteLLM never reported
+    is rejected (400); a known one is accepted (200)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kuv.db"))
+    db.init()
+    # known-users set = the emails LiteLLM reported (the detection cache)
+    monkeypatch.setattr(appmod, "_TEAMS_DETECT_CACHE",
+                        {"kA": {"detected": "AppSec", "user": "u1",
+                                "user_name": "ricardo.morim@example.com",
+                                "budget": 0.0, "spent": 0.0}}, raising=False)
+    c, csrf = await _admin_client(monkeypatch, user="kuvadm", pw="kuvadmp1")
+    try:
+        # a made-up user → rejected
+        r = await c.post("/api/admin/key-user",
+                         data={"key": "kA", "user": "stranger@example.com"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400 and "existing user" in (await r.json())["error"]
+        assert "kA" not in db.key_user_overrides()
+        # an existing user → accepted
+        r = await c.post("/api/admin/key-user",
+                         data={"key": "kA", "user": "ricardo.morim@example.com"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["overridden"] is True
+        assert db.key_user_overrides().get("kA") == "ricardo.morim@example.com"
+    finally:
+        await c.close()
+
+
+async def test_ui_layout_persists_card_grid(tmp_path, monkeypatch):
+    """The free-form Settings board layout (per-card {x,y,w,h}) is persisted server-side
+    (DB) via /api/admin/ui-layout: GET returns the grid, POST saves + clamps it, unknown
+    names + non-JSON are rejected, and CSRF is required."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "lay.db"))
+    db.init()
+    c, csrf = await _admin_client(monkeypatch, user="layadm", pw="layadmpw1")
+    try:
+        assert (await (await c.get("/api/admin/ui-layout?name=settings_cards")).json())["grid"] == {}
+        r = await c.post("/api/admin/ui-layout",
+                         data={"name": "settings_cards",
+                               "grid": '{"g:LiteLLM":{"x":1,"y":1,"w":4,"h":8},'
+                                       '"l:teams":{"x":5,"y":1,"w":8,"h":14}}'},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        grid = (await (await c.get("/api/admin/ui-layout?name=settings_cards")).json())["grid"]
+        assert grid["g:LiteLLM"] == {"x": 1, "y": 1, "w": 4, "h": 8}
+        assert grid["l:teams"]["x"] == 5 and grid["l:teams"]["w"] == 8
+        assert db.ui_layout_get("settings_cards")["grid"]["g:LiteLLM"]["h"] == 8
+        # x+w clamped to the 12-col grid (x=10, w=8 → w=3)
+        r2 = await c.post("/api/admin/ui-layout",
+                          data={"name": "settings_cards", "grid": '{"k":{"x":10,"y":1,"w":8,"h":4}}'},
+                          headers={"X-CSRF-Token": csrf})
+        assert (await r2.json())["grid"]["k"]["w"] == 3
+        # unknown layout name + bad payload rejected; no CSRF rejected
+        assert (await c.get("/api/admin/ui-layout?name=nope")).status == 400
+        assert (await c.post("/api/admin/ui-layout",
+                             data={"name": "settings_cards", "grid": "notjson"},
+                             headers={"X-CSRF-Token": csrf})).status == 400
+        assert (await c.post("/api/admin/ui-layout",
+                             data={"name": "settings_cards", "grid": "{}"})).status == 403
     finally:
         await c.close()
 

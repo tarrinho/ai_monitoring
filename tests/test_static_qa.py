@@ -880,7 +880,7 @@ def test_demo_seed_theme_shim_forwards_kwargs():
 
 def test_settings_page_exists_with_tunables_and_teams():
     html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
-    assert 'id="groups"' in html and 'id="teams"' in html, "settings page missing sections"
+    assert 'id="board"' in html and 'id="teams"' in html, "settings page missing sections"
     assert "/api/admin/settings" in html and "/api/admin/teams" in html
     # admin-only note + LiteLLM-enterprise team-budgets documentation on the page
     assert "Enterprise" in html and "team budgets" in html.lower()
@@ -895,22 +895,32 @@ def test_settings_page_exists_with_tunables_and_teams():
     # (DOM is built in JS, so match the className strings, not rendered HTML attributes.)
     assert '"urow"' in html and "By user" in html and '"teamcell"' in html
     assert "/api/admin/teams/sync" in html and "__unassigned__" in html
-    # grouped list is capped (~10 rows) and scrolls; the raw user_id (UUID) is only ever
-    # in the tooltip (title), never rendered inline as text.
+    # grouped list is tall enough for the top users and scrolls; clicking a user name opens
+    # a STRUCTURED details panel (User ID · Username · Email · Team · Keys) — the raw UUID
+    # lives there, never rendered inline as a truncated slice.
     assert '"uscroll"' in html and "max-height" in html
-    assert '"user_id "' in html and 'g.uid.slice' not in html
+    assert '"udetails"' in html and "User ID" in html and 'g.uid.slice' not in html
+    assert "ranked by usage" in html    # users sorted by spend, top first
     # one block per user in order email → team → keys: email primary, team is a SELECT of
     # the identified teams plus an "add new" option, a per-user budget input, and ALL keys
     # on a single horizontally-scrolling line of chips (not a stacked row per key).
     assert '"kstrip"' in html and '"kchip"' in html and '"urow"' in html
     assert '"tsel"' in html and "__new__" in html and "new team" in html
     assert 'chosenTeam' in html and '"bin"' in html    # team picker + per-user budget
+    # reassigning a key's user is restricted to EXISTING users — a dropdown, not free text
+    assert "_knownEmails" in html and "existing users only" in html
+    assert "/api/admin/key-user" in html
     # config groups + Model-cost rows still use the compact one-line .srow style
     assert '"grid2"' in html and "srow tmodel" in html
-    # drag-to-reorder config cards, remembered in localStorage across the re-render,
-    # with a grip handle and a Reset-layout control.
-    assert "aimon_settings_card_order" in html and "applySavedOrder" in html
-    assert '"draghandle"' in html and 'id="reset-layout"' in html
+    # unified free-form board: any card moves ANYWHERE + resizes (column span), order +
+    # sizes persisted SERVER-SIDE in the DB, with grip + resize handles + Reset-layout.
+    assert "/api/admin/ui-layout" in html and "loadLayout" in html and "saveLayout" in html
+    assert 'id="board"' in html and '"draghandle"' in html and 'id="reset-layout"' in html
+    assert "makeResizable" in html and "freeAt" in html and "gridColumn" in html  # 2-D + collision
+    assert '"rsz rsz-"+dir' in html and "gridRow" in html                         # w/h/corner handles
+    assert 'data-card="l:teams"' in html and 'data-card="l:models"' in html       # Teams/Models on board
+    # click a key chip → popup to reassign its user/email (per-key user override)
+    assert "openKeyUserPopup" in html and "/api/admin/key-user" in html
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 

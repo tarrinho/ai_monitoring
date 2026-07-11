@@ -27,16 +27,31 @@
   .card .gsub{margin-bottom:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
     padding:14px 16px;margin-bottom:16px}
-  /* dense masonry-ish grid of config groups across the full width */
-  #groups{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
-    gap:12px;align-items:start;margin-bottom:14px}
-  #groups .card{margin-bottom:0;padding:12px 14px}
-  #groups .card h2{margin-bottom:6px;display:flex;align-items:center;gap:6px}
-  /* drag-to-reorder: grip handle + dragging state (order remembered in localStorage) */
+  /* ── free-form dashboard board: 12-col grid, fixed row unit → cards placed at explicit
+        x/y with real gaps, resizable in width AND height ── */
+  #board{display:grid;grid-template-columns:repeat(12,1fr);grid-auto-rows:26px;gap:10px;
+    margin-bottom:14px;align-items:stretch}
+  #board > .card{margin-bottom:0;padding:12px 14px;position:relative;min-width:0;overflow:auto}
+  #board > .card h2{margin-bottom:6px;display:flex;align-items:center;gap:6px}
+  @media(max-width:900px){                     /* stack full-width on narrow screens */
+    #board{display:block}
+    #board > .card{margin-bottom:12px}
+  }
+  /* grip = move to any cell · edge/corner handles = resize width/height/both */
   .draghandle{cursor:grab;color:var(--muted);font-size:12px;line-height:1;user-select:none;
     flex-shrink:0;letter-spacing:-1px}
   .draghandle:hover{color:var(--fg)} .draghandle:active{cursor:grabbing}
-  #groups .card.dragging{opacity:.45;outline:2px dashed var(--accent);outline-offset:-2px}
+  #board > .card.dragging{opacity:.55;outline:2px dashed var(--accent);outline-offset:-2px;
+    box-shadow:0 8px 24px rgba(0,0,0,.4)}
+  #board > .card.resizing{outline:2px dashed var(--accent);outline-offset:-2px;user-select:none}
+  .rsz{position:absolute;z-index:3;color:transparent}
+  .rsz-e{top:0;right:0;width:10px;height:100%;cursor:ew-resize}
+  .rsz-s{left:0;bottom:0;height:10px;width:100%;cursor:ns-resize}
+  .rsz-se{right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize}
+  #board > .card:hover .rsz-se{color:var(--muted)}
+  .rsz-se::after{content:"⌟";position:absolute;right:2px;bottom:-1px;font-size:11px}
+  .rsz-e:hover,.rsz-s:hover,.rsz-se:hover{color:var(--accent)!important;
+    background:linear-gradient(var(--accent),var(--accent));background-size:100% 100%;opacity:.12}
   /* two compact settings per row inside each card (auto-fits to card width) */
   .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
     gap:2px 14px;margin-top:2px}
@@ -93,11 +108,19 @@
   .srow .min{width:auto;max-width:130px;flex:0 0 auto}
   .srow .ksync{margin-left:0;font-size:13px}
   /* Teams — ONE line per user: email · team · budget · actions · keys(scroll) */
+  .ublock{border-top:1px solid var(--line)} .ublock:first-child{border-top:0}
   .urow{display:grid;grid-template-columns:minmax(140px,1.1fr) 150px 66px auto minmax(0,1.9fr);
-    gap:10px;align-items:center;padding:6px 11px;border-top:1px solid var(--line)}
-  .urow:first-child{border-top:0}
+    gap:10px;align-items:center;padding:6px 11px}
   .urow .uid{font-weight:600;font-size:12.5px;min-width:0;overflow:hidden;
-    text-overflow:ellipsis;white-space:nowrap}
+    text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+  .urow .uid:hover{color:var(--accent);text-decoration:underline}
+  /* click-to-open structured details: ID · username · email · team · keys */
+  .udetails{padding:8px 12px 12px;background:var(--panel2);font-size:12px}
+  .udrow{display:flex;gap:12px;padding:2px 0}
+  .udk{flex:0 0 92px;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;padding-top:2px}
+  .udv{flex:1;min-width:0;word-break:break-word;font-variant-numeric:tabular-nums}
+  .udkeys{display:flex;flex-direction:column;gap:2px;margin-top:2px;padding-left:104px}
+  .udkey{font-size:11.5px} .udkey b{font-weight:600} .udkm{color:var(--muted)}
   .teamcell{min-width:0} .teamcell .tsel,.teamcell .newin{width:100%;padding:4px 6px;font-size:12px}
   .urow .bin{width:66px;text-align:right}
   .ubtns{display:flex;gap:3px;align-items:center}
@@ -107,8 +130,22 @@
   .kchip{flex-shrink:0;font-size:11px;background:var(--panel);border:1px solid var(--line);
     border-radius:20px;padding:2px 9px;white-space:nowrap;font-variant-numeric:tabular-nums}
   .kchip.ov{border-color:var(--warn);color:var(--warn)}
-  /* keep the list compact: ~10 rows (≈32px each) then scroll the rest */
-  .uscroll{max-height:320px;overflow:auto;overscroll-behavior:contain;
+  .kchip{cursor:pointer} .kchip:hover{border-color:var(--accent);color:var(--accent)}
+  /* key → user/email reassignment popup */
+  .modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;
+    align-items:center;justify-content:center;z-index:200}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:18px 20px;width:min(420px,92vw);box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .modal h3{margin:0 0 4px;font-size:14px}
+  .modal .msub{color:var(--muted);font-size:11.5px;margin-bottom:12px;word-break:break-all}
+  .modal label{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.05em;margin-bottom:4px}
+  .modal input{width:100%;margin-bottom:6px}
+  .modal .mmsg{font-size:12px;min-height:16px} .modal .mmsg.bad{color:var(--bad)}
+  .modal .mbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
+  .modal .mbtns .spacer{margin-right:auto}
+  /* tall enough to show the top ~10 users by usage before scrolling */
+  .uscroll{max-height:min(64vh,460px);overflow:auto;overscroll-behavior:contain;
     border:1px solid var(--line);border-radius:9px;margin-top:6px}
   @media(max-width:820px){
     .urow{grid-template-columns:1fr 130px 60px auto;row-gap:6px}
@@ -208,13 +245,12 @@
     </div>
   </header>
   <main>
-    <p class="intro">Operator tuning — applied live, persisted, admin-only &amp; audited. Hover a label for help; <b>✓</b> saves, <b>↺</b> resets to default. Drag a card's <b>⠿</b> handle to reorder; the layout is remembered in this browser.
+    <p class="intro">Operator tuning — applied live, persisted, admin-only &amp; audited. Hover a label for help; <b>✓</b> saves, <b>↺</b> resets to default. Drag a card's <b>⠿</b> handle to place it at any position (gaps allowed); drag its right/bottom edge or corner (<b>⌟</b>) to resize width &amp; height; layout is saved in the DB.
       <span class="ttip" tabindex="0" title="Changes apply live (no restart) and persist across restarts, overriding the .env defaults. Only non-secret operational settings are here — secrets, ports, backend URLs and security switches stay in .env. Reset returns a setting to its environment/default value.">ⓘ</span>
       <button id="reset-layout" type="button" class="btn-refresh" style="padding:2px 9px;font-size:11px;margin-left:6px">Reset layout</button></p>
     <div class="secnav" id="secnav"></div>
-    <div id="groups"></div>
-    <div class="litellm-grid">
-    <section class="card" id="teams-card">
+    <div id="board">
+    <section class="card" id="teams-card" data-card="l:teams">
       <h2 id="sec-teams" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <span>Teams</span>
         <button id="teams-refresh" type="button" class="btn-refresh">Refresh from LiteLLM</button>
@@ -227,7 +263,7 @@
       <div id="teams-src" class="gsub" style="margin-top:-2px;font-style:italic"></div>
       <div id="teams"></div>
     </section>
-    <section class="card" id="models-card">
+    <section class="card" id="models-card" data-card="l:models">
       <h2 id="sec-models">Model costs</h2>
       <div class="gsub">Mark each model <b>real</b> (external paid) or <b>estimated</b>
         (self-hosted) — drives the split on <a href="/spend">Spend</a>.
@@ -249,6 +285,7 @@
     document.documentElement.setAttribute("data-theme",c);localStorage.setItem("aimon-theme",c);icon();});
 
   var CSRF="";
+  var _knownEmails=[];   // existing users (emails LiteLLM reported) — the only allowed reassign targets
   function fmt(v){return (typeof v==="number"&&!Number.isInteger(v))?String(v):String(v);}
   function post(params){
     return fetch("/api/admin/settings",{method:"POST",
@@ -258,73 +295,118 @@
   }
   // Build one editable row per tunable, grouped by section. DOM API only (no innerHTML).
   function slug(s){ return "sec-"+String(s).toLowerCase().replace(/[^a-z0-9]+/g,"-"); }
-  // ── drag-to-reorder config cards, remembered per browser (localStorage) ──
-  var ORDER_KEY="aimon_settings_card_order";
-  function savedOrder(){ try{return JSON.parse(localStorage.getItem(ORDER_KEY))||[];}catch(e){return [];} }
-  function saveOrder(a){ try{localStorage.setItem(ORDER_KEY,JSON.stringify(a));}catch(e){} }
-  function applySavedOrder(order){
-    var saved=savedOrder(); if(!saved.length) return order;
-    var known=order.filter(function(g){return saved.indexOf(g)>=0;})
-      .sort(function(a,b){return saved.indexOf(a)-saved.indexOf(b);});
-    var rest=order.filter(function(g){return saved.indexOf(g)<0;});  // new groups → end
-    return known.concat(rest);
+  // ── free-form dashboard board: each card has an explicit {x,y,w,h} in a 12-col grid
+  //    (real gaps allowed), drag to ANY cell + resize in BOTH width and height. Positions
+  //    /sizes saved SERVER-SIDE (DB) so the arrangement follows the deployment. ──
+  var COLS=12, GAP=10, ROWH=26, _grid={};   // _grid: {card_id:{x,y,w,h}}
+  function board(){ return document.getElementById("board"); }
+  function isCard(c){ return c.classList&&c.classList.contains("card"); }
+  function boardCards(){ return [].slice.call(board().children).filter(isCard); }
+  function defWH(card){ var id=card.dataset.card;
+    return id==="l:teams"?{w:8,h:14}:(id==="l:models"?{w:4,h:9}:{w:4,h:8}); }
+  function loadLayout(cb){
+    fetch("/api/admin/ui-layout?name=settings_cards").then(function(r){return r.ok?r.json():null;})
+      .then(function(d){ _grid=(d&&d.grid)||{}; if(cb)cb(); }).catch(function(){ if(cb)cb(); });
   }
-  function persistDomOrder(root){
-    saveOrder([].slice.call(root.querySelectorAll(".card"))
-      .map(function(c){return c.dataset.group;}).filter(Boolean));
+  function saveLayout(){
+    var g={}; boardCards().forEach(function(c){ var id=c.dataset.card; if(id&&_grid[id]) g[id]=_grid[id]; });
+    _grid=g;
+    fetch("/api/admin/ui-layout",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams({name:"settings_cards",grid:JSON.stringify(g)}).toString()}).catch(function(){});
   }
-  function dragAfter(root,x,y){    // nearest card center; insert before it if cursor is above/left
-    var els=[].slice.call(root.querySelectorAll(".card:not(.dragging)"));
-    var best=null,bestD=Infinity,before=true;
-    els.forEach(function(el){
-      var r=el.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2;
-      var d=(x-cx)*(x-cx)+(y-cy)*(y-cy);
-      if(d<bestD){ bestD=d; best=el; before=(y<cy-4)||(Math.abs(y-cy)<=r.height/2 && x<cx); }
-    });
-    return best ? (before?best:best.nextElementSibling) : null;
+  function overlap(a,b){ return a.x<b.x+b.w && a.x+a.w>b.x && a.y<b.y+b.h && a.y+a.h>b.y; }
+  function others(exclude){ return boardCards().filter(function(c){
+    return c!==exclude && _grid[c.dataset.card]; }).map(function(c){
+      var g=_grid[c.dataset.card]; return {x:g.x,y:g.y,w:g.w,h:g.h}; }); }
+  function freeAt(x,y,w,h,exclude){          // no overlap with any OTHER card (gaps ok)
+    if(x<1||y<1||x+w>COLS+1) return false;
+    var box={x:x,y:y,w:w,h:h};
+    return !others(exclude).some(function(r){ return overlap(box,r); });
   }
-  function initDrag(root){
-    if(root._dragInit) return; root._dragInit=true;
-    root.addEventListener("dragover",function(e){
-      var dragging=root.querySelector(".card.dragging"); if(!dragging) return;
-      e.preventDefault();
-      var ref=dragAfter(root,e.clientX,e.clientY);
-      if(ref==null) root.appendChild(dragging); else root.insertBefore(dragging,ref);
-    });
+  function firstFree(w,h,exclude){           // top-left-most empty slot for a new/auto card
+    for(var y=1;y<300;y++) for(var x=1;x<=COLS-w+1;x++) if(freeAt(x,y,w,h,exclude)) return {x:x,y:y};
+    return {x:1,y:1};
   }
-  function makeDraggable(card,root){
+  function place(card){ var g=_grid[card.dataset.card]; if(!g) return;
+    card.style.gridColumn=g.x+" / span "+g.w; card.style.gridRow=g.y+" / span "+g.h; }
+  function applyBoard(){                      // place every card; auto-slot the un-positioned
+    boardCards().forEach(function(c){ var id=c.dataset.card; if(!id) return;
+      if(!_grid[id]){ var d=defWH(c); var p=firstFree(d.w,d.h,c); _grid[id]={x:p.x,y:p.y,w:d.w,h:d.h}; }
+      place(c); });
+  }
+  function metrics(){ var r=board().getBoundingClientRect();
+    return {r:r, colW:(r.width-GAP*(COLS-1))/COLS}; }
+  function cellFromXY(cx,cy){ var m=metrics();
+    return {x:Math.round((cx-m.r.left)/(m.colW+GAP))+1, y:Math.round((cy-m.r.top)/(ROWH+GAP))+1}; }
+  function makeDraggable(card){
+    if(card._dragMade) return; card._dragMade=true;
     var h=card.querySelector("h2");
     var grip=document.createElement("span"); grip.className="draghandle"; grip.textContent="⠿";
-    grip.title="Drag to reorder";
-    // only the handle starts a drag, so inputs inside the card stay clickable
-    grip.addEventListener("mousedown",function(){ card.draggable=true; });
-    document.addEventListener("mouseup",function(){ card.draggable=false; });
-    card.addEventListener("dragstart",function(e){ card.classList.add("dragging");
-      e.dataTransfer.effectAllowed="move"; try{e.dataTransfer.setData("text/plain",card.dataset.group);}catch(_){} });
-    card.addEventListener("dragend",function(){ card.classList.remove("dragging");
-      card.draggable=false; persistDomOrder(root); });
+    grip.title="Drag to move this card to any position (gaps allowed)";
+    function mv(e){ var g=_grid[card.dataset.card]; if(!g) return;
+      var cell=cellFromXY(e.clientX,e.clientY);
+      var x=Math.max(1,Math.min(COLS-g.w+1,cell.x)), y=Math.max(1,cell.y);
+      if((x!==g.x||y!==g.y) && freeAt(x,y,g.w,g.h,card)){ g.x=x; g.y=y; place(card); } }
+    function up(){ card.classList.remove("dragging"); document.removeEventListener("mousemove",mv);
+      document.removeEventListener("mouseup",up); saveLayout(); }
+    grip.addEventListener("mousedown",function(e){ e.preventDefault(); card.classList.add("dragging");
+      document.addEventListener("mousemove",mv); document.addEventListener("mouseup",up); });
     if(h) h.insertBefore(grip,h.firstChild);
+  }
+  function makeResizable(card){
+    if(card._rszMade) return; card._rszMade=true;
+    ["e","s","se"].forEach(function(dir){     // right = width, bottom = height, corner = both
+      var hd=document.createElement("div"); hd.className="rsz rsz-"+dir;
+      hd.title = dir==="e"?"Drag to resize width":(dir==="s"?"Drag to resize height":"Drag to resize");
+      card.appendChild(hd);
+      hd.addEventListener("mousedown",function(e){ e.preventDefault(); e.stopPropagation();
+        var g=_grid[card.dataset.card], m=metrics(), sx=e.clientX, sy=e.clientY, sw=g.w, sh=g.h;
+        card.classList.add("resizing");
+        function mv(ev){
+          if(dir.indexOf("e")>=0){ var nw=Math.max(1,Math.min(COLS-g.x+1,
+            sw+Math.round((ev.clientX-sx)/(m.colW+GAP)))); if(freeAt(g.x,g.y,nw,g.h,card)) g.w=nw; }
+          if(dir.indexOf("s")>=0){ var nh=Math.max(1,
+            sh+Math.round((ev.clientY-sy)/(ROWH+GAP))); if(freeAt(g.x,g.y,g.w,nh,card)) g.h=nh; }
+          place(card);
+        }
+        function up(){ card.classList.remove("resizing"); document.removeEventListener("mousemove",mv);
+          document.removeEventListener("mouseup",up); saveLayout(); }
+        document.addEventListener("mousemove",mv); document.addEventListener("mouseup",up);
+      });
+    });
+  }
+  function armCard(card){ makeDraggable(card); makeResizable(card); }
+  function initBoard(){}                       // custom pointer-drag → no container handler needed
+  function initBoardStatic(){                  // Teams + Model-costs cards are static → arm once
+    var t=document.getElementById("teams-card"), m=document.getElementById("models-card");
+    if(t) armCard(t); if(m) armCard(m);
+    applyBoard();
   }
 
   function render(list){
     var groups={},order=[];
     list.forEach(function(s){ if(!groups[s.group]){groups[s.group]=[];order.push(s.group);} groups[s.group].push(s); });
-    order=applySavedOrder(order);                 // restore the remembered card order
-    var root=document.getElementById("groups"); root.textContent=""; initDrag(root);
-    // quick-nav across the setting sections + Teams (better on-page organization)
+    var b=board(); initBoard();
+    // remove existing config cards (keep the static Teams / Model-costs cards intact)
+    [].slice.call(b.querySelectorAll(":scope > .card.gcard")).forEach(function(c){ c.remove(); });
     var nav=document.getElementById("secnav"); nav.textContent="";
     order.concat(["Teams","Models"]).forEach(function(g){
       var a=document.createElement("a"); a.href="#"+slug(g); a.textContent=g; nav.appendChild(a);
     });
+    var firstStatic=b.querySelector(":scope > .card:not(.gcard)");   // teams-card (or null)
+    var frag=document.createDocumentFragment();
     order.forEach(function(g){
-      var card=document.createElement("section"); card.className="card"; card.dataset.group=g;
+      var card=document.createElement("section"); card.className="card gcard";
+      card.dataset.group=g; card.dataset.card="g:"+g; card.dataset.defspan="4";
       var h=document.createElement("h2"); h.id=slug(g); h.textContent=g; card.appendChild(h);
       var grid=document.createElement("div"); grid.className="grid2";
       groups[g].forEach(function(s){ grid.appendChild(rowFor(s)); });
       card.appendChild(grid);
-      root.appendChild(card);
-      makeDraggable(card,root);
+      frag.appendChild(card); armCard(card);
     });
+    b.insertBefore(frag, firstStatic);            // config cards first by default
+    applyBoard();                                 // then restore saved order + sizes (DB)
   }
   // One compact line per setting: label (help + default in a hover tooltip) · small field
   // · ✓ save · ↺ reset. Status is a brief colour flash on ✓ (title carries the message).
@@ -374,7 +456,7 @@
   }
   function load(){
     fetch("/api/admin/settings").then(function(r){return r.ok?r.json():null;}).then(function(d){
-      if(!d){document.getElementById("groups").textContent="Settings are admin-only.";return;}
+      if(!d){document.getElementById("board").textContent="Settings are admin-only.";return;}
       render(d.settings||[]);
     }).catch(function(){});
   }
@@ -382,13 +464,14 @@
   // keys (horizontally-scrolling). Team/budget/⟳/↺ apply to EVERY key the user owns.
   function userBlock(g, gid, teams){
     var unassigned = gid==="__unassigned__";
+    var block=document.createElement("div"); block.className="ublock";
     var row=document.createElement("div"); row.className="urow";
-    // 1) EMAIL — primary identity (raw user_id only in tooltip). Falls back to the key
-    //    name when LiteLLM reports no email, so the row is still identifiable.
+    // 1) EMAIL — primary identity. Click it to open a structured details panel
+    //    (User ID · username · email · team · keys). Falls back to the key name.
     var uname=document.createElement("span"); uname.className="uid";
     uname.textContent = unassigned ? "Unassigned"
       : (g.name || (g.keys[0] && g.keys[0].key) || "Unnamed user");
-    if(!unassigned && g.uid) uname.title=(g.name?(g.name+"\n"):"")+"user_id "+g.uid;
+    uname.title="Click for details (ID · username · email · team · keys)";
     row.appendChild(uname);
     // 2) TEAM — pick an existing (identified) team or add a new one (same cell)
     var teamcell=document.createElement("div"); teamcell.className="teamcell";
@@ -448,14 +531,49 @@
     var strip=document.createElement("div"); strip.className="kstrip";
     g.keys.forEach(function(k){
       var chip=document.createElement("span"); chip.className="kchip"; chip.textContent=k.key;
-      chip.title=k.key+(k.overridden?"\n(team overridden)":"")
+      chip.title=k.key+"\n(click to change the associated user/email)"
+        +(k.user_overridden?("\nuser overridden → "+(k.user_name||"")):"")
+        +(k.overridden?"\n(team overridden)":"")
         +(k.budget_overridden?("\nbudget $"+k.budget):"")
         +(k.detected?("\nLiteLLM team: "+k.detected):"");
-      if(k.overridden) chip.classList.add("ov");
+      if(k.overridden||k.user_overridden) chip.classList.add("ov");
+      chip.addEventListener("click",function(){ openKeyUserPopup(k); });
       strip.appendChild(chip);
     });
     row.appendChild(strip);
-    return row;
+    block.appendChild(row);
+    // click-to-open STRUCTURED details: ID · username · email · team · keys
+    var det=document.createElement("div"); det.className="udetails"; det.style.display="none";
+    function dline(k, v){
+      var r=document.createElement("div"); r.className="udrow";
+      var a=document.createElement("span"); a.className="udk"; a.textContent=k;
+      var b=document.createElement("span"); b.className="udv"; b.textContent=(v==null||v==="")?"—":v;
+      r.appendChild(a); r.appendChild(b); return r;
+    }
+    var email=g.name||"", uid=g.uid||"";
+    det.appendChild(dline("User ID", unassigned ? "(no LiteLLM user)" : uid));
+    det.appendChild(dline("Username", email ? email.split("@")[0] : ""));
+    det.appendChild(dline("Email", email));
+    det.appendChild(dline("Team", g.team));
+    var kh=document.createElement("div"); kh.className="udrow";
+    var kka=document.createElement("span"); kka.className="udk"; kka.textContent="Keys ("+g.keys.length+")";
+    kh.appendChild(kka); det.appendChild(kh);
+    var klist=document.createElement("div"); klist.className="udkeys";
+    g.keys.forEach(function(k){
+      var kr=document.createElement("div"); kr.className="udkey";
+      var nm=document.createElement("b"); nm.textContent=k.key; kr.appendChild(nm);
+      var parts=["team "+(k.team||"—")];
+      if(k.budget_overridden && k.budget) parts.push("budget $"+k.budget);
+      if((Number(k.spent)||0)>0) parts.push("spent $"+Number(k.spent).toFixed(2));
+      if(k.overridden) parts.push("overridden");
+      var m=document.createElement("span"); m.className="udkm"; m.textContent=" — "+parts.join(" · ");
+      kr.appendChild(m); klist.appendChild(kr);
+    });
+    det.appendChild(klist);
+    block.appendChild(det);
+    uname.addEventListener("click", function(){
+      det.style.display = det.style.display==="none" ? "" : "none"; });
+    return block;
   }
   function post2(params){
     return fetch("/api/admin/teams",{method:"POST",
@@ -497,6 +615,48 @@
     });
     return wrap;
   }
+  // Click a key chip → popup to change its associated user/email (a per-key override
+  // that regroups the key under that user; empty resets to LiteLLM's reported user).
+  function openKeyUserPopup(k){
+    var ov=document.createElement("div"); ov.className="modal-ov";
+    var m=document.createElement("div"); m.className="modal";
+    var h=document.createElement("h3"); h.textContent="Change associated user / email"; m.appendChild(h);
+    var sub=document.createElement("div"); sub.className="msub"; sub.textContent="Key: "+k.key; m.appendChild(sub);
+    var lb=document.createElement("label"); lb.textContent="User / email (existing users only)"; m.appendChild(lb);
+    // dropdown of EXISTING users only — no free text, so a key can't be reassigned to a
+    // made-up user. The current override (if any) is kept selectable even if it left the list.
+    var inp=document.createElement("select");
+    var o0=document.createElement("option"); o0.value=""; o0.textContent="— pick a user —"; inp.appendChild(o0);
+    var cur=(k.user_overridden?(k.user_name||""):"");
+    var opts=_knownEmails.slice(); if(cur && opts.indexOf(cur)<0) opts.push(cur);
+    opts.forEach(function(e){ var o=document.createElement("option"); o.value=e; o.textContent=e; inp.appendChild(o); });
+    inp.value=cur;
+    m.appendChild(inp);
+    if(!_knownEmails.length){ var w=document.createElement("div"); w.className="msub";
+      w.textContent="No known users yet — click Refresh on the Teams board first."; m.appendChild(w); }
+    var det=document.createElement("div"); det.className="msub";
+    det.textContent="LiteLLM-detected: "+(k.user_name&&!k.user_overridden?k.user_name:(k.user?("user "+k.user):"(none)"));
+    m.appendChild(det);
+    var msg=document.createElement("div"); msg.className="mmsg"; m.appendChild(msg);
+    var btns=document.createElement("div"); btns.className="mbtns";
+    function close(){ document.body.removeChild(ov); }
+    function post(params){ return fetch("/api/admin/key-user",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams(params).toString()}).then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});}); }
+    var resetB=document.createElement("button"); resetB.type="button"; resetB.className="reset spacer"; resetB.textContent="Reset to detected";
+    resetB.addEventListener("click",function(){ post({action:"reset",key:k.key}).then(function(res){
+      if(!res.ok){msg.className="mmsg bad";msg.textContent=(res.j&&res.j.error)||"failed";return;} close(); loadTeams(); }); });
+    var cancelB=document.createElement("button"); cancelB.type="button"; cancelB.className="reset"; cancelB.textContent="Cancel";
+    cancelB.addEventListener("click",close);
+    var saveB=document.createElement("button"); saveB.type="button"; saveB.className="save"; saveB.textContent="Save";
+    saveB.addEventListener("click",function(){ post({key:k.key,user:inp.value.trim()}).then(function(res){
+      if(!res.ok){msg.className="mmsg bad";msg.textContent=(res.j&&res.j.error)||"failed";return;} close(); loadTeams(); }); });
+    btns.appendChild(resetB); btns.appendChild(cancelB); btns.appendChild(saveB);
+    m.appendChild(btns); ov.appendChild(m);
+    ov.addEventListener("click",function(e){ if(e.target===ov) close(); });
+    document.addEventListener("keydown",function esc(e){ if(e.key==="Escape"){close();document.removeEventListener("keydown",esc);} });
+    document.body.appendChild(ov); inp.focus();
+  }
   function loadTeams(force){
     var rb=document.getElementById("teams-refresh");
     if(force&&rb){rb.disabled=true;rb.textContent="Refreshing…";}
@@ -516,25 +676,33 @@
         hd.textContent=ts.length+" team"+(ts.length>1?"s":"")+" · monthly budget per member (each key inherits it)";
         el.appendChild(hd); el.appendChild(teamSummaryStrip(ts));
       }
-      var asn=document.createElement("div"); asn.className="tsumhd"; asn.textContent="By user · team · keys";
+      var asn=document.createElement("div"); asn.className="tsumhd";
+      asn.textContent="By user — ranked by usage · click a name for details (ID · username · email · team · keys)";
       el.appendChild(asn);
       var dl=document.createElement("datalist"); dl.id="team-names";
       (d.teams||[]).forEach(function(t){var o=document.createElement("option");o.value=t;dl.appendChild(o);});
       el.appendChild(dl);
+      // existing users (distinct emails LiteLLM reported) — the reassign dropdown offers
+      // ONLY these, so a key can never be moved to a made-up user.
+      _knownEmails=(d.keys||[]).map(function(k){return k.user_name;})
+        .filter(function(e,i,a){return e && e.indexOf("@")>0 && a.indexOf(e)===i;}).sort();
       // group keys by LiteLLM user: username (primary) → team → its keys. Keys with no
       // user fall into one "Unassigned" group at the bottom.
       var groups={}, order=[];
       (d.keys||[]).forEach(function(k){
-        var gid=k.user||"__unassigned__";
-        if(!groups[gid]){ groups[gid]={uid:k.user||"",name:k.user_name||"",team:"",keys:[]}; order.push(gid); }
+        // a per-key user override (user_grp) regroups the key under the new user/email
+        var gid=k.user_grp||k.user||"__unassigned__";
+        if(!groups[gid]){ groups[gid]={uid:k.user||"",name:k.user_name||"",team:"",keys:[],spent:0}; order.push(gid); }
         var g=groups[gid]; g.keys.push(k);
+        g.spent += Number(k.spent)||0;
         if(!g.name && k.user_name) g.name=k.user_name;
         if(!g.team && k.team) g.team=k.team;
       });
+      // rank by USAGE (total spend) so the top spenders are at the top — the scroll box
+      // is sized to show ~10 users; "Unassigned" always sinks to the bottom.
       order.sort(function(a,b){
         if(a==="__unassigned__") return 1; if(b==="__unassigned__") return -1;
-        var na=(groups[a].name||groups[a].uid).toLowerCase(), nb=(groups[b].name||groups[b].uid).toLowerCase();
-        return na<nb?-1:(na>nb?1:0);
+        return (groups[b].spent||0)-(groups[a].spent||0);
       });
       var scroll=document.createElement("div"); scroll.className="uscroll";
       order.forEach(function(gid){ scroll.appendChild(userBlock(groups[gid], gid, d.teams||[])); });
@@ -602,14 +770,17 @@
   if(_rb) _rb.addEventListener("click",function(){loadTeams(true);});
   var _rl=document.getElementById("reset-layout");
   if(_rl) _rl.addEventListener("click",function(){
-    try{localStorage.removeItem("aimon_settings_card_order");}catch(e){}
-    load();   // re-render config cards in their default order
+    _grid={};                       // clear saved DB positions + sizes → default arrangement
+    fetch("/api/admin/ui-layout",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+      body:new URLSearchParams({name:"settings_cards",grid:"{}"}).toString()})
+      .then(function(){ load(); initBoardStatic(); }).catch(function(){ load(); });
   });
 
   fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
     if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}
-    load(); loadTeams(); loadModels();
-  }).catch(function(){load();loadTeams();loadModels();});
+    loadLayout(function(){ load(); loadTeams(); loadModels(); initBoardStatic(); });
+  }).catch(function(){ loadLayout(function(){load();loadTeams();loadModels();initBoardStatic();}); });
 })();
 </script>
 <script>

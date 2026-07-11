@@ -390,8 +390,9 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
             "wait_avg_ms": None, "wait_max_ms": None, "p95_ms": None,
             "slo_pct": None, "cost": None,
         } for m in pm][:20]
-    # top keys by spend (pre-aggregated)
-    ks, e3 = await fetch_json(session, f"{base}/global/spend/keys?limit=10",
+    # keys by spend (pre-aggregated). limit=100 (not 10) so the Spend "Cost by key" chart
+    # sees EVERY key on the fallback path, not just the top 10.
+    ks, e3 = await fetch_json(session, f"{base}/global/spend/keys?limit=100",
                               headers=h, timeout_s=t)
     if e3 is None and isinstance(ks, list):
         out["top_keys"] = [{
@@ -399,7 +400,7 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
             "alias": k.get("key_alias") or k.get("key_name") or "",
             "reqs": None, "tokens": None,
             "cost": round(float(k.get("total_spend") or 0), 4),
-        } for k in ks][:10]
+        } for k in ks]
     _dbg(f"/spend lite: requests={out.get('requests_window')} "
          f"per_model={len(out.get('per_model', []))} top_keys={len(out.get('top_keys', []))} "
          f"errs=({e1},{e2},{e3})")

@@ -171,6 +171,16 @@ CREATE TABLE IF NOT EXISTS team_budgets (team TEXT PRIMARY KEY, budget REAL NOT 
 CREATE TABLE IF NOT EXISTS model_cost_kind (model TEXT PRIMARY KEY, kind TEXT NOT NULL,
     updated REAL);
 
+-- Persisted UI layout (Settings page card order, etc.). Stored server-side so the
+-- arrangement follows the deployment, not a single browser. value is a JSON string.
+CREATE TABLE IF NOT EXISTS ui_layout (name TEXT PRIMARY KEY, value TEXT NOT NULL,
+    updated REAL);
+
+-- Admin-set per-key USER/EMAIL override (Settings → Teams key popup). Reassigns a key
+-- to a different user/email for the by-user grouping, overriding LiteLLM's reported user.
+CREATE TABLE IF NOT EXISTS key_user_ovr (key TEXT PRIMARY KEY, user_name TEXT NOT NULL,
+    updated REAL);
+
 -- Persisted LiteLLM team DETECTION (Settings → Teams). LiteLLM's team lookup is flaky
 -- and slow, so the last good detection per key is cached here and reloaded on startup —
 -- the board shows teams immediately without re-polling LiteLLM every boot. Distinct from
@@ -1030,6 +1040,64 @@ def team_delete(key: str) -> bool:
     try:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM key_teams WHERE key = ?", (key,))
+        return (cur.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def ui_layout_get(name: str) -> list | dict | None:
+    """Return the persisted UI layout value for `name` (JSON-decoded), or None."""
+    try:
+        with _connect() as conn:
+            r = conn.execute("SELECT value FROM ui_layout WHERE name = ?",
+                             (str(name),)).fetchone()
+        return json.loads(r[0]) if r and r[0] else None
+    except Exception:
+        return None
+
+
+def ui_layout_set(name: str, value, now: float) -> bool:
+    """Persist a UI layout value (list/dict → JSON) under `name` (upsert)."""
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO ui_layout(name, value, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET value = excluded.value, "
+                "updated = excluded.updated",
+                (str(name), json.dumps(value, separators=(",", ":")), now))
+        return True
+    except Exception:
+        return False
+
+
+def key_user_overrides() -> dict[str, str]:
+    """Admin-assigned per-key user/email overrides as {key: user_name}."""
+    try:
+        with _connect() as conn:
+            return {r[0]: r[1] for r in
+                    conn.execute("SELECT key, user_name FROM key_user_ovr").fetchall()}
+    except Exception:
+        return {}
+
+
+def key_user_set(key: str, user_name: str, now: float) -> bool:
+    """Reassign a key to a user/email (upsert)."""
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO key_user_ovr(key, user_name, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET user_name = excluded.user_name, "
+                "updated = excluded.updated", (str(key), str(user_name), now))
+        return True
+    except Exception:
+        return False
+
+
+def key_user_delete(key: str) -> bool:
+    """Drop a user override so the key falls back to its LiteLLM-reported user."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM key_user_ovr WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
     except Exception:
         return False

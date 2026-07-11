@@ -457,14 +457,19 @@ function renderCostChart(keys){
   } else {
     rows=keys.map(k=>({name:k.key,spent:k.spent||0}));
   }
-  rows=rows.filter(r=>r.spent>0).sort((a,b)=>b.spent-a.spent).slice(0,12);
+  // show EVERY key/team with spend — no fixed top-N cap (regression: "Cost by key" used
+  // to slice to 12 and hide the rest). Rank by spend, biggest first.
+  rows=rows.filter(r=>r.spent>0).sort((a,b)=>b.spent-a.spent);
   const card=document.getElementById("card-cost");
   if(!rows.length){ card.style.display="none"; return; }
   card.style.display="";
+  // grow the chart so all bars fit (≈24px/bar, min 230px) instead of squeezing them
+  var wrap=costChart.canvas.parentNode;
+  if(wrap) wrap.style.height=Math.max(230, rows.length*24+28)+"px";
   costChart.data.labels=rows.map(r=>r.name);
   costChart.data.datasets[0].data=rows.map(r=>Math.round(r.spent*100)/100);
   costChart.data.datasets[0].backgroundColor=cssv("--accent");
-  costChart.update("none");
+  costChart.resize(); costChart.update("none");
 }
 document.querySelectorAll("#cost-by button[data-by]").forEach(b=>{
   b.addEventListener("click",()=>{
