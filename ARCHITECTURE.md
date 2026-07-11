@@ -83,8 +83,14 @@ per-IP maps are pruned so they can't grow without bound, and server-side session
 are hard-capped (`SESSION_MAX`). Dashboard pages set the cookie from `?token=`
 then 302 to a clean URL — the cookie holds an **opaque session id, not the raw
 token**, so the shared secret never lands in a browser cookie. A too-short
-`MONITOR_DASHBOARD_TOKEN` (<16 chars) is refused at boot by `validate()`. Handlers
-read the in-memory ring (`_latest`, `_ring`) for "now" and SQLite for history.
+`MONITOR_DASHBOARD_TOKEN` (<16 chars) is refused at boot by `validate()`.
+**Privilege tiers** (`_auth_ctx` / `_is_master_token_auth`): a login **session**
+carries its DB role (admin/viewer) and a **PAT** carries its own role, but the
+**shared master token** is dashboards-only — `_auth_mw` returns `403` when it hits an
+admin path (`/settings`, `/admin/users`, `/api/admin/*`) or the Alerts surface
+(`/alerts`, `/api/alerts*`), and `/api/nav` drops the Settings/Alerts links for it.
+Handlers read the in-memory ring (`_latest`, `_ring`) for "now" and SQLite for
+history.
 `GET /api/stream` is a **Server-Sent Events** channel that pushes each new
 snapshot over one connection (the Overview uses it and falls back to polling on
 error); `/api/events?kind=model` serves the model load/unload timeline. An

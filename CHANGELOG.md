@@ -4,9 +4,49 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.5.7] — 2026-07-11
+
+### Added
+- **`SECURITY.md`** — vulnerability-disclosure policy (private reporting via GitHub
+  advisories + email, supported-version window, coordinated-disclosure + safe-harbor
+  terms, scope, image-signature verification, and an operator hardening checklist).
+  Linked from the README Security section and added to the publish ALLOW-list.
+- **Sidebar icons + grouping** — every nav item now carries an icon, and related
+  pages are indented as sub-items: **Spend & Quota / Ollama / llama.cpp** under
+  **LiteLLM**, and **Alerts / Users** under **Settings**.
+- **New QA test suites** (all in the in-image gate): `test_property_parsers.py`
+  (Hypothesis property/fuzz), `test_time_frozen.py` (freezegun deterministic dates),
+  `test_error_matrix.py` (upstream failure-mode matrix), `test_contract_litellm.py`
+  (recorded LiteLLM response-shape contract + no-real-data guard), `test_snapshot_api.py`
+  (golden/snapshot of API row shapes).
+- **README badges** — CodeQL (code-scanning status) and a Security-Policy badge.
+
+### Changed
+- **Settings page: "Reset layout" moved into the header, before the title.**
+
+### Fixed
+- **`_norm_date` no longer raises `OverflowError`** on out-of-range epoch input from
+  upstream (surfaced by the new property tests) — malformed values degrade to empty.
+- **armv7 image build** — dev dependencies (and the pytest run) are now installed
+  only when `RUN_TESTS=1`, so emulated cross-arch builds no longer fail on a dev dep
+  that lacks a musl/armv7 wheel and would need a Rust toolchain. The native arch
+  still gates the full suite.
+- The "hide Alerts link for token/PAT auth" removal is now attribute/icon-tolerant
+  (regex, not an exact-string match), so it keeps working with the new nav markup.
+
 ## [1.5.6] — 2026-07-10
 
 ### Changed
+- **The shared URL/master token is now withheld from Alerts and the admin surfaces
+  (Settings, Users).** The dashboard token rides in the `?token=` URL and is meant
+  for read-only dashboard sharing, so it no longer counts as admin: the **Alerts**
+  and **Settings** links are absent from its sidebar, and `/alerts`, `/settings`,
+  `/api/alerts*` and `/api/admin/*` return **403** for it (previously the token was
+  full admin and could reach all of them). These surfaces now require an interactive
+  login, or a scoped **admin PAT** for automation — mint one under Account → Tokens.
+  A new env-keyed `_is_master_token_auth()` gate drives both the nav flags and the
+  backend block; user sessions and PATs are unaffected. Also gates Spend & Quota on
+  LiteLLM being configured (link hidden + `/spend` 404s when it isn't).
 - **Settings page: all explanatory text moved into click-the-title info popups.**
   The inline descriptions that crowded the compact board are gone; each title is
   now a button that opens an organized, labelled modal (click or focus +

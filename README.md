@@ -41,6 +41,38 @@ numbers**, not just system metrics.
   containers / top apps, every metric as live time-series.</em>
 </p>
 
+### Spend & Quota — the cost-first landing page
+
+<p align="center">
+  <img src="docs/img/dash-spend-dark.png" alt="Spend &amp; Quota dashboard" width="100%">
+  <br><em>Spend &amp; Quota — LLM cost and usage first: real-cash summary, usage and
+  real-vs-estimated cost over time, cost-by-key for every key, by-team rollup, and
+  per-key budgets ranked closest-to-cap. (Demo data.)</em>
+</p>
+
+`/spend` is where the dashboard leads with **money and usage**, not system metrics.
+It reads LiteLLM's own accounting and lays it out top-to-bottom:
+
+- **Cost summary** — total **real cash** this period (external paid models) with the
+  self-hosted **estimated** cost shown alongside but kept separate.
+- **Usage over time** — requests + tokens as **30-day daily** / **12-month monthly**
+  bars, each with **per-year** totals, so growth is visible at a glance. (LiteLLM's
+  free tier reports usage, not daily `$`, so the timeline is usage — the `$` split
+  comes from the cost chart below.)
+- **Cost over time** — daily tokens × your per-model price, drawn as **real
+  (external)** vs **estimated (self-hosted)** series, per-day accurate (an external
+  model's cost lands only on days it actually ran), plus a **current-year cost card**.
+- **Cost by key** — cumulative `$` for **every** key (no top-N cap), with a
+  **key/team** toggle.
+- **By-team rollup** — spend grouped by the teams you assign on the Settings page.
+- **Per-key budgets** — `%` used, `$/day` burn, days-to-cap and projected month-end,
+  **ranked closest-to-cap first**. Budgets cap **real cash only**; estimated
+  self-hosted cost is shown but never consumes a budget.
+
+Because every number here comes from LiteLLM, the page and its sidebar link only
+appear when a LiteLLM backend is configured (otherwise `/spend` is hidden and
+returns 404).
+
 - **Zero external deps to monitor** — reads `/proc`, Ollama `/api/*`, LiteLLM
   `/spend/logs` + `/health/*`, llama.cpp `/slots`, `nvidia-smi` (local or over
   SSH), and the Docker socket (read-only) for container health. aiohttp + a
@@ -134,7 +166,7 @@ secrets are never logged or persisted. `0` / empty disables a feature.
 | `MONITOR_DB_PATH` | `/data/ai-monitoring.db` | SQLite path (on the `/data` volume) |
 | `MONITOR_SAMPLE_INTERVAL` | `5` | seconds between samples |
 | `MONITOR_HTTP_TIMEOUT` | `4` | per-collector request timeout |
-| `MONITOR_DASHBOARD_TOKEN` | *(empty)* | legacy shared token (Bearer / `?token=` → cookie); still works alongside user login |
+| `MONITOR_DASHBOARD_TOKEN` | *(empty)* | shared **dashboards-only** token (Bearer / `?token=` → cookie); views dashboards but is **not** admin — Alerts + Settings/Users are blocked for it (use a login or admin PAT) |
 | `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` / `MONITOR_ADMIN_EMAIL` | *(empty)* | seed the first **admin** account on an empty users table (idempotent) |
 | `MONITOR_SESSION_TTL_S` | `604800` | login session lifetime (seconds; default 7 days) |
 | `MONITOR_ALLOW_OPEN` | `0` | `1` = run with **no** auth (loopback / behind an auth proxy only) |
@@ -172,8 +204,14 @@ webhook plus the operator-set global `ALERT_WEBHOOK_URL`. User URLs are SSRF-gua
 
 Seed the first admin via `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` /
 `MONITOR_ADMIN_EMAIL`, then manage everyone else from `/admin/users`. Passwords are
-scrypt-hashed in SQLite; sessions are HttpOnly + SameSite=Strict + Secure. The
-legacy `MONITOR_DASHBOARD_TOKEN` keeps working for automation.
+scrypt-hashed in SQLite; sessions are HttpOnly + SameSite=Strict + Secure.
+
+**Shared token is dashboards-only.** The `MONITOR_DASHBOARD_TOKEN` rides in the
+`?token=` URL and is meant for read-only dashboard sharing, so it is **not** an admin
+credential: the **Alerts** and **Settings/Users** links are hidden from it and those
+pages/APIs (`/alerts`, `/settings`, `/api/alerts*`, `/api/admin/*`) return **403**.
+Anything that needs Alerts or admin — including automation — uses an **interactive
+login** or a scoped **admin PAT** (Account → Tokens), not the URL token.
 
 An **audit trail** records logins (success / failure / lockout), logouts, and every
 user-management action (create / disable / enable / delete / reset) with actor,
@@ -432,6 +470,10 @@ tests/           full QA suite (static + dynamic + live-integration)
 
 - **Auth**: optional dashboard token — constant-time compare, HttpOnly
   `SameSite=Strict` cookie session (token leaves the URL after first load).
+- **Privilege tiers**: the shared URL token is **dashboards-only** (Alerts +
+  Settings/Users blocked, `403`); **Alerts** and **admin** require an interactive
+  login (viewer / admin role) or a scoped **admin PAT** — the shared secret can't
+  reach sensitive config.
 - **Headers**: `X-Frame-Options: DENY`, CSP `frame-ancestors 'none'`, nosniff,
   no-referrer, server-version hidden.
 - **XSS**: every dynamic value HTML-escaped; single DOMPurify-sanitised
