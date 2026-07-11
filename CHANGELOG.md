@@ -7,14 +7,32 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.5.6] — 2026-07-10
 
 ### Changed
-- **Settings → Teams and Model costs cards: description moved into a click-the-title
-  info popup.** Both cards dropped their inline explanatory paragraph (and its `ⓘ`
-  hover tooltip), which crowded the compact board. The card title (`Teams`, `Model
-  costs`) is now a button — click (or focus + Enter/Space) it to open an organized,
-  labelled modal: Teams covers Purpose/Layout/Set team/Change user/Refresh/Caching/
-  Budgets; Model costs covers Purpose/Auto-detect/Override/Cost basis. Both render
-  through one DOM-built `cardInfoModal(title, rows)` helper (no `innerHTML`), closed
-  by "Got it", overlay click, or Escape.
+- **Settings page: all explanatory text moved into click-the-title info popups.**
+  The inline descriptions that crowded the compact board are gone; each title is
+  now a button that opens an organized, labelled modal (click or focus +
+  Enter/Space; closed by "Got it", overlay click, or Escape). Three titles are
+  now buttons: the **Teams** card (Purpose/Layout/Set team/Change user/Refresh/
+  Caching/Budgets), the **Model costs** card (Purpose/Auto-detect/Override/Cost
+  basis), and the page **Settings** header itself (Purpose/Persistence/Scope/Edit
+  a setting/Arrange cards — merging the old intro paragraph and its `ⓘ` hover
+  tooltip). All render through one DOM-built `cardInfoModal(title, rows)` helper
+  (no `innerHTML`).
+- **Settings: removed the section quick-nav bar.** The sticky row of jump chips
+  (Alerts / Sampling / Retention / GPU / LiteLLM / Teams / Models) was redundant
+  with the draggable free-form board and is gone; the "Reset layout" button
+  stays.
+- **CI now runs the full test suite.** The `tests` job ran only
+  `test_static_qa.py` + `test_dynamic_qa.py`, silently skipping five files
+  (`property_parsers`, `snapshot_api`, `error_matrix`, `time_frozen`,
+  `contract_litellm`). It now runs the whole `tests/` dir (matching the in-image
+  build gate and rules.md §2), so a new suite can never go unrun. The badges job
+  is `continue-on-error` + warns instead of failing the run when the token is
+  read-only.
+- **Architecture diagram rebuilt for accuracy** (`docs/img/architecture.svg`).
+  Now shows the decoupled per-backend loops → `_backend_latest` cache (the
+  anti-freeze design), all eight dashboards, SSE `/api/stream`, and the real
+  storage tables — the old one showed a single `asyncio.gather()` loop and six
+  dashboards. rules.md §15 gains an architecture-diagram-parity rule.
 - **CI supply-chain hardening.** Every GitHub Action pinned to a full 40-char
   commit SHA (was major-tag `@vN` / branch `@main`). The `trufflesecurity/trufflehog@main`
   branch pin — the highest-risk mutable ref — is now `@27b0417c…` (v3.95.9).
