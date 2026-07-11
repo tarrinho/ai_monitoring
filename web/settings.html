@@ -232,19 +232,20 @@
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">Overview</a>
-    <a href="/spend">Spend &amp; Quota</a>
     <a href="/gpu">GPU</a>
     <a href="/litellm">LiteLLM</a>
-    <a href="/ollama">Ollama</a>
-    <a href="/llamacpp">llama.cpp</a>
-    <a href="/alerts">Alerts</a>
+    <a href="/spend" style="padding-left:26px">Spend &amp; Quota</a>
+    <a href="/ollama" style="padding-left:26px">Ollama</a>
+    <a href="/llamacpp" style="padding-left:26px">llama.cpp</a>
     <a href="/settings">⚙️ Settings</a>
+    <a href="/alerts" style="padding-left:26px">Alerts</a>
   </nav>
 </div>
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
 <div id="main-area">
   <header>
     <h1 style="display:flex;align-items:center;gap:6px">
+      <button id="reset-layout" type="button" class="btn-refresh" style="padding:2px 9px;font-size:11px;margin-right:14px">Reset layout</button>
       <span id="settings-info" class="cardinfo" tabindex="0" role="button"
             title="Click for info about this page">Settings <span class="ci-i">ⓘ</span></span>
     </h1>
@@ -254,8 +255,6 @@
     </div>
   </header>
   <main>
-    <p class="intro" style="margin:0 0 12px">
-      <button id="reset-layout" type="button" class="btn-refresh" style="padding:2px 9px;font-size:11px">Reset layout</button></p>
     <div id="board">
     <section class="card" id="teams-card" data-card="l:teams">
       <h2 id="sec-teams" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
@@ -859,7 +858,7 @@
       if(a.getAttribute("href")===p)a.classList.add("active");});
     fetch("/api/nav").then(function(r){return r.ok?r.json():null;}).then(function(n){
       if(!n)return;
-      [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+      [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
         if(!x[1])document.querySelectorAll('#sidebar-nav a[href="/'+x[0]+'"]').forEach(function(a){a.style.display="none";});
       });
     }).catch(function(){});

@@ -303,10 +303,12 @@ def test_all_pages_have_theme_toggle():
         assert 'id="theme-btn"' in html, f"{name}: no theme button"
         assert 'data-theme="light"' in html, f"{name}: no light palette"
         assert "aimon-theme" in html, f"{name}: theme not persisted"
-        # nav links hidden for unconfigured backends — filter targets all three
+        # nav links hidden for unconfigured backends — filter targets all backends
         assert "/api/nav" in html, f"{name}: no nav-link filter"
-        for be in ("litellm", "gpu", "ollama"):
+        for be in ("litellm", "gpu", "ollama", "spend"):
             assert f'"{be}"' in html, f"{name}: nav filter missing {be}"
+        # Spend & Quota is LiteLLM-derived — its link is gated by the nav "spend" flag
+        assert '["spend",n.spend]' in html, f"{name}: /spend link not gated on nav.spend"
 
 
 def test_dashboard_uptime_and_export_wired():

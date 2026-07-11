@@ -789,7 +789,9 @@ def _serve_page(path: Path, prefix: str = "", user: str | None = None,
     # no-ops when the anchor is gone). Done before _apply_prefix so it matches
     # the raw href regardless of any sub-path prefix.
     if not show_alerts:
-        html = html.replace('<a href="/alerts">Alerts</a>', "")
+        # regex, not a literal: the sidebar Alerts link carries a style attr
+        # (indented sub-item), so match the anchor regardless of its attributes.
+        html = re.sub(r'<a href="/alerts"[^>]*>Alerts</a>', "", html)
     if prefix:
         html = _apply_prefix(html, prefix)
     extra = _sidebar_extra(user, role, prefix)
@@ -827,6 +829,10 @@ async def litellm_page_handler(request: web.Request) -> web.Response:
 
 
 async def spend_page_handler(request: web.Request) -> web.Response:
+    # Spend & Quota is LiteLLM-derived — with no LiteLLM configured the page is
+    # hidden from the nav and blocked here so a direct URL can't reach it either.
+    if not _litellm_configured():
+        raise web.HTTPNotFound()
     return _page(request, _WEB / "spend.html", "/spend")
 
 
@@ -1373,12 +1379,21 @@ def _configured(name: str, env_ok: bool) -> bool:
     return env_ok
 
 
+def _litellm_configured() -> bool:
+    """Spend & Quota is entirely LiteLLM-derived — with no LiteLLM configured the
+    link is hidden and the page 404s. Keyed on the env URL (not the live sample):
+    "configured" is a deployment fact, so a configured-but-momentarily-down LiteLLM
+    still keeps its Spend link, and the gate is deterministic."""
+    return bool(config.LITELLM_BASE_URL)
+
+
 async def nav_handler(request: web.Request) -> web.Response:
     """Which backend dashboards are configured — drives nav-link visibility.
     `admin` reveals admin-only links (Settings) in the sidebar."""
     _, role, _ = _auth_ctx(request)
     return web.json_response({
         "litellm": _configured("litellm", bool(config.LITELLM_BASE_URL)),
+        "spend": _litellm_configured(),   # Spend & Quota — hidden with no LiteLLM
         "ollama": _configured("ollama", bool(config.OLLAMA_BASE_URL)),
         "llamacpp": _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)),
         "gpu": _configured("gpu", bool(config.GPU_SSH or config.GPU_METRICS_URL)),

@@ -2052,7 +2052,7 @@ async def test_nav_endpoint_shape():
     c = await _client()
     try:
         d = await (await c.get("/api/nav")).json()
-        assert set(d) == {"litellm", "ollama", "llamacpp", "gpu", "admin"}
+        assert set(d) == {"litellm", "spend", "ollama", "llamacpp", "gpu", "admin"}
         assert all(isinstance(v, bool) for v in d.values())
     finally:
         await c.close()
@@ -2534,6 +2534,7 @@ async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
 
 async def test_spend_page_served_and_gated(monkeypatch):
     """The Spend & Quota page renders open and is auth-gated once a token is set."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")  # spend needs LiteLLM
     c = await _client()
     try:
         r = await c.get("/spend")
@@ -2564,6 +2565,29 @@ async def test_spend_page_served_and_gated(monkeypatch):
     try:
         r2 = await c2.get("/spend", allow_redirects=False)
         assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
+    finally:
+        await c2.close()
+
+
+async def test_spend_blocked_when_litellm_not_configured(monkeypatch):
+    """No LiteLLM configured → Spend & Quota is unavailable: the nav flag is off (so
+    the link is hidden) and the /spend page 404s even on a direct URL. The gate is
+    env-keyed, so it's deterministic regardless of the background sampler."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    c = await _client()
+    try:
+        nav = await (await c.get("/api/nav")).json()
+        assert nav["spend"] is False                       # link hidden
+        assert (await c.get("/spend")).status == 404       # page blocked server-side
+    finally:
+        await c.close()
+    # and when LiteLLM IS configured, the page + nav flag come back
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    c2 = await _client()
+    try:
+        nav = await (await c2.get("/api/nav")).json()
+        assert nav["spend"] is True
+        assert (await c2.get("/spend")).status == 200
     finally:
         await c2.close()
 
@@ -3281,7 +3305,7 @@ async def test_token_auth_hides_alerts_link(monkeypatch):
         r = await c.get("/", headers={"Authorization": "Bearer " + TOK})
         assert r.status == 200
         h = await r.text()
-        assert '<a href="/alerts">Alerts</a>' not in h      # link removed
+        assert '>Alerts</a>' not in h                        # visible link removed
         assert '<a href="/gpu">' in h                        # other nav intact
         assert 'a[href="/alerts"]' in h                      # alert-dot JS kept
     finally:
@@ -3300,7 +3324,7 @@ async def test_user_session_keeps_alerts_link(monkeypatch):
                          allow_redirects=False)
         assert r.status == 302
         h = await (await c.get("/")).text()
-        assert '<a href="/alerts">Alerts</a>' in h           # user keeps Alerts
+        assert '>Alerts</a>' in h                            # user keeps Alerts
     finally:
         await c.close()
 
@@ -3316,7 +3340,7 @@ async def test_pat_auth_hides_alerts_link(monkeypatch):
     try:
         r = await c.get("/", headers={"Authorization": "Bearer " + raw})
         assert r.status == 200
-        assert '<a href="/alerts">Alerts</a>' not in (await r.text())
+        assert '>Alerts</a>' not in (await r.text())
     finally:
         await c.close()
 
@@ -3328,7 +3352,7 @@ async def test_open_mode_denies_alerts():
     c = await _client()
     try:
         h = await (await c.get("/")).text()      # overview still open...
-        assert '<a href="/alerts">Alerts</a>' not in h   # ...but Alerts link gone
+        assert '>Alerts</a>' not in h   # ...but Alerts link gone
         assert (await c.get("/alerts")).status == 403        # page denied
         assert (await c.get("/api/alerts")).status == 403    # API denied
         # a benign open endpoint is unaffected

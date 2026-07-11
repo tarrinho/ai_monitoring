@@ -32,14 +32,16 @@ RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev \
 # --- test stage: run the QA suite; build aborts here on any failure ----------
 FROM base AS test
 ARG RUN_TESTS=1
-# pytest + pytest-asyncio are pure-python wheels — no build deps needed here.
 COPY requirements-dev.txt .
-RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY . .
-# On success drop a marker the runtime stage depends on. RUN_TESTS=0 skips the
-# (emulated) suite for cross-arch builds but still produces the marker.
+# Dev deps are installed AND the suite runs only when RUN_TESTS=1 (native builds).
+# RUN_TESTS=0 (emulated cross-arch: armv7/amd64 under QEMU) skips both — the suite
+# already gated on the native arch, and some dev deps have no musl wheel for
+# arm/v7, so a source build would need a Rust toolchain that isn't there. The
+# /qa-passed marker is still produced so the runtime stage can depend on it.
 RUN if [ "$RUN_TESTS" = "1" ]; then \
-        MONITOR_DB_PATH=/tmp/build-test.db python -m pytest tests/ -q; \
+        pip install --no-cache-dir -r requirements-dev.txt \
+        && MONITOR_DB_PATH=/tmp/build-test.db python -m pytest tests/ -q; \
     fi && touch /qa-passed
 
 

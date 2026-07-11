@@ -111,7 +111,7 @@
         {headers:tok?{Authorization:"Bearer "+tok}:{}})
         .then(function(r){return r.ok?r.json():null;})
         .then(function(n){ if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
-          [["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
             if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
               .forEach(function(a){a.style.display="none";});
           });
@@ -144,13 +144,13 @@
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">Overview</a>
-    <a href="/spend">Spend &amp; Quota</a>
     <a href="/gpu">GPU</a>
     <a href="/litellm">LiteLLM</a>
-    <a href="/ollama">Ollama</a>
-    <a href="/llamacpp">llama.cpp</a>
-    <a href="/alerts">Alerts</a>
+    <a href="/spend" style="padding-left:26px">Spend &amp; Quota</a>
+    <a href="/ollama" style="padding-left:26px">Ollama</a>
+    <a href="/llamacpp" style="padding-left:26px">llama.cpp</a>
     <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
+    <a href="/alerts" style="padding-left:26px">Alerts</a>
   </nav>
 </div>
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
