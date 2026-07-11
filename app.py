@@ -1635,6 +1635,13 @@ async def _detect_teams(session, force: bool) -> tuple[dict, str]:
     return _TEAMS_DETECT_CACHE, ("litellm" if hit_litellm else "cache")
 
 
+async def api_admin_keys_diag(request: web.Request) -> web.Response:
+    """Admin diagnostic: the raw /key/list + /user/list field structure (email VALUES
+    redacted) — used to locate which LiteLLM field carries the user email when it doesn't
+    show on the board. Admin-only via the /api/admin/* gate."""
+    return web.json_response(await litellm.keys_diag(request.app[_SESSION]))
+
+
 async def api_admin_teams_get(request: web.Request) -> web.Response:
     """Team board for the Settings page: every known key, its LiteLLM-detected team,
     the resolved team (override wins), and whether it is overridden. Admin-only.
@@ -2394,6 +2401,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/admin/settings", api_admin_settings_get)
     app.router.add_post("/api/admin/settings", api_admin_settings_set)
     app.router.add_get("/api/admin/teams", api_admin_teams_get)
+    app.router.add_get("/api/admin/keys-diag", api_admin_keys_diag)
     app.router.add_post("/api/admin/teams", api_admin_teams_set)
     app.router.add_post("/api/admin/teams/sync", api_admin_team_sync)
     app.router.add_post("/api/admin/team-budget", api_admin_team_budget_set)

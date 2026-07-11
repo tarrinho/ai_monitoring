@@ -34,6 +34,11 @@ Versioning: [SemVer](https://semver.org/).
   boolean `workflow_dispatch` input for re-tag scenarios where CI was
   cancelled/expired but the operator has verified locally.
 
+### Added
+- **`GET /api/admin/keys-diag`** — admin diagnostic that reports the raw `/key/list` and
+  `/user/list` field names and *which* fields hold an email-like value (values redacted),
+  to locate the field carrying the user email when it doesn't surface on the Teams board.
+
 ### Fixed
 - **`collectors/litellm.py::spend_report_debug` mypy dict-item errors** — the
   `attempts` list and its intermediate `row` were inferred as
@@ -97,7 +102,24 @@ Versioning: [SemVer](https://semver.org/).
   returns `cost_models: {real:[…], reference:[…]}`, biggest-usage first).
 
 ### Fixed
-### Changed
+- **Settings → Teams board is now one LINE per user: email · team · budget · keys.** The
+  email, the team dropdown, the per-user budget, the actions and all of that user's keys
+  (horizontally scrolling) sit on a single row — matching the proposed layout. Each user
+  shows their **email as the primary identifier** (raw `user_id` only in the tooltip;
+  falls back to the key name when LiteLLM reports no email), a **team dropdown** to pick one
+  of the identified teams or **add a new one**, a **per-user budget** input, and **all of
+  that user's keys on a single horizontally-scrolling line** of chips (overridden key
+  highlighted). Save/⟳/↺ apply to every key the user owns (a user has one team + budget).
+  **User email now reads straight off the key row** — LiteLLM carries it in the key's
+  `User`/`Created By` columns (`user_email` / `created_by`), which populate even when
+  `/user/list` returns no email; the board prefers an email-shaped value (`_pick_email`)
+  from `user_email` → metadata → `/user/list` → `created_by`, so real emails show as the
+  per-user identity instead of "Unnamed user".
+- **Settings → Teams board is more compact.** The "by user · team · keys" list is capped
+  to ~10 rows and scrolls beyond that (so a long key list no longer stretches the page),
+  each entry stays on one line, and a user's raw `user_id` (UUID) is now shown **only in
+  the hover tooltip** — the inline label shows the human name (or "Unnamed user"), never a
+  truncated UUID.
 - **Settings → Teams: per-key ⟳ now lets LiteLLM win.** The **⟳** button re-detects a
   key's team from LiteLLM and **overwrites any saved override** with the freshly detected
   team (the endpoint drops the override so the detected value shows; the board reloads).

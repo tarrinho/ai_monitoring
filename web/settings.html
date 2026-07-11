@@ -31,7 +31,12 @@
   #groups{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
     gap:12px;align-items:start;margin-bottom:14px}
   #groups .card{margin-bottom:0;padding:12px 14px}
-  #groups .card h2{margin-bottom:6px}
+  #groups .card h2{margin-bottom:6px;display:flex;align-items:center;gap:6px}
+  /* drag-to-reorder: grip handle + dragging state (order remembered in localStorage) */
+  .draghandle{cursor:grab;color:var(--muted);font-size:12px;line-height:1;user-select:none;
+    flex-shrink:0;letter-spacing:-1px}
+  .draghandle:hover{color:var(--fg)} .draghandle:active{cursor:grabbing}
+  #groups .card.dragging{opacity:.45;outline:2px dashed var(--accent);outline-offset:-2px}
   /* two compact settings per row inside each card (auto-fits to card width) */
   .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
     gap:2px 14px;margin-top:2px}
@@ -50,10 +55,11 @@
   .srow .ib.reset:hover{color:var(--fg)}
   .srow .ib.ok{border-color:var(--ok);color:var(--ok)}
   .srow .ib.bad{border-color:var(--bad);color:var(--bad)}
-  /* Teams + Model costs side-by-side below the config grid, collapsing on narrow screens */
-  .litellm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));
+  /* Teams (wide, per-user rows + key strips) vs Model costs (thin: model · kind · ✓↺) */
+  .litellm-grid{display:grid;grid-template-columns:minmax(0,1.9fr) minmax(0,1fr);
     gap:16px;align-items:start}
-  .litellm-grid .card{margin-bottom:0}
+  @media(max-width:900px){.litellm-grid{grid-template-columns:1fr}}  /* stack on narrow */
+  .litellm-grid .card{margin-bottom:0;min-width:0}
   .card h2{margin:0 0 2px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
   .card .gsub{color:var(--muted);font-size:12px;margin:0 0 12px}
   .row{display:grid;grid-template-columns:1fr 150px auto auto;gap:10px;align-items:center;
@@ -86,15 +92,28 @@
   .srow .tin{width:104px;flex:0 0 auto} .srow .bin{width:56px;flex:0 0 auto}
   .srow .min{width:auto;max-width:130px;flex:0 0 auto}
   .srow .ksync{margin-left:0;font-size:13px}
-  /* Teams grouped by user: username (primary) · team · keys area */
-  .ugroup{border:1px solid var(--line);border-radius:9px;margin-top:9px;overflow:hidden}
-  .uhead{display:flex;align-items:center;gap:9px;padding:6px 11px;background:var(--panel2);
-    border-bottom:1px solid var(--line)}
-  .uhead .uname{font-weight:650;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .uhead .uteam{font-size:10.5px;color:var(--accent);border:1px solid var(--line);
-    border-radius:20px;padding:1px 9px;flex-shrink:0}
-  .uhead .ukcount{margin-left:auto;font-size:11px;color:var(--muted);flex-shrink:0}
-  .ukeys{padding:0 11px 4px}
+  /* Teams — ONE line per user: email · team · budget · actions · keys(scroll) */
+  .urow{display:grid;grid-template-columns:minmax(140px,1.1fr) 150px 66px auto minmax(0,1.9fr);
+    gap:10px;align-items:center;padding:6px 11px;border-top:1px solid var(--line)}
+  .urow:first-child{border-top:0}
+  .urow .uid{font-weight:600;font-size:12.5px;min-width:0;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .teamcell{min-width:0} .teamcell .tsel,.teamcell .newin{width:100%;padding:4px 6px;font-size:12px}
+  .urow .bin{width:66px;text-align:right}
+  .ubtns{display:flex;gap:3px;align-items:center}
+  /* all of a user's keys on the SAME line, horizontally scrolling (chips; details in tooltip) */
+  .kstrip{display:flex;gap:6px;min-width:0;overflow-x:auto;white-space:nowrap;
+    padding-bottom:1px;overscroll-behavior:contain}
+  .kchip{flex-shrink:0;font-size:11px;background:var(--panel);border:1px solid var(--line);
+    border-radius:20px;padding:2px 9px;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .kchip.ov{border-color:var(--warn);color:var(--warn)}
+  /* keep the list compact: ~10 rows (≈32px each) then scroll the rest */
+  .uscroll{max-height:320px;overflow:auto;overscroll-behavior:contain;
+    border:1px solid var(--line);border-radius:9px;margin-top:6px}
+  @media(max-width:820px){
+    .urow{grid-template-columns:1fr 130px 60px auto;row-gap:6px}
+    .urow .kstrip{grid-column:1/-1}
+  }
   .save{background:var(--accent);color:#fff} .save:hover{filter:brightness(1.08)}
   .reset{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .reset:hover{color:var(--fg)}
@@ -189,8 +208,9 @@
     </div>
   </header>
   <main>
-    <p class="intro">Operator tuning — applied live, persisted, admin-only &amp; audited. Hover a label for help; <b>✓</b> saves, <b>↺</b> resets to default.
-      <span class="ttip" tabindex="0" title="Changes apply live (no restart) and persist across restarts, overriding the .env defaults. Only non-secret operational settings are here — secrets, ports, backend URLs and security switches stay in .env. Reset returns a setting to its environment/default value.">ⓘ</span></p>
+    <p class="intro">Operator tuning — applied live, persisted, admin-only &amp; audited. Hover a label for help; <b>✓</b> saves, <b>↺</b> resets to default. Drag a card's <b>⠿</b> handle to reorder; the layout is remembered in this browser.
+      <span class="ttip" tabindex="0" title="Changes apply live (no restart) and persist across restarts, overriding the .env defaults. Only non-secret operational settings are here — secrets, ports, backend URLs and security switches stay in .env. Reset returns a setting to its environment/default value.">ⓘ</span>
+      <button id="reset-layout" type="button" class="btn-refresh" style="padding:2px 9px;font-size:11px;margin-left:6px">Reset layout</button></p>
     <div class="secnav" id="secnav"></div>
     <div id="groups"></div>
     <div class="litellm-grid">
@@ -238,22 +258,72 @@
   }
   // Build one editable row per tunable, grouped by section. DOM API only (no innerHTML).
   function slug(s){ return "sec-"+String(s).toLowerCase().replace(/[^a-z0-9]+/g,"-"); }
+  // ── drag-to-reorder config cards, remembered per browser (localStorage) ──
+  var ORDER_KEY="aimon_settings_card_order";
+  function savedOrder(){ try{return JSON.parse(localStorage.getItem(ORDER_KEY))||[];}catch(e){return [];} }
+  function saveOrder(a){ try{localStorage.setItem(ORDER_KEY,JSON.stringify(a));}catch(e){} }
+  function applySavedOrder(order){
+    var saved=savedOrder(); if(!saved.length) return order;
+    var known=order.filter(function(g){return saved.indexOf(g)>=0;})
+      .sort(function(a,b){return saved.indexOf(a)-saved.indexOf(b);});
+    var rest=order.filter(function(g){return saved.indexOf(g)<0;});  // new groups → end
+    return known.concat(rest);
+  }
+  function persistDomOrder(root){
+    saveOrder([].slice.call(root.querySelectorAll(".card"))
+      .map(function(c){return c.dataset.group;}).filter(Boolean));
+  }
+  function dragAfter(root,x,y){    // nearest card center; insert before it if cursor is above/left
+    var els=[].slice.call(root.querySelectorAll(".card:not(.dragging)"));
+    var best=null,bestD=Infinity,before=true;
+    els.forEach(function(el){
+      var r=el.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2;
+      var d=(x-cx)*(x-cx)+(y-cy)*(y-cy);
+      if(d<bestD){ bestD=d; best=el; before=(y<cy-4)||(Math.abs(y-cy)<=r.height/2 && x<cx); }
+    });
+    return best ? (before?best:best.nextElementSibling) : null;
+  }
+  function initDrag(root){
+    if(root._dragInit) return; root._dragInit=true;
+    root.addEventListener("dragover",function(e){
+      var dragging=root.querySelector(".card.dragging"); if(!dragging) return;
+      e.preventDefault();
+      var ref=dragAfter(root,e.clientX,e.clientY);
+      if(ref==null) root.appendChild(dragging); else root.insertBefore(dragging,ref);
+    });
+  }
+  function makeDraggable(card,root){
+    var h=card.querySelector("h2");
+    var grip=document.createElement("span"); grip.className="draghandle"; grip.textContent="⠿";
+    grip.title="Drag to reorder";
+    // only the handle starts a drag, so inputs inside the card stay clickable
+    grip.addEventListener("mousedown",function(){ card.draggable=true; });
+    document.addEventListener("mouseup",function(){ card.draggable=false; });
+    card.addEventListener("dragstart",function(e){ card.classList.add("dragging");
+      e.dataTransfer.effectAllowed="move"; try{e.dataTransfer.setData("text/plain",card.dataset.group);}catch(_){} });
+    card.addEventListener("dragend",function(){ card.classList.remove("dragging");
+      card.draggable=false; persistDomOrder(root); });
+    if(h) h.insertBefore(grip,h.firstChild);
+  }
+
   function render(list){
     var groups={},order=[];
     list.forEach(function(s){ if(!groups[s.group]){groups[s.group]=[];order.push(s.group);} groups[s.group].push(s); });
-    var root=document.getElementById("groups"); root.textContent="";
+    order=applySavedOrder(order);                 // restore the remembered card order
+    var root=document.getElementById("groups"); root.textContent=""; initDrag(root);
     // quick-nav across the setting sections + Teams (better on-page organization)
     var nav=document.getElementById("secnav"); nav.textContent="";
     order.concat(["Teams","Models"]).forEach(function(g){
       var a=document.createElement("a"); a.href="#"+slug(g); a.textContent=g; nav.appendChild(a);
     });
     order.forEach(function(g){
-      var card=document.createElement("section"); card.className="card";
+      var card=document.createElement("section"); card.className="card"; card.dataset.group=g;
       var h=document.createElement("h2"); h.id=slug(g); h.textContent=g; card.appendChild(h);
       var grid=document.createElement("div"); grid.className="grid2";
       groups[g].forEach(function(s){ grid.appendChild(rowFor(s)); });
       card.appendChild(grid);
       root.appendChild(card);
+      makeDraggable(card,root);
     });
   }
   // One compact line per setting: label (help + default in a hover tooltip) · small field
@@ -308,55 +378,83 @@
       render(d.settings||[]);
     }).catch(function(){});
   }
-  // ── Teams board ──
-  function teamRow(k, teams){
-    // compact one-line row (matches the config cards): key · ⟳ · team · budget · ✓ · ↺.
-    // The LiteLLM-detected team/user lives in the hover tooltip, not a sub-line.
-    var row=document.createElement("div"); row.className="srow tteam";
-    function tip(u,d){return k.key+"\nLiteLLM: "+(u?("user "+u+" · "):"")+"team "+(d||"none reported");}
-    var lbl=document.createElement("span"); lbl.className="lbl kname"; lbl.textContent=k.key;
-    lbl.title=tip(k.user,k.detected);
-    if(k.overridden||k.budget_overridden) lbl.classList.add("mod");
-    row.appendChild(lbl);
-    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save";
+  // ── Teams board ── ONE line per user: email · team · budget · actions · all that user's
+  // keys (horizontally-scrolling). Team/budget/⟳/↺ apply to EVERY key the user owns.
+  function userBlock(g, gid, teams){
+    var unassigned = gid==="__unassigned__";
+    var row=document.createElement("div"); row.className="urow";
+    // 1) EMAIL — primary identity (raw user_id only in tooltip). Falls back to the key
+    //    name when LiteLLM reports no email, so the row is still identifiable.
+    var uname=document.createElement("span"); uname.className="uid";
+    uname.textContent = unassigned ? "Unassigned"
+      : (g.name || (g.keys[0] && g.keys[0].key) || "Unnamed user");
+    if(!unassigned && g.uid) uname.title=(g.name?(g.name+"\n"):"")+"user_id "+g.uid;
+    row.appendChild(uname);
+    // 2) TEAM — pick an existing (identified) team or add a new one (same cell)
+    var teamcell=document.createElement("div"); teamcell.className="teamcell";
+    var tsel=document.createElement("select"); tsel.className="tsel";
+    tsel.title="Team for this user — Save applies it to all "+g.keys.length+" key(s)";
+    var o0=document.createElement("option"); o0.value=""; o0.textContent="(no team)"; tsel.appendChild(o0);
+    var tlist=(teams||[]).slice(); if(g.team && tlist.indexOf(g.team)<0) tlist.push(g.team);
+    tlist.forEach(function(t){ var o=document.createElement("option"); o.value=t; o.textContent=t; tsel.appendChild(o); });
+    var oNew=document.createElement("option"); oNew.value="__new__"; oNew.textContent="＋ new team…"; tsel.appendChild(oNew);
+    tsel.value=g.team||"";
+    var newin=document.createElement("input"); newin.type="text"; newin.className="newin"; newin.placeholder="new team";
+    newin.maxLength=64; newin.style.display="none";
+    tsel.addEventListener("change",function(){
+      if(tsel.value==="__new__"){ tsel.style.display="none"; newin.style.display=""; newin.focus(); } });
+    newin.addEventListener("blur",function(){
+      if(!newin.value.trim()){ newin.style.display="none"; tsel.style.display=""; tsel.value=g.team||""; } });
+    function chosenTeam(){ return newin.style.display!=="none" ? newin.value.trim() : tsel.value; }
+    teamcell.appendChild(tsel); teamcell.appendChild(newin); row.appendChild(teamcell);
+    // 3) BUDGET per user (applies to all this user's keys)
+    var bud=document.createElement("input"); bud.type="number"; bud.className="bin"; bud.min="0"; bud.step="any";
+    bud.placeholder="$/mo"; bud.title="Monthly budget for this user (applies to all their keys)";
+    var bv=g.keys.map(function(k){return (k.budget_overridden&&k.budget)?k.budget:null;});
+    bud.value=(bv.length && bv.every(function(v){return v!=null && v===bv[0];})) ? bv[0] : "";
+    row.appendChild(bud);
+    // 4) ACTIONS
+    var btns=document.createElement("span"); btns.className="ubtns";
+    var sync=document.createElement("button"); sync.type="button"; sync.className="ksync"; sync.textContent="⟳";
+    sync.title="Re-detect from LiteLLM for all this user's keys (LiteLLM wins, clears overrides)";
+    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save team + budget for all this user's keys";
+    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Clear team + budget overrides for all this user's keys";
     function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
       save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
-    var sync=document.createElement("button"); sync.type="button"; sync.className="ksync";
-    sync.textContent="⟳"; sync.title="Re-detect this key's team from LiteLLM and use it — LiteLLM wins, overwriting any saved override (and anything typed here)";
-    var inp=document.createElement("input"); inp.type="text"; inp.className="tin"; inp.value=k.team||"";
-    inp.placeholder="team"; inp.maxLength=64; inp.setAttribute("list","team-names"); inp.title=tip(k.user,k.detected);
-    var bud=document.createElement("input"); bud.type="number"; bud.className="bin"; bud.min="0"; bud.step="any";
-    bud.placeholder=(k.team_budget>0?("t"+Math.round(k.team_budget)):"$/mo");
-    bud.value=(k.budget_overridden&&k.budget?k.budget:""); bud.title="Override this key's monthly budget ($)";
-    sync.addEventListener("click",function(){
-      sync.disabled=true; sync.classList.add("spin");
-      fetch("/api/admin/teams/sync",{method:"POST",
-        headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
-        body:new URLSearchParams({key:k.key}).toString()})
-        .then(function(r){return r.ok?r.json():null;}).then(function(j){
-          sync.disabled=false; sync.classList.remove("spin");
-          if(!j||!j.ok){say("sync failed",false);return;}
-          // ⟳ = LiteLLM wins: the endpoint drops any override, so reload the board to show
-          // the freshly detected team (overwriting the previously-defined name).
-          say(j.detected?("→ "+j.detected):"no team reported",true);
-          setTimeout(loadTeams,700);
-        }).catch(function(){sync.disabled=false;sync.classList.remove("spin");say("sync failed",false);});
-    });
-    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset team + budget";
+    function bulk(fn){ return Promise.all(g.keys.map(fn)); }
     save.addEventListener("click",function(){
-      post2({action:"set",key:k.key,team:inp.value.trim(),budget:bud.value.trim()}).then(function(res){
-        if(!res.ok){say((res.j&&res.j.error)||"save failed",false);return;}
+      var team=chosenTeam(), budget=bud.value.trim();
+      bulk(function(k){return post2({action:"set",key:k.key,team:team,budget:budget});}).then(function(rs){
+        if(rs.some(function(r){return !r.ok;})){say("save failed",false);return;}
         say("saved",true); setTimeout(loadTeams,900);
       }).catch(function(){say("save failed",false);});
     });
     reset.addEventListener("click",function(){
-      post2({action:"reset",key:k.key}).then(function(res){
-        if(!res.ok){say((res.j&&res.j.error)||"reset failed",false);return;}
+      bulk(function(k){return post2({action:"reset",key:k.key});}).then(function(rs){
+        if(rs.some(function(r){return !r.ok;})){say("reset failed",false);return;}
         say("reset",true); setTimeout(loadTeams,900);
       }).catch(function(){say("reset failed",false);});
     });
-    row.appendChild(sync); row.appendChild(inp); row.appendChild(bud);
-    row.appendChild(save); row.appendChild(reset);
+    sync.addEventListener("click",function(){
+      sync.disabled=true; sync.classList.add("spin");
+      bulk(function(k){return fetch("/api/admin/teams/sync",{method:"POST",
+        headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
+        body:new URLSearchParams({key:k.key}).toString()}).then(function(r){return r.ok?r.json():null;});
+      }).then(function(){ sync.disabled=false; sync.classList.remove("spin"); say("re-detected",true); setTimeout(loadTeams,700);
+      }).catch(function(){sync.disabled=false;sync.classList.remove("spin");say("sync failed",false);});
+    });
+    btns.appendChild(sync); btns.appendChild(save); btns.appendChild(reset); row.appendChild(btns);
+    // 5) KEYS — all on the SAME line, horizontally scrolling (chips; details in tooltip)
+    var strip=document.createElement("div"); strip.className="kstrip";
+    g.keys.forEach(function(k){
+      var chip=document.createElement("span"); chip.className="kchip"; chip.textContent=k.key;
+      chip.title=k.key+(k.overridden?"\n(team overridden)":"")
+        +(k.budget_overridden?("\nbudget $"+k.budget):"")
+        +(k.detected?("\nLiteLLM team: "+k.detected):"");
+      if(k.overridden) chip.classList.add("ov");
+      strip.appendChild(chip);
+    });
+    row.appendChild(strip);
     return row;
   }
   function post2(params){
@@ -438,24 +536,9 @@
         var na=(groups[a].name||groups[a].uid).toLowerCase(), nb=(groups[b].name||groups[b].uid).toLowerCase();
         return na<nb?-1:(na>nb?1:0);
       });
-      order.forEach(function(gid){
-        var g=groups[gid];
-        var block=document.createElement("div"); block.className="ugroup";
-        var head=document.createElement("div"); head.className="uhead";
-        var uname=document.createElement("span"); uname.className="uname";
-        uname.textContent = gid==="__unassigned__" ? "Unassigned"
-          : (g.name || ("user "+g.uid.slice(0,8)+"…"));
-        if(gid!=="__unassigned__" && g.uid) uname.title="user_id "+g.uid;
-        head.appendChild(uname);
-        if(g.team){ var ut=document.createElement("span"); ut.className="uteam"; ut.textContent=g.team; head.appendChild(ut); }
-        var kc=document.createElement("span"); kc.className="ukcount";
-        kc.textContent=g.keys.length+" key"+(g.keys.length>1?"s":""); head.appendChild(kc);
-        block.appendChild(head);
-        var keysbox=document.createElement("div"); keysbox.className="ukeys";
-        g.keys.forEach(function(k){ keysbox.appendChild(teamRow(k, d.teams||[])); });
-        block.appendChild(keysbox);
-        el.appendChild(block);
-      });
+      var scroll=document.createElement("div"); scroll.className="uscroll";
+      order.forEach(function(gid){ scroll.appendChild(userBlock(groups[gid], gid, d.teams||[])); });
+      el.appendChild(scroll);
     }).catch(function(){});
   }
 
@@ -517,6 +600,11 @@
 
   var _rb=document.getElementById("teams-refresh");
   if(_rb) _rb.addEventListener("click",function(){loadTeams(true);});
+  var _rl=document.getElementById("reset-layout");
+  if(_rl) _rl.addEventListener("click",function(){
+    try{localStorage.removeItem("aimon_settings_card_order");}catch(e){}
+    load();   // re-render config cards in their default order
+  });
 
   fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
     if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}

@@ -46,6 +46,23 @@ def _is_team_id(s) -> bool:
     return bool(s) and bool(_TEAM_ID_RE.match(str(s).strip()))
 
 
+def _email_like(s) -> bool:
+    """True if `s` looks like an email (LiteLLM shows the user's email in the key's
+    'User'/'Created By' columns) — used to prefer it as the user identity."""
+    s = str(s or "").strip()
+    return "@" in s and "." in s.rsplit("@", 1)[-1]
+
+
+def _pick_email(*vals) -> str:
+    """First email-looking value among the candidates (LiteLLM carries the user email on
+    the key row itself: user_email / created_by, and in /user/list). '' if none."""
+    for v in vals:
+        s = str(v or "").strip()
+        if _email_like(s):
+            return s
+    return ""
+
+
 # Track LiteLLM auth so a rejected master key is reported CLEARLY and ONCE (not a
 # wall of "HTTP 401" debug lines), and so a dead key doesn't get hammered every tick.
 _AUTH_BAD = False
@@ -810,7 +827,10 @@ async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,
     eff: int | None = None
     while page <= 50:
         sep = "&" if "?" in url else "?"
-        d, err = await fetch_json(session, f"{url}{sep}page={page}&size=500&page_size=500",
+        # page_size=100, NOT 500 — LiteLLM's /user/list rejects a large page_size with
+        # HTTP 422, which silently emptied the user→email map (so no emails on the board).
+        # 100 is accepted by both /user/list and /key/list; the walker fetches all pages.
+        d, err = await fetch_json(session, f"{url}{sep}page={page}&size=100&page_size=100",
                                   headers=_headers(), timeout_s=timeout_s)
         if err is not None:
             break
@@ -891,8 +911,10 @@ async def _team_directory(session: aiohttp.ClientSession,
         uid = str(u.get("user_id") or "")
         if not uid:
             continue
-        name = str(u.get("user_email") or u.get("user_alias") or "").strip()
-        if name:                              # user_id → human name for the board grouping
+        umeta = u.get("metadata") if isinstance(u.get("metadata"), dict) else {}
+        name = str(u.get("user_email") or u.get("email") or u.get("user_alias")
+                   or u.get("alias") or umeta.get("user_email") or "").strip()
+        if name and not _is_team_id(name):    # user_id → human name for the board grouping
             by_user_name[uid] = name
         if uid in by_user:
             continue
@@ -1019,7 +1041,15 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
             team = by_user.get(uid, "")                    # else via the user's team
         if _is_team_id(team):                              # never surface a raw UUID as a name
             team = ""
-        uname = by_user_name.get(uid, "")
+        # user's EMAIL — LiteLLM shows it in the key's 'User'/'Created By' columns, so read
+        # it straight off the key row (user_email / created_by / litellm_user_email), then
+        # the /user/list directory. Prefer an email-shaped value; fall back to any name.
+        meta = k.get("metadata") if isinstance(k.get("metadata"), dict) else {}
+        uname = _pick_email(k.get("user_email"), k.get("litellm_user_email"),
+                            meta.get("user_email"), by_user_name.get(uid, ""),
+                            k.get("created_by"), k.get("user"))
+        if not uname:                                      # no email → any readable name
+            uname = str(by_user_name.get(uid, "") or k.get("user_alias") or "").strip()
         if _is_team_id(uname):                             # user_id-looking name → not a name
             uname = ""
         out[str(alias)] = {
@@ -1045,6 +1075,55 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     if out and not (incomplete and len(out) < len(cache)):
         _KEY_BUDGETS_CACHE = out
     return out or _KEY_BUDGETS_CACHE
+
+
+async def keys_diag(session: aiohttp.ClientSession) -> dict:
+    """Diagnostic: what do /key/list and /user/list actually return, and WHERE is the user
+    email? Reports each endpoint's field names + which fields hold an EMAIL-like value
+    (values REDACTED to first 2 chars + domain). Admin-only; used to wire the user-email
+    display when it doesn't show up."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return {"available": False, "error": "LiteLLM base URL or master key not set"}
+    base = base.rstrip("/")
+    to = max(config.HTTP_TIMEOUT, config.LITELLM_SPEND_TIMEOUT)
+
+    def _redact(v):
+        s = str(v or "")
+        if _email_like(s):
+            u, _, dom = s.partition("@")
+            return (u[:2] + "…@" + dom)
+        return (s[:6] + "…") if len(s) > 8 else s
+
+    def _probe(rows, n=5):
+        rows = rows if isinstance(rows, list) else []
+        if not rows:
+            return {"count": 0}
+        first = rows[0] if isinstance(rows[0], dict) else {}
+        emf, per = set(), []
+        for r in rows[:n]:
+            if not isinstance(r, dict):
+                continue
+            ef = [f for f, v in r.items() if _email_like(v)]
+            emf.update(ef)
+            per.append({"ref": r.get("key_alias") or r.get("key_name") or r.get("user_id"),
+                        "email_fields": ef,
+                        "email_samples": {f: _redact(r.get(f)) for f in ef}})
+        return {"count": len(rows), "fields": sorted(first.keys()),
+                "email_fields_found": sorted(emf), "per_row": per}
+
+    out: dict = {"available": True}
+    kd, kerr = await fetch_json(
+        session, f"{base}/key/list?return_full_object=true&page=1&size=5",
+        headers=_headers(), timeout_s=to)
+    out["key_list"] = ({"error": str(kerr)} if kerr is not None else
+                       _probe((kd.get("keys") or kd.get("data")) if isinstance(kd, dict) else kd))
+    ud, uerr = await fetch_json(
+        session, f"{base}/user/list?page=1&page_size=5&size=5",
+        headers=_headers(), timeout_s=to)
+    out["user_list"] = ({"error": str(uerr)} if uerr is not None else
+                        _probe((ud.get("users") or ud.get("data")) if isinstance(ud, dict) else ud))
+    return out
 
 
 def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[dict]:

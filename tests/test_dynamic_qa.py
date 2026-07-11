@@ -3938,6 +3938,66 @@ def test_is_team_id_recognizes_uuids():
     assert not litellm._is_team_id("") and not litellm._is_team_id(None)
 
 
+def test_email_pick_helpers():
+    assert litellm._email_like("bruno.ribeiro@example.com")
+    assert not litellm._email_like("bruno") and not litellm._email_like("")
+    assert not litellm._email_like("8b1f7f4a-1ee7-412a-bf89-c7a0f7010532")
+    assert litellm._pick_email("", "not-an-email", "x@y.io") == "x@y.io"
+    assert litellm._pick_email("nope", "also-nope") == ""
+
+
+async def test_keys_diag_locates_email_field_redacted(monkeypatch):
+    """keys_diag reports WHICH /key/list + /user/list fields hold an email, values
+    redacted — used to locate the email field when it doesn't show on the board."""
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            return ({"keys": [
+                {"key_alias": "kA", "user_id": "u1", "created_by": "alice.a@example.com"},
+                {"key_alias": "kB", "user_id": "u2", "user_email": "bob.b@example.com"}]}, None)
+        if "/user/list" in url:
+            return ({"users": [{"user_id": "u1", "user_email": "alice.a@example.com"}]}, None)
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    d = await litellm.keys_diag(None)
+    assert d["available"] is True
+    assert "created_by" in d["key_list"]["email_fields_found"]
+    assert "user_email" in d["key_list"]["email_fields_found"]
+    assert "user_email" in d["user_list"]["email_fields_found"]
+    samp = list(d["key_list"]["per_row"][0]["email_samples"].values())[0]
+    assert "…@example.com" in samp and "alice.a@" not in samp    # redacted local-part
+
+
+async def test_key_budgets_reads_user_email_from_key_row(monkeypatch):
+    """LiteLLM carries the user's email on the key row (the 'User'/'Created By' columns),
+    so the board's identity picks it up even when /user/list returns no email."""
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        if "/key/list" in url:
+            return ({"keys": [
+                {"key_alias": "brlribeiro",
+                 "user_id": "64938f26-1b87-4405-93a9-f368672756ed",
+                 "created_by": "bruno.ribeiro@example.com", "spend": 1.0, "max_budget": 0},
+                {"key_alias": "svc", "user_id": "u2",
+                 "user_email": "pedro.tarrinho@example.com", "spend": 0, "max_budget": 0},
+            ]}, None)
+        if "/team/list" in url:
+            return ({"teams": []}, None)
+        if "/user/list" in url:
+            return ({"users": []}, None)          # NO email from /user/list
+        return (None, "HTTP 404")
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    litellm._KEY_BUDGETS_CACHE = None
+    out = await litellm.key_budgets(None)
+    assert out["brlribeiro"]["user_name"] == "bruno.ribeiro@example.com"   # from created_by
+    assert out["svc"]["user_name"] == "pedro.tarrinho@example.com"         # from user_email
+    litellm._TEAM_DIR_CACHE = ({}, {}, {})
+
+
 async def test_key_budgets_never_surfaces_raw_team_id(monkeypatch):
     """When /team/list can't resolve a key's team_id to an alias, the team is BLANK —
     never the raw UUID (which would render as a 'strange number' on the board)."""
@@ -4132,6 +4192,25 @@ async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
     out = await litellm._paginate(None, "http://x/user/list", ("users", "data"),
                                   "user_id", 5.0)
     assert len(out) == 2 and calls["n"] <= 3        # deduped, did not walk 50 pages
+
+
+async def test_paginate_uses_page_size_the_server_accepts(monkeypatch):
+    """Regression: LiteLLM's /user/list returns HTTP 422 for page_size=500 — _paginate
+    must request a size the server accepts (100), or the user→email map came back empty
+    and no emails showed on the Teams board."""
+    seen = []
+
+    async def fake_fetch(session, url, headers=None, timeout_s=None):
+        seen.append(url)
+        return ({"users": [{"user_id": "u1", "user_email": "a@example.com"}],
+                 "total_pages": 1}, None)
+    monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    out = await litellm._paginate(None, "http://x/user/list", ("users", "data"),
+                                  "user_id", 5.0)
+    assert out and out[0]["user_email"] == "a@example.com"
+    assert all("size=500" not in u for u in seen)        # never the 422-triggering size
+    assert any("page_size=100" in u for u in seen)
 
 
 async def test_paginate_walks_via_total_pages(monkeypatch):

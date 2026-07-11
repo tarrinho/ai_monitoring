@@ -893,10 +893,24 @@ def test_settings_page_exists_with_tunables_and_teams():
     # Teams board is grouped by USER → team → keys (user-centric view), with a per-key
     # sync endpoint and an "Unassigned" bucket for keys LiteLLM reports no owner for.
     # (DOM is built in JS, so match the className strings, not rendered HTML attributes.)
-    assert '"ugroup"' in html and "By user" in html and '"uhead"' in html
+    assert '"urow"' in html and "By user" in html and '"teamcell"' in html
     assert "/api/admin/teams/sync" in html and "__unassigned__" in html
-    # config groups + Teams/Models rows use the compact one-line .srow style
-    assert '"grid2"' in html and "srow tteam" in html and "srow tmodel" in html
+    # grouped list is capped (~10 rows) and scrolls; the raw user_id (UUID) is only ever
+    # in the tooltip (title), never rendered inline as text.
+    assert '"uscroll"' in html and "max-height" in html
+    assert '"user_id "' in html and 'g.uid.slice' not in html
+    # one block per user in order email → team → keys: email primary, team is a SELECT of
+    # the identified teams plus an "add new" option, a per-user budget input, and ALL keys
+    # on a single horizontally-scrolling line of chips (not a stacked row per key).
+    assert '"kstrip"' in html and '"kchip"' in html and '"urow"' in html
+    assert '"tsel"' in html and "__new__" in html and "new team" in html
+    assert 'chosenTeam' in html and '"bin"' in html    # team picker + per-user budget
+    # config groups + Model-cost rows still use the compact one-line .srow style
+    assert '"grid2"' in html and "srow tmodel" in html
+    # drag-to-reorder config cards, remembered in localStorage across the re-render,
+    # with a grip handle and a Reset-layout control.
+    assert "aimon_settings_card_order" in html and "applySavedOrder" in html
+    assert '"draghandle"' in html and 'id="reset-layout"' in html
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 
