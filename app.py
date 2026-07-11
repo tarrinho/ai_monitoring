@@ -1776,9 +1776,11 @@ async def api_admin_ui_layout_get(request: web.Request) -> web.Response:
     if name not in _UI_LAYOUT_NAMES:
         return web.json_response({"error": "unknown layout"}, status=400)
     saved = db.ui_layout_get(name)
-    grid = {}
+    grid: dict = {}
     if isinstance(saved, dict):
-        grid = saved.get("grid") if isinstance(saved.get("grid"), dict) else {}
+        g = saved.get("grid")
+        if isinstance(g, dict):
+            grid = g
     return web.json_response({"name": name, "grid": _clean_grid_layout(grid)})
 
 

@@ -912,7 +912,8 @@ async def _team_directory(session: aiohttp.ClientSession,
         uid = str(u.get("user_id") or "")
         if not uid:
             continue
-        umeta = u.get("metadata") if isinstance(u.get("metadata"), dict) else {}
+        _um = u.get("metadata")
+        umeta = _um if isinstance(_um, dict) else {}
         name = str(u.get("user_email") or u.get("email") or u.get("user_alias")
                    or u.get("alias") or umeta.get("user_email") or "").strip()
         if name and not _is_team_id(name):    # user_id → human name for the board grouping
@@ -1045,7 +1046,8 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         # user's EMAIL — LiteLLM shows it in the key's 'User'/'Created By' columns, so read
         # it straight off the key row (user_email / created_by / litellm_user_email), then
         # the /user/list directory. Prefer an email-shaped value; fall back to any name.
-        meta = k.get("metadata") if isinstance(k.get("metadata"), dict) else {}
+        _km = k.get("metadata")
+        meta = _km if isinstance(_km, dict) else {}
         uname = _pick_email(k.get("user_email"), k.get("litellm_user_email"),
                             meta.get("user_email"), by_user_name.get(uid, ""),
                             k.get("created_by"), k.get("user"))
