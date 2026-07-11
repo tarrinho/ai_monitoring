@@ -2059,12 +2059,15 @@ async def test_nav_endpoint_shape():
 
 
 async def test_alerts_endpoint_shape(monkeypatch):
-    # alert config is auth-gated (never open), so present a credential
-    TOK = "alerts-shape-tok-1"
-    monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
+    # alert config needs an interactive login — the shared URL master token is
+    # withheld from Alerts — so log a user in and present the session.
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("alshape", "as@x.io", auth.hash_password("alshapepw1"),
+                   "viewer", time.time())
     c = await _client()
     try:
-        r = await c.get("/api/alerts", headers={"Authorization": "Bearer " + TOK})
+        await c.post("/login", data={"username": "alshape", "password": "alshapepw1"})
+        r = await c.get("/api/alerts")
         assert r.status == 200
         d = await r.json()
         assert "channels" in d and "thresholds" in d
@@ -2767,21 +2770,28 @@ def test_channels_and_thresholds_status(monkeypatch):
 
 
 async def test_alerts_page_served_and_gated(monkeypatch):
-    # alert config is never open — it serves only WITH a credential and is gated
-    # (redirect / 401) without one, even though the rest of the app may be open.
-    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-al-1")
+    # alert config needs an interactive login: it serves WITH a user session and is
+    # gated (redirect / 401) without one. The shared URL token cannot reach it.
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("alpage", "ap@x.io", auth.hash_password("alpagepw1"),
+                   "viewer", time.time())
     c = await _client()
     try:
-        r = await c.get("/alerts", headers={"Authorization": "Bearer tok-al-1"})
+        await c.post("/login", data={"username": "alpage", "password": "alpagepw1"})
+        r = await c.get("/alerts")
         assert r.status == 200
         html = await r.text()
         assert "Alerts" in html and "Send test alert" in html
-        # gated without a credential
-        r2 = await c.get("/alerts", allow_redirects=False)
-        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
-        assert (await c.get("/api/alerts")).status == 401
     finally:
         await c.close()
+    # gated without a credential (fresh client, no session)
+    c2 = await _client()
+    try:
+        r2 = await c2.get("/alerts", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
+        assert (await c2.get("/api/alerts")).status == 401
+    finally:
+        await c2.close()
 
 
 async def test_anomalies_endpoint():
@@ -3305,7 +3315,7 @@ async def test_token_auth_hides_alerts_link(monkeypatch):
         r = await c.get("/", headers={"Authorization": "Bearer " + TOK})
         assert r.status == 200
         h = await r.text()
-        assert '>Alerts</a>' not in h                        # visible link removed
+        assert 'Alerts</a>' not in h                        # visible link removed
         assert '<a href="/gpu">' in h                        # other nav intact
         assert 'a[href="/alerts"]' in h                      # alert-dot JS kept
     finally:
@@ -3324,7 +3334,7 @@ async def test_user_session_keeps_alerts_link(monkeypatch):
                          allow_redirects=False)
         assert r.status == 302
         h = await (await c.get("/")).text()
-        assert '>Alerts</a>' in h                            # user keeps Alerts
+        assert 'Alerts</a>' in h                            # user keeps Alerts
     finally:
         await c.close()
 
@@ -3340,7 +3350,7 @@ async def test_pat_auth_hides_alerts_link(monkeypatch):
     try:
         r = await c.get("/", headers={"Authorization": "Bearer " + raw})
         assert r.status == 200
-        assert '>Alerts</a>' not in (await r.text())
+        assert 'Alerts</a>' not in (await r.text())
     finally:
         await c.close()
 
@@ -3352,7 +3362,7 @@ async def test_open_mode_denies_alerts():
     c = await _client()
     try:
         h = await (await c.get("/")).text()      # overview still open...
-        assert '>Alerts</a>' not in h   # ...but Alerts link gone
+        assert 'Alerts</a>' not in h   # ...but Alerts link gone
         assert (await c.get("/alerts")).status == 403        # page denied
         assert (await c.get("/api/alerts")).status == 403    # API denied
         # a benign open endpoint is unaffected
@@ -3361,18 +3371,56 @@ async def test_open_mode_denies_alerts():
         await c.close()
 
 
-async def test_token_mode_still_allows_alerts_access(monkeypatch):
-    """Guard against over-restricting: with auth enabled, the master token still
-    reaches the alerts page + API (its link is hidden, but access is allowed)."""
+async def test_token_mode_blocks_alerts_access(monkeypatch):
+    """The shared master token (rides in the dashboard URL) is withheld from Alerts:
+    the link is hidden AND the page + API are blocked in the backend — Alerts config
+    (webhook URLs, thresholds) requires an interactive login, not the URL secret."""
     TOK = "alerts-access-tok-12"
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
     c = await _client()
     try:
         hdr = {"Authorization": "Bearer " + TOK}
-        assert (await c.get("/alerts", headers=hdr)).status == 200
-        assert (await c.get("/api/alerts", headers=hdr)).status == 200
+        assert (await c.get("/alerts", headers=hdr)).status == 403
+        assert (await c.get("/api/alerts", headers=hdr)).status == 403
     finally:
         await c.close()
+
+
+async def test_master_token_hides_and_blocks_alerts_and_settings(monkeypatch):
+    """Full policy for the URL token: Alerts + Settings links are absent from the
+    sidebar AND the pages/APIs are blocked in the backend — while a real admin
+    login sees the links and reaches the surfaces."""
+    TOK = "urltok-policy-12"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
+    hdr = {"Authorization": "Bearer " + TOK}
+    c = await _client()
+    try:
+        h = await (await c.get("/", headers=hdr)).text()
+        assert ">Alerts</a>" not in h                 # alerts link stripped
+        nav = await (await c.get("/api/nav", headers=hdr)).json()
+        assert nav["admin"] is False                  # Settings link stays hidden
+        # backend blocks — direct URL / API cannot reach either surface
+        assert (await c.get("/alerts", headers=hdr)).status == 403
+        assert (await c.get("/api/alerts", headers=hdr)).status == 403
+        assert (await c.get("/settings", headers=hdr)).status == 403
+        assert (await c.get("/api/admin/users", headers=hdr)).status == 403
+        # dashboards the token IS meant to see still work
+        assert (await c.get("/gpu", headers=hdr)).status == 200
+        assert (await c.get("/api/data", headers=hdr)).status == 200
+    finally:
+        await c.close()
+    # a real admin login keeps full access
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("realadm", "ra@x.io", auth.hash_password("realadmpw1"), "admin", time.time())
+    c2 = await _client()
+    try:
+        await c2.post("/login", data={"username": "realadm", "password": "realadmpw1"})
+        nav = await (await c2.get("/api/nav")).json()
+        assert nav["admin"] is True
+        assert (await c2.get("/settings")).status == 200
+        assert (await c2.get("/api/alerts")).status == 200
+    finally:
+        await c2.close()
 
 
 def test_apply_prefix_covers_form_action_and_js_redirect():
@@ -4397,12 +4445,14 @@ async def test_paginate_walks_via_total_pages(monkeypatch):
     assert [u["user_id"] for u in out] == ["a", "b", "c"]
 
 
-async def test_legacy_token_reaches_admin(monkeypatch):
+async def test_master_token_blocked_from_admin(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "master-tok-123")
     c = await _client()
     try:
-        # the master token counts as admin and is CSRF-exempt (not a browser cookie)
-        assert (await c.get("/api/admin/users?token=master-tok-123")).status == 200
+        # the shared URL token is NOT admin: admin pages/APIs (Settings, Users) are
+        # blocked for it — those need an interactive login or a scoped admin PAT.
+        assert (await c.get("/api/admin/users?token=master-tok-123")).status == 403
+        assert (await c.get("/settings?token=master-tok-123")).status == 403
     finally:
         await c.close()
 
@@ -4657,17 +4707,32 @@ async def test_create_rejects_bad_role_and_dup_and_weak_pw(monkeypatch):
         await c.close()
 
 
-async def test_token_auth_admin_write_is_csrf_exempt(monkeypatch):
-    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "mtok-abc-123")
+async def test_admin_pat_write_is_csrf_exempt(monkeypatch):
+    """Admin writes over Bearer auth are CSRF-exempt (not a browser cookie). The
+    master token is now blocked from admin, so this uses a scoped admin PAT — the
+    supported way to script admin actions — which stays allowed + CSRF-exempt."""
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("patadm", "pa@x.io", auth.hash_password("patadmpw1"), "admin", time.time())
     c = await _client()
     try:
-        # bearer/token auth is not a browser cookie -> no CSRF token needed
-        r = await c.post("/api/admin/users?token=mtok-abc-123",
-                         data={"username": "viaTok", "email": "t@x.io",
-                               "password": "tokpw1234", "role": "viewer"})
-        assert r.status == 200 and db.user_get("viaTok") is not None
+        await c.post("/login", data={"username": "patadm", "password": "patadmpw1"})
+        csrf = (await (await c.get("/api/me")).json())["csrf"]
+        j = await (await c.post("/api/account/tokens",
+                                data={"label": "adm", "role": "admin"},
+                                headers={"X-CSRF-Token": csrf})).json()
+        tok = j["token"]
     finally:
         await c.close()
+    c2 = await _client()
+    try:
+        # Bearer admin PAT → no CSRF token needed, admin write succeeds
+        r = await c2.post("/api/admin/users",
+                          headers={"Authorization": "Bearer " + tok},
+                          data={"username": "viaTok", "email": "t@x.io",
+                                "password": "tokpw1234", "role": "viewer"})
+        assert r.status == 200 and db.user_get("viaTok") is not None
+    finally:
+        await c2.close()
 
 
 async def test_audit_logs_logout_and_reset_and_lockout(monkeypatch):

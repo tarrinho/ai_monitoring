@@ -7,10 +7,12 @@
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot&logoColor=white)](.github/dependabot.yml)
 [![cosign](https://img.shields.io/badge/cosign-keyless%20signed-2496ED?logo=sigstore&logoColor=white)](https://github.com/tarrinho/ai_monitoring/pkgs/container/ai_monitoring)
+[![Security Policy](https://img.shields.io/badge/security-policy-brightgreen)](SECURITY.md)
 [![AI-assisted](https://img.shields.io/badge/AI--assisted-Claude-8A2BE2?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 
-<!-- Per-control status from the single CI workflow, published to the `badges` branch. -->
+<!-- Workflow status (CI, CodeQL) + per-control status from the CI workflow, published to the `badges` branch. -->
 [![CI](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/tarrinho/ai_monitoring/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/tarrinho/ai_monitoring/security/code-scanning)
 [![secret-scan](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/secret-scan.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 [![lint](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/lint.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/tests.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)

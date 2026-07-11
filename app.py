@@ -556,6 +556,19 @@ def _auth_ctx(request: web.Request) -> tuple[bool, str | None, dict | None]:
     return False, None, None
 
 
+def _is_master_token_auth(request: web.Request) -> bool:
+    """True when the request is authenticated ONLY by the shared master/dashboard
+    token (the ?token= / Bearer secret or its cookie) — not a personal login session
+    and not a personal access token. The master token is a broad, shareable secret
+    (it rides in the dashboard URL), so the Alerts + admin surfaces (Settings, Users)
+    are withheld from it: those require an interactive login (or a scoped PAT)."""
+    if _session_from_req(request):
+        return False
+    if _pat_auth(request):
+        return False
+    return _token_ok(_request_token(request)) or _token_cookie_valid(request)
+
+
 # HTML pages that require auth (static assets + /healthz + /login stay open).
 _PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
           "/admin/users", "/account", "/settings")
@@ -700,6 +713,15 @@ async def _auth_mw(request: web.Request, handler):
             return web.json_response(
                 {"error": "password change required"}, status=403)
         raise web.HTTPFound(_fwd_prefix(request) + "/account?force=1")
+    # The shared master token (rides in the dashboard URL) is withheld from the
+    # sensitive surfaces: Alerts (config) and the admin pages/APIs (Settings, Users).
+    # These require an interactive login or a scoped PAT, not the URL secret — the
+    # link is already hidden, and here the route itself is blocked.
+    master = _is_master_token_auth(request)
+    if master and (is_admin_path or _is_alerts_path(p)):
+        if p.startswith("/api/"):
+            return web.json_response({"error": "forbidden"}, status=403)
+        return web.Response(text="403 — interactive login required", status=403)
     if is_admin_path and role != "admin":
         if p.startswith("/api/"):
             return web.json_response({"error": "forbidden"}, status=403)
@@ -771,7 +793,7 @@ def _sidebar_extra(user: str | None, role: str | None, prefix: str) -> str:
     safe = _html_escape(user)
     links = ""
     if role == "admin":
-        links += f'<a href="{prefix}/admin/users">&#128101; Users</a>'
+        links += f'<a href="{prefix}/admin/users" style="padding-left:26px">&#128101; Users</a>'
     links += f'<a href="{prefix}/account">&#128273; Account</a>'
     links += (f'<a href="{prefix}/logout" title="Log out">&#9099; Logout '
               f'<span style="opacity:.6">({safe})</span></a>')
@@ -790,8 +812,9 @@ def _serve_page(path: Path, prefix: str = "", user: str | None = None,
     # the raw href regardless of any sub-path prefix.
     if not show_alerts:
         # regex, not a literal: the sidebar Alerts link carries a style attr
-        # (indented sub-item), so match the anchor regardless of its attributes.
-        html = re.sub(r'<a href="/alerts"[^>]*>Alerts</a>', "", html)
+        # (indented sub-item) and an icon prefix, so match the anchor regardless
+        # of its attributes and any leading icon text.
+        html = re.sub(r'<a href="/alerts"[^>]*>[^<]*Alerts</a>', "", html)
     if prefix:
         html = _apply_prefix(html, prefix)
     extra = _sidebar_extra(user, role, prefix)
@@ -1397,7 +1420,9 @@ async def nav_handler(request: web.Request) -> web.Response:
         "ollama": _configured("ollama", bool(config.OLLAMA_BASE_URL)),
         "llamacpp": _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)),
         "gpu": _configured("gpu", bool(config.GPU_SSH or config.GPU_METRICS_URL)),
-        "admin": (role == "admin") or not _auth_enabled(),
+        # Settings link: real admin only — the shared URL token is NOT admin here.
+        "admin": (role == "admin" and not _is_master_token_auth(request))
+                 or not _auth_enabled(),
     })
 
 

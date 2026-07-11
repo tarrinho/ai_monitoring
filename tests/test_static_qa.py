@@ -974,9 +974,11 @@ def test_sidebar_gpu_between_overview_and_litellm():
     """regression: sidebar order is Overview → GPU → LiteLLM on every page."""
     for name in _PAGES:
         html = _page(name)
-        o = html.find('href="/">Overview')
-        g = html.find('href="/gpu">GPU')
-        ll = html.find('href="/litellm">LiteLLM')
+        # nav labels carry an icon prefix (e.g. "🏠 Overview"), so anchor on the
+        # closing text, not "href=…>Label", which the icon now sits between.
+        o = html.find('Overview</a>')
+        g = html.find('GPU</a>')
+        ll = html.find('LiteLLM</a>')
         assert o >= 0 and g >= 0 and ll >= 0, f"{name}: nav links missing"
         assert o < g < ll, f"{name}: sidebar order must be Overview < GPU < LiteLLM"
 
