@@ -138,6 +138,8 @@ async def test_ollama_page_served_and_gated(monkeypatch):
 
 
 async def test_llamacpp_page_served_and_gated(monkeypatch):
+    monkeypatch.setattr(config, "LLAMACPP_BASE_URL", "http://lc:8080")  # so its nav link stays
+    monkeypatch.setattr(appmod, "_latest", {"ts": 0, "collectors": {}})
     c = await _client()
     try:
         r = await c.get("/llamacpp")
@@ -3308,6 +3310,8 @@ async def test_token_auth_hides_alerts_link(monkeypatch):
     the other nav links remain."""
     TOK = "alerts-hide-tok-1234"
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
+    monkeypatch.setattr(config, "GPU_METRICS_URL", "http://gpu:9100/")  # so /gpu link stays
+    monkeypatch.setattr(appmod, "_latest", {"ts": 0, "collectors": {}})  # env-based, deterministic
     c = await _client()
     try:
         # Bearer header authenticates as the master token and returns HTML
@@ -3316,7 +3320,7 @@ async def test_token_auth_hides_alerts_link(monkeypatch):
         assert r.status == 200
         h = await r.text()
         assert 'Alerts</a>' not in h                        # visible link removed
-        assert '<a href="/gpu">' in h                        # other nav intact
+        assert '<a href="/gpu">' in h                        # other nav intact (configured)
         assert 'a[href="/alerts"]' in h                      # alert-dot JS kept
     finally:
         await c.close()
@@ -3419,6 +3423,41 @@ async def test_master_token_hides_and_blocks_alerts_and_settings(monkeypatch):
         assert nav["admin"] is True
         assert (await c2.get("/settings")).status == 200
         assert (await c2.get("/api/alerts")).status == 200
+    finally:
+        await c2.close()
+
+
+async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
+    """Unconfigured-backend sidebar links (LiteLLM/Spend/Ollama/llama.cpp/GPU) are
+    dropped SERVER-side, not only by the client /api/nav fetch — so a slow/failed
+    fetch can't leave a dead link visible (the reported token-session symptom). The
+    Overview 'details →' /litellm link is anchored on its name and left intact."""
+    TOK = "navstrip-tok-123"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
+    for v in ("LITELLM_BASE_URL", "OLLAMA_BASE_URL", "LLAMACPP_BASE_URL",
+              "GPU_SSH", "GPU_METRICS_URL"):
+        monkeypatch.setattr(config, v, "")
+    monkeypatch.setattr(appmod, "_latest", {"ts": 0, "collectors": {}})
+    hdr = {"Authorization": "Bearer " + TOK}
+    c = await _client()
+    try:
+        h = await (await c.get("/", headers=hdr)).text()
+        assert "🔀 LiteLLM" not in h and "LiteLLM</a>" not in h   # sidebar link gone
+        assert "Spend &amp; Quota</a>" not in h
+        assert "🦙 Ollama" not in h and "🐫 llama.cpp" not in h
+        assert "🖥️ GPU" not in h
+        assert "details →" in h                                    # details link kept
+    finally:
+        await c.close()
+    # configured → links come back
+    for v in ("LITELLM_BASE_URL", "OLLAMA_BASE_URL", "LLAMACPP_BASE_URL"):
+        monkeypatch.setattr(config, v, "http://backend:9000")
+    monkeypatch.setattr(config, "GPU_METRICS_URL", "http://gpu:9100/")
+    c2 = await _client()
+    try:
+        h2 = await (await c2.get("/", headers=hdr)).text()
+        assert "🔀 LiteLLM" in h2 and "🦙 Ollama" in h2 and "🖥️ GPU" in h2
+        assert "Spend &amp; Quota</a>" in h2
     finally:
         await c2.close()
 

@@ -13,6 +13,7 @@
 <!-- Workflow status (CI, CodeQL) + per-control status from the CI workflow, published to the `badges` branch. -->
 [![CI](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/tarrinho/ai_monitoring/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/tarrinho/ai_monitoring/security/code-scanning)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/tarrinho/ai_monitoring/badge)](https://scorecard.dev/viewer/?uri=github.com/tarrinho/ai_monitoring)
 [![secret-scan](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/secret-scan.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 [![lint](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/lint.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/tests.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)

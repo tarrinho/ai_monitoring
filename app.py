@@ -801,7 +801,8 @@ def _sidebar_extra(user: str | None, role: str | None, prefix: str) -> str:
 
 
 def _serve_page(path: Path, prefix: str = "", user: str | None = None,
-                role: str | None = None, show_alerts: bool = True) -> web.Response:
+                role: str | None = None, show_alerts: bool = True,
+                hidden_nav: set[str] | None = None) -> web.Response:
     try:
         html = path.read_text(encoding="utf-8")
     except Exception:
@@ -815,6 +816,15 @@ def _serve_page(path: Path, prefix: str = "", user: str | None = None,
         # (indented sub-item) and an icon prefix, so match the anchor regardless
         # of its attributes and any leading icon text.
         html = re.sub(r'<a href="/alerts"[^>]*>[^<]*Alerts</a>', "", html)
+    # Unconfigured-backend links are dropped SERVER-side too (not only via the
+    # client /api/nav fetch) so a slow/failed fetch can't leak a dead dashboard
+    # link. Anchored on each sidebar link's NAME so the Overview "details →"
+    # /litellm link is left untouched.
+    for hp in (hidden_nav or ()):
+        name = _NAV_LINK_NAME.get(hp)
+        if name:
+            html = re.sub(r'<a href="%s"[^>]*>[^<]*%s[^<]*</a>'
+                          % (re.escape(hp), re.escape(name)), "", html)
     if prefix:
         html = _apply_prefix(html, prefix)
     extra = _sidebar_extra(user, role, prefix)
@@ -840,7 +850,8 @@ def _page(request: web.Request, path: Path, dest: str) -> web.Response:
     # Token/PAT (sess is None) and open mode are denied at the route in _auth_mw,
     # so their link is hidden too — no dead link that just 403s.
     return _serve_page(path, _fwd_prefix(request), user=user, role=role,
-                       show_alerts=sess is not None)
+                       show_alerts=sess is not None,
+                       hidden_nav=_hidden_nav_paths())
 
 
 async def index_handler(request: web.Request) -> web.Response:
@@ -1408,6 +1419,33 @@ def _litellm_configured() -> bool:
     "configured" is a deployment fact, so a configured-but-momentarily-down LiteLLM
     still keeps its Spend link, and the gate is deterministic."""
     return bool(config.LITELLM_BASE_URL)
+
+
+# Sidebar link name per backend path — used to strip an unconfigured backend's link
+# server-side (anchored on the name so the Overview "details →" /litellm link stays).
+_NAV_LINK_NAME = {
+    "/litellm": "LiteLLM", "/spend": "Spend", "/ollama": "Ollama",
+    "/llamacpp": "llama.cpp", "/gpu": "GPU",
+}
+
+
+def _hidden_nav_paths() -> set[str]:
+    """Backend dashboards whose sidebar link is omitted server-side because their
+    backend isn't configured — defence-in-depth so a slow/failed client `/api/nav`
+    fetch can't leave a dead link visible. Same flags the fetch uses (Spend tracks
+    LiteLLM); mirrors how the Alerts link is stripped."""
+    hidden: set[str] = set()
+    if not _configured("litellm", bool(config.LITELLM_BASE_URL)):
+        hidden.add("/litellm")
+    if not _litellm_configured():
+        hidden.add("/spend")
+    if not _configured("ollama", bool(config.OLLAMA_BASE_URL)):
+        hidden.add("/ollama")
+    if not _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)):
+        hidden.add("/llamacpp")
+    if not _configured("gpu", bool(config.GPU_SSH or config.GPU_METRICS_URL)):
+        hidden.add("/gpu")
+    return hidden
 
 
 async def nav_handler(request: web.Request) -> web.Response:

@@ -4,6 +4,15 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **OpenSSF Scorecard** — `.github/workflows/scorecard.yml` (pinned action SHAs)
+  runs the OpenSSF Scorecard analysis weekly + on push to `main`, publishes results
+  to the public crawler (`api.securityscorecards.dev`), and uploads SARIF to
+  code-scanning. New README badge links to the Scorecard viewer. Added to the
+  publish ALLOW-list.
+
 ## [1.5.7] — 2026-07-11
 
 ### Added
