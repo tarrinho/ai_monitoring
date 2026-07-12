@@ -3455,6 +3455,15 @@ async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
     monkeypatch.setattr(config, "GPU_METRICS_URL", "http://gpu:9100/")
     c2 = await _client()
     try:
+        # Pin _latest to a configured snapshot: _configured() prefers the live
+        # sample over the env URL, and the background sampler rebinds this module
+        # global on its own cadence — without pinning, a slow tick can leave the
+        # PART-1 "unconfigured" note in place and race the assertion (flaked the
+        # in-image gate under QEMU). Configured URLs never resample to
+        # "unconfigured", so this is deterministic.
+        monkeypatch.setattr(appmod, "_latest", {"ts": 1, "collectors": {
+            "litellm": {"available": True}, "ollama": {"available": True},
+            "llamacpp": {"available": True}, "gpu": {"available": True}}})
         h2 = await (await c2.get("/", headers=hdr)).text()
         assert "🔀 LiteLLM" in h2 and "🦙 Ollama" in h2 and "🖥️ GPU" in h2
         assert "Spend &amp; Quota</a>" in h2
