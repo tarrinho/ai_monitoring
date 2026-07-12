@@ -28,14 +28,18 @@ on:
         default: false
         required: false
 
+# Minimal default for the whole workflow (OpenSSF Scorecard Token-Permissions);
+# the release job escalates only the writes it needs.
 permissions:
-  contents: write   # create the GitHub Release
-  packages: write   # push the image to ghcr.io
-  id-token: write   # cosign keyless signing (Fulcio OIDC)
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release
+      packages: write   # push the image to ghcr.io
+      id-token: write   # cosign keyless signing (Fulcio OIDC)
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 

@@ -25,6 +25,17 @@ async def _client():
     db.init()
     c = TestClient(TestServer(appmod.build_app()))
     await c.start_server()
+    # Kill the background sampler tasks immediately: they rebind the module-global
+    # appmod._latest on their own cadence, which races (and cross-test pollutes) the
+    # many nav/config tests that monkeypatch _latest for deterministic assertions
+    # (e.g. a stale gpu/litellm "unconfigured" note stripping a link that should
+    # show). Tests that exercise the loops call them directly, not via _client().
+    app = c.app
+    for _t in app.get(appmod._BACKENDS, []) or []:
+        _t.cancel()
+    _s = app.get(appmod._SAMPLER)
+    if _s is not None:
+        _s.cancel()
     return c
 
 

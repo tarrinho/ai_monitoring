@@ -13,6 +13,17 @@ Versioning: [SemVer](https://semver.org/).
   code-scanning. New README badge links to the Scorecard viewer. Added to the
   publish ALLOW-list.
 
+### Fixed
+- **Flaky in-image test gate (CI `build-scan` red on amd64).** Two nav tests
+  (`test_unconfigured_backend_links_stripped_serverside`,
+  `test_token_auth_hides_alerts_link`) raced the background sampler, which rebinds
+  the module-global `_latest` on its own cadence — a prior test's lingering sampler
+  could leave a stale `"unconfigured"` collector note that stripped a sidebar link
+  the test expected to see. Surfaced only in CI because the in-image pytest gate
+  runs native on amd64 (emulated arches skip it). Fix: `_client()` now cancels the
+  background sampler tasks right after startup, so tests fully control `_latest`;
+  the reconfigure assertion also pins `_latest` explicitly. Test-only change.
+
 ## [1.5.7] — 2026-07-11
 
 ### Added

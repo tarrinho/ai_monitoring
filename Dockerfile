@@ -7,7 +7,11 @@
 # marker, so a regression fails `docker build`. For emulated cross-arch builds
 # (armv7 under QEMU) pass --build-arg RUN_TESTS=0 to skip the slow emulated
 # suite — the tests already ran on the native arch.
-FROM python:3.14-alpine AS base
+# Base image pinned by multi-arch manifest digest (OpenSSF Scorecard
+# Pinned-Dependencies). The tag is kept in the comment for readability; Dependabot
+# (docker ecosystem) bumps the digest. Re-pin with:
+#   docker buildx imagetools inspect python:3.14-alpine   # top-level Digest
+FROM python:3.14-alpine@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
