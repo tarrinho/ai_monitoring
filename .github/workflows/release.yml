@@ -59,15 +59,33 @@ jobs:
         run: |
           set -euo pipefail
           sha="${{ github.sha }}"
-          conclusion=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&status=completed" \
-            --jq '.workflow_runs[] | select(.name=="CI") | .conclusion' | head -1)
-          if [ "$conclusion" != "success" ]; then
-            echo "::error::CI is not green on ${sha} (last conclusion: '${conclusion:-none}')."
-            echo "::error::Either wait for CI to pass, or re-dispatch with skip_ci_check=true after manual verification."
-            exit 1
-          fi
-          echo "CI green on ${sha} — proceeding to release."
+          # CI and this release both fire on the tag push, so CI is usually still
+          # running when we get here — POLL for the newest CI run on this SHA to
+          # CONCLUDE (don't demand it be already-completed, which raced to 'none').
+          deadline=$(( $(date +%s) + 1200 ))   # wait up to 20 min for CI to finish
+          while :; do
+            line=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}" \
+              --jq '[.workflow_runs[] | select(.name=="CI")][0] // {}
+                    | "\(.status // "none") \(.conclusion // "none")"')
+            status="${line% *}"; conclusion="${line#* }"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI green on ${sha} — proceeding to release."
+                break
+              fi
+              echo "::error::CI concluded '${conclusion}' (not success) on ${sha}."
+              echo "::error::Fix CI, or re-dispatch with skip_ci_check=true after manual verification."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for CI on ${sha} (last status: '${status}')."
+              echo "::error::Wait for CI to finish, or re-dispatch with skip_ci_check=true."
+              exit 1
+            fi
+            echo "CI status='${status}' on ${sha} — waiting 15s for it to finish…"
+            sleep 15
+          done
 
       # ── Packages: multi-arch image → GHCR ─────────────────────────────────
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
