@@ -133,6 +133,99 @@ jobs:
           exit-code: "1"
           cache: "false"
 
+  deps-audit:
+    name: pip-audit + license compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install runtime deps + audit tools
+        run: |
+          pip install -r requirements.txt
+          pip install pip-audit pip-licenses
+      - name: pip-audit (shipped deps → known CVEs)
+        run: pip-audit -r requirements.txt
+      - name: license compliance (no strong copyleft in deps)
+        # AI-Monitoring ships under Apache-2.0. Fail if any dependency carries a
+        # strong-copyleft license (GPL/AGPL/LGPL/SSPL) that would be incompatible.
+        # MPL/permissive (BSD/MIT/Apache/PSF) are allowed. pip-licenses' own deps
+        # are permissive, so the check is safe to run over the whole env.
+        run: |
+          pip-licenses --format=markdown --order=license
+          pip-licenses --fail-on="GPLv2;GPLv3;GNU General Public License;AGPL;GNU Affero General Public License;LGPL;SSPL;Server Side Public License"
+
+  dependency-review:
+    name: dependency review (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Dependency review (block vulnerable / strong-copyleft deps in PRs)
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-3.0, SSPL-1.0
+
+  lighthouse:
+    name: lighthouse + chromium dashboard render
+    runs-on: ubuntu-latest
+    env:
+      # Fixed, non-secret CI token (≥16 chars, per config validation). Used only to
+      # authenticate Lighthouse's Chrome to the throwaway local dashboard instance.
+      TOK: lighthouse-ci-token-abcdef0123456789
+      MONITOR_DB_PATH: /tmp/lighthouse.db
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install runtime deps
+        run: pip install -r requirements.txt
+      - name: Boot the dashboard
+        run: |
+          MONITOR_DASHBOARD_TOKEN="$TOK" python app.py &
+          for i in $(seq 1 30); do
+            curl -sf -m2 http://127.0.0.1:9925/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -sf -m5 http://127.0.0.1:9925/healthz
+      - name: Lighthouse (perf / a11y / best-practices) — also the Chromium render smoke
+        run: |
+          cat > lighthouserc.json <<EOF
+          {
+            "ci": {
+              "collect": {
+                "url": [
+                  "http://127.0.0.1:9925/",
+                  "http://127.0.0.1:9925/gpu",
+                  "http://127.0.0.1:9925/litellm",
+                  "http://127.0.0.1:9925/ollama",
+                  "http://127.0.0.1:9925/llamacpp"
+                ],
+                "numberOfRuns": 1,
+                "settings": {
+                  "chromeFlags": "--no-sandbox --headless=new",
+                  "extraHeaders": { "Authorization": "Bearer ${TOK}" }
+                }
+              },
+              "assert": {
+                "assertions": {
+                  "categories:accessibility":  ["warn", { "minScore": 0.9 }],
+                  "categories:best-practices": ["warn", { "minScore": 0.9 }],
+                  "categories:performance":    ["warn", { "minScore": 0.5 }]
+                }
+              },
+              "upload": { "target": "filesystem", "outputDir": ".lighthouseci" }
+            }
+          }
+          EOF
+          npx --yes @lhci/cli@0.14.0 autorun --config=lighthouserc.json
+
   # Aggregate each control's result into per-control shields "endpoint" badges,
   # committed to an orphan `badges` branch (single force-pushed commit, no history
   # churn, off main). Runs even when a control fails, only on pushes to main.

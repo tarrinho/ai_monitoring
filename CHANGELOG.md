@@ -22,6 +22,13 @@ Versioning: [SemVer](https://semver.org/).
   (auto-approves + enables auto-merge on Dependabot PRs via the built-in `gh` CLI —
   no third-party action to pin — so dependency bumps land automatically once CI
   passes, with no second reviewer needed). Merge still gates on required checks.
+- **CI coverage expanded** (matching a mature reference pipeline) — three new `ci.yml`
+  jobs: **`deps-audit`** (`pip-audit` on shipped deps + `pip-licenses` fail-on
+  strong-copyleft, keeping the tree Apache-2.0-compatible), **`dependency-review`**
+  (PR-only `actions/dependency-review-action`, blocks vulnerable / GPL-family deps
+  before merge), and **`lighthouse`** (boots the dashboard and runs Lighthouse
+  perf/a11y/best-practices via headless Chromium over 5 pages — doubles as a render
+  smoke; scores are advisory `warn`, so only a failed boot/render reds the job).
 
 ### Changed
 - **Supply-chain hardening for OpenSSF Scorecard.** `release.yml` now uses a minimal
@@ -43,12 +50,15 @@ Versioning: [SemVer](https://semver.org/).
   ClusterFuzzLite/OSS-Fuzz build image runs as root by contract; added `AVD-DS-0002`
   to `.trivyignore` as a documented accepted-risk (the shipped runtime image still
   runs non-root). CI `trivy-fs` job back to green.
-- **CodeQL default-setup conflict** — an advanced `.github/workflows/codeql.yml`
+- **CodeQL default-setup conflict** — the advanced `.github/workflows/codeql.yml`
   was rejected by code-scanning because CodeQL **default setup** is enabled
   (*"analyses from advanced configurations cannot be processed when the default
-  setup is enabled"*). Resolved by removing the advanced workflow and keeping
-  default setup (which already scans Python + Actions); the README CodeQL badge
-  stays on the default-setup path.
+  setup is enabled"*). Resolved by **disabling** the advanced workflow (reduced to
+  a `workflow_dispatch`-only no-op stub — it no longer runs on push/PR, so it
+  uploads no conflicting SARIF) and keeping default setup, which already scans
+  Python + Actions. Kept as a stub rather than deleted because the publish/sync
+  pipeline does not propagate file deletions. README CodeQL badge stays on the
+  default-setup path.
 
 ## [1.5.7] — 2026-07-11
 
