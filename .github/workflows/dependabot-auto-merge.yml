@@ -1,0 +1,41 @@
+# Auto-approve + auto-merge Dependabot PRs once required status checks pass — so
+# dependency bumps never wait on a manual review (a solo maintainer has no second
+# reviewer). Uses ONLY the built-in `gh` CLI: no third-party action, so there is
+# nothing to SHA-pin and OpenSSF Scorecard's Pinned-Dependencies / Dangerous-Workflow
+# checks stay happy. It triggers on `pull_request` (not `pull_request_target`) and
+# never checks out PR code, so it is not a dangerous workflow.
+#
+# Two ONE-TIME repo toggles are required for this to work (I cannot set them — you must):
+#   • Settings → General → "Allow auto-merge"                                (enables --auto)
+#   • Settings → Actions → General → Workflow permissions →
+#       "Allow GitHub Actions to create and approve pull requests"           (enables approve)
+#
+# Safety: auto-merge only completes AFTER your required CI checks pass — a Dependabot
+# bump that breaks the build will NOT merge. Merge waits for checks, it does not bypass them.
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    # Only act on Dependabot's own PRs — never on human PRs.
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    permissions:
+      contents: write        # enable auto-merge on the PR
+      pull-requests: write   # approve + set auto-merge
+    steps:
+      - name: Approve the PR
+        continue-on-error: true   # no-op if "Actions approve PRs" is disabled
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enable auto-merge (squash) once checks pass
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

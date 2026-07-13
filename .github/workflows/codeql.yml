@@ -1,0 +1,47 @@
+# CodeQL static analysis (advanced setup — a workflow file, so OpenSSF Scorecard's
+# SAST check can detect it; the "default setup" is invisible to Scorecard because it
+# has no committed workflow). Results appear under Security → Code scanning.
+#
+# NOTE: GitHub rejects an advanced CodeQL workflow while "CodeQL default setup" is
+# enabled. Before this lands, switch it off: repo Settings → Code security →
+# "CodeQL analysis" → disable Default setup (advanced replaces it).
+#
+# Action SHAs are pinned (Scorecard Pinned-Dependencies / Dangerous-Workflow).
+name: CodeQL
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '31 4 * * 1'   # weekly, Monday 04:31 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload results to code-scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ python, actions ]   # actions = the workflow YAML themselves
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9e8d0789d4a0fa9ceb6b1738f7e269594bdd67f0 # v3.28.9
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality   # broader than the default security suite
+
+      # Python + Actions are interpreted — no build step; CodeQL reads the source.
+      - name: Analyze
+        uses: github/codeql-action/analyze@9e8d0789d4a0fa9ceb6b1738f7e269594bdd67f0 # v3.28.9
+        with:
+          category: "/language:${{ matrix.language }}"

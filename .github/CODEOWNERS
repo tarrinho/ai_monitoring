@@ -1,0 +1,10 @@
+# Code owners for AI-Monitoring — the solo maintainer owns the whole tree.
+#
+# This file is INFORMATIONAL: it auto-requests @tarrinho as reviewer on PRs and
+# records ownership. It does NOT, by itself, require any approval.
+#
+# ⚠️  Do NOT enable branch-protection "Require review from Code Owners" while you
+#     are the only developer: GitHub forbids approving your OWN pull request, so
+#     that toggle would block every PR you open. Keep "Required approvals" at 0
+#     (see the branch-protection notes in the README).
+*       @tarrinho

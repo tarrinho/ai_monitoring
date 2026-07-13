@@ -815,6 +815,53 @@ def test_ci_actions_pinned_to_current_majors():
             f"{rel} has a stale checkout pin"
 
 
+def test_supply_chain_scorecard_invariants():
+    """Lock in the OpenSSF Scorecard checks that reached 10/10 so a later edit can't
+    silently regress them: SHA-pinned actions, minimal top-level workflow permissions,
+    a digest-pinned base image, and the SAST/Fuzzing/Scorecard workflows + fuzz
+    harness present (and in the publish ALLOW-list). See rules.md §9a."""
+    wf_dir = ROOT / ".github" / "workflows"
+    workflows = sorted(wf_dir.glob("*.yml"))
+    assert workflows, "no CI workflows found"
+
+    for w in workflows:
+        text = w.read_text(encoding="utf-8")
+        # (a) every `uses:` is SHA-pinned (40 hex), never a mutable @vN / @main / branch
+        for i, ln in enumerate(text.splitlines(), 1):
+            m = re.search(r"uses:\s*([^\s@]+)@(\S+)", ln)
+            if m:
+                assert re.fullmatch(r"[0-9a-f]{40}", m.group(2)), \
+                    f"{w.name}:{i} action {m.group(1)} not SHA-pinned (@{m.group(2)})"
+        # (b) no WRITE at the workflow (top) level — writes escalate per-job only
+        top = text.split("\njobs:", 1)[0]
+        inline = re.search(r"(?m)^permissions:[ \t]+(\S.*)$", top)
+        block = re.search(r"(?m)^permissions:[ \t]*\n((?:[ \t]+\S.*\n)+)", top)
+        perm = (inline.group(1) if inline else "") + (block.group(1) if block else "")
+        assert "write" not in perm, f"{w.name} grants write at the top (workflow) level"
+
+    # (c) Dockerfile base image pinned by digest (Pinned-Dependencies)
+    base = [ln for ln in (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+            if ln.startswith("FROM ") and " AS base" in ln]
+    assert base and all("@sha256:" in ln for ln in base), \
+        "Dockerfile base image must be pinned by @sha256 digest"
+
+    # (d) SAST / Scorecard / Fuzzing workflows + the fuzz harness exist
+    for f in ("codeql.yml", "scorecard.yml", "cflite-pr.yml"):
+        assert (wf_dir / f).exists(), f"missing security workflow {f}"
+    assert (ROOT / "fuzz" / "fuzz_parsers.py").exists(), "missing fuzz harness"
+    assert (ROOT / ".clusterfuzzlite" / "Dockerfile").exists(), "missing ClusterFuzzLite config"
+
+    # (e) those files stay in the publish ALLOW-list (the private publisher is
+    #     intentionally not published, so skip when it isn't in this checkout)
+    pub = ROOT / "deploy" / "publish-github.sh"
+    if pub.exists():
+        allow = pub.read_text(encoding="utf-8")
+        for f in (".github/workflows/codeql.yml", ".github/workflows/cflite-pr.yml",
+                  "fuzz/fuzz_parsers.py", ".clusterfuzzlite/Dockerfile",
+                  ".clusterfuzzlite/build.sh"):
+            assert f in allow, f"publish ALLOW-list missing {f}"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Extra QA — Overview layout regressions (1.0.4)
 # ══════════════════════════════════════════════════════════════════════════════

@@ -90,7 +90,14 @@ jobs:
       # Whole tests/ dir — the live test_testenv.py auto-skips when the stack is
       # absent (it is, in CI). Do NOT name individual files: a new suite would
       # then silently never run. Mirrors rules.md §2 + the in-image build gate.
-      - run: python -m pytest tests/ -q
+      # --reruns 1: a transient cross-test/timing flake retries once (a real failure
+      # fails twice → still red). --cov-fail-under: coverage floor, can't silently rot.
+      - run: >
+          python -m pytest tests/ -q
+          --reruns 1 --reruns-delay 2
+          --cov=app --cov=config --cov=db --cov=auth --cov=alerts
+          --cov=anomaly --cov=metrics_prom --cov=collectors
+          --cov-report=term-missing --cov-fail-under=80
 
   trivy-fs:
     name: Trivy filesystem scan

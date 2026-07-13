@@ -17,6 +17,11 @@ Versioning: [SemVer](https://semver.org/).
   and numeric coercion), `.clusterfuzzlite/` build config, and
   `.github/workflows/cflite-pr.yml` (runs on PRs, SHA-pinned, minimal permissions,
   uploads crashes as SARIF). Satisfies Scorecard's Fuzzing check.
+- **Solo-maintainer un-blockers** — `.github/CODEOWNERS` (informational; owns the
+  tree without requiring approval) and `.github/workflows/dependabot-auto-merge.yml`
+  (auto-approves + enables auto-merge on Dependabot PRs via the built-in `gh` CLI —
+  no third-party action to pin — so dependency bumps land automatically once CI
+  passes, with no second reviewer needed). Merge still gates on required checks.
 
 ### Changed
 - **Supply-chain hardening for OpenSSF Scorecard.** `release.yml` now uses a minimal

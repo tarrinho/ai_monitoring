@@ -1,5 +1,8 @@
 -r requirements.txt
 pytest>=9.1.1,<10
 pytest-asyncio>=1.4.0
+pytest-cov>=6,<8             # coverage measurement + --cov-fail-under gate (CI)
+pytest-rerunfailures>=15,<17 # retry a transient flake once (--reruns) so infra
+                             # races don't red CI; a real failure still fails twice
 hypothesis>=6.100,<7          # property-based / fuzz tests
 freezegun>=1.5,<2             # time-frozen (deterministic date/window tests)
