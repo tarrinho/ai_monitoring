@@ -12,6 +12,21 @@ Versioning: [SemVer](https://semver.org/).
   to the public crawler (`api.securityscorecards.dev`), and uploads SARIF to
   code-scanning. New README badge links to the Scorecard viewer. Added to the
   publish ALLOW-list.
+- **CodeQL advanced workflow** — `.github/workflows/codeql.yml` (Python + Actions,
+  `security-and-quality` queries, SHA-pinned, minimal permissions). A committed
+  workflow is detectable by Scorecard's SAST check, unlike GitHub "default setup"
+  (which must be turned off before this is enabled).
+- **Fuzzing via ClusterFuzzLite** — `fuzz/fuzz_parsers.py` (Atheris harness over the
+  untrusted-input parsers: nvidia-smi CSV, the `/spend/logs` byte parser, timestamp
+  and numeric coercion), `.clusterfuzzlite/` build config, and
+  `.github/workflows/cflite-pr.yml` (runs on PRs, SHA-pinned, minimal permissions,
+  uploads crashes as SARIF). Satisfies Scorecard's Fuzzing check.
+
+### Changed
+- **Supply-chain hardening for OpenSSF Scorecard.** `release.yml` now uses a minimal
+  top-level `permissions: contents: read` and escalates writes only in the release
+  job (Token-Permissions 0 → 10). The Dockerfile base image is pinned by multi-arch
+  manifest digest (Pinned-Dependencies; Dependabot's docker ecosystem bumps it).
 
 ### Fixed
 - **Flaky in-image test gate (CI `build-scan` red on amd64).** Two nav tests
