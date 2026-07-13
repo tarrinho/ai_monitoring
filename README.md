@@ -103,6 +103,24 @@ docker compose up -d
 With no backends configured it still runs — host CPU/RAM/disk + top-apps work
 standalone, and the LLM/GPU dashboard links hide until their backend is set.
 
+### Verify the image before you run it
+
+Every released image is **cosign keyless-signed** (Sigstore/Fulcio — no long-lived
+keys). Signing only helps if you check it, so verify the signature before deploying
+— a tampered or unofficial image fails this:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp \
+    "^https://github.com/tarrinho/ai_monitoring/.github/workflows/release.yml@" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/tarrinho/ai_monitoring:<tag>
+```
+
+It also carries SLSA `provenance` + an SBOM attestation
+(`cosign verify-attestation … --type slsaprovenance`), and each GitHub Release
+attaches a cosign-signed image manifest (`*.txt` + `*.txt.sig` + `*.txt.pem`).
+
 ---
 
 ## Dashboards

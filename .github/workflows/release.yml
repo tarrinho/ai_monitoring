@@ -138,6 +138,30 @@ jobs:
           fi
           cosign sign --yes "${{ steps.meta.outputs.image }}@${digest}"
 
+      # ── Signed release assets (OpenSSF Scorecard Signed-Releases) ─────────
+      # The OCI image signature above is NOT visible to Scorecard's Signed-Releases
+      # check — that check inspects GitHub *Release assets*. So also emit a small
+      # image-provenance manifest and keyless-sign it as a detached blob; the
+      # resulting .sig / .pem are attached to the Release below.
+      - name: Sign release manifest (cosign sign-blob)
+        id: signblob
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          tag="${{ steps.meta.outputs.tag }}"
+          man="ai-monitoring-${tag}-image.txt"
+          {
+            echo "image:     ${{ steps.meta.outputs.image }}:${tag}"
+            echo "digest:    ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+            echo "platforms: linux/amd64, linux/arm64, linux/arm/v7"
+          } > "$man"
+          cosign sign-blob --yes \
+            --output-signature "${man}.sig" \
+            --output-certificate "${man}.pem" \
+            "$man"
+          echo "manifest=${man}" >> "$GITHUB_OUTPUT"
+
       # ── Releases: GitHub Release with CHANGELOG notes ─────────────────────
       - name: Extract CHANGELOG section for this tag
         run: |
@@ -172,8 +196,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.meta.outputs.tag }}"
+          man="${{ steps.signblob.outputs.manifest }}"
+          assets=("$man" "${man}.sig" "${man}.pem")   # signed release artifacts
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" --title "AI-Monitoring $tag" --notes-file RELEASE_NOTES.md
+            gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" --title "AI-Monitoring $tag" --notes-file RELEASE_NOTES.md
+            gh release create "$tag" --title "AI-Monitoring $tag" --notes-file RELEASE_NOTES.md "${assets[@]}"
           fi

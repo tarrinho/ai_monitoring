@@ -12,6 +12,13 @@ Versioning: [SemVer](https://semver.org/).
   to the public crawler (`api.securityscorecards.dev`), and uploads SARIF to
   code-scanning. New README badge links to the Scorecard viewer. Added to the
   publish ALLOW-list.
+- **Supply-chain: verify-on-deploy + signed release assets.** README now documents
+  the `cosign verify` (keyless, identity-scoped to `release.yml`) an operator should
+  run before deploying, plus the SLSA-provenance/SBOM attestations. `release.yml`
+  additionally `cosign sign-blob`s a small image-provenance manifest and attaches
+  `*.txt` + `*.txt.sig` + `*.txt.pem` to each GitHub Release — the OCI image
+  signature isn't visible to OpenSSF Scorecard's Signed-Releases check, but release
+  assets are.
 - **Fuzzing via ClusterFuzzLite** — `fuzz/fuzz_parsers.py` (Atheris harness over the
   untrusted-input parsers: nvidia-smi CSV, the `/spend/logs` byte parser, timestamp
   and numeric coercion), `.clusterfuzzlite/` build config, and
@@ -31,6 +38,12 @@ Versioning: [SemVer](https://semver.org/).
   smoke; scores are advisory `warn`, so only a failed boot/render reds the job).
 
 ### Changed
+- **Node 20 → 24 action bump.** `scorecard.yml`'s three Node-20 actions were the only
+  ones left triggering GitHub's Node-20 deprecation warning; pinned to node24 SHAs:
+  `actions/checkout` v4.2.2 → v7.0.0 (reusing the repo's existing pin),
+  `actions/upload-artifact` v4.6.0 → v7.0.1, `github/codeql-action/upload-sarif`
+  v3.28.9 → codeql-bundle-v2.26.0. Verified every remaining action across all
+  workflows is node24 / composite / docker — no Node-20 warnings remain.
 - **Supply-chain hardening for OpenSSF Scorecard.** `release.yml` now uses a minimal
   top-level `permissions: contents: read` and escalates writes only in the release
   job (Token-Permissions 0 → 10). The Dockerfile base image is pinned by multi-arch
