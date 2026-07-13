@@ -38,6 +38,13 @@ Versioning: [SemVer](https://semver.org/).
   runs native on amd64 (emulated arches skip it). Fix: `_client()` now cancels the
   background sampler tasks right after startup, so tests fully control `_latest`;
   the reconfigure assertion also pins `_latest` explicitly. Test-only change.
+- **Trivy fs red on `.clusterfuzzlite/Dockerfile` (`AVD-DS-0002`, HIGH).** The
+  ClusterFuzzLite/OSS-Fuzz build image runs as root by contract; added `AVD-DS-0002`
+  to `.trivyignore` as a documented accepted-risk (the shipped runtime image still
+  runs non-root). CI `trivy-fs` job back to green.
+- **CodeQL badge** now tracks the advanced `codeql.yml` workflow
+  (`actions/workflows/codeql.yml/badge.svg`) instead of the default-setup path,
+  matching the committed advanced setup.
 
 ## [1.5.7] — 2026-07-11
 

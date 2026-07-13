@@ -8,3 +8,13 @@
 # hostPID it cannot see host processes. The container is otherwise hardened
 # (runAsNonRoot, read-only mounts, no host writes). Owner: Pedro Tarrinho.
 AVD-KSV-0010
+
+# AVD-DS-0002 — .clusterfuzzlite/Dockerfile has no USER (runs as root)
+# ACCEPTED (by design): this is the ClusterFuzzLite / OSS-Fuzz build image
+# (FROM gcr.io/oss-fuzz-base/base-builder-python). The OSS-Fuzz build contract
+# requires root — the base-builder toolchain writes to $SRC/$OUT as root and the
+# fuzzing runtime drops privileges itself. It is a throw-away CI build container,
+# never a deployed runtime, so a USER directive would break the fuzz build with no
+# security benefit. The shipped runtime image (Dockerfile) DOES run non-root.
+# Owner: Pedro Tarrinho.
+AVD-DS-0002
