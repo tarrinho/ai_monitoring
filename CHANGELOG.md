@@ -12,10 +12,6 @@ Versioning: [SemVer](https://semver.org/).
   to the public crawler (`api.securityscorecards.dev`), and uploads SARIF to
   code-scanning. New README badge links to the Scorecard viewer. Added to the
   publish ALLOW-list.
-- **CodeQL advanced workflow** — `.github/workflows/codeql.yml` (Python + Actions,
-  `security-and-quality` queries, SHA-pinned, minimal permissions). A committed
-  workflow is detectable by Scorecard's SAST check, unlike GitHub "default setup"
-  (which must be turned off before this is enabled).
 - **Fuzzing via ClusterFuzzLite** — `fuzz/fuzz_parsers.py` (Atheris harness over the
   untrusted-input parsers: nvidia-smi CSV, the `/spend/logs` byte parser, timestamp
   and numeric coercion), `.clusterfuzzlite/` build config, and
@@ -42,9 +38,12 @@ Versioning: [SemVer](https://semver.org/).
   ClusterFuzzLite/OSS-Fuzz build image runs as root by contract; added `AVD-DS-0002`
   to `.trivyignore` as a documented accepted-risk (the shipped runtime image still
   runs non-root). CI `trivy-fs` job back to green.
-- **CodeQL badge** now tracks the advanced `codeql.yml` workflow
-  (`actions/workflows/codeql.yml/badge.svg`) instead of the default-setup path,
-  matching the committed advanced setup.
+- **CodeQL default-setup conflict** — an advanced `.github/workflows/codeql.yml`
+  was rejected by code-scanning because CodeQL **default setup** is enabled
+  (*"analyses from advanced configurations cannot be processed when the default
+  setup is enabled"*). Resolved by removing the advanced workflow and keeping
+  default setup (which already scans Python + Actions); the README CodeQL badge
+  stays on the default-setup path.
 
 ## [1.5.7] — 2026-07-11
 
