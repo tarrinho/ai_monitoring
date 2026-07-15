@@ -6,7 +6,17 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-07-15
+
 ### Added
+- **Owner identity on the budget/usage boards.** Both the Spend **Per-key budgets**
+  card and the Settings **By user** board now lead each row with the owner
+  **username** (the email local part), with the full **email** and the rest of the
+  breakdown (**User ID · username · email · team · key(s)**) in the click-to-expand
+  details; the header reads **User / key**. `key_budgets`' resolved `user`/`user_name`
+  are carried through `merge_key_budgets` → `budget_rows` (`email` + `user` fields,
+  frozen in the snapshot test). Note: the Spend page is viewer/token-visible, so this
+  surfaces user identity more broadly than the admin-only Teams board (intended).
 - **OpenSSF Scorecard** — `.github/workflows/scorecard.yml` (pinned action SHAs)
   runs the OpenSSF Scorecard analysis weekly + on push to `main`, publishes results
   to the public crawler (`api.securityscorecards.dev`), and uploads SARIF to

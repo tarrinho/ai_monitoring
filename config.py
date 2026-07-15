@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.5.7"
+VERSION = "AI-Monitoring_1.6.1"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:

@@ -226,7 +226,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.7</div>
+      <div id="sidebar-brand-ver">v1.6.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -464,11 +464,13 @@
     var unassigned = gid==="__unassigned__";
     var block=document.createElement("div"); block.className="ublock";
     var row=document.createElement("div"); row.className="urow";
-    // 1) EMAIL — primary identity. Click it to open a structured details panel
-    //    (User ID · username · email · team · keys). Falls back to the key name.
+    // 1) USERNAME — primary identity (email local part). Click it to open a
+    //    structured details panel (User ID · username · email · team · keys) that
+    //    shows the FULL email. Falls back to the key name, then "Unnamed user".
     var uname=document.createElement("span"); uname.className="uid";
     uname.textContent = unassigned ? "Unassigned"
-      : (g.name || (g.keys[0] && g.keys[0].key) || "Unnamed user");
+      : (((g.name && g.name.indexOf("@")>0) ? g.name.split("@")[0] : g.name)
+         || (g.keys[0] && g.keys[0].key) || "Unnamed user");
     uname.title="Click for details (ID · username · email · team · keys)";
     row.appendChild(uname);
     // 2) TEAM — pick an existing (identified) team or add a new one (same cell)

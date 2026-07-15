@@ -371,7 +371,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.5.7"
+    assert config.VERSION == "AI-Monitoring_1.6.1"
 
 
 def test_ux_improvements_present():
@@ -813,6 +813,25 @@ def test_ci_actions_pinned_to_current_majors():
         assert "actions/checkout@v5" not in text and "checkout@" in text \
             and not any("actions/checkout" in ln and "# v5" in ln for ln in lines), \
             f"{rel} has a stale checkout pin"
+
+
+def test_spend_budget_card_shows_owner_details():
+    """Per-key budgets card enriches each row with the owner email and a click-to-
+    expand details panel (ID · username · email · team · key), mirroring the Settings
+    Teams board. Guards the renderKeys wiring + the fields it reads."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert "renderKeys" in html
+    # owner email subline + the clickable key that toggles the detail row
+    assert 'class="kemail"' in html and 'class="kx"' in html
+    assert "Click for details" in html
+    # the structured detail rows read email + user off the budget row
+    assert "r.email" in html and "r.user" in html
+    for label in ("User ID", "Username", "Email", "Team", "Key"):
+        assert label in html, f"budget owner-detail missing '{label}' row"
+    # header leads with the owner username → "User / key"
+    assert "User / key" in html
+    # the row's main label is the owner username (email local part), key as fallback
+    assert 'email.split("@")[0]:r.key' in html
 
 
 def test_supply_chain_scorecard_invariants():

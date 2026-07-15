@@ -116,6 +116,14 @@
   .bnote{margin-top:10px;font-size:11.5px;color:var(--muted);line-height:1.5}
   .bnote b{color:var(--fg)}
   .bmeta{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px}
+  /* per-key owner: email subline + click-to-expand details (mirrors Settings Teams) */
+  .kx{cursor:pointer} .kx:hover{color:var(--accent)}
+  .kxa{color:var(--muted);font-size:10px}
+  .kemail{font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;max-width:220px;white-space:nowrap}
+  .kdcell{background:var(--panel2);padding:8px 12px}
+  .kdrow{display:flex;gap:10px;font-size:12px;padding:2px 0}
+  .kdk{flex:0 0 88px;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;padding-top:2px}
+  .kdv{flex:1;min-width:0;word-break:break-word} .kdv b{color:var(--fg)}
   .bpill{font-size:11px;font-weight:600;border-radius:20px;padding:3px 9px;border:1px solid currentColor;white-space:nowrap}
 
   /* sidebar (shared pattern) */
@@ -198,7 +206,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.5.7</div>
+      <div id="sidebar-brand-ver">v1.6.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -594,7 +602,7 @@ function renderKeys(keys){
     +`as “No budget”).</div>`); return; }
   const nbCount=keys.filter(k=>!k.budget).length;
   const baseline=keys.reduce((m,k)=>Math.max(m,k.spent||0),0);
-  const rows=keys.map(r=>{
+  const rows=keys.map((r,i)=>{
     const nb=!r.budget;                       // no budget defined for this key
     const bg="var(--"+(r.status==="bad"?"bad":r.status==="warn"?"warn":"ok")+")";
     const dc=nb?"—":((r.days_to_cap==null)?"—":(r.days_to_cap<0?"over":r.days_to_cap+"d"));
@@ -607,15 +615,33 @@ function renderKeys(keys){
     const cap=nb
       ? `<span style="color:var(--muted)">${money(r.implied_budget||baseline)} <span style="color:var(--warn)">ref*</span></span>`
       : `${money(r.budget)} real`;
-    return `<tr><td><b>${escapeHtml(r.key)}</b>`
-      +(r.team?`<span class="srv">${escapeHtml(r.team)}</span>`:"")+`</td>`
+    const email=r.email||"", uid=r.user||"";
+    // Lead each row with the owner's username (email local part), falling back to
+    // the raw key when the owner has no resolved email/alias. The key stays in the
+    // click-to-expand details below.
+    const uname=email?email.split("@")[0]:r.key;
+    // click the key to expand structured owner details (ID · username · email · team · key)
+    const dline=(k,v)=>`<div class="kdrow"><span class="kdk">${k}</span><span class="kdv">${v}</span></div>`;
+    const detail=`<tr class="kd" id="kd-${i}" style="display:none"><td colspan="6" class="kdcell">`
+      +dline("User ID", uid?escapeHtml(uid):"—")
+      +dline("Username", email?escapeHtml(email.split("@")[0]):"—")
+      +dline("Email", email?escapeHtml(email):"—")
+      +dline("Team", r.team?escapeHtml(r.team):"—")
+      +dline("Key", "<b>"+escapeHtml(r.key)+"</b>")
+      +`</td></tr>`;
+    return `<tr><td>`
+      +`<b class="kx" data-i="${i}" title="Click for details (ID · username · email · team · key)">`
+      +`${escapeHtml(uname)} <span class="kxa">▸</span></b>`
+      +(r.team?`<span class="srv">${escapeHtml(r.team)}</span>`:"")
+      +(email?`<div class="kemail" title="${escapeHtml(email)}">${escapeHtml(email)}</div>`:"")+`</td>`
       +`<td style="min-width:200px"><div class="btrack">${bar}</div>`
       +`<div class="bmeta"><span class="num">${money(r.spent)} / ${cap}</span>`
       +`<span${nb?' style="color:var(--muted)"':''}>${ipct}%${nb?"*":""}</span></div></td>`
       +`<td class="r" style="color:var(--muted)">${ref}</td>`
       +`<td class="r">${money(r.burn)}</td>`
       +`<td class="r ${dcls}">${dc}</td>`
-      +`<td class="r"><span class="bpill c-${r.status}">${SLBL[r.status]}</span></td></tr>`;
+      +`<td class="r"><span class="bpill c-${r.status}">${SLBL[r.status]}</span></td></tr>`
+      +detail;
   }).join("");
   const note = nbCount
     ? `<div class="bnote">* No budget set. The bar is drawn against this month's `
@@ -623,10 +649,20 @@ function renderKeys(keys){
       +`comparable — it is <b>not a budget</b>, consumes no quota, and never triggers `
       +`a cap alert.</div>`
     : "";
-  setHtml(document.getElementById("keys-body"),
-    `<div class="tscroll"><table><tr><th>Key / team</th><th>Real spend vs budget</th>`
+  const body=document.getElementById("keys-body");
+  setHtml(body,
+    `<div class="tscroll"><table><tr><th>User / key</th><th>Real spend vs budget</th>`
     +`<th class="r">Ref cost</th><th class="r">Burn/day</th>`
     +`<th class="r">Days to cap</th><th class="r">Status</th></tr>${rows}</table></div>${note}`);
+  // click a key → toggle its structured owner-details row. Select the detail via the
+  // main row's next sibling (robust to DOMPurify id/data handling after setHtml).
+  body.querySelectorAll(".kx").forEach(function(el){
+    el.addEventListener("click",function(){
+      const tr=el.closest("tr"), dr=tr&&tr.nextElementSibling;
+      if(dr&&dr.classList.contains("kd"))
+        dr.style.display = (dr.style.display==="none") ? "" : "none";
+    });
+  });
 }
 
 async function tick(){

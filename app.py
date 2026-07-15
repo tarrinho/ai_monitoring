@@ -1580,7 +1580,10 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
     if live:
         for alias, info in live.items():
             keys.append({"alias": alias, "cost": info.get("spend", 0.0),
-                         "team": info.get("team", ""), "budget": info.get("budget", 0.0)})
+                         "team": info.get("team", ""), "budget": info.get("budget", 0.0),
+                         # carry the resolved owner through so the budget rows can show
+                         # email + user id (was dropped here → budgets card had no user).
+                         "user": info.get("user", ""), "user_name": info.get("user_name", "")})
             seen.add(str(alias))
     for sk in (snapshot_keys or []):     # fold in snapshot spend keys not already present
         a = _alias(sk)

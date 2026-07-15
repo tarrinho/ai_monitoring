@@ -1167,6 +1167,8 @@ def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[di
         rows.append({
             "key": str(alias), "role": k.get("role", "viewer"),
             "team": k.get("team") or "",
+            "email": k.get("user_name") or "",   # resolved owner email/alias
+            "user": k.get("user") or "",         # LiteLLM user id (the "ID" in details)
             "spent": round(real, 2),            # real cash — counts against budget
             "reference": round(ref, 2),         # self-hosted — informational only
             "total": round(real + ref, 2),
