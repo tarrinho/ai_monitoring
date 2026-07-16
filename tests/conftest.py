@@ -29,6 +29,7 @@ def _reset_litellm_heavy_cache():
     _litellm._HEAVY = {}
     _litellm._HEAVY_TS = 0.0
     _litellm._CB = {}
+    _litellm._PRICES_CACHE = {}   # last-good /model/info prices — isolate per test
     yield
 
 

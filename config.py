@@ -117,6 +117,13 @@ LITELLM_SPEND_WINDOW_MIN = _int("LITELLM_SPEND_WINDOW_MIN", 15)  # latency windo
 # Optional per-key monthly budgets as JSON {"key-alias": 2000, ...} — drives the
 # Spend & Quota panel until real max_budget is read from LiteLLM /key/info.
 KEY_BUDGETS_JSON   = _str("MONITOR_KEY_BUDGETS", "")
+# Optional per-model cost override as JSON {"model": <USD per 1M tokens>, ...}. Highest
+# precedence — pins a model's $/token when LiteLLM's own price is wrong/unreliable (e.g. an
+# external model billed at a premium rate, or priced without the cache-read discount). The
+# value is a blended effective rate: your real spend for that model ÷ its tokens, per 1M.
+# Example: MONITOR_MODEL_COSTS='{"provider/model": 0.20}'  (i.e. USD 0.20 per 1M tokens).
+# Set it in your own .env (git-ignored) — it never ships in the repo.
+MODEL_COSTS_JSON   = _str("MONITOR_MODEL_COSTS", "")
 # Self-hosted / internal model providers: their cost is a REFERENCE (imputed
 # electricity/amortization), not real cash. Only external providers spend money.
 # Matched against the model's provider prefix (before '/') or as a name substring.

@@ -193,7 +193,18 @@
       var statusTd=cell(u.disabled?"disabled":"active","pill "+(u.disabled?"off":"ok"));
       if(u.must_change_pw&&!u.disabled){var pend=document.createElement("span");
         pend.className="pill off";pend.style.marginLeft="6px";pend.textContent="reset pending";
-        pend.title="Must set a new password on next login";statusTd.appendChild(pend);}
+        pend.title="Must set a new password on next login";statusTd.appendChild(pend);
+        // cancel the forced-reset requirement right where the message is
+        var cancel=document.createElement("button");cancel.type="button";
+        cancel.style.cssText="margin-left:6px;padding:1px 7px;font-size:11px;cursor:pointer;"
+          +"background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:5px";
+        cancel.textContent="Cancel";
+        cancel.title="Cancel the forced password reset — the user keeps their current password";
+        cancel.addEventListener("click",function(){
+          if(confirm("Cancel the password-reset requirement for "+u.name+"? They keep their current "
+            +"password and will not be forced to change it on next login."))
+            act({username:u.name,action:"clear_reset"});});
+        statusTd.appendChild(cancel);}
       tr.appendChild(statusTd);
       tr.appendChild(cell(fmtTime(u.last_login)));
       var td=document.createElement("td"); var wrap=document.createElement("div"); wrap.className="actions";

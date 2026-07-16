@@ -238,6 +238,24 @@ def test_litellm_has_window_delta_key_chart():
     assert 'type:"line"' in html and "d.points" in html
 
 
+def test_litellm_has_per_user_usage_charts():
+    """The keys usage charts (bar 'by requests' + delta 'requests in window') each
+    have a per-USER sibling that aggregates keys by owner client-side, using the
+    alias→owner map built from /api/budgets (keys with no owner fall back to the key)."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # the two new cards + their canvases
+    assert 'id="card-userkeys"' in html and 'id="user-keys-chart"' in html
+    assert 'id="card-userdelta"' in html and 'id="userdelta-chart"' in html
+    assert "Top 10 API users by requests" in html
+    assert "Top 10 API users — requests in window" in html
+    # the aggregation wiring: owner map from budgets + the two render/load funcs
+    assert "buildKeyUser" in html and "_keyUser" in html and "userOf(" in html
+    assert "renderUserKeys" in html and "userKeysChart" in html
+    assert "loadUserDelta" in html and "userDeltaChart" in html
+    # user-delta reuses the keydelta endpoint and is refreshed on window change/pan
+    assert html.count("loadUserDelta(") >= 3   # def + rangedReload + window handler
+
+
 def test_windowed_pages_have_live_button():
     # a "Live" button jumps the window back to the current time (TIMEEND=null),
     # enabled only when panned into history.
@@ -815,6 +833,45 @@ def test_ci_actions_pinned_to_current_majors():
             f"{rel} has a stale checkout pin"
 
 
+def test_spend_budget_table_is_paginated():
+    """Per-key budgets table shows 20 per page (ranked by risk) with Prev/Next paging;
+    the backend still returns every key (pagination is display-only)."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert "KEYS_PER_PAGE=20" in html
+    assert "_keysPage" in html                         # current-page state
+    assert 'data-pg="prev"' in html and 'data-pg="next"' in html
+    assert "keys.slice(pStart,pEnd)" in html           # only the page is rendered
+    assert "of ${total} · ranked by risk" in html      # "X–Y of N" range label
+    assert 'class="kpager"' in html
+
+
+def test_spend_cost_chart_groups_by_user_and_expands_keys():
+    """Spend "Cost by user": the cumulative-cost bar chart defaults to grouping spend
+    by USER (email), with a user/key/team toggle, and clicking a user/team bar expands
+    a panel listing the keys behind it. Guards the grouping + click wiring + safety."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    # card renamed + user is the DEFAULT grouping
+    assert "Cost by user" in html
+    assert 'let COSTBY="user"' in html
+    # three toggles, "by user" active by default
+    for by in ("user", "key", "team"):
+        assert f'data-by="{by}"' in html, f"cost toggle missing by-{by}"
+    assert 'data-by="user" class="active"' in html
+    # grouping logic: user → email (fallback "Unassigned"), team → team, key → key;
+    # every group carries its underlying keys for the click-to-expand
+    assert 'k.email||"Unassigned"' in html
+    assert "COSTBY===\"user\"" in html and "COSTBY===\"team\"" in html
+    assert "keys:v.keys" in html            # grouped rows keep their keys
+    # click a bar → showCostKeys lists that group's keys (wired via chart onClick)
+    assert "onClick:(e,els)" in html and "showCostKeys" in html and "_costRows" in html
+    assert "click a user to see the keys they used" in html
+    # the detail panel is DOM-safe (escaped) and never innerHTML-raw
+    assert "function showCostKeys" in html
+    assert "escapeHtml(k.key)" in html and "escapeHtml(row.name)" in html
+    # regression: no fixed top-N cap — every row shown (bars sized by count)
+    assert ".slice(0,12)" not in html and "rows.length*24" in html
+
+
 def test_spend_budget_card_shows_owner_details():
     """Per-key budgets card enriches each row with the owner email and a click-to-
     expand details panel (ID · username · email · team · key), mirroring the Settings
@@ -1229,6 +1286,16 @@ def test_admin_page_has_profile_editor():
     assert "beginEdit" in html and '"Edit"' in html
     assert 'action:"update"' in html
     assert "innerHTML" not in html          # editor built with DOM APIs, not innerHTML
+
+
+def test_admin_reset_pending_has_cancel_button():
+    """A 'reset pending' user shows a Cancel button next to the message that lifts the
+    forced-reset requirement (clear_reset action). Built with DOM APIs."""
+    html = (ROOT / "web" / "admin.html").read_text(encoding="utf-8")
+    assert "reset pending" in html
+    # cancel control is wired to the clear_reset admin action, next to the pill
+    assert 'action:"clear_reset"' in html
+    assert "must_change_pw" in html and "Cancel" in html
 
 
 # ============================================================================

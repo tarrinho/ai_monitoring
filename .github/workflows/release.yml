@@ -142,7 +142,7 @@ jobs:
       # The OCI image signature above is NOT visible to Scorecard's Signed-Releases
       # check — that check inspects GitHub *Release assets*. So also emit a small
       # image-provenance manifest and keyless-sign it as a detached blob; the
-      # resulting .sig / .pem are attached to the Release below.
+      # resulting .bundle (cosign signature + certificate + Rekor proof) is attached below.
       - name: Sign release manifest (cosign sign-blob)
         id: signblob
         env:
@@ -156,9 +156,13 @@ jobs:
             echo "digest:    ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
             echo "platforms: linux/amd64, linux/arm64, linux/arm/v7"
           } > "$man"
+          # cosign's current default is the single-file bundle format (signature +
+          # certificate + Rekor inclusion proof in one .bundle). The old
+          # --output-signature / --output-certificate flags are deprecated and IGNORED
+          # under it (and error out when no --bundle is given), so emit a .bundle.
+          # Verify with: cosign verify-blob --bundle <man>.bundle --certificate-identity-regexp … <man>
           cosign sign-blob --yes \
-            --output-signature "${man}.sig" \
-            --output-certificate "${man}.pem" \
+            --bundle "${man}.bundle" \
             "$man"
           echo "manifest=${man}" >> "$GITHUB_OUTPUT"
 
@@ -197,7 +201,7 @@ jobs:
         run: |
           tag="${{ steps.meta.outputs.tag }}"
           man="${{ steps.signblob.outputs.manifest }}"
-          assets=("$man" "${man}.sig" "${man}.pem")   # signed release artifacts
+          assets=("$man" "${man}.bundle")   # signed release artifacts (cosign bundle)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" --title "AI-Monitoring $tag" --notes-file RELEASE_NOTES.md
             gh release upload "$tag" "${assets[@]}" --clobber

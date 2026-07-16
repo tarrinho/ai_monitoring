@@ -9,6 +9,18 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.6.1] — 2026-07-15
 
 ### Added
+- **Cancel a pending password reset.** A user forced to reset their password shows a
+  **"reset pending"** badge on `/admin/users`; a new **Cancel** button next to it lifts
+  the requirement (new `clear_reset` admin action → clears `must_change_pw` and drops
+  the gated session so the change takes effect immediately). The user keeps their
+  current password and logs in normally instead of being routed to `/account`.
+- **Per-user usage charts on the LiteLLM page.** Two new charts sit beside the
+  per-key ones — **Top 10 API users by requests** (bar) and **Top 10 API users —
+  requests in window** (timeline) — aggregating each owner's keys. Done client-side:
+  the alias→owner map is built from `/api/budgets` (fetched once per tick and shared
+  with the budget card), and the key aliases in `top_keys` / `/api/keydelta` line up
+  with the budget rows' alias, so keys sum cleanly per user (a key with no resolved
+  owner falls back to its key label). No backend/schema change.
 - **Owner identity on the budget/usage boards.** Both the Spend **Per-key budgets**
   card and the Settings **By user** board now lead each row with the owner
   **username** (the email local part), with the full **email** and the rest of the
@@ -26,7 +38,7 @@ Versioning: [SemVer](https://semver.org/).
   the `cosign verify` (keyless, identity-scoped to `release.yml`) an operator should
   run before deploying, plus the SLSA-provenance/SBOM attestations. `release.yml`
   additionally `cosign sign-blob`s a small image-provenance manifest and attaches
-  `*.txt` + `*.txt.sig` + `*.txt.pem` to each GitHub Release — the OCI image
+  `*.txt` + `*.txt.bundle` to each GitHub Release — the OCI image
   signature isn't visible to OpenSSF Scorecard's Signed-Releases check, but release
   assets are.
 - **Fuzzing via ClusterFuzzLite** — `fuzz/fuzz_parsers.py` (Atheris harness over the
@@ -48,6 +60,16 @@ Versioning: [SemVer](https://semver.org/).
   smoke; scores are advisory `warn`, so only a failed boot/render reds the job).
 
 ### Changed
+- **Spend → "Per-key budgets" table is now paginated (20 per page).** The card can
+  list many keys; it shows the top 20 **ranked by risk** with **‹ Prev / Next ›**
+  controls and an "X–Y of N" label. The backend still returns every key (paging is
+  display-only), and the page position persists across the 5s polls.
+- **Spend → "Cost by key" is now "Cost by user".** The cumulative-cost bar chart
+  defaults to grouping spend **by user** (resolved email; unowned keys → "Unassigned"),
+  with a `by user / by key / by team` toggle. **Click a user (or team) bar** to expand
+  a panel listing the individual keys behind it — each with its spend and team/email —
+  so the user is the primary reference and the keys are one click away. Still uncapped
+  (every row shown, ranked by spend). Pairs with the per-user LiteLLM charts above.
 - **Node 20 → 24 action bump.** `scorecard.yml`'s three Node-20 actions were the only
   ones left triggering GitHub's Node-20 deprecation warning; pinned to node24 SHAs:
   `actions/checkout` v4.2.2 → v7.0.0 (reusing the repo's existing pin),
@@ -59,7 +81,39 @@ Versioning: [SemVer](https://semver.org/).
   job (Token-Permissions 0 → 10). The Dockerfile base image is pinned by multi-arch
   manifest digest (Pinned-Dependencies; Dependabot's docker ecosystem bumps it).
 
+### Added
+- **`MONITOR_MODEL_COSTS` — per-model cost override (highest precedence).** Pin a model's
+  real `$/1M-tokens` when LiteLLM's own price is wrong or keeps reverting (e.g. an external
+  model billed at a premium rate). JSON env `{"provider/model": <USD per 1M>}`, mirroring
+  `MONITOR_KEY_BUDGETS`; the value is a blended effective rate (your real spend ÷ tokens).
+  Lives in the operator's own `.env` (git-ignored) — never shipped in the repo. Wins over
+  both the LiteLLM price and the spend-anchor.
+
 ### Fixed
+- **Release signing broke on newer cosign (`sign-blob` exit 1).** cosign now defaults to the
+  single-file `--new-bundle-format`, under which `--output-signature`/`--output-certificate`
+  are deprecated + ignored and, with no `--bundle` given, it errors (`create bundle file:
+  open : no such file`). `release.yml` now emits a `.bundle` (`--bundle <man>.bundle`) and
+  attaches `*.txt` + `*.txt.bundle`. Verify: `cosign verify-blob --bundle <man>.bundle …`.
+- **External-model cost wildly over-estimated (cache-heavy workloads).** The cost estimate
+  priced every token at `input_cost + output_cost` (double-counting — a token is input *or*
+  output) and ignored cache-read discounts, so a cache-heavy client (e.g. Claude Code on a
+  cheap external model) showed ~10× its real cost. Fix: for **external** models the estimate
+  now anchors to LiteLLM's **actual key-spend ÷ tokens** (cache-accurate, self-correcting —
+  it tracks the real bill and follows when the operator fixes model pricing) via
+  `_anchor_real_prices`, and an operator `MONITOR_MODEL_COSTS` override (above) wins over
+  that; self-hosted (reference) models keep the imputed token estimate.
+  Falls back to config prices when LiteLLM exposes no spend. (Free-tier LiteLLM has no per-day
+  `$` — `/spend/report` is Enterprise-only — so the daily *shape* is still token-derived; the
+  per-model total is anchored to real spend.)
+- **Spend "Cost over time" card flickered on/off between polls.** LiteLLM's
+  `/model/info` price endpoint intermittently answers empty (or times out) on a busy
+  proxy; `model_prices` returned `{}`, which zeroed every day's estimated cost →
+  `cost_available` flipped false → the card hid itself, then reappeared on the next
+  good poll. `model_prices` now keeps a **last-good price cache** (`_PRICES_CACHE`) and
+  reuses it on a transient error or empty response — prices are stable config, so the
+  cost overlay (and the card) stays put. Mirrors the existing `_KEY_BUDGETS_CACHE` /
+  `_COST_RATES` last-good patterns.
 - **Flaky in-image test gate (CI `build-scan` red on amd64).** Two nav tests
   (`test_unconfigured_backend_links_stripped_serverside`,
   `test_token_auth_hides_alerts_link`) raced the background sampler, which rebinds

@@ -1245,6 +1245,12 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
         # setting one (keeps their current password working only to reach /account).
         db.user_set_must_change(name, True)
         auth.sessions_drop_user(name)     # end active sessions so the gate applies now
+    elif action == "clear_reset":
+        # Cancel a pending forced reset: the user keeps their current password and is no
+        # longer gated to /account. Drop any gated session so the lift takes effect now
+        # (a stale session still carries must_change=True until re-login).
+        db.user_set_must_change(name, False)
+        auth.sessions_drop_user(name)
     elif action == "update":
         # edit a user's profile (email + role). Role is revalidated per request in
         # _auth_ctx, so a change takes effect on the target's next request.
@@ -1485,6 +1491,9 @@ async def litellm_models_handler(request: web.Request) -> web.Response:
     # Estimated $ per model = tokens × LiteLLM per-model price; tagged real/estimated by
     # cost_kind so the UI can draw a 2-colour cost-by-model breakdown (free tier has no $).
     prices = await litellm.model_prices(request.app[_SESSION])
+    # Anchor external-model rates to LiteLLM's ACTUAL spend (cache-accurate) instead of the
+    # config input+output price, which double-counts and ignores cache reads.
+    await _anchor_real_prices(request.app[_SESSION], rows, prices)
     priced = 0
     for r in rows or []:
         # real = external cash; reference = self-hosted imputed (estimated). Both priced
@@ -2178,6 +2187,66 @@ def bucket_spend(daily: list, window: str) -> dict:
     return out
 
 
+def effective_real_cpt(real_spend: float | None, real_tokens: int | None) -> float | None:
+    """LiteLLM's ACTUAL $/token for external models = real key-spend ÷ real tokens.
+    Returns None when either input is missing so callers fall back to config prices."""
+    if real_tokens and real_tokens > 0 and real_spend and real_spend > 0:
+        return real_spend / real_tokens
+    return None
+
+
+def model_cost_overrides() -> dict:
+    """Operator per-model $/token overrides from MONITOR_MODEL_COSTS (JSON {model: USD per
+    1M tokens}). Highest-precedence price source: pins a model's cost when LiteLLM's own
+    price is wrong/unreliable. Value is a blended effective rate ($ per 1M → $ per token)."""
+    raw = config.MODEL_COSTS_JSON
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    out: dict = {}
+    for k, v in (d.items() if isinstance(d, dict) else []):
+        try:
+            out[str(k)] = float(v) / 1_000_000.0     # USD/1M tokens → USD/token
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+async def _anchor_real_prices(session, per_model: list | None, prices: dict) -> dict:
+    """Fix external-model $/token in `prices` when LiteLLM's own price is unreliable, in
+    precedence order:
+      1. MONITOR_MODEL_COSTS operator override (pins a known real rate — wins over all).
+      2. LiteLLM's ACTUAL effective rate = real key-spend ÷ real tokens (cache-accurate,
+         self-correcting) — the `/model/info` input+output price both DOUBLE-COUNTS (a token
+         is input xor output) and ignores cache-read discounts, so a cache-heavy workload
+         (e.g. Claude Code on a cheap model) is wildly over-estimated.
+    Models with an explicit override are NOT re-anchored. No-op when nothing is available."""
+    ov = model_cost_overrides()
+    for m, cpt in ov.items():
+        prices[m] = cpt                              # operator override — highest precedence
+    real = [r for r in (per_model or [])
+            if r.get("cost_kind") == "real" and r.get("model") and r["model"] not in ov]
+    real_tokens = sum(int(r.get("tokens") or 0) for r in real)
+    if real_tokens <= 0:
+        return prices
+    try:
+        kb = await litellm.key_budgets(session)
+    except Exception:
+        kb = None
+    if not kb:
+        return prices
+    real_spend = sum(float(v.get("spend") or 0) for v in kb.values())
+    eff = effective_real_cpt(real_spend, real_tokens)
+    if eff is None:
+        return prices
+    for r in real:
+        prices[r["model"]] = eff
+    return prices
+
+
 def cost_rates(per_model: list, prices: dict) -> tuple[float, float]:
     """($/token attributable to REAL external models, $/token to REFERENCE self-hosted
     models), from windowed per-model tokens × LiteLLM per-model prices. Free-tier LiteLLM
@@ -2310,6 +2379,9 @@ async def spend_series_handler(request: web.Request) -> web.Response:
             prices = await litellm.model_prices(request.app[_SESSION])
             per_model = await litellm.per_model_range(request.app[_SESSION], start, end,
                                                       overrides)
+            # Anchor external-model rates to LiteLLM's ACTUAL spend (cache-accurate) — the
+            # config input+output price double-counts and ignores cache-read discounts.
+            await _anchor_real_prices(request.app[_SESSION], per_model, prices)
             # ACCURATE path: per-day per-model tokens → each day's cost from its own model
             # mix, so an external model's cost lands only on the days it actually ran.
             daily_cost = await litellm.per_model_daily_cost(

@@ -115,6 +115,13 @@
     rgba(255,255,255,.16) 0 3px, transparent 3px 6px)}
   .bnote{margin-top:10px;font-size:11.5px;color:var(--muted);line-height:1.5}
   .bnote b{color:var(--fg)}
+  /* per-key budget pager (20/page) */
+  .kpager{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:12px}
+  .kpager .kpginfo{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .kpg{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;
+    padding:4px 11px;font-size:12px;cursor:pointer}
+  .kpg:hover:not([disabled]){border-color:var(--accent);color:var(--accent)}
+  .kpg[disabled]{opacity:.4;cursor:default}
   .bmeta{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px}
   /* per-key owner: email subline + click-to-expand details (mirrors Settings Teams) */
   .kx{cursor:pointer} .kx:hover{color:var(--accent)}
@@ -124,6 +131,15 @@
   .kdrow{display:flex;gap:10px;font-size:12px;padding:2px 0}
   .kdk{flex:0 0 88px;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;padding-top:2px}
   .kdv{flex:1;min-width:0;word-break:break-word} .kdv b{color:var(--fg)}
+  /* Cost-by-user: click a bar → panel listing that user's keys */
+  .cdet{margin-top:12px;border-top:1px solid var(--line);padding-top:10px;font-size:12.5px}
+  .cdet .ch{color:var(--muted);margin-bottom:6px}
+  .cdet .ch b{color:var(--fg)}
+  .cdet .crow{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid var(--line)}
+  .cdet .crow:last-child{border-bottom:none}
+  .cdet .ck{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cdet .ck .srv{margin-left:6px}
+  .cdet .cv{flex-shrink:0;font-variant-numeric:tabular-nums;color:var(--fg)}
   .bpill{font-size:11px;font-weight:600;border-radius:20px;padding:3px 9px;border:1px solid currentColor;white-space:nowrap}
 
   /* sidebar (shared pattern) */
@@ -263,14 +279,16 @@
     <div class="chart-wrap"><canvas id="cost-time-chart"></canvas></div>
   </section>
 
-  <section class="card" id="card-cost" aria-label="Cost by key">
-    <h2>Cost by key
+  <section class="card" id="card-cost" aria-label="Cost by user">
+    <h2>Cost by user
       <span class="windows" id="cost-by">
-        <button data-by="key" class="active">by key</button>
+        <button data-by="user" class="active">by user</button>
+        <button data-by="key">by key</button>
         <button data-by="team">by team</button>
       </span></h2>
-    <div class="hint" style="margin-top:2px">cumulative spend to date (LiteLLM per-key totals) — real cash, all-time</div>
+    <div class="hint" style="margin-top:2px">cumulative spend to date (LiteLLM per-key totals) — real cash, all-time · <b>click a user to see the keys they used</b></div>
     <div class="chart-wrap"><canvas id="cost-chart"></canvas></div>
+    <div id="cost-detail"></div>
   </section>
 
   <div class="teamhd" id="teamhd" style="display:none">
@@ -445,29 +463,51 @@ function renderYearCost(d, realCol, estCol){
 }
 // Cost by key/team — cumulative $ spend (LiteLLM per-key totals). Horizontal bars so
 // long key names stay readable; real cash, all-time (not a time series).
-let COSTBY="key", _lastKeys=[];
+let COSTBY="user", _lastKeys=[], _costRows=[], _keysPage=0;
+const KEYS_PER_PAGE=20;
 const costChart=new Chart(document.getElementById("cost-chart"),{
   type:"bar",
   data:{labels:[],datasets:[{label:"Spend",data:[],borderRadius:3,backgroundColor:cssv("--accent")}]},
   options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
+    // click a grouped bar (user/team) → list the keys behind it
+    onClick:(e,els)=>{ if(els.length) showCostKeys(_costRows[els[0].index]); },
     plugins:{legend:{display:false},
       tooltip:{callbacks:{label:c=>" $"+Number(c.parsed.x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}}},
     scales:{
       x:{ticks:{color:"#8b949e",font:{size:10},callback:v=>"$"+v},grid:{color:"#30363d55"},beginAtZero:true},
       y:{ticks:{color:"#8b949e",font:{size:11},autoSkip:false},grid:{display:false}}}}
 });
+// list the keys that make up a clicked user/team bar, below the chart
+function showCostKeys(row){
+  const el=document.getElementById("cost-detail");
+  if(!row||!row.keys||COSTBY==="key"){ setHtml(el,""); return; }
+  const kind = COSTBY==="user" ? "user" : "team";
+  const rows=row.keys.slice().filter(k=>(k.spent||0)>0).sort((a,b)=>(b.spent||0)-(a.spent||0))
+    .map(k=>`<div class="crow"><span class="ck"><b>${escapeHtml(k.key)}</b>`
+      +(kind==="user"&&k.team?`<span class="srv">${escapeHtml(k.team)}</span>`:"")
+      +(kind==="team"&&k.email?`<span class="srv">${escapeHtml(k.email)}</span>`:"")
+      +`</span><span class="cv">${money(k.spent||0)}</span></div>`).join("");
+  setHtml(el,`<div class="cdet"><div class="ch">Keys used by <b>${escapeHtml(row.name)}</b> `
+    +`(${row.keys.length}) · ${money(row.spent)}</div>${rows}</div>`);
+}
 function renderCostChart(keys){
   let rows;
   if(COSTBY==="team"){
     const t={};
-    keys.forEach(k=>{ const n=k.team||"—"; t[n]=(t[n]||0)+(k.spent||0); });
-    rows=Object.entries(t).map(([name,spent])=>({name,spent}));
+    keys.forEach(k=>{ const n=k.team||"—"; (t[n]=t[n]||{spent:0,keys:[]}); t[n].spent+=(k.spent||0); t[n].keys.push(k); });
+    rows=Object.entries(t).map(([name,v])=>({name,spent:v.spent,keys:v.keys}));
+  } else if(COSTBY==="user"){
+    const u={};
+    keys.forEach(k=>{ const n=k.email||"Unassigned"; (u[n]=u[n]||{spent:0,keys:[]}); u[n].spent+=(k.spent||0); u[n].keys.push(k); });
+    rows=Object.entries(u).map(([name,v])=>({name,spent:v.spent,keys:v.keys}));
   } else {
-    rows=keys.map(k=>({name:k.key,spent:k.spent||0}));
+    rows=keys.map(k=>({name:k.key,spent:k.spent||0,keys:[k]}));
   }
-  // show EVERY key/team with spend — no fixed top-N cap (regression: "Cost by key" used
-  // to slice to 12 and hide the rest). Rank by spend, biggest first.
+  // show EVERY user/key/team with spend — no fixed top-N cap (regression: used to
+  // slice to 12 and hide the rest). Rank by spend, biggest first.
   rows=rows.filter(r=>r.spent>0).sort((a,b)=>b.spent-a.spent);
+  _costRows=rows;
+  setHtml(document.getElementById("cost-detail"),"");   // collapse detail on re-render
   const card=document.getElementById("card-cost");
   if(!rows.length){ card.style.display="none"; return; }
   card.style.display="";
@@ -602,7 +642,12 @@ function renderKeys(keys){
     +`as “No budget”).</div>`); return; }
   const nbCount=keys.filter(k=>!k.budget).length;
   const baseline=keys.reduce((m,k)=>Math.max(m,k.spent||0),0);
-  const rows=keys.map((r,i)=>{
+  // paginate: keys arrive already ranked by risk (backend sort); show one page of 20.
+  const total=keys.length, pages=Math.max(1,Math.ceil(total/KEYS_PER_PAGE));
+  if(_keysPage>=pages) _keysPage=pages-1;
+  if(_keysPage<0) _keysPage=0;
+  const pStart=_keysPage*KEYS_PER_PAGE, pEnd=Math.min(pStart+KEYS_PER_PAGE,total);
+  const rows=keys.slice(pStart,pEnd).map((r,i)=>{
     const nb=!r.budget;                       // no budget defined for this key
     const bg="var(--"+(r.status==="bad"?"bad":r.status==="warn"?"warn":"ok")+")";
     const dc=nb?"—":((r.days_to_cap==null)?"—":(r.days_to_cap<0?"over":r.days_to_cap+"d"));
@@ -649,11 +694,17 @@ function renderKeys(keys){
       +`comparable — it is <b>not a budget</b>, consumes no quota, and never triggers `
       +`a cap alert.</div>`
     : "";
+  // pager (only when more than one page) — Prev / range / Next
+  const pager = total>KEYS_PER_PAGE
+    ? `<div class="kpager"><button class="kpg" data-pg="prev"${_keysPage<=0?" disabled":""}>‹ Prev</button>`
+      +`<span class="kpginfo num">${pStart+1}–${pEnd} of ${total} · ranked by risk</span>`
+      +`<button class="kpg" data-pg="next"${_keysPage>=pages-1?" disabled":""}>Next ›</button></div>`
+    : "";
   const body=document.getElementById("keys-body");
   setHtml(body,
     `<div class="tscroll"><table><tr><th>User / key</th><th>Real spend vs budget</th>`
     +`<th class="r">Ref cost</th><th class="r">Burn/day</th>`
-    +`<th class="r">Days to cap</th><th class="r">Status</th></tr>${rows}</table></div>${note}`);
+    +`<th class="r">Days to cap</th><th class="r">Status</th></tr>${rows}</table></div>${pager}${note}`);
   // click a key → toggle its structured owner-details row. Select the detail via the
   // main row's next sibling (robust to DOMPurify id/data handling after setHtml).
   body.querySelectorAll(".kx").forEach(function(el){
@@ -661,6 +712,14 @@ function renderKeys(keys){
       const tr=el.closest("tr"), dr=tr&&tr.nextElementSibling;
       if(dr&&dr.classList.contains("kd"))
         dr.style.display = (dr.style.display==="none") ? "" : "none";
+    });
+  });
+  // page nav — persists across polls (_keysPage is module-level)
+  body.querySelectorAll(".kpg").forEach(function(b){
+    b.addEventListener("click",function(){
+      if(b.disabled) return;
+      _keysPage += (b.dataset.pg==="next" ? 1 : -1);
+      renderKeys(_lastKeys);
     });
   });
 }

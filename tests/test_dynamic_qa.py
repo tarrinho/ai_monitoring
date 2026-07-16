@@ -2561,10 +2561,13 @@ async def test_spend_page_served_and_gated(monkeypatch):
         # Free-tier LiteLLM has no daily $ (that's Enterprise /global/spend/report), so
         # the timeline is a USAGE chart (requests + tokens), not an empty $ chart.
         assert "Usage over time" in html and "requests &amp; tokens per day" in html
-        # cumulative cost still visualised — "Cost by key" horizontal bar chart (the $
-        # that DOES exist, from /global/spend/keys), with a key/team toggle.
-        assert "Cost by key" in html and "cost-chart" in html and "renderCostChart" in html
-        # regression: the cost-by-key chart must show ALL keys, not a hardcoded top-12 slice
+        # cumulative cost horizontal bar chart (the $ that DOES exist, from
+        # /global/spend/keys) — grouped by USER (main), with user/key/team toggle;
+        # click a user bar to list the keys they used.
+        assert "Cost by user" in html and "cost-chart" in html and "renderCostChart" in html
+        assert 'data-by="user"' in html and "showCostKeys" in html
+        assert "click a user to see the keys they used" in html
+        # regression: the cost chart must show ALL rows, not a hardcoded top-12 slice
         assert ".slice(0,12)" not in html and "rows.length*24" in html
         # estimated cost over time — daily tokens × per-model price, real vs estimated.
         assert "Cost over time" in html and "cost-time-chart" in html and "renderCostTime" in html
@@ -3494,6 +3497,74 @@ def test_apply_prefix_covers_form_action_and_js_redirect():
     assert 'fetch("/ai_monitoring/api/a"' in out
     assert 'api("/ai_monitoring/api/b"' in out
     assert 'location.href="/ai_monitoring/"' in out         # account redirect
+
+
+def test_effective_real_cpt_anchors_to_actual_spend():
+    """External-model cost uses LiteLLM's ACTUAL key-spend ÷ tokens, not the config
+    input+output price (which double-counts and ignores cache-read discounts → wildly
+    over-estimates a cache-heavy workload). None when spend/tokens are unavailable."""
+    assert appmod.effective_real_cpt(100.0, 10_000_000) == pytest.approx(100.0 / 10_000_000)
+    assert appmod.effective_real_cpt(0.0, 1000) is None      # no spend → fall back
+    assert appmod.effective_real_cpt(10.0, 0) is None        # no tokens → fall back
+    assert appmod.effective_real_cpt(None, 100) is None
+
+
+async def test_anchor_real_prices_overrides_only_external(monkeypatch):
+    """_anchor_real_prices replaces the EXTERNAL model $/token with real key-spend ÷ real
+    tokens; reference (self-hosted) rates are left as-is. This is what makes the Spend
+    cost chart match the provider bill instead of the double-counted config price."""
+    async def _kb(_session):
+        return {"k1": {"spend": 60.0}, "k2": {"spend": 40.0}}   # $100 total real cash
+    monkeypatch.setattr(appmod.litellm, "key_budgets", _kb)
+    per_model = [
+        {"model": "extern/model-a", "tokens": 10_000_000, "cost_kind": "real"},
+        {"model": "selfhosted/model-b", "tokens": 80_000_000, "cost_kind": "reference"},
+    ]
+    prices = {"extern/model-a": 0.00000225, "selfhosted/model-b": 0.0000001}
+    out = await appmod._anchor_real_prices(None, per_model, prices)
+    assert out["extern/model-a"] == pytest.approx(100.0 / 10_000_000)   # anchored to real
+    assert out["selfhosted/model-b"] == 0.0000001                        # untouched
+
+
+def test_model_cost_overrides_parses_usd_per_1m(monkeypatch):
+    """MONITOR_MODEL_COSTS is JSON {model: USD per 1M tokens} → {model: USD per token};
+    bad JSON / non-numeric values are ignored, not fatal."""
+    monkeypatch.setattr(config, "MODEL_COSTS_JSON",
+                        '{"extern/model-a": 0.20, "bad": "x"}')
+    ov = appmod.model_cost_overrides()
+    assert ov["extern/model-a"] == pytest.approx(0.20 / 1_000_000)
+    assert "bad" not in ov
+    monkeypatch.setattr(config, "MODEL_COSTS_JSON", "not-json")
+    assert appmod.model_cost_overrides() == {}
+    monkeypatch.setattr(config, "MODEL_COSTS_JSON", "")
+    assert appmod.model_cost_overrides() == {}
+
+
+async def test_operator_cost_override_beats_spend_anchor(monkeypatch):
+    """A MONITOR_MODEL_COSTS override pins the model's $/token and is NOT re-anchored to
+    LiteLLM's (possibly wrong) spend — the operator's known rate wins over the premium-
+    mispriced number LiteLLM reports."""
+    monkeypatch.setattr(config, "MODEL_COSTS_JSON", '{"extern/model-a": 0.20}')  # $0.20/1M
+    async def _kb(_session):    # LiteLLM still reports a wrong (premium) spend
+        return {"k1": {"spend": 200.0}}
+    monkeypatch.setattr(appmod.litellm, "key_budgets", _kb)
+    per_model = [{"model": "extern/model-a", "tokens": 10_000_000, "cost_kind": "real"}]
+    prices = {"extern/model-a": 0.00000225}
+    out = await appmod._anchor_real_prices(None, per_model, prices)
+    rate = out["extern/model-a"]
+    assert rate == pytest.approx(0.20 / 1_000_000)                   # override wins
+    assert round(10_000_000 * rate, 2) == pytest.approx(2.00, abs=0.01)   # tokens×rate
+
+
+async def test_anchor_real_prices_noop_without_spend(monkeypatch):
+    """No real spend or no key data → keep the config prices (never zero the chart)."""
+    async def _empty(_session):
+        return None
+    monkeypatch.setattr(appmod.litellm, "key_budgets", _empty)
+    per_model = [{"model": "extern/model-a", "tokens": 1000, "cost_kind": "real"}]
+    prices = {"extern/model-a": 0.00000225}
+    out = await appmod._anchor_real_prices(None, per_model, prices)
+    assert out["extern/model-a"] == 0.00000225
 
 
 def test_gpu_http_collector_refuses_redirects():
@@ -4451,6 +4522,34 @@ async def test_model_prices_parses_model_info(monkeypatch):
     assert round(pr["azure_ai/gpt-5-mini"], 12) == 2.25e-06   # in + out
     assert "free-local" not in pr                             # 0-priced dropped
     assert litellm.price_for("gpt-5-mini", pr) == pr["azure_ai/gpt-5-mini"]   # prefix-tolerant
+
+
+async def test_model_prices_reuses_last_good_when_endpoint_blips(monkeypatch):
+    """/model/info blips empty/errors intermittently on a busy proxy. model_prices must
+    reuse the last-good prices so estimated cost stays > 0 — otherwise the Spend
+    'Cost over time' card flickers off (cost_available flips false). Regression."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def good(session, url, headers=None, timeout_s=None):
+        return ({"data": [{"model_name": "azure_ai/gpt-5-mini",
+                           "litellm_params": {"input_cost_per_token": 1e-06,
+                                              "output_cost_per_token": 1.25e-06}}]}, None)
+    monkeypatch.setattr(litellm, "fetch_json", good)
+    warm = await litellm.model_prices(None)
+    assert warm.get("azure_ai/gpt-5-mini")                    # priced, cached
+
+    # 1) transient ERROR → last-good, not empty
+    async def erred(session, url, headers=None, timeout_s=None):
+        return (None, "timeout")
+    monkeypatch.setattr(litellm, "fetch_json", erred)
+    assert await litellm.model_prices(None) == warm
+
+    # 2) endpoint answers but prices NOTHING (mid-reload) → still last-good
+    async def empty(session, url, headers=None, timeout_s=None):
+        return ({"data": []}, None)
+    monkeypatch.setattr(litellm, "fetch_json", empty)
+    assert await litellm.model_prices(None) == warm
 
 
 async def test_paginate_stops_when_endpoint_ignores_page(monkeypatch):
@@ -5752,6 +5851,35 @@ async def test_admin_force_reset_flags_user(monkeypatch):
     finally:
         await c.close()
     assert db.user_get("frtarget")["must_change_pw"] is True   # flagged, password unchanged
+
+
+async def test_admin_clear_reset_cancels_pending_requirement(monkeypatch):
+    """Admin can CANCEL a pending forced reset ('reset pending'): clear_reset lifts the
+    must_change flag and the target logs in normally (no /account gate)."""
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("cadm", "ca@x.io", auth.hash_password("cadmpw12"), "admin", time.time())
+    db.user_create("crtarget", "ct@x.io", auth.hash_password("crtpw123"), "viewer",
+                   time.time(), must_change_pw=True)          # starts 'reset pending'
+    assert db.user_get("crtarget")["must_change_pw"] is True
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "cadm", "password": "cadmpw12"})
+        csrf = (await (await c.get("/api/admin/users")).json())["csrf"]
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "crtarget", "action": "clear_reset"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+    finally:
+        await c.close()
+    assert db.user_get("crtarget")["must_change_pw"] is False  # requirement cancelled
+    # target now logs in WITHOUT being gated to /account
+    c2 = await _client()
+    try:
+        r2 = await c2.post("/login", data={"username": "crtarget", "password": "crtpw123"},
+                           allow_redirects=False)
+        assert r2.status == 302 and "/account?force=1" not in r2.headers.get("Location", "")
+    finally:
+        await c2.close()
 
 
 async def test_force_reset_gates_target_on_next_login(monkeypatch):

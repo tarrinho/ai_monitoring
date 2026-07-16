@@ -496,13 +496,14 @@ async def model_prices(session: aiohttp.ClientSession) -> dict:
     already knows external model prices (that's how it tracks real spend); self-hosted
     models are $0 until the operator sets `input/output_cost_per_token` in model_list.
     Used to ESTIMATE cost from token counts (free tier gives no per-day $)."""
+    global _PRICES_CACHE
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
         return {}
     d, err = await fetch_json(session, f"{base.rstrip('/')}/model/info",
                               headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
     if err is not None:
-        return {}
+        return dict(_PRICES_CACHE)        # transient error → reuse last-good prices
     rows = (d.get("data") or d.get("model_list")) if isinstance(d, dict) else d
     out: dict = {}
     for m in rows if isinstance(rows, list) else []:
@@ -516,7 +517,12 @@ async def model_prices(session: aiohttp.ClientSession) -> dict:
         rate = ic + oc                    # per-token blended (in+out) — a rough estimate
         if name and rate > 0:
             out[name] = rate
-    return out
+    if out:
+        _PRICES_CACHE = dict(out)         # cache a non-empty result as last-good
+        return out
+    # endpoint answered but priced nothing (momentary empty / mid-reload) → last-good,
+    # so the Cost-over-time card doesn't blink off between polls.
+    return dict(_PRICES_CACHE)
 
 
 def price_for(model: str, prices: dict) -> float:
@@ -816,6 +822,9 @@ _KEY_LIST_ERR: str | None = None
 _KEY_BUDGETS_CACHE: dict | None = None  # last good /key/list result
 # last good (by_team_id→alias, by_user_id→team_alias, by_user_id→user_name) maps
 _TEAM_DIR_CACHE: tuple[dict, dict, dict] = ({}, {}, {})
+_PRICES_CACHE: dict = {}  # last good /model/info {model: $/token} — prices are stable
+                          # config, so reuse them when the endpoint blips empty (else
+                          # cost=0 → the Spend "Cost over time" card flickers off)
 
 
 async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,

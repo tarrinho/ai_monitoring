@@ -119,7 +119,7 @@ cosign verify \
 
 It also carries SLSA `provenance` + an SBOM attestation
 (`cosign verify-attestation … --type slsaprovenance`), and each GitHub Release
-attaches a cosign-signed image manifest (`*.txt` + `*.txt.sig` + `*.txt.pem`).
+attaches a cosign-signed image manifest (`*.txt` + `*.txt.bundle`).
 
 ---
 

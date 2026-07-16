@@ -221,6 +221,13 @@
     <div class="chart-wrap" style="height:240px"><canvas id="keys-chart"></canvas></div>
   </section>
 
+  <section class="card span-2" id="card-userkeys">
+    <h2>Top 10 API users by requests <span class="badge" id="userkeys-win"></span></h2>
+    <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
+      keys aggregated per owner (username = email local part; a key with no resolved owner is shown by its key)</div>
+    <div class="chart-wrap" style="height:240px"><canvas id="user-keys-chart"></canvas></div>
+  </section>
+
   <section class="card span-2" id="card-keytime">
     <h2>Top 10 API keys over time <span id="keytime-metric" class="badge">by requests</span> — <span id="keytime-win">24h</span></h2>
     <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart"></canvas></div>
@@ -231,6 +238,13 @@
     <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
       cumulative requests during the window (running total from the window start), so a key with no new activity stays flat at 0</div>
     <div class="chart-wrap" style="height:260px"><canvas id="keydelta-chart"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-userdelta">
+    <h2>Top 10 API users — requests in window <span id="userdelta-win" class="badge"></span></h2>
+    <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
+      cumulative requests during the window, aggregated per user (sum of each owner's keys)</div>
+    <div class="chart-wrap" style="height:260px"><canvas id="userdelta-chart"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-corr">
@@ -487,8 +501,8 @@ function _bstat(k,v,cls,sub){
     +`<div class="bv"${cv}>${escapeHtml(String(v))}</div>`
     +(sub?`<div class="bs">${escapeHtml(sub)}</div>`:"")+`</div>`;
 }
-async function loadBudgets(){
-  const d=await api("/api/budgets");
+async function loadBudgets(pre){
+  const d = pre || await api("/api/budgets");
   const el=document.getElementById("bud-body"); if(!d) return;
   if(!d.available||!(d.keys&&d.keys.length)){
     setHtml(el,`<div class="unavail">No key budgets configured — set per-key `
@@ -545,6 +559,45 @@ function renderKeys(l){
   keysChart.update("none");
 }
 
+// alias -> owner username, built each tick from /api/budgets (rows carry the key
+// alias + resolved owner email). Lets the "by user" charts aggregate keys per owner
+// client-side (the budget row key, the top_keys alias, and the key_series label are
+// all the same alias, so the mapping lines up).
+let _keyUser = {};
+function usernameOf(email){ email = String(email||""); return email.indexOf("@")>0 ? email.split("@")[0] : email; }
+function buildKeyUser(budgets){
+  _keyUser = {};
+  const ks = (budgets && budgets.keys) || [];
+  ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) _keyUser[k.key] = u; } });
+}
+function userOf(aliasLabel){ return _keyUser[aliasLabel] || String(aliasLabel||"?"); }
+
+// Top-10 API USERS by requests — keys aggregated per owner (mirrors keys-chart).
+const userKeysChart = new Chart(document.getElementById("user-keys-chart"), {
+  type:"bar",
+  data:{labels:[],datasets:[{label:"requests",data:[],
+    backgroundColor:"#3fb95088",borderColor:"#3fb950",borderWidth:1}]},
+  options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
+    plugins:{legend:{display:false}},
+    scales:{x:{beginAtZero:true,ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:"#e6edf3",font:{size:10}},grid:{display:false}}}}
+});
+function renderUserKeys(l){
+  const win=document.getElementById("userkeys-win");
+  if(win) win.textContent = l&&l.spend_window_min?("last "+l.spend_window_min+"m"):"";
+  const keys=(l&&l.top_keys)||[];
+  const agg={};   // username -> summed requests (or cost in lite mode)
+  keys.forEach(k=>{
+    const u = userOf(keyLabel(k));
+    const v = (k.reqs!=null ? k.reqs : (k.cost||0));
+    agg[u] = (agg[u]||0) + v;
+  });
+  const top = Object.keys(agg).sort((a,b)=>agg[b]-agg[a]).slice(0,10);
+  userKeysChart.data.labels = top.map(keyDisp);
+  userKeysChart.data.datasets[0].data = top.map(u=>agg[u]);
+  userKeysChart.update("none");
+}
+
 // Top-10 keys OVER TIME — one colored line per key.
 const KEY_COLORS = ["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff",
                     "#ff7b72","#39c5cf","#f0883e","#7ee787","#db61a2"];
@@ -585,6 +638,37 @@ async function loadKeyDelta(){
     backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
     borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
   keyDeltaChart.update("none");
+}
+
+// Top-10 API USERS — requests in window (mirrors keydelta; each user's keys summed).
+const userDeltaChart = new Chart(document.getElementById("userdelta-chart"), {
+  type:"line",
+  data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+});
+async function loadUserDelta(){
+  const d=await api("/api/keydelta?window="+WIN);
+  const w=document.getElementById("userdelta-win"); if(w) w.textContent=WIN;
+  if(!d) return;
+  const pts=d.points||[]; const labels=d.labels||[];
+  const byUser={};                                   // username -> [key alias labels]
+  labels.forEach(lab=>{ const u=userOf(lab); (byUser[u]=byUser[u]||[]).push(lab); });
+  const last = pts.length ? pts[pts.length-1] : {};
+  const users = Object.keys(byUser).sort((a,b)=>
+    byUser[b].reduce((s,l)=>s+(last[l]||0),0) - byUser[a].reduce((s,l)=>s+(last[l]||0),0)
+  ).slice(0,10);
+  userDeltaChart.data.labels=pts.map(axisT(pts));
+  userDeltaChart.data.datasets=users.map((u,i)=>({
+    label:keyDisp(u),
+    data:pts.map(p=>{ let s=null; byUser[u].forEach(l=>{ const v=p[l]; if(v!=null) s=(s||0)+v; }); return s; }),
+    borderColor:KEY_COLORS[i%KEY_COLORS.length],
+    backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
+  userDeltaChart.update("none");
 }
 async function loadAnomalies(){
   const d=await api("/api/anomalies");
@@ -766,7 +850,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact(); loadModels(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadCorr(); loadImpact(); loadModels(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -805,7 +889,7 @@ document.querySelectorAll("#windows button[data-w]").forEach(b=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
     b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
     document.getElementById("win-label").textContent=WIN;
-    loadSeries(); loadKeyTime(); loadKeyDelta(); loadCorr(); loadImpact(); loadModels();
+    loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadCorr(); loadImpact(); loadModels();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -814,6 +898,8 @@ document.getElementById("export-btn").addEventListener("click",()=>{
 });
 
 async function tick(){
+  const budgets = await api("/api/budgets");   // fetched once → owner map + budget card
+  buildKeyUser(budgets);
   const d=await api("/api/data?history=1");
   if(d){
     const c=(d.latest||{}).collectors||{};
@@ -822,6 +908,7 @@ async function tick(){
     _spendMode = (c.litellm && c.litellm.spend_mode) || "full";
     renderKpis(c.litellm);
     renderKeys(c.litellm);
+    renderUserKeys(c.litellm);
     renderFailures(c.litellm);
     const t=(d.latest||{}).ts?new Date(d.latest.ts*1000).toLocaleTimeString():"—";
     document.getElementById("updated").textContent="updated "+t;
@@ -829,11 +916,12 @@ async function tick(){
   await loadSeries();
   await loadKeyTime();
   await loadKeyDelta();
+  await loadUserDelta();
   await loadCorr();
   await loadImpact();
   await loadAnomalies();
   await loadModels();     // cheap pre-aggregated endpoint (NOT /spend/logs)
-  await loadBudgets();    // per-key spend vs budget
+  await loadBudgets(budgets);    // reuse the fetch above (per-key spend vs budget)
 }
 updateRangeUI();
 tick();
