@@ -389,7 +389,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.6.1"
+    assert config.VERSION == "AI-Monitoring_1.6.2"
 
 
 def test_ux_improvements_present():
