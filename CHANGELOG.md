@@ -9,6 +9,13 @@ Versioning: [SemVer](https://semver.org/).
 ## [1.6.1] — 2026-07-15
 
 ### Added
+- **Spend → "Cost per model over time" card.** A new chart above Per-key budgets plots
+  each model's **real or estimated** `$` over time (real = solid line, estimated =
+  dashed), one line per model, respecting the shared 30d/12mo window (daily/monthly
+  buckets). Top 10 models by windowed cost; the rest fold into an "Other" line; click a
+  legend label to toggle a series. Backed by a new `litellm.per_model_daily_series`
+  (keeps `/global/activity/model`'s per-model daily breakdown instead of collapsing it)
+  + `GET /api/spend/model-series` (LiteLLM-gated) and the pure `bucket_model_series`.
 - **Cancel a pending password reset.** A user forced to reset their password shows a
   **"reset pending"** badge on `/admin/users`; a new **Cancel** button next to it lifts
   the requirement (new `clear_reset` admin action → clears `must_change_pw` and drops
@@ -60,6 +67,11 @@ Versioning: [SemVer](https://semver.org/).
   smoke; scores are advisory `warn`, so only a failed boot/render reds the job).
 
 ### Changed
+- **Settings → Model costs board is ranked by usage.** Models are ordered by their
+  **30-day token usage (most → least)** instead of alphabetically, so the models that
+  matter are on top; unused models fall to the bottom (alphabetical tiebreak). Each
+  row's hover tooltip shows its 30-day token count. (`/api/admin/model-kinds` now
+  carries a per-model `tokens` field and sorts on it.)
 - **Spend → "Per-key budgets" table is now paginated (20 per page).** The card can
   list many keys; it shows the top 20 **ranked by risk** with **‹ Prev / Next ›**
   controls and an "X–Y of N" label. The backend still returns every key (paging is
@@ -82,30 +94,64 @@ Versioning: [SemVer](https://semver.org/).
   manifest digest (Pinned-Dependencies; Dependabot's docker ecosystem bumps it).
 
 ### Added
+- **`MONITOR_CURRENCY` — currency symbol for money values.** The dashboards showed a
+  hardcoded `$`; set e.g. `MONITOR_CURRENCY=€` and every cost/spend/budget value renders
+  with it. Injected as a nonce'd `window.CUR` global into each page (CSP-safe); all money
+  helpers use it. Display label only — no FX conversion; the numbers are LiteLLM's as-is.
+- **Settings → Model costs: per-model cost shown + editable.** The Model-costs card now
+  displays each model's effective **$/1M-tokens** cost and lets an admin **pin** it inline
+  (a `$/1M` input → Save; Reset clears it). Backed by a new `model_cost_price` table +
+  `model_cost.set`/`.reset` on `/api/admin/model-kinds` (audited, CSRF-guarded). This is the
+  UI counterpart of `MONITOR_MODEL_COSTS`, and a UI value **wins over** the env — so you can
+  correct an unreliable LiteLLM price without touching the deployment or the repo.
 - **`MONITOR_MODEL_COSTS` — per-model cost override (highest precedence).** Pin a model's
   real `$/1M-tokens` when LiteLLM's own price is wrong or keeps reverting (e.g. an external
   model billed at a premium rate). JSON env `{"provider/model": <USD per 1M>}`, mirroring
   `MONITOR_KEY_BUDGETS`; the value is a blended effective rate (your real spend ÷ tokens).
   Lives in the operator's own `.env` (git-ignored) — never shipped in the repo. Wins over
-  both the LiteLLM price and the spend-anchor.
+  the LiteLLM `/model/info` price.
 
 ### Fixed
+- **All dashboards: charts lost your selection on every poll (and re-animated).** Every
+  page polls on an interval and re-rendered its multi-series charts by **replacing
+  `chart.data.datasets`** — which reset legend toggles (a line you hid reappeared) and
+  re-ran the draw animation. A new shared **`updateSeries(chart, labels, next)`** helper
+  now refreshes them: when the set of series is unchanged it updates each dataset's
+  **values in place** (no rebuild, keeps everything); when a series appears/disappears it
+  rebuilds but **carries over the hidden state by key** (`_k`). Applied to all 6 affected
+  charts — Overview (per-app CPU/RAM), LiteLLM (key/user deltas, key timeline, service
+  impact), GPU (per-app CPU), and Spend (cost per model). The Spend **Cost by user**
+  chart also re-opens its expanded key list (`_costOpen`) after a poll. (Cost-over-time,
+  Ollama and llama.cpp already updated in place.)
+- **Light theme: chart axis/legend text was unreadable.** Chart.js tick/label/legend
+  colors were hardcoded to dark-theme values — `#8b949e` (only ~2.8:1 on the light
+  theme's white, fails WCAG AA) and, on two LiteLLM y-axes, `#e6edf3` (near-white →
+  invisible on white). They now resolve from the theme variables at render
+  (`cssv("--muted")` → `#59636e` ≈ 5.6:1 in light; `cssv("--fg")` for the emphasised
+  ticks), so chart text is legible in both themes. 56 literals across 6 dashboards;
+  a `cssv` helper was added to the pages that lacked one. (Grid lines are translucent
+  and already render fine in both themes.)
+- **Keys wrongly grouped under "Unassigned" (by-user board) despite having an owner.**
+  `key_budgets` resolved the owner only via `key.user_id`, but LiteLLM's `/key/list` commonly
+  leaves `user_id` NULL while the owner is on `created_by` (a user_id) or the **nested**
+  `created_by_user` object — neither of which the resolver (nor the `keys-diag` scanner) read.
+  Fix: gather every candidate owner-id (`user_id` / `created_by` / `created_by_user.user_id` /
+  `user`), resolve any against the `/user/list` directory, and read `created_by_user.user_email`.
+  `keys-diag` now also scans nested objects + reports which owner-id fields are populated.
 - **Release signing broke on newer cosign (`sign-blob` exit 1).** cosign now defaults to the
   single-file `--new-bundle-format`, under which `--output-signature`/`--output-certificate`
   are deprecated + ignored and, with no `--bundle` given, it errors (`create bundle file:
   open : no such file`). `release.yml` now emits a `.bundle` (`--bundle <man>.bundle`) and
   attaches `*.txt` + `*.txt.bundle`. Verify: `cosign verify-blob --bundle <man>.bundle …`.
-- **External-model cost wildly over-estimated (cache-heavy workloads).** The cost estimate
-  priced every token at `input_cost + output_cost` (double-counting — a token is input *or*
-  output) and ignored cache-read discounts, so a cache-heavy client (e.g. Claude Code on a
-  cheap external model) showed ~10× its real cost. Fix: for **external** models the estimate
-  now anchors to LiteLLM's **actual key-spend ÷ tokens** (cache-accurate, self-correcting —
-  it tracks the real bill and follows when the operator fixes model pricing) via
-  `_anchor_real_prices`, and an operator `MONITOR_MODEL_COSTS` override (above) wins over
-  that; self-hosted (reference) models keep the imputed token estimate.
-  Falls back to config prices when LiteLLM exposes no spend. (Free-tier LiteLLM has no per-day
-  `$` — `/spend/report` is Enterprise-only — so the daily *shape* is still token-derived; the
-  per-model total is anchored to real spend.)
+- **External-model cost misattributed across models (a second Azure model showed ~$22k/1M).**
+  An earlier attempt "anchored" un-overridden external models to LiteLLM's **total key-spend ÷
+  tokens**. With more than one external model that MISATTRIBUTES: an overridden model's large
+  (historical, mispriced) spend was divided by a *second* model's tiny token count, so the
+  whole bill landed on the new model. Removed the spend-anchor (`_anchor_real_prices` →
+  `_apply_cost_overrides`): external-model cost is now just the LiteLLM `/model/info` price,
+  and the per-model **`MONITOR_MODEL_COSTS` / Settings override** is the explicit, per-model way
+  to correct a wrong price (no cross-model bleed). Note: the Spend "real cash" figure is still
+  LiteLLM's own key `.spend` — reset it in LiteLLM to clear spend banked at an old wrong price.
 - **Spend "Cost over time" card flickered on/off between polls.** LiteLLM's
   `/model/info` price endpoint intermittently answers empty (or times out) on a busy
   proxy; `model_prices` returned `{}`, which zeroed every day's estimated cost →

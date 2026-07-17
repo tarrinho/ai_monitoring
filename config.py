@@ -124,6 +124,10 @@ KEY_BUDGETS_JSON   = _str("MONITOR_KEY_BUDGETS", "")
 # Example: MONITOR_MODEL_COSTS='{"provider/model": 0.20}'  (i.e. USD 0.20 per 1M tokens).
 # Set it in your own .env (git-ignored) — it never ships in the repo.
 MODEL_COSTS_JSON   = _str("MONITOR_MODEL_COSTS", "")
+# Currency symbol shown before money values on the dashboards (default "$"). Set to your
+# provider's billing currency, e.g. MONITOR_CURRENCY=€ (it's only a display label — the
+# numbers come from LiteLLM / your configured per-token prices as-is, no FX conversion).
+CURRENCY           = (_str("MONITOR_CURRENCY", "$") or "$").replace("<", "").replace(">", "")[:8]
 # Self-hosted / internal model providers: their cost is a REFERENCE (imputed
 # electricity/amortization), not real cash. Only external providers spend money.
 # Matched against the model's provider prefix (before '/') or as a name substring.

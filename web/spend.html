@@ -7,6 +7,23 @@
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
+<script>
+// Refresh a multi-series chart WITHOUT losing the user's legend toggles: when the set
+// of series is unchanged, update each dataset's values IN PLACE (no rebuild); when a
+// series appears/disappears, rebuild but carry over hidden state by key (_k).
+function updateSeries(chart,labels,next){
+  if(labels!==undefined) chart.data.labels=labels;
+  var cur=chart.data.datasets;
+  var same=cur.length===next.length && next.every(function(d,i){return cur[i]&&cur[i]._k===d._k;});
+  if(same){ next.forEach(function(d,i){ cur[i].data=d.data; if(d.label!==undefined)cur[i].label=d.label; }); }
+  else{
+    var vis={}; cur.forEach(function(ds,i){ if(ds._k!==undefined) vis[ds._k]=chart.isDatasetVisible(i); });
+    next.forEach(function(d){ if(vis[d._k]===false) d.hidden=true; });
+    chart.data.datasets=next;
+  }
+  chart.update("none");
+}
+</script>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
@@ -296,6 +313,12 @@
   </div>
   <section class="teams" id="teams" aria-label="Budget by team"></section>
 
+  <section class="card" id="card-model-cost-time" aria-label="Cost per model over time" style="display:none">
+    <h2>Cost per model over time
+      <span class="hint">real (solid) vs estimated (dashed) cost per model, per bucket · top 10 + Other · click a legend label to toggle</span></h2>
+    <div class="chart-wrap"><canvas id="model-cost-chart"></canvas></div>
+  </section>
+
   <section class="card" id="card-keys" aria-label="Per-key budgets">
     <h2>Per-key budgets — ranked by risk
       <span class="hint">budget vs spent · projected exhaustion · closest-to-cap first</span></h2>
@@ -332,7 +355,7 @@ async function api(path){
     return await r.json();
   }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
 }
-const money=v=>"$"+Math.round(v||0).toLocaleString();
+const money=v=>CUR+Math.round(v||0).toLocaleString();
 const scls=p=>p>=90?"bad":p>=70?"warn":"ok";
 const SLBL={bad:"Critical",warn:"Watch",ok:"On track",none:"No budget"};
 
@@ -358,15 +381,15 @@ const spendChart=new Chart(document.getElementById("spend-chart"),{
   ]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     plugins:{legend:{display:true,position:"top",align:"end",
-        labels:{color:"#8b949e",boxWidth:10,boxHeight:10,font:{size:11}}},
+        labels:{color:cssv("--muted"),boxWidth:10,boxHeight:10,font:{size:11}}},
       tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "+Number(c.parsed.y).toLocaleString()}}},
     scales:{
-      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:10}},grid:{display:false}},
-      y:{position:"left",ticks:{color:"#8b949e",font:{size:10},callback:v=>tokFmt(v)},
+      x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:10}},grid:{display:false}},
+      y:{position:"left",ticks:{color:cssv("--muted"),font:{size:10},callback:v=>tokFmt(v)},
          grid:{color:"#30363d55"},beginAtZero:true,
-         title:{display:true,text:"tokens",color:"#8b949e",font:{size:10}}},
-      y1:{position:"right",ticks:{color:"#8b949e",font:{size:10}},grid:{display:false},
-         beginAtZero:true,title:{display:true,text:"requests",color:"#8b949e",font:{size:10}}}}}
+         title:{display:true,text:"tokens",color:cssv("--muted"),font:{size:10}}},
+      y1:{position:"right",ticks:{color:cssv("--muted"),font:{size:10}},grid:{display:false},
+         beginAtZero:true,title:{display:true,text:"requests",color:cssv("--muted"),font:{size:10}}}}}
 });
 // Cost over time (estimated) — stacked real (external, tracked-price) vs estimated
 // (self-hosted, tokens × per-model price). Free-tier LiteLLM gives no per-day $.
@@ -379,10 +402,10 @@ const costTimeChart=new Chart(document.getElementById("cost-time-chart"),{
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{mode:"index",intersect:false},   // hover anywhere on a day shows the tooltip
     plugins:{legend:{display:false},   // replaced by a custom HTML legend (click to toggle, hover for models)
-      tooltip:{enabled:true,callbacks:{label:c=>" "+c.dataset.label+": $"+Number(c.parsed.y).toLocaleString(undefined,{maximumFractionDigits:2})}}},
+      tooltip:{enabled:true,callbacks:{label:c=>" "+c.dataset.label+": "+CUR+Number(c.parsed.y).toLocaleString(undefined,{maximumFractionDigits:2})}}},
     scales:{
-      x:{stacked:true,ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:10}},grid:{display:false}},
-      y:{stacked:true,ticks:{color:"#8b949e",font:{size:10},callback:v=>"$"+v},
+      x:{stacked:true,ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:10}},grid:{display:false}},
+      y:{stacked:true,ticks:{color:cssv("--muted"),font:{size:10},callback:v=>CUR+v},
          grid:{color:"#30363d55"},beginAtZero:true}}}
 });
 function renderCostTime(d){
@@ -413,7 +436,7 @@ function renderCostTime(d){
     li.title=modelsTitle(models)+"\n(click to show/hide on the chart)";
     var sw=document.createElement("span"); sw.className="sw"; sw.style.background=color;
     var tx=document.createElement("span");
-    var b=document.createElement("b"); b.textContent="$"+Number(dollars||0).toFixed(2);
+    var b=document.createElement("b"); b.textContent=CUR+Number(dollars||0).toFixed(2);
     tx.appendChild(b); tx.appendChild(document.createTextNode(" "+label
       +" · "+((models||[]).length)+" model"+((models||[]).length===1?"":"s")));
     li.appendChild(sw); li.appendChild(tx);
@@ -444,7 +467,7 @@ function renderYearCost(d, realCol, estCol){
   if(!y){ box.style.display="none"; return; }
   box.style.display="";
   var real=Number(y.real_cost||0), est=Number(y.est_cost||0);
-  var money2=function(v){return "$"+Number(v||0).toLocaleString(undefined,
+  var money2=function(v){return CUR+Number(v||0).toLocaleString(undefined,
     {minimumFractionDigits:2,maximumFractionDigits:2});};
   var hd=document.createElement("div"); hd.className="yh";
   hd.textContent=y.year+" · estimated cost";
@@ -463,7 +486,7 @@ function renderYearCost(d, realCol, estCol){
 }
 // Cost by key/team — cumulative $ spend (LiteLLM per-key totals). Horizontal bars so
 // long key names stay readable; real cash, all-time (not a time series).
-let COSTBY="user", _lastKeys=[], _costRows=[], _keysPage=0;
+let COSTBY="user", _lastKeys=[], _costRows=[], _keysPage=0, _costOpen=null;
 const KEYS_PER_PAGE=20;
 const costChart=new Chart(document.getElementById("cost-chart"),{
   type:"bar",
@@ -472,15 +495,16 @@ const costChart=new Chart(document.getElementById("cost-chart"),{
     // click a grouped bar (user/team) → list the keys behind it
     onClick:(e,els)=>{ if(els.length) showCostKeys(_costRows[els[0].index]); },
     plugins:{legend:{display:false},
-      tooltip:{callbacks:{label:c=>" $"+Number(c.parsed.x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}}},
+      tooltip:{callbacks:{label:c=>" "+CUR+Number(c.parsed.x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}}},
     scales:{
-      x:{ticks:{color:"#8b949e",font:{size:10},callback:v=>"$"+v},grid:{color:"#30363d55"},beginAtZero:true},
-      y:{ticks:{color:"#8b949e",font:{size:11},autoSkip:false},grid:{display:false}}}}
+      x:{ticks:{color:cssv("--muted"),font:{size:10},callback:v=>CUR+v},grid:{color:"#30363d55"},beginAtZero:true},
+      y:{ticks:{color:cssv("--muted"),font:{size:11},autoSkip:false},grid:{display:false}}}}
 });
 // list the keys that make up a clicked user/team bar, below the chart
 function showCostKeys(row){
   const el=document.getElementById("cost-detail");
-  if(!row||!row.keys||COSTBY==="key"){ setHtml(el,""); return; }
+  if(!row||!row.keys||COSTBY==="key"){ _costOpen=null; setHtml(el,""); return; }
+  _costOpen=row.name;   // remember the open selection so a poll can restore it
   const kind = COSTBY==="user" ? "user" : "team";
   const rows=row.keys.slice().filter(k=>(k.spent||0)>0).sort((a,b)=>(b.spent||0)-(a.spent||0))
     .map(k=>`<div class="crow"><span class="ck"><b>${escapeHtml(k.key)}</b>`
@@ -507,7 +531,10 @@ function renderCostChart(keys){
   // slice to 12 and hide the rest). Rank by spend, biggest first.
   rows=rows.filter(r=>r.spent>0).sort((a,b)=>b.spent-a.spent);
   _costRows=rows;
-  setHtml(document.getElementById("cost-detail"),"");   // collapse detail on re-render
+  // keep the user's expanded keys open across the 5s poll — re-show if it still exists
+  const _open=_costOpen && rows.find(r=>r.name===_costOpen);
+  if(_open) showCostKeys(_open);
+  else { _costOpen=null; setHtml(document.getElementById("cost-detail"),""); }
   const card=document.getElementById("card-cost");
   if(!rows.length){ card.style.display="none"; return; }
   card.style.display="";
@@ -536,6 +563,47 @@ function renderYears(years){
     +`<div class="bs" style="margin-top:6px;color:var(--muted)">${(y.requests||0).toLocaleString()} requests</div></div>`
   ).join(""));
 }
+// ── Cost per model over time (one line per model; real=solid, estimated=dashed) ──
+const MC_COLORS=["#58a6ff","#7ee787","#f0883e","#bc8cff","#f778ba","#39c5cf",
+                 "#e3b341","#ff7b72","#a5d6ff","#56d4dd","#ffab70"];
+const modelCostChart=new Chart(document.getElementById("model-cost-chart"),{
+  type:"line",
+  data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:"index",intersect:false},
+    plugins:{legend:{display:true,position:"top",
+        labels:{color:cssv("--muted"),boxWidth:12,boxHeight:2,font:{size:10}}},
+      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "+CUR
+        +Number(c.parsed.y).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}}},
+    scales:{
+      x:{ticks:{color:cssv("--muted"),font:{size:10},maxRotation:0,autoSkip:true},grid:{display:false}},
+      y:{ticks:{color:cssv("--muted"),font:{size:10},callback:v=>CUR+v},
+         grid:{color:"#30363d33"},beginAtZero:true}}}
+});
+function renderModelCostTime(d){
+  const card=document.getElementById("card-model-cost-time");
+  const ms=(d&&d.models)||[];
+  if(!d||d.available===false||!ms.length){ card.style.display="none"; return; }
+  card.style.display="";
+  // in-place update when the model set is unchanged; rebuild-preserving-toggles when
+  // it changes (updateSeries keys on _k = model name — the label carries the $total).
+  const gran=d.window==="12mo"?"month":"day";
+  updateSeries(modelCostChart,
+    (d.labels||[]).map(function(l){
+      return axisSp(Date.parse((gran==="month"?l+"-01":l)+"T00:00:00Z")/1000, gran); }),
+    ms.map(function(m,i){
+      const col=MC_COLORS[i%MC_COLORS.length], est=m.kind!=="real";
+      return {_k:m.model,
+        label:m.model+(est?" · est":"")+" · "+CUR+Number(m.total||0).toFixed(2),
+        data:m.costs||[], borderColor:col, backgroundColor:col, borderWidth:2,
+        borderDash:est?[5,3]:[], pointRadius:0, tension:.25, fill:false};
+    }));
+}
+async function loadModelCostSeries(){
+  const d=await api("/api/spend/model-series?window="+SPWIN);
+  renderModelCostTime(d||{available:false,models:[]});
+}
+
 async function loadSpendSeries(){
   const d=await api("/api/spend/series?window="+SPWIN);
   if(!d) return;
@@ -569,7 +637,7 @@ async function loadSpendSeries(){
 document.querySelectorAll("#sp-windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#sp-windows button").forEach(x=>x.classList.remove("active"));
-    b.classList.add("active"); SPWIN=b.dataset.w; loadSpendSeries();
+    b.classList.add("active"); SPWIN=b.dataset.w; loadSpendSeries(); loadModelCostSeries();
   });
 });
 
@@ -736,7 +804,7 @@ async function tick(){
       +`(override with <b>MONITOR_KEY_BUDGETS</b>); keys without one still show their spend.</div>`);
     document.getElementById("teamhd").style.display="none";
     setHtml(document.getElementById("budget-gap"),"");
-    renderKeys([]); renderCostChart([]); loadSpendSeries(); return;
+    renderKeys([]); renderCostChart([]); loadSpendSeries(); loadModelCostSeries(); return;
   }
   renderSummary(d.summary||{});
   renderGap(d.summary||{}, d.budget_source);
@@ -744,7 +812,7 @@ async function tick(){
   renderKeys(d.keys);
   _lastKeys=d.keys||[];
   renderCostChart(_lastKeys);
-  loadSpendSeries();
+  loadSpendSeries(); loadModelCostSeries();
 }
 tick();
 _timers.push(setInterval(tick, 5000));

@@ -830,6 +830,12 @@ def _serve_page(path: Path, prefix: str = "", user: str | None = None,
     extra = _sidebar_extra(user, role, prefix)
     if extra:                       # inject the user/admin links before </nav>
         html = html.replace("</nav>", extra + "</nav>", 1)
+    # Currency symbol for the money helpers (window.CUR; default "$"). Injected BEFORE the
+    # nonce stamp below so this <script> also gets the nonce → CSP allows it. json.dumps
+    # escapes the value into a JS string literal; config.CURRENCY already stripped < > and is
+    # length-capped, so it can't break out of the tag.
+    html = html.replace(
+        "</head>", f"<script>window.CUR={json.dumps(config.CURRENCY)};</script></head>", 1)
     # F5: stamp every <script> tag with a fresh nonce and hand it to the header
     # layer (via _NONCE_HDR) so the CSP allows exactly these scripts and nothing
     # injected. token_urlsafe is base64url — no ", ' or > to break the attribute.
@@ -1493,7 +1499,7 @@ async def litellm_models_handler(request: web.Request) -> web.Response:
     prices = await litellm.model_prices(request.app[_SESSION])
     # Anchor external-model rates to LiteLLM's ACTUAL spend (cache-accurate) instead of the
     # config input+output price, which double-counts and ignores cache reads.
-    await _anchor_real_prices(request.app[_SESSION], rows, prices)
+    _apply_cost_overrides(prices)
     priced = 0
     for r in rows or []:
         # real = external cash; reference = self-hosted imputed (estimated). Both priced
@@ -2028,26 +2034,40 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
     now = time.time()
     start = time.strftime("%Y-%m-%d", time.gmtime(now - 30 * 86400))
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    usage: dict[str, int] = {}          # model → tokens (last 30d), for usage ranking
     try:
         recent = await litellm.per_model_range(request.app[_SESSION], start, end, ov)
         for r in recent or []:
             nm = r.get("model")
             if nm and nm != "(unattributed)":
                 names.add(nm)
+                usage[nm] = usage.get(nm, 0) + int(r.get("tokens") or 0)
     except Exception:
         pass
     names.update(k for k in ov if k)
+    cost_ov = db.model_cost_prices()          # {model: USD per 1M} admin cost overrides
+    all_cost = model_cost_overrides()         # merged env+DB, USD per token (override wins)
+    names.update(k for k in cost_ov if k)
     models = []
-    for name in sorted(names, key=lambda s: str(s).lower()):
+    for name in names:
         default = litellm.classify_model(name)          # heuristic, no override
         eff = litellm.classify_model(name, ov)          # override wins
-        rate = litellm.price_for(name, prices)
+        rate = litellm.price_for(name, prices)          # LiteLLM $/token (0 if unpriced)
+        eff_cpt = all_cost.get(name, rate)              # effective $/token — cost override wins
         models.append({"model": name,
+                       "tokens": usage.get(name, 0),    # 30d usage — drives the ranking
                        "default_kind": default["cost_kind"],
                        "kind": eff["cost_kind"],
                        "overridden": bool(eff.get("overridden")),
-                       "priced": rate > 0,
-                       "rate": rate})
+                       "priced": (eff_cpt > 0),
+                       "rate": rate,
+                       # cost in USD per 1M tokens: the admin override (None if unset) + the
+                       # EFFECTIVE rate actually used (override → env → LiteLLM price).
+                       "cost_1m": cost_ov.get(name),
+                       "eff_cost_1m": round(eff_cpt * 1_000_000.0, 6) if eff_cpt else 0.0,
+                       "cost_overridden": name in all_cost})
+    # most-used first; unused models fall to the bottom, alphabetical as the tiebreak
+    models.sort(key=lambda m: (-int(m["tokens"]), str(m["model"]).lower()))
     return web.json_response({"models": models,
                               "error": None if prices or models
                               else litellm.last_key_list_error()})
@@ -2073,6 +2093,22 @@ async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
         default = litellm.classify_model(model)
         return web.json_response({"ok": True, "model": model,
                                   "kind": default["cost_kind"], "overridden": False})
+    # Per-model cost override (USD per 1M tokens) — pins the cost when LiteLLM's price is wrong.
+    if action == "cost_reset":
+        db.model_cost_price_delete(model)
+        _audit(request, actor, "model_cost.reset", target=model)
+        return web.json_response({"ok": True, "model": model, "cost_overridden": False})
+    if action == "cost":
+        try:
+            usd_1m = float(str(data.get("usd_1m") or "").strip())
+        except (TypeError, ValueError):
+            return web.json_response({"error": "usd_1m must be a number (USD per 1M tokens)"},
+                                     status=400)
+        if not db.model_cost_price_set(model, usd_1m, time.time()):
+            return web.json_response({"error": "invalid cost (must be ≥ 0)"}, status=400)
+        _audit(request, actor, "model_cost.set", target=model, detail=str(usd_1m))
+        return web.json_response({"ok": True, "model": model, "cost_1m": usd_1m,
+                                  "cost_overridden": True})
     kind = str(data.get("kind") or "").strip().lower()
     if kind not in db.MODEL_KINDS:
         return web.json_response({"error": "kind must be 'real' or 'reference'"},
@@ -2123,6 +2159,51 @@ def _date_epoch(date) -> float | None:
         return float(calendar.timegm(dt.utctimetuple()))
     except (ValueError, TypeError):
         return None
+
+
+def bucket_model_series(series: dict, window: str, now: float, top_n: int = 10) -> dict:
+    """Fold a per-model daily-cost series (from litellm.per_model_daily_series) into the
+    window's granularity (30d → daily, 12mo → monthly), align every model to one shared
+    label axis, keep the top-N models by windowed cost and roll the rest into 'Other'.
+    Chart-ready: {window, available, labels, models:[{model,kind,total,costs[]}]}."""
+    if window == "12mo":
+        labels, lt = [], time.gmtime(now)
+        y, mo = lt.tm_year, lt.tm_mon
+        for _ in range(12):
+            labels.append(f"{y:04d}-{mo:02d}")
+            mo -= 1
+            if mo == 0:
+                mo, y = 12, y - 1
+        labels.reverse()
+        bucket = lambda d: d[:7]                 # date → YYYY-MM  # noqa: E731
+    else:
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - 2592000))   # last 30d
+        labels = sorted(d for d in series.get("dates", []) if d >= cutoff)
+        bucket = lambda d: d                     # noqa: E731
+    lidx = {lab: i for i, lab in enumerate(labels)}
+    rows: list = []
+    for m in series.get("models", []):
+        costs = [0.0] * len(labels)
+        for d, v in (m.get("daily") or {}).items():
+            i = lidx.get(bucket(d))
+            if i is not None:
+                costs[i] += v
+        tot = round(sum(costs), 2)
+        if tot > 0:
+            rows.append({"model": m["model"], "kind": m["kind"], "total": tot,
+                         "costs": [round(c, 4) for c in costs]})
+    rows.sort(key=lambda r: -r["total"])
+    models, rest = rows[:top_n], rows[top_n:]
+    if rest:
+        other = [0.0] * len(labels)
+        for r in rest:
+            for i, c in enumerate(r["costs"]):
+                other[i] += c
+        models.append({"model": f"Other ({len(rest)})", "kind": "mixed",
+                       "total": round(sum(other), 2),
+                       "costs": [round(c, 4) for c in other]})
+    return {"window": window, "available": bool(models), "labels": labels,
+            "models": models}
 
 
 def bucket_spend(daily: list, window: str) -> dict:
@@ -2187,63 +2268,43 @@ def bucket_spend(daily: list, window: str) -> dict:
     return out
 
 
-def effective_real_cpt(real_spend: float | None, real_tokens: int | None) -> float | None:
-    """LiteLLM's ACTUAL $/token for external models = real key-spend ÷ real tokens.
-    Returns None when either input is missing so callers fall back to config prices."""
-    if real_tokens and real_tokens > 0 and real_spend and real_spend > 0:
-        return real_spend / real_tokens
-    return None
-
-
 def model_cost_overrides() -> dict:
-    """Operator per-model $/token overrides from MONITOR_MODEL_COSTS (JSON {model: USD per
-    1M tokens}). Highest-precedence price source: pins a model's cost when LiteLLM's own
-    price is wrong/unreliable. Value is a blended effective rate ($ per 1M → $ per token)."""
-    raw = config.MODEL_COSTS_JSON
-    if not raw:
-        return {}
-    try:
-        d = json.loads(raw)
-    except (ValueError, TypeError):
-        return {}
+    """Operator per-model $/token overrides. Highest-precedence price source: pins a model's
+    cost when LiteLLM's own price is wrong/unreliable. Two sources, merged (both USD per 1M
+    tokens → USD per token): the MONITOR_MODEL_COSTS env JSON, then the admin-set Settings
+    values (`db.model_cost_prices`) which WIN over the env (a UI edit beats the deploy env)."""
     out: dict = {}
-    for k, v in (d.items() if isinstance(d, dict) else []):
+    raw = config.MODEL_COSTS_JSON
+    if raw:
         try:
-            out[str(k)] = float(v) / 1_000_000.0     # USD/1M tokens → USD/token
+            d = json.loads(raw)
         except (ValueError, TypeError):
-            continue
+            d = {}
+        for k, v in (d.items() if isinstance(d, dict) else []):
+            try:
+                out[str(k)] = float(v) / 1_000_000.0     # USD/1M tokens → USD/token
+            except (ValueError, TypeError):
+                continue
+    try:
+        for m, usd_1m in db.model_cost_prices().items():      # admin UI overrides win
+            out[m] = float(usd_1m) / 1_000_000.0
+    except Exception:
+        pass
     return out
 
 
-async def _anchor_real_prices(session, per_model: list | None, prices: dict) -> dict:
-    """Fix external-model $/token in `prices` when LiteLLM's own price is unreliable, in
-    precedence order:
-      1. MONITOR_MODEL_COSTS operator override (pins a known real rate — wins over all).
-      2. LiteLLM's ACTUAL effective rate = real key-spend ÷ real tokens (cache-accurate,
-         self-correcting) — the `/model/info` input+output price both DOUBLE-COUNTS (a token
-         is input xor output) and ignores cache-read discounts, so a cache-heavy workload
-         (e.g. Claude Code on a cheap model) is wildly over-estimated.
-    Models with an explicit override are NOT re-anchored. No-op when nothing is available."""
-    ov = model_cost_overrides()
-    for m, cpt in ov.items():
-        prices[m] = cpt                              # operator override — highest precedence
-    real = [r for r in (per_model or [])
-            if r.get("cost_kind") == "real" and r.get("model") and r["model"] not in ov]
-    real_tokens = sum(int(r.get("tokens") or 0) for r in real)
-    if real_tokens <= 0:
-        return prices
-    try:
-        kb = await litellm.key_budgets(session)
-    except Exception:
-        kb = None
-    if not kb:
-        return prices
-    real_spend = sum(float(v.get("spend") or 0) for v in kb.values())
-    eff = effective_real_cpt(real_spend, real_tokens)
-    if eff is None:
-        return prices
-    for r in real:
-        prices[r["model"]] = eff
+def _apply_cost_overrides(prices: dict) -> dict:
+    """Overlay the operator per-model cost overrides (MONITOR_MODEL_COSTS env + Settings DB)
+    onto `prices` — highest precedence, over LiteLLM's own /model/info price. Pins a model's
+    cost when LiteLLM's price is wrong/unreliable.
+
+    (An earlier version also 'anchored' un-overridden external models to `total key-spend ÷
+    tokens`. That was removed: with several external models it MISATTRIBUTES one model's spend
+    to another — e.g. an overridden model's large historical spend divided by a second model's
+    tiny token count showed a ~$22k/1M rate — and it only ever reflected LiteLLM's own key
+    spend, which the explicit override already corrects. Use a per-model override instead.)"""
+    for m, cpt in model_cost_overrides().items():
+        prices[m] = cpt
     return prices
 
 
@@ -2381,7 +2442,7 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                                                       overrides)
             # Anchor external-model rates to LiteLLM's ACTUAL spend (cache-accurate) — the
             # config input+output price double-counts and ignores cache-read discounts.
-            await _anchor_real_prices(request.app[_SESSION], per_model, prices)
+            _apply_cost_overrides(prices)
             # ACCURATE path: per-day per-model tokens → each day's cost from its own model
             # mix, so an external model's cost lands only on the days it actually ran.
             daily_cost = await litellm.per_model_daily_cost(
@@ -2424,6 +2485,32 @@ async def spend_series_handler(request: web.Request) -> web.Response:
         print(f"[error] /api/spend/series {type(e).__name__}: {e}", file=sys.stderr)
         return web.json_response({"window": window, "available": False,
                                   "points": [], "years": [], "error": type(e).__name__})
+
+
+async def spend_model_series_handler(request: web.Request) -> web.Response:
+    """Cost per model over time (Spend page 'Cost per model' chart): each model's real
+    or estimated $ per bucket. LiteLLM-gated like the rest of Spend; 30d → daily,
+    12mo → monthly; top models by windowed cost, the rest folded into 'Other'."""
+    if not _litellm_configured():
+        raise web.HTTPNotFound()
+    window = request.query.get("window", "30d")
+    if window not in ("30d", "12mo"):
+        window = "30d"
+    now = time.time()
+    start = time.strftime("%Y-%m-%d", time.gmtime(now - 31536000))   # full year
+    end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    series = None
+    try:
+        prices = await litellm.model_prices(request.app[_SESSION])
+        _apply_cost_overrides(prices)                # same effective price as the $ chart
+        series = await litellm.per_model_daily_series(
+            request.app[_SESSION], start, end, prices, db.model_kind_overrides())
+    except Exception as e:      # cost is best-effort — never 500 the page
+        print(f"[warn] /api/spend/model-series {type(e).__name__}: {e}", file=sys.stderr)
+    if not series:
+        return web.json_response({"window": window, "available": False,
+                                  "labels": [], "models": []})
+    return web.json_response(bucket_model_series(series, window, now))
 
 
 async def alerts_handler(request: web.Request) -> web.Response:
@@ -2686,6 +2773,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/litellm/models", litellm_models_handler)
     app.router.add_get("/api/budgets", budgets_handler)
     app.router.add_get("/api/spend/series", spend_series_handler)
+    app.router.add_get("/api/spend/model-series", spend_model_series_handler)
     app.router.add_get("/api/alerts", alerts_handler)
     app.router.add_post("/api/alerts/test", alerts_test_handler)
     app.router.add_get("/api/export", export_handler)

@@ -7,6 +7,24 @@
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
+<script>
+// Refresh a multi-series chart WITHOUT losing the user's legend toggles: when the set
+// of series is unchanged, update each dataset's values IN PLACE (no rebuild); when a
+// series appears/disappears, rebuild but carry over hidden state by key (_k).
+function updateSeries(chart,labels,next){
+  if(labels!==undefined) chart.data.labels=labels;
+  var cur=chart.data.datasets;
+  var same=cur.length===next.length && next.every(function(d,i){return cur[i]&&cur[i]._k===d._k;});
+  if(same){ next.forEach(function(d,i){ cur[i].data=d.data; if(d.label!==undefined)cur[i].label=d.label; }); }
+  else{
+    var vis={}; cur.forEach(function(ds,i){ if(ds._k!==undefined) vis[ds._k]=chart.isDatasetVisible(i); });
+    next.forEach(function(d){ if(vis[d._k]===false) d.hidden=true; });
+    chart.data.datasets=next;
+  }
+  chart.update("none");
+}
+</script>
+<script>function cssv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n;}</script>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
@@ -411,7 +429,7 @@ const CHARTS = [
   {g:"LLM",  id:"c-tin",  key:"tok_in",    label:"Prompt tok/s", color:"#39c5cf"},
   {g:"LLM",  id:"c-tout", key:"tok_out",   label:"Completion tok/s",color:"#26a641"},
   {g:"LLM",  id:"c-err",  key:"errrate",   label:"Error rate %", color:"#f85149", unit:"%", max:100},
-  {g:"LLM",  id:"c-cost", key:"costrate",  label:"Cost $/h",     color:"#e3b341", unit:" $"},
+  {g:"LLM",  id:"c-cost", key:"costrate",  label:"Cost/h",        color:"#e3b341", unit:" "+CUR},
   {g:"LLM",  id:"c-kv",   key:"kvcache",   label:"KV-cache %",   color:"#cea5fb", unit:"%", max:100},
   {g:"LLM",  id:"c-tw",   key:"tokwatt",   label:"Tokens/watt",  color:"#7ee787"},
   {g:"LLM",  id:"c-bklog",key:"backlog",   label:"LLM Backlog Reqs",color:"#ff9bce"},
@@ -421,8 +439,8 @@ const _charts = {};
 
 function mkChart(canvas, cfg){
   const yTick = cfg.bytes
-    ? {color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
-    : {color:"#8b949e",font:{size:9}};
+    ? {color:cssv("--muted"),font:{size:9},callback:v=>bytes(v)}
+    : {color:cssv("--muted"),font:{size:9}};
   return new Chart(canvas, {
     type:"line",
     data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
@@ -432,7 +450,7 @@ function mkChart(canvas, cfg){
       interaction:{intersect:false,mode:"index"},
       plugins:{legend:{display:false}},
       scales:{
-        x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+        x:{ticks:{color:cssv("--muted"),maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
         y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
   });
 }
@@ -656,26 +674,24 @@ function renderContainers(c){
 const PROC_COLORS=["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff","#ff7b72",
   "#39c5cf","#ffa657","#7ee787","#d2a8ff"];
 function mkEvo(id, isBytes){
-  const yTick=isBytes?{color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
-                     :{color:"#8b949e",font:{size:9}};
+  const yTick=isBytes?{color:cssv("--muted"),font:{size:9},callback:v=>bytes(v)}
+                     :{color:cssv("--muted"),font:{size:9}};
   return new Chart(document.getElementById(id),{type:"line",
     data:{labels:[],datasets:[]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{intersect:false,mode:"index"},
-      plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
-      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+      scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
               y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true}}}});
 }
 const cpuEvo=mkEvo("cpuevo-chart",false), ramEvo=mkEvo("ramevo-chart",true);
 function fillEvo(chart, d, unit){
   const pts=d.points||[], apps=d.apps||[];
-  chart.data.labels=pts.map(axisT(pts));
-  chart.data.datasets=apps.map((a,i)=>({label:a+(unit||""),
+  updateSeries(chart, pts.map(axisT(pts)), apps.map((a,i)=>({_k:a, label:a+(unit||""),
     data:pts.map(p=>p[a]==null?null:p[a]),
     borderColor:PROC_COLORS[i%PROC_COLORS.length],
     backgroundColor:PROC_COLORS[i%PROC_COLORS.length]+"22",
-    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
-  chart.update("none");
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
 }
 async function loadProcEvo(){
   document.getElementById("cpuevo-win").textContent=WIN;
@@ -741,10 +757,10 @@ function renderLlmSummary(l){
   const num=n=>{ try{ return Number(n).toLocaleString(); }catch(e){ return String(n); } };
   // spend over the window: cost_window (full mode) or sum of top-key spend (lite)
   let spend="—";
-  if(l.cost_window!=null) spend="$"+l.cost_window;
+  if(l.cost_window!=null) spend=CUR+l.cost_window;
   else if(l.top_keys&&l.top_keys.length)
-    spend="$"+l.top_keys.reduce((s,k)=>s+(k.cost||0),0).toFixed(4);
-  const rate = l.cost_rate_hr!=null ? "$"+l.cost_rate_hr+"/h" : "—";
+    spend=CUR+l.top_keys.reduce((s,k)=>s+(k.cost||0),0).toFixed(4);
+  const rate = l.cost_rate_hr!=null ? CUR+l.cost_rate_hr+"/h" : "—";
   // tokens: today's total (lite) or in+out throughput per second (full)
   let toks="—";
   if(l.tokens_today!=null) toks=num(l.tokens_today);
@@ -779,7 +795,7 @@ function renderLitellm(l){
       +`<td class="num">${m.reqs}</td>`
       +`<td class="num">${m.wait_avg_ms!=null?m.wait_avg_ms+" ms":"—"}</td>`
       +`<td class="num">${m.tokens}</td>`
-      +`<td class="num">${m.cost!=null?"$"+m.cost:"—"}</td></tr>`;}).join("");
+      +`<td class="num">${m.cost!=null?CUR+m.cost:"—"}</td></tr>`;}).join("");
     setHtml(document.getElementById("litellm-models"),
       `<table><tr><th>Model</th><th class="num">reqs</th>`
       +`<th class="num">wait</th><th class="num">tok</th>`
@@ -881,9 +897,9 @@ async function loadSeries(){
            borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
         options:{responsive:true,maintainAspectRatio:false,animation:false,
           interaction:{intersect:false,mode:"index"},
-          plugins:{legend:{display:true,labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
-          scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:5,font:{size:9}},grid:{color:"#30363d33"}},
-                  y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true,max:100}}}});
+          plugins:{legend:{display:true,labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+          scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:5,font:{size:9}},grid:{color:"#30363d33"}},
+                  y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true,max:100}}}});
     }
     _hostSpark.data.labels=labels;
     _hostSpark.data.datasets[0].data=pts.map(p=>p.cpu==null?null:p.cpu);

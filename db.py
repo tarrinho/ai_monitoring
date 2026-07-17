@@ -171,6 +171,12 @@ CREATE TABLE IF NOT EXISTS team_budgets (team TEXT PRIMARY KEY, budget REAL NOT 
 CREATE TABLE IF NOT EXISTS model_cost_kind (model TEXT PRIMARY KEY, kind TEXT NOT NULL,
     updated REAL);
 
+-- Admin-set per-model cost override (USD per 1M tokens) — a blended effective rate that
+-- pins a model's cost when LiteLLM's own price is wrong/unreliable. UI counterpart of the
+-- MONITOR_MODEL_COSTS env override; the DB value (set here) takes precedence over the env.
+CREATE TABLE IF NOT EXISTS model_cost_price (model TEXT PRIMARY KEY, usd_1m REAL NOT NULL,
+    updated REAL);
+
 -- Persisted UI layout (Settings page card order, etc.). Stored server-side so the
 -- arrangement follows the deployment, not a single browser. value is a JSON string.
 CREATE TABLE IF NOT EXISTS ui_layout (name TEXT PRIMARY KEY, value TEXT NOT NULL,
@@ -1232,6 +1238,50 @@ def model_kind_set(model: str, kind: str, now: float) -> bool:
                 "ON CONFLICT(model) DO UPDATE SET kind = excluded.kind, "
                 "updated = excluded.updated", (model, kind, now))
         return True
+    except Exception:
+        return False
+
+
+def model_cost_prices() -> dict[str, float]:
+    """Admin-set per-model cost overrides {model: USD per 1M tokens}. Highest-precedence
+    price source (UI counterpart of MONITOR_MODEL_COSTS); pins a model's cost when
+    LiteLLM's own price is wrong/unreliable."""
+    try:
+        with _connect() as conn:
+            return {r[0]: float(r[1]) for r in
+                    conn.execute("SELECT model, usd_1m FROM model_cost_price").fetchall()}
+    except Exception:
+        return {}
+
+
+def model_cost_price_set(model: str, usd_1m: float, now: float) -> bool:
+    """Pin a model's cost to USD-per-1M-tokens. False on a bad value or DB error."""
+    model = str(model or "").strip()
+    if not model:
+        return False
+    try:
+        v = float(usd_1m)
+    except (TypeError, ValueError):
+        return False
+    if v < 0 or v != v or v == float("inf"):     # reject negative / NaN / inf
+        return False
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO model_cost_price(model, usd_1m, updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(model) DO UPDATE SET usd_1m = excluded.usd_1m, "
+                "updated = excluded.updated", (model, v, now))
+        return True
+    except Exception:
+        return False
+
+
+def model_cost_price_delete(model: str) -> bool:
+    """Drop a cost override so the model falls back to env / LiteLLM pricing."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM model_cost_price WHERE model = ?", (model,))
+        return (cur.rowcount or 0) > 0
     except Exception:
         return False
 

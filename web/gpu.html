@@ -7,6 +7,24 @@
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
+<script>
+// Refresh a multi-series chart WITHOUT losing the user's legend toggles: when the set
+// of series is unchanged, update each dataset's values IN PLACE (no rebuild); when a
+// series appears/disappears, rebuild but carry over hidden state by key (_k).
+function updateSeries(chart,labels,next){
+  if(labels!==undefined) chart.data.labels=labels;
+  var cur=chart.data.datasets;
+  var same=cur.length===next.length && next.every(function(d,i){return cur[i]&&cur[i]._k===d._k;});
+  if(same){ next.forEach(function(d,i){ cur[i].data=d.data; if(d.label!==undefined)cur[i].label=d.label; }); }
+  else{
+    var vis={}; cur.forEach(function(ds,i){ if(ds._k!==undefined) vis[ds._k]=chart.isDatasetVisible(i); });
+    next.forEach(function(d){ if(vis[d._k]===false) d.hidden=true; });
+    chart.data.datasets=next;
+  }
+  chart.update("none");
+}
+</script>
+<script>function cssv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n;}</script>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
@@ -233,15 +251,15 @@ const CHARTS = [
 const _charts = {};
 function mkChart(canvas, cfg){
   const yTick = cfg.bytes
-    ? {color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
-    : {color:"#8b949e",font:{size:9}};
+    ? {color:cssv("--muted"),font:{size:9},callback:v=>bytes(v)}
+    : {color:cssv("--muted"),font:{size:9}};
   return new Chart(canvas, {
     type:"line",
     data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
       backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+      scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
               y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
   });
 }
@@ -271,19 +289,18 @@ const appCpuChart=new Chart(document.getElementById("appcpu-chart"),{
   type:"line", data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
     scales:{
-      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
       y:{stacked:true,beginAtZero:true,grid:{color:"#30363d33"},
-         ticks:{color:"#8b949e",font:{size:9},callback:v=>v+"%"}}}}
+         ticks:{color:cssv("--muted"),font:{size:9},callback:v=>v+"%"}}}}
 });
 async function loadAppCpu(){
   document.getElementById("appcpu-win").textContent=WIN;
   const d=await api("/api/procseries?kind=cpu&window="+WIN);
   if(!d) return;
   const pts=d.points||[], apps=d.apps||[];
-  appCpuChart.data.labels=pts.map(axisT(pts));
-  appCpuChart.data.datasets=apps.map((a,i)=>({label:a,
+  updateSeries(appCpuChart, pts.map(axisT(pts)), apps.map((a,i)=>({_k:a, label:a,
     // an app with no sample in a bucket (process absent / not in top-N then) is 0,
     // NOT null: on a STACKED area a null gets span-gapped into a straight diagonal
     // across the gap, producing the huge phantom bands. A flat 0 draws correctly.
@@ -293,8 +310,7 @@ async function loadAppCpu(){
     // stacked area: fill to the previous dataset (not to zero) so each band shows
     // its own pure colour — fill:true fills to origin, stacking translucent layers
     // and blending every band with the ones below (green→olive, pink→mauve).
-    borderWidth:1,pointRadius:0,tension:.25,fill:i?"-1":"origin",spanGaps:false}));
-  appCpuChart.update("none");
+    borderWidth:1,pointRadius:0,tension:.25,fill:i?"-1":"origin",spanGaps:false})));
 }
 function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(Math.round(v*100)/100)+(cfg.unit||"")); }
 function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }

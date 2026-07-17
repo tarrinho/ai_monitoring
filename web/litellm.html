@@ -7,6 +7,24 @@
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
+<script>
+// Refresh a multi-series chart WITHOUT losing the user's legend toggles: when the set
+// of series is unchanged, update each dataset's values IN PLACE (no rebuild); when a
+// series appears/disappears, rebuild but carry over hidden state by key (_k).
+function updateSeries(chart,labels,next){
+  if(labels!==undefined) chart.data.labels=labels;
+  var cur=chart.data.datasets;
+  var same=cur.length===next.length && next.every(function(d,i){return cur[i]&&cur[i]._k===d._k;});
+  if(same){ next.forEach(function(d,i){ cur[i].data=d.data; if(d.label!==undefined)cur[i].label=d.label; }); }
+  else{
+    var vis={}; cur.forEach(function(ds,i){ if(ds._k!==undefined) vis[ds._k]=chart.isDatasetVisible(i); });
+    next.forEach(function(d){ if(vis[d._k]===false) d.hidden=true; });
+    chart.data.datasets=next;
+  }
+  chart.update("none");
+}
+</script>
+<script>function cssv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n;}</script>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
@@ -344,7 +362,7 @@ const CHARTS = [
   {id:"c-tin",  key:"tok_in",   label:"Prompt tok/s",    color:"#39c5cf"},
   {id:"c-tout", key:"tok_out",  label:"Completion tok/s",color:"#26a641"},
   {id:"c-err",  key:"errrate",  label:"Error rate %",    color:"#f85149", unit:"%", max:100},
-  {id:"c-cost", key:"costrate", label:"Cost $/h",        color:"#e3b341", unit:" $"},
+  {id:"c-cost", key:"costrate", label:"Cost/h",           color:"#e3b341", unit:" "+CUR},
   {id:"c-bklog",key:"backlog",  label:"LLM Backlog Reqs",color:"#ff9bce"},
   {id:"c-conc", key:"conc",     label:"Concurrent LLM work",color:"#a371f7"},
   {id:"c-ttft", key:"ttft",     label:"TTFT (ms)",       color:"#ffab70", unit:" ms"},
@@ -353,15 +371,15 @@ const CHARTS = [
 const _charts = {};
 function mkChart(canvas, cfg){
   const yTick = cfg.bytes
-    ? {color:"#8b949e",font:{size:9},callback:v=>bytes(v)}
-    : {color:"#8b949e",font:{size:9}};
+    ? {color:cssv("--muted"),font:{size:9},callback:v=>bytes(v)}
+    : {color:cssv("--muted"),font:{size:9}};
   return new Chart(canvas, {
     type:"line",
     data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
       backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+      scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
               y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
   });
 }
@@ -431,11 +449,11 @@ function renderKpis(l){
   add("Wait avg", l.wait_avg_ms, " ms");
   add("Wait max", l.wait_max_ms, " ms");
   add("Error %", l.error_pct, "%", (l.error_pct>0?"bad":""));
-  add("Cost/h", l.cost_rate_hr!=null?("$"+l.cost_rate_hr):null, "");
+  add("Cost/h", l.cost_rate_hr!=null?(CUR+l.cost_rate_hr):null, "");
   add("Req/s", l.req_rate, "");
   add("TTFT", l.ttft_avg_ms, " ms");
   add("Cache hit", l.cache_hit_pct, "%");
-  add("Cache saved", l.cache_saved!=null?("$"+l.cache_saved):null, "");
+  add("Cache saved", l.cache_saved!=null?(CUR+l.cache_saved):null, "");
   setHtml(document.getElementById("ll-kpis"), t.join(""));
   // The Per-model table is rendered separately by loadModels() so it can honor
   // the time-window selector (queries LiteLLM's aggregated per-model endpoint for
@@ -508,7 +526,7 @@ async function loadBudgets(pre){
     setHtml(el,`<div class="unavail">No key budgets configured — set per-key `
       +`max_budget in LiteLLM (or MONITOR_KEY_BUDGETS) to track spend vs quota.</div>`); return; }
   const s=d.summary, L={bad:"Critical",warn:"Watch",ok:"On track"};
-  const money=v=>"$"+Math.round(v||0).toLocaleString();
+  const money=v=>CUR+Math.round(v||0).toLocaleString();
   const sum=`<div class="bsum">`
     +_bstat("Spend · month",money(s.spent),"","of "+money(s.budget))
     +_bstat("Budget used",s.pct+"%",(s.pct>=90?"bad":s.pct>=70?"warn":"ok"),s.keys+" keys")
@@ -541,8 +559,8 @@ const keysChart = new Chart(document.getElementById("keys-chart"), {
     backgroundColor:"#58a6ff88",borderColor:"#58a6ff",borderWidth:1}]},
   options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
     plugins:{legend:{display:false}},
-    scales:{x:{beginAtZero:true,ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"}},
-            y:{ticks:{color:"#e6edf3",font:{size:10}},grid:{display:false}}}}
+    scales:{x:{beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:cssv("--fg"),font:{size:10}},grid:{display:false}}}}
 });
 function keyLabel(k){
   if(k.alias) return k.alias;
@@ -579,8 +597,8 @@ const userKeysChart = new Chart(document.getElementById("user-keys-chart"), {
     backgroundColor:"#3fb95088",borderColor:"#3fb950",borderWidth:1}]},
   options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
     plugins:{legend:{display:false}},
-    scales:{x:{beginAtZero:true,ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"}},
-            y:{ticks:{color:"#e6edf3",font:{size:10}},grid:{display:false}}}}
+    scales:{x:{beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:cssv("--fg"),font:{size:10}},grid:{display:false}}}}
 });
 function renderUserKeys(l){
   const win=document.getElementById("userkeys-win");
@@ -606,9 +624,9 @@ const keyTimeChart = new Chart(document.getElementById("keytime-chart"), {
   data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
-    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
-            y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
 function keyDisp(label){
   const s=String(label||"?");
@@ -621,23 +639,21 @@ const keyDeltaChart = new Chart(document.getElementById("keydelta-chart"), {
   data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
-    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
-            y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
 async function loadKeyDelta(){
   const d=await api("/api/keydelta?window="+WIN);
   const w=document.getElementById("keydelta-win"); if(w) w.textContent=WIN;
   if(!d) return;
   const pts=d.points||[]; const labels=d.labels||[];
-  keyDeltaChart.data.labels=pts.map(axisT(pts));
-  keyDeltaChart.data.datasets=labels.map((lab,i)=>({
-    label:keyDisp(lab),
+  updateSeries(keyDeltaChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
+    _k:lab, label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
     backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
-    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
-  keyDeltaChart.update("none");
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
 }
 
 // Top-10 API USERS — requests in window (mirrors keydelta; each user's keys summed).
@@ -646,9 +662,9 @@ const userDeltaChart = new Chart(document.getElementById("userdelta-chart"), {
   data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
-    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
-            y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
 async function loadUserDelta(){
   const d=await api("/api/keydelta?window="+WIN);
@@ -661,14 +677,12 @@ async function loadUserDelta(){
   const users = Object.keys(byUser).sort((a,b)=>
     byUser[b].reduce((s,l)=>s+(last[l]||0),0) - byUser[a].reduce((s,l)=>s+(last[l]||0),0)
   ).slice(0,10);
-  userDeltaChart.data.labels=pts.map(axisT(pts));
-  userDeltaChart.data.datasets=users.map((u,i)=>({
-    label:keyDisp(u),
+  updateSeries(userDeltaChart, pts.map(axisT(pts)), users.map((u,i)=>({
+    _k:u, label:keyDisp(u),
     data:pts.map(p=>{ let s=null; byUser[u].forEach(l=>{ const v=p[l]; if(v!=null) s=(s||0)+v; }); return s; }),
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
     backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
-    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
-  userDeltaChart.update("none");
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
 }
 async function loadAnomalies(){
   const d=await api("/api/anomalies");
@@ -702,9 +716,9 @@ const corrChart = new Chart(document.getElementById("corr-chart"), {
      borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yl"}]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
     scales:{
-      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
       yc:{position:"left",beginAtZero:true,ticks:{color:"#a371f7",font:{size:9}},
           grid:{color:"#30363d33"},title:{display:true,text:"concurrency",color:"#a371f7"}},
       yl:{position:"right",beginAtZero:true,ticks:{color:"#e3b341",font:{size:9}},
@@ -726,13 +740,13 @@ const impactChart = new Chart(document.getElementById("impact-chart"), {
      borderWidth:1.3,pointRadius:0,tension:.25,fill:false,spanGaps:true,yAxisID:"yp"}]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
     scales:{
-      x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+      x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
       yr:{position:"left",beginAtZero:true,ticks:{color:"#58a6ff",font:{size:9}},
           grid:{color:"#30363d33"},title:{display:true,text:"req/s",color:"#58a6ff"}},
-      yp:{position:"right",beginAtZero:true,max:100,ticks:{color:"#8b949e",font:{size:9}},
-          grid:{display:false},title:{display:true,text:"impact %",color:"#8b949e"}}}}
+      yp:{position:"right",beginAtZero:true,max:100,ticks:{color:cssv("--muted"),font:{size:9}},
+          grid:{display:false},title:{display:true,text:"impact %",color:cssv("--muted")}}}}
 });
 // Dedicated over-time charts: one CPU, one RAM, one line per LLM serving process.
 function mkSvcChart(id, isBytes){
@@ -740,11 +754,11 @@ function mkSvcChart(id, isBytes){
     type:"line", data:{labels:[],datasets:[]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{intersect:false,mode:"index"},
-      plugins:{legend:{labels:{color:"#8b949e",boxWidth:10,font:{size:10}}}},
+      plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
       scales:{
-        x:{ticks:{color:"#8b949e",maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+        x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
         y:{beginAtZero:true,grid:{color:"#30363d33"},
-           ticks:{color:"#8b949e",font:{size:9},callback:isBytes?(v=>bytes(v)):(v=>v+"%")}}}}
+           ticks:{color:cssv("--muted"),font:{size:9},callback:isBytes?(v=>bytes(v)):(v=>v+"%")}}}}
   });
 }
 const svcCpuChart = mkSvcChart("svc-cpu-chart", false);
@@ -754,7 +768,7 @@ function _svcDatasets(feed){
   if(!(feed && feed.points && feed.apps)) return {labels:[],datasets:[]};
   const apps=(feed.apps||[]).filter(a=>/llama|ollama/i.test(a));   // LLM servers only
   return {labels:feed.points.map(axisT(feed.points)),
-    datasets:apps.map((a,i)=>({label:a,
+    datasets:apps.map((a,i)=>({_k:a, label:a,
       data:feed.points.map(p=>p[a]==null?null:p[a]),
       borderColor:_SVC_COLORS[i%_SVC_COLORS.length],borderWidth:1.4,pointRadius:0,
       tension:.25,fill:false,spanGaps:true}))};
@@ -762,7 +776,7 @@ function _svcDatasets(feed){
 function _drawSvc(chart, feed, winId){
   document.getElementById(winId).textContent=WIN;
   const d=_svcDatasets(feed);
-  chart.data.labels=d.labels; chart.data.datasets=d.datasets; chart.update("none");
+  updateSeries(chart, d.labels, d.datasets);
 }
 async function loadImpact(){
   document.getElementById("impact-win").textContent=WIN;
@@ -808,17 +822,15 @@ async function loadKeyTime(){
   document.getElementById("keytime-win").textContent=WIN;
   // lite mode ranks keys by spend (no per-key request counts) → label accordingly
   const km=document.getElementById("keytime-metric");
-  if(km) km.textContent = _spendMode==="lite" ? "by spend ($)" : "by requests";
+  if(km) km.textContent = _spendMode==="lite" ? "by spend" : "by requests";
   if(!d){ return; }
   const pts=d.points||[]; const labels=d.labels||[];
-  keyTimeChart.data.labels=pts.map(axisT(pts));
-  keyTimeChart.data.datasets=labels.map((lab,i)=>({
-    label:keyDisp(lab),
+  updateSeries(keyTimeChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
+    _k:lab, label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
     backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
-    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true}));
-  keyTimeChart.update("none");
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
 }
 
 function renderFailures(l){

@@ -93,6 +93,18 @@ def test_serve_page_accepts_user_and_role_kwargs():
     assert anon.status == 200 and "Users" not in (anon.text or "")
 
 
+def test_serve_page_injects_currency(monkeypatch):
+    """MONITOR_CURRENCY (default $) is injected as a nonce'd `window.CUR` global into every
+    dashboard page so the JS money helpers render the operator's currency (e.g. €)."""
+    monkeypatch.setattr(config, "CURRENCY", "€")
+    body = appmod._serve_page(appmod._WEB / "spend.html", "", user="a", role="admin").text or ""
+    assert 'window.CUR="\\u20ac"' in body                       # € injected (json-escaped)
+    assert re.search(r'<script nonce="[^"]+">window\.CUR=', body)   # nonce'd → CSP allows it
+    monkeypatch.setattr(config, "CURRENCY", "$")
+    body2 = appmod._serve_page(appmod._WEB / "spend.html", "", user="a", role="admin").text or ""
+    assert 'window.CUR="$"' in body2                            # default is $
+
+
 def test_overview_summary_hidden_when_litellm_unconfigured():
     # The LLM cost/usage strip must not leave an empty panel on a pure-infra
     # deployment: it is display:none by default and only shown by JS when the
@@ -2453,6 +2465,63 @@ def test_bucket_spend_day_month_and_years():
     assert years == {2025: 30.0, 2026: 30.0}
 
 
+def test_bucket_model_series_windows_and_other():
+    """bucket_model_series aligns each model's daily cost to a shared axis (30d daily /
+    12mo monthly), ranks by windowed cost, and folds models past top_n into 'Other'."""
+    import time as _t
+    series = {"dates": ["2026-07-14", "2026-07-15", "2026-07-16"], "models": [
+        {"model": "gpt-5-mini", "kind": "real", "daily": {"2026-07-15": 10.0, "2026-07-16": 20.0}},
+        {"model": "local-llama", "kind": "reference", "daily": {"2026-07-14": 1.0, "2026-07-16": 2.0}},
+    ]}
+    now = _t.mktime(_t.strptime("2026-07-16", "%Y-%m-%d"))
+    out = appmod.bucket_model_series(series, "30d", now)
+    assert out["available"] is True and out["labels"] == series["dates"]
+    top = out["models"][0]
+    assert top["model"] == "gpt-5-mini" and top["kind"] == "real"      # ranked by cost
+    assert top["costs"] == [0.0, 10.0, 20.0] and top["total"] == 30.0  # aligned to axis
+    # top_n grouping: with a low cap the smaller model rolls into 'Other'
+    out2 = appmod.bucket_model_series(series, "30d", now, top_n=1)
+    assert out2["models"][0]["model"] == "gpt-5-mini"
+    assert out2["models"][1]["model"].startswith("Other")
+    # 12mo → monthly buckets
+    mon = appmod.bucket_model_series(series, "12mo", now)
+    assert mon["labels"][-1] == "2026-07"
+    assert next(m for m in mon["models"] if m["model"] == "gpt-5-mini")["total"] == 30.0
+
+
+async def test_spend_model_series_endpoint(monkeypatch):
+    """/api/spend/model-series is LiteLLM-gated (404 without) and returns per-model
+    cost-over-time (labels + one entry per model with its cost array)."""
+    # gated: no LiteLLM → 404
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    c = await _client()
+    try:
+        assert (await c.get("/api/spend/model-series")).status == 404
+    finally:
+        await c.close()
+    # configured + mocked per-model daily series → shaped response
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def fake_prices(session):
+        return {"gpt-5-mini": 2.25e-06}
+
+    async def fake_series(session, start, end, prices, ov):
+        return {"dates": ["2026-07-15", "2026-07-16"], "models": [
+            {"model": "gpt-5-mini", "kind": "real", "total": 30.0,
+             "daily": {"2026-07-15": 10.0, "2026-07-16": 20.0}}]}
+    monkeypatch.setattr(litellm, "model_prices", fake_prices)
+    monkeypatch.setattr(litellm, "per_model_daily_series", fake_series)
+    c2 = await _client()
+    try:
+        d = await (await c2.get("/api/spend/model-series?window=30d")).json()
+        assert d["available"] is True and d["labels"]
+        m = d["models"][0]
+        assert m["model"] == "gpt-5-mini" and m["kind"] == "real" and len(m["costs"]) == len(d["labels"])
+    finally:
+        await c2.close()
+
+
 async def test_spend_series_endpoint(monkeypatch):
     """/api/spend/series is auth-gated, validates the window, and degrades cleanly
     when LiteLLM is unconfigured."""
@@ -2716,6 +2785,33 @@ def test_merge_key_budgets_unions_live_and_snapshot():
     keys = appmod.merge_key_budgets(live, snap, {})
     ids = [(k.get("alias") or k.get("key")) for k in keys]
     assert set(ids) == {"kA", "kB", "kC", "hash1"} and len(keys) == 4    # all four, kB once
+
+
+async def test_key_budgets_owner_from_created_by_or_nested(monkeypatch):
+    """Bug fix — keys must resolve an owner even when LiteLLM leaves `user_id` NULL and puts
+    the owner on `created_by` (a user_id) or the nested `created_by_user` object; otherwise
+    every such key wrongly falls into 'Unassigned' on the by-user board."""
+    from collectors import litellm as _ll
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-supersecretvalue")
+    async def _dir(_session, _base):            # /user/list directory: user_id UUID -> email
+        return ({}, {}, {"uid-rod": "rod@example.com"})
+    monkeypatch.setattr(_ll, "_team_directory", _dir)
+    rows = [
+        {"key_alias": "RodKey", "user_id": None, "created_by": "uid-rod",   # via directory
+         "spend": 5.0, "max_budget": 0},
+        {"key_alias": "NestedKey", "user_id": None, "created_by": None,     # via nested object
+         "created_by_user": {"user_email": "leo@example.com"}, "spend": 2.0, "max_budget": 0},
+        {"key_alias": "Orphan", "user_id": None, "spend": 1.0, "max_budget": 0},   # truly none
+    ]
+    async def _fj(_session, url, **_kw):
+        return ({"keys": rows, "total_count": len(rows)}, None) if "/key/list" in url else (None, "x")
+    monkeypatch.setattr(_ll, "fetch_json", _fj)
+    _ll._KEY_BUDGETS_CACHE = None
+    out = await _ll.key_budgets(None)
+    assert out["RodKey"]["user_name"] == "rod@example.com"       # created_by → /user/list join
+    assert out["NestedKey"]["user_name"] == "leo@example.com"    # nested created_by_user email
+    assert out["Orphan"]["user_name"] == ""                       # no owner anywhere → unassigned
 
 
 def test_budget_rows_split_real_vs_reference():
@@ -3499,31 +3595,16 @@ def test_apply_prefix_covers_form_action_and_js_redirect():
     assert 'location.href="/ai_monitoring/"' in out         # account redirect
 
 
-def test_effective_real_cpt_anchors_to_actual_spend():
-    """External-model cost uses LiteLLM's ACTUAL key-spend ÷ tokens, not the config
-    input+output price (which double-counts and ignores cache-read discounts → wildly
-    over-estimates a cache-heavy workload). None when spend/tokens are unavailable."""
-    assert appmod.effective_real_cpt(100.0, 10_000_000) == pytest.approx(100.0 / 10_000_000)
-    assert appmod.effective_real_cpt(0.0, 1000) is None      # no spend → fall back
-    assert appmod.effective_real_cpt(10.0, 0) is None        # no tokens → fall back
-    assert appmod.effective_real_cpt(None, 100) is None
-
-
-async def test_anchor_real_prices_overrides_only_external(monkeypatch):
-    """_anchor_real_prices replaces the EXTERNAL model $/token with real key-spend ÷ real
-    tokens; reference (self-hosted) rates are left as-is. This is what makes the Spend
-    cost chart match the provider bill instead of the double-counted config price."""
-    async def _kb(_session):
-        return {"k1": {"spend": 60.0}, "k2": {"spend": 40.0}}   # $100 total real cash
-    monkeypatch.setattr(appmod.litellm, "key_budgets", _kb)
-    per_model = [
-        {"model": "extern/model-a", "tokens": 10_000_000, "cost_kind": "real"},
-        {"model": "selfhosted/model-b", "tokens": 80_000_000, "cost_kind": "reference"},
-    ]
-    prices = {"extern/model-a": 0.00000225, "selfhosted/model-b": 0.0000001}
-    out = await appmod._anchor_real_prices(None, per_model, prices)
-    assert out["extern/model-a"] == pytest.approx(100.0 / 10_000_000)   # anchored to real
-    assert out["selfhosted/model-b"] == 0.0000001                        # untouched
+def test_apply_cost_overrides_only_overridden(monkeypatch):
+    """_apply_cost_overrides pins ONLY the models with an operator override; everything else
+    keeps its LiteLLM /model/info price. (It no longer 'anchors' un-overridden models to total
+    key-spend — that misattributed one model's spend to another.)"""
+    monkeypatch.setattr(config, "MODEL_COSTS_JSON", '{"extern/model-a": 0.20}')  # $0.20/1M
+    db.init(); db.model_cost_price_delete("extern/model-a"); db.model_cost_price_delete("extern/model-b")
+    prices = {"extern/model-a": 0.00000225, "extern/model-b": 0.00000525}
+    out = appmod._apply_cost_overrides(prices)
+    assert out["extern/model-a"] == pytest.approx(0.20 / 1_000_000)   # override applied
+    assert out["extern/model-b"] == 0.00000525                        # untouched (no override)
 
 
 def test_model_cost_overrides_parses_usd_per_1m(monkeypatch):
@@ -3540,31 +3621,28 @@ def test_model_cost_overrides_parses_usd_per_1m(monkeypatch):
     assert appmod.model_cost_overrides() == {}
 
 
-async def test_operator_cost_override_beats_spend_anchor(monkeypatch):
-    """A MONITOR_MODEL_COSTS override pins the model's $/token and is NOT re-anchored to
-    LiteLLM's (possibly wrong) spend — the operator's known rate wins over the premium-
-    mispriced number LiteLLM reports."""
-    monkeypatch.setattr(config, "MODEL_COSTS_JSON", '{"extern/model-a": 0.20}')  # $0.20/1M
-    async def _kb(_session):    # LiteLLM still reports a wrong (premium) spend
-        return {"k1": {"spend": 200.0}}
-    monkeypatch.setattr(appmod.litellm, "key_budgets", _kb)
-    per_model = [{"model": "extern/model-a", "tokens": 10_000_000, "cost_kind": "real"}]
-    prices = {"extern/model-a": 0.00000225}
-    out = await appmod._anchor_real_prices(None, per_model, prices)
-    rate = out["extern/model-a"]
-    assert rate == pytest.approx(0.20 / 1_000_000)                   # override wins
-    assert round(10_000_000 * rate, 2) == pytest.approx(2.00, abs=0.01)   # tokens×rate
+def test_model_cost_price_db_roundtrip():
+    """DB per-model cost override (the Settings-page store): set/read/delete USD-per-1M;
+    negative / non-numeric values are rejected."""
+    db.init()
+    db.model_cost_price_delete("extern/model-a")
+    assert db.model_cost_price_set("extern/model-a", 0.20, time.time()) is True
+    assert db.model_cost_prices().get("extern/model-a") == 0.20
+    assert db.model_cost_price_set("extern/model-a", -1, time.time()) is False   # negative
+    assert db.model_cost_price_set("extern/model-a", "nope", time.time()) is False
+    assert db.model_cost_price_delete("extern/model-a") is True
+    assert "extern/model-a" not in db.model_cost_prices()
 
 
-async def test_anchor_real_prices_noop_without_spend(monkeypatch):
-    """No real spend or no key data → keep the config prices (never zero the chart)."""
-    async def _empty(_session):
-        return None
-    monkeypatch.setattr(appmod.litellm, "key_budgets", _empty)
-    per_model = [{"model": "extern/model-a", "tokens": 1000, "cost_kind": "real"}]
-    prices = {"extern/model-a": 0.00000225}
-    out = await appmod._anchor_real_prices(None, per_model, prices)
-    assert out["extern/model-a"] == 0.00000225
+def test_model_cost_overrides_db_beats_env(monkeypatch):
+    """The Settings-page (DB) cost override wins over the MONITOR_MODEL_COSTS env value."""
+    db.init()
+    db.model_cost_price_delete("extern/model-a")
+    monkeypatch.setattr(config, "MODEL_COSTS_JSON", '{"extern/model-a": 0.50}')
+    assert appmod.model_cost_overrides()["extern/model-a"] == pytest.approx(0.50 / 1_000_000)
+    db.model_cost_price_set("extern/model-a", 0.20, time.time())      # admin UI edit
+    assert appmod.model_cost_overrides()["extern/model-a"] == pytest.approx(0.20 / 1_000_000)
+    db.model_cost_price_delete("extern/model-a")
 
 
 def test_gpu_http_collector_refuses_redirects():
@@ -3970,6 +4048,26 @@ async def test_model_kinds_get_set_reset(monkeypatch):
         assert "gemma-self" not in db.model_kind_overrides()
     finally:
         db.model_kind_delete("gemma-self")
+        await c.close()
+
+
+async def test_model_kinds_ordered_by_usage(monkeypatch):
+    """The Model costs board ranks models by 30-day usage (most → least); each row
+    carries its token count so the ordering is meaningful/visible."""
+    async def fake_range(session, start, end, ov):
+        return [{"model": "mc-low", "tokens": 100},
+                {"model": "mc-high", "tokens": 900000},
+                {"model": "mc-mid", "tokens": 5000}]
+    monkeypatch.setattr(litellm, "per_model_range", fake_range)
+    c, csrf = await _admin_client(monkeypatch, user="mkord", pw="mkordpw1")
+    try:
+        j = await (await c.get("/api/admin/model-kinds")).json()
+        idx = {m["model"]: i for i, m in enumerate(j["models"])}
+        # most-used first (relative order, robust to any other models present)
+        assert idx["mc-high"] < idx["mc-mid"] < idx["mc-low"]
+        hi = next(m for m in j["models"] if m["model"] == "mc-high")
+        assert hi["tokens"] == 900000            # usage exposed for the ranking
+    finally:
         await c.close()
 
 

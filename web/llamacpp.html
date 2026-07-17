@@ -7,6 +7,7 @@
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
+<script>function cssv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n;}</script>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
@@ -225,8 +226,8 @@ function mkChart(canvas, cfg){
       backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
-              y:{ticks:{color:"#8b949e",font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
+      scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
+              y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
   });
 }
 (function build(){

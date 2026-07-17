@@ -225,7 +225,7 @@ function render(d){
   const t=d.thresholds||{};
   const rows=[["CPU %",t.cpu_pct],["MEM %",t.mem_pct],["Disk %",t.disk_pct],
     ["GPU %",t.gpu_pct],["VRAM %",t.vram_pct],["LLM wait ms",t.llm_wait_ms],
-    ["Backlog",t.backlog],["Anomaly ×",t.anomaly_factor],["Key $/h",t.key_budget_hr]]
+    ["Backlog",t.backlog],["Anomaly ×",t.anomaly_factor],["Key/h",t.key_budget_hr]]
     .map(([k,v])=>`<tr><td>${escapeHtml(k)}</td><td class="num">`
       +`${(!v||v==0)?'<span class="badge off">off</span>':escapeHtml(v)}</td></tr>`).join("");
   setHtml(document.getElementById("thresh"),

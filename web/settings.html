@@ -492,7 +492,7 @@
     teamcell.appendChild(tsel); teamcell.appendChild(newin); row.appendChild(teamcell);
     // 3) BUDGET per user (applies to all this user's keys)
     var bud=document.createElement("input"); bud.type="number"; bud.className="bin"; bud.min="0"; bud.step="any";
-    bud.placeholder="$/mo"; bud.title="Monthly budget for this user (applies to all their keys)";
+    bud.placeholder=CUR+"/mo"; bud.title="Monthly budget for this user (applies to all their keys)";
     var bv=g.keys.map(function(k){return (k.budget_overridden&&k.budget)?k.budget:null;});
     bud.value=(bv.length && bv.every(function(v){return v!=null && v===bv[0];})) ? bv[0] : "";
     row.appendChild(bud);
@@ -534,7 +534,7 @@
       chip.title=k.key+"\n(click to change the associated user/email)"
         +(k.user_overridden?("\nuser overridden → "+(k.user_name||"")):"")
         +(k.overridden?"\n(team overridden)":"")
-        +(k.budget_overridden?("\nbudget $"+k.budget):"")
+        +(k.budget_overridden?("\nbudget "+CUR+k.budget):"")
         +(k.detected?("\nLiteLLM team: "+k.detected):"");
       if(k.overridden||k.user_overridden) chip.classList.add("ov");
       chip.addEventListener("click",function(){ openKeyUserPopup(k); });
@@ -563,7 +563,7 @@
       var kr=document.createElement("div"); kr.className="udkey";
       var nm=document.createElement("b"); nm.textContent=k.key; kr.appendChild(nm);
       var parts=["team "+(k.team||"—")];
-      if(k.budget_overridden && k.budget) parts.push("budget $"+k.budget);
+      if(k.budget_overridden && k.budget) parts.push("budget "+CUR+k.budget);
       if((Number(k.spent)||0)>0) parts.push("spent $"+Number(k.spent).toFixed(2));
       if(k.overridden) parts.push("overridden");
       var m=document.createElement("span"); m.className="udkm"; m.textContent=" — "+parts.join(" · ");
@@ -581,7 +581,7 @@
       body:new URLSearchParams(params).toString()})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
   }
-  function money(n){ n=Number(n)||0; return n>=100?("$"+Math.round(n)):("$"+n.toFixed(2)); }
+  function money(n){ n=Number(n)||0; return n>=100?(CUR+Math.round(n)):(CUR+n.toFixed(2)); }
   function postTeamBudget(params){
     return fetch("/api/admin/team-budget",{method:"POST",
       headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
@@ -599,7 +599,7 @@
       chip.appendChild(meta);
       var brow=document.createElement("div"); brow.className="tbrow";
       var bud=document.createElement("input"); bud.type="number"; bud.min="0"; bud.step="any";
-      bud.placeholder="$/mo per member"; bud.value=(t.budget>0?t.budget:"");
+      bud.placeholder=CUR+"/mo per member"; bud.value=(t.budget>0?t.budget:"");
       bud.title="Monthly budget every member of "+t.team+" inherits";
       var set=document.createElement("button"); set.className="save"; set.type="button"; set.textContent="Set";
       var msg=document.createElement("span"); msg.className="tbmsg";
@@ -692,7 +692,7 @@
   }
   function openTeamsInfo(){
     cardInfoModal("Teams — what this card does",[
-      ["Purpose",function(v){ _T(v,"Group LiteLLM keys by "); _B(v,"user → team"); _T(v,", and set a monthly "); _B(v,"budget ($/mo)"); _T(v," per team. This feeds the by-team rollup on the Spend & Quota page."); }],
+      ["Purpose",function(v){ _T(v,"Group LiteLLM keys by "); _B(v,"user → team"); _T(v,", and set a monthly "); _B(v,"budget (per month)"); _T(v," per team. This feeds the by-team rollup on the Spend & Quota page."); }],
       ["Layout",function(v){ _T(v,"One row per "); _B(v,"user"); _T(v," (email/alias). Click a user to expand their "); _B(v,"keys"); _T(v,"; users with no owner fall under "); _B(v,"Unassigned"); _T(v,"."); }],
       ["Set team",function(v){ _T(v,"Type a team name and click "); _B(v,"✓"); _T(v," to save an override for that user's keys. "); _B(v,"↺"); _T(v," clears the team + budget override."); }],
       ["Change user",function(v){ _T(v,"Click a "); _B(v,"key chip"); _T(v," to reassign that key's associated "); _B(v,"user / email"); _T(v," (regroups the key)."); }],
@@ -773,7 +773,10 @@
   function modelRow(m){
     // compact one-line row: model · kind select · ✓ · ↺; auto-detect + priced in tooltip.
     var row=document.createElement("div"); row.className="srow tmodel";
-    var tip=m.model+"\nauto: "+kindLabel(m.default_kind)+(m.priced?" · LiteLLM priced":" · no LiteLLM price");
+    // rows are ordered by 30d usage (most→least); surface that count on hover
+    var ut=m.tokens||0;
+    var uStr=ut>=1e6?(ut/1e6).toFixed(ut>=1e7?0:1)+"M":ut>=1e3?(ut/1e3).toFixed(0)+"k":String(ut);
+    var tip=m.model+"\n30d usage: "+uStr+" tokens\nauto: "+kindLabel(m.default_kind)+(m.priced?" · LiteLLM priced":" · no LiteLLM price");
     var lbl=document.createElement("span"); lbl.className="lbl kname"; lbl.textContent=m.model; lbl.title=tip;
     if(m.overridden) lbl.classList.add("mod");
     row.appendChild(lbl);
@@ -782,23 +785,36 @@
       var op=document.createElement("option"); op.value=o[0]; op.textContent=o[1]; sel.appendChild(op);
     });
     sel.value=m.kind;
-    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save";
+    // Cost per model — USD per 1M tokens. Shows the effective rate (LiteLLM/env) as a hint;
+    // type a value + Save to PIN it when LiteLLM's price is wrong. Blank = fall back.
+    var cost=document.createElement("input"); cost.type="number"; cost.className="min mcost";
+    cost.step="any"; cost.min="0"; cost.style.width="90px";
+    cost.title="Cost override — USD per 1M tokens. Pins this model's cost when LiteLLM's price "
+      +"is wrong/unreliable. Leave blank to use LiteLLM's own price (or the MONITOR_MODEL_COSTS env).";
+    if(m.cost_1m!=null){ cost.value=m.cost_1m; if(m.cost_overridden) cost.classList.add("mod"); }
+    else cost.placeholder=(m.eff_cost_1m?(m.eff_cost_1m+"/1M"):CUR+"/1M");   // effective rate as hint
+    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save kind + cost";
     function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
       save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
-    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset to auto-detect";
+    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset kind + cost to auto";
     save.addEventListener("click",function(){
-      postModel({action:"set",model:m.model,kind:sel.value}).then(function(res){
-        if(!res.ok){say((res.j&&res.j.error)||"save failed",false);return;}
+      var cv=cost.value.trim();
+      var jobs=[postModel({action:"set",model:m.model,kind:sel.value})];
+      if(cv!=="") jobs.push(postModel({action:"cost",model:m.model,usd_1m:cv}));
+      else if(m.cost_1m!=null) jobs.push(postModel({action:"cost_reset",model:m.model})); // cleared field → drop override
+      Promise.all(jobs).then(function(rs){
+        if(rs.some(function(r){return !r.ok;})){say((rs.find(function(r){return !r.ok;}).j||{}).error||"save failed",false);return;}
         say("saved",true); setTimeout(loadModels,900);
       }).catch(function(){say("save failed",false);});
     });
     reset.addEventListener("click",function(){
-      postModel({action:"reset",model:m.model}).then(function(res){
-        if(!res.ok){say((res.j&&res.j.error)||"reset failed",false);return;}
+      Promise.all([postModel({action:"reset",model:m.model}),
+                   postModel({action:"cost_reset",model:m.model})]).then(function(rs){
+        if(rs.some(function(r){return !r.ok;})){say("reset failed",false);return;}
         say("reset",true); setTimeout(loadModels,900);
       }).catch(function(){say("reset failed",false);});
     });
-    row.appendChild(sel); row.appendChild(save); row.appendChild(reset);
+    row.appendChild(sel); row.appendChild(cost); row.appendChild(save); row.appendChild(reset);
     return row;
   }
   function loadModels(){

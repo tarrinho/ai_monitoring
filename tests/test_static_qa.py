@@ -833,6 +833,73 @@ def test_ci_actions_pinned_to_current_majors():
             f"{rel} has a stale checkout pin"
 
 
+def test_chart_text_colors_are_theme_resolved_not_hardcoded():
+    """Chart.js axis/legend TEXT must resolve from the theme var (cssv('--muted') /
+    cssv('--fg')) — never a hardcoded dark-theme hex. `#8b949e` on the light theme's
+    white is only ~2.8:1 (fails WCAG AA) and `#e6edf3` is invisible on white; both
+    were literal Chart tick colors. Guards light-theme legibility."""
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "spend"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        # the readable-in-both-themes muted var is used for chart text
+        assert 'cssv("--muted")' in html, f"{name}: chart text not theme-resolved"
+        # no hardcoded dark-theme greys/whites as a quoted Chart color literal
+        assert '"#8b949e"' not in html, f"{name}: hardcoded #8b949e chart color"
+        assert '"#e6edf3"' not in html, f"{name}: hardcoded #e6edf3 chart color"
+        # the var-definition of --muted stays (it's the dark-theme default, themed over)
+        assert "--muted:#8b949e" in html
+
+
+def test_spend_has_cost_per_model_over_time_card():
+    """A 'Cost per model over time' chart card sits above Per-key budgets, driven by
+    /api/spend/model-series, real=solid vs estimated=dashed lines."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert 'id="card-model-cost-time"' in html and 'id="model-cost-chart"' in html
+    assert "loadModelCostSeries" in html and "/api/spend/model-series" in html
+    assert "renderModelCostTime" in html
+    # placed ABOVE the per-key budgets card
+    assert html.index('id="card-model-cost-time"') < html.index('id="card-keys"')
+    # estimated series drawn dashed (kind !== real)
+    assert 'borderDash:est?[5,3]:[]' in html
+
+
+def test_all_dashboard_charts_update_in_place_not_rebuilt():
+    """Every dashboard polls on an interval; multi-series charts must refresh via
+    updateSeries() — updating dataset VALUES in place (and preserving the user's legend
+    toggles by key when the series set changes) — never by replacing the whole
+    chart.data.datasets array, which reset selections and re-animated. Guards all charts."""
+    # pages with dynamic multi-series charts: the helper + no caller-side full rebuild
+    for name in ("index", "litellm", "gpu", "spend"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert "function updateSeries" in html, f"{name}: missing updateSeries helper"
+        # helper: in-place value update + toggle-preserving rebuild
+        assert "cur[i].data=d.data" in html, f"{name}: helper doesn't update in place"
+        assert "isDatasetVisible(i)" in html and "hidden=true" in html, \
+            f"{name}: helper doesn't preserve legend toggles"
+        # BAN a caller rebuilding a chart's whole datasets array (only the helper may,
+        # as `chart.data.datasets=next`).
+        offenders = [ln.strip() for ln in html.splitlines()
+                     if ".data.datasets=" in ln and "datasets=next" not in ln]
+        assert not offenders, f"{name}: caller rebuilds datasets (use updateSeries): {offenders}"
+    # single fixed-dataset chart pages update .data in place already (no full rebuild)
+    for name in ("ollama", "llamacpp"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        offenders = [ln.strip() for ln in html.splitlines()
+                     if ".data.datasets=" in ln and "datasets=next" not in ln]
+        assert not offenders, f"{name}: rebuilds datasets: {offenders}"
+
+
+def test_spend_charts_keep_selection_across_poll():
+    """The Spend page polls every 5s; chart interactions must survive it. The
+    cost-per-model chart preserves hidden model lines (by name) across the datasets
+    rebuild, and the cost-by-user chart re-opens the expanded selection."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    # model-cost lines refresh via the shared updateSeries helper, keyed by model name
+    # (it preserves legend toggles + updates values in place)
+    assert "updateSeries(modelCostChart" in html and "_k:m.model" in html
+    # cost-by-user expanded selection remembered + restored on re-render
+    assert "_costOpen" in html and "rows.find(r=>r.name===_costOpen)" in html
+
+
 def test_spend_budget_table_is_paginated():
     """Per-key budgets table shows 20 per page (ranked by risk) with Prev/Next paging;
     the backend still returns every key (pagination is display-only)."""
@@ -1057,6 +1124,57 @@ def test_settings_page_exists_with_tunables_and_teams():
     assert 'class="intro">Operator tuning' not in html   # old inline intro removed
     # no raw innerHTML sink — the page is built with DOM APIs
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
+
+
+def test_dashboards_use_currency_global_not_hardcoded_dollar():
+    """Money is rendered via the injected `window.CUR` currency global (default $), not a
+    hardcoded `"$"` — so MONITOR_CURRENCY can switch it (e.g. to €) with no code change."""
+    # money-rendering pages must use CUR
+    for f in ("spend.html", "litellm.html", "settings.html", "index.html"):
+        html = (ROOT / "web" / f).read_text(encoding="utf-8")
+        assert "CUR" in html, f"{f} should render money via the CUR currency global"
+    # NO page may hardcode a "$" money prefix
+    for f in ("spend.html", "litellm.html", "settings.html", "index.html", "alerts.html"):
+        html = (ROOT / "web" / f).read_text(encoding="utf-8")
+        assert '"$"' not in html, f'{f} still hardcodes "$" as a money prefix'
+
+
+def test_dashboard_inline_scripts_parse():
+    """Every inline <script> in the dashboards must be valid JS. Guards against
+    edits (e.g. the CUR currency swap) that mangle a string across a newline and
+    ship an `Uncaught SyntaxError` to the browser. Skipped if node is absent."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available to syntax-check inline scripts")
+    import os
+    import tempfile
+
+    _INLINE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.S)
+    for f in ("spend.html", "litellm.html", "settings.html", "index.html", "alerts.html"):
+        txt = (ROOT / "web" / f).read_text(encoding="utf-8")
+        for i, m in enumerate(_INLINE.finditer(txt)):
+            code = m.group(1)
+            if not code.strip():
+                continue
+            tf = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False)
+            tf.write(code)
+            tf.close()
+            try:
+                r = subprocess.run([node, "--check", tf.name], capture_output=True, text=True)
+            finally:
+                os.unlink(tf.name)
+            assert r.returncode == 0, f"{f} inline script #{i} has a JS syntax error:\n{r.stderr}"
+
+
+def test_settings_model_cost_override_ui():
+    """Model-costs card exposes each model's $/1M cost and lets an admin PIN it (per-model
+    cost input + action=cost / cost_reset), so an unreliable LiteLLM price can be corrected
+    from the UI. Guards the wiring + the fields it reads."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    assert '"min mcost"' in html                             # the per-model cost input (JS-built)
+    assert 'action:"cost"' in html and "usd_1m" in html      # Save posts a cost override
+    assert 'action:"cost_reset"' in html                     # Reset clears it
+    assert "eff_cost_1m" in html and "cost_1m" in html        # shows effective + set $/1M
 
 
 def test_config_tunables_exclude_secrets_and_switches():

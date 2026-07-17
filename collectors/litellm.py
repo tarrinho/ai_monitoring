@@ -491,6 +491,59 @@ async def per_model_daily_cost(session: aiohttp.ClientSession, start_date: str,
     return out if saw_daily else None
 
 
+async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str,
+                                 end_date: str, prices: dict,
+                                 kind_overrides: dict | None = None) -> dict | None:
+    """Like per_model_daily_cost but WITHOUT collapsing across models — keeps each
+    model's per-day cost so the UI can chart cost-per-model over time. Returns
+    {"models": [{"model", "kind", "total", "daily": {date: $}} …] sorted by total desc,
+    "dates": [sorted union of dates]}, or None when there's no per-model daily data."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    pm, err = await fetch_json(
+        session,
+        f"{base}/global/activity/model?start_date={start_date}&end_date={end_date}",
+        headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None or not isinstance(pm, list):
+        return None
+    models: list = []
+    dates: set[str] = set()
+    saw = False
+    for m in pm:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("model") or ""
+        rate = price_for(name, prices)
+        kind = classify_model(name, kind_overrides)["cost_kind"]
+        if rate <= 0 or kind not in ("real", "reference") or not name:
+            continue                       # unpriced / unattributed → no $ line
+        daily = m.get("daily_data") or m.get("daily") or m.get("data") or []
+        if not isinstance(daily, list):
+            continue
+        dmap: dict[str, float] = {}
+        for dd in daily:
+            if not isinstance(dd, dict):
+                continue
+            date = _norm_date(dd.get("date") or dd.get("day") or dd.get("start_date") or "")
+            toks = int(dd.get("total_tokens") or dd.get("sum_total_tokens")
+                       or dd.get("tokens") or 0)
+            if not date or toks <= 0:
+                continue
+            saw = True
+            dmap[date] = dmap.get(date, 0.0) + toks * rate
+            dates.add(date)
+        if dmap:
+            models.append({"model": name, "kind": kind,
+                           "total": round(sum(dmap.values()), 2),
+                           "daily": {d: round(v, 4) for d, v in dmap.items()}})
+    if not saw:
+        return None
+    models.sort(key=lambda x: -x["total"])
+    return {"models": models, "dates": sorted(dates)}
+
+
 async def model_prices(session: aiohttp.ClientSession) -> dict:
     """{model_name: $/token} from LiteLLM `/model/info` (input+output cost). LiteLLM
     already knows external model prices (that's how it tracks real spend); self-hosted
@@ -1046,7 +1099,19 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         alias = (k.get("key_alias") or k.get("key_name") or k.get("token") or "")
         if not alias:
             continue
-        uid = str(k.get("user_id") or "")
+        # Owner user-id can live on ANY of several fields: `user_id` (owner), `created_by`
+        # (a user_id string), the nested `created_by_user` object, or `user`. LiteLLM's
+        # /key/list commonly leaves `user_id` NULL while the owner is only on created_by /
+        # created_by_user — so gather every candidate and resolve against the /user/list
+        # directory (by_user_name: user_id → email), not just `user_id`. (Was: keys with a
+        # created_by-only owner all fell into "Unassigned".)
+        _cbu = k.get("created_by_user")
+        cbu = _cbu if isinstance(_cbu, dict) else {}
+        id_cands = [c for c in (str(k.get("user_id") or ""), str(k.get("created_by") or ""),
+                                str(cbu.get("user_id") or ""), str(k.get("user") or "")) if c]
+        # grouping uid = the first candidate the directory can name, else the first non-empty
+        uid = next((c for c in id_cands if by_user_name.get(c)),
+                   id_cands[0] if id_cands else "")
         team = str(k.get("team_alias") or "").strip()
         if not team:
             tid = str(k.get("team_id") or "")
@@ -1055,16 +1120,17 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
             team = by_user.get(uid, "")                    # else via the user's team
         if _is_team_id(team):                              # never surface a raw UUID as a name
             team = ""
-        # user's EMAIL — LiteLLM shows it in the key's 'User'/'Created By' columns, so read
-        # it straight off the key row (user_email / created_by / litellm_user_email), then
-        # the /user/list directory. Prefer an email-shaped value; fall back to any name.
+        # user's EMAIL — off the key row (user_email / created_by / the nested created_by_user
+        # object) or the /user/list directory keyed by ANY candidate id. Prefer an email.
         _km = k.get("metadata")
         meta = _km if isinstance(_km, dict) else {}
         uname = _pick_email(k.get("user_email"), k.get("litellm_user_email"),
-                            meta.get("user_email"), by_user_name.get(uid, ""),
+                            meta.get("user_email"), cbu.get("user_email"),
+                            *(by_user_name.get(c, "") for c in id_cands),
                             k.get("created_by"), k.get("user"))
         if not uname:                                      # no email → any readable name
-            uname = str(by_user_name.get(uid, "") or k.get("user_alias") or "").strip()
+            uname = str(by_user_name.get(uid, "") or cbu.get("user_alias")
+                        or k.get("user_alias") or "").strip()
         if _is_team_id(uname):                             # user_id-looking name → not a name
             uname = ""
         out[str(alias)] = {
@@ -1110,6 +1176,8 @@ async def keys_diag(session: aiohttp.ClientSession) -> dict:
             return (u[:2] + "…@" + dom)
         return (s[:6] + "…") if len(s) > 8 else s
 
+    _OWNER_IDS = ("user_id", "created_by", "user", "created_by_user", "end_user_id")
+
     def _probe(rows, n=5):
         rows = rows if isinstance(rows, list) else []
         if not rows:
@@ -1120,10 +1188,23 @@ async def keys_diag(session: aiohttp.ClientSession) -> dict:
             if not isinstance(r, dict):
                 continue
             ef = [f for f, v in r.items() if _email_like(v)]
+            # also scan NESTED objects (e.g. created_by_user) — LiteLLM tucks the owner email
+            # there, and a top-level-only scan (and the resolver) would miss it.
+            nested = {}
+            for f, v in r.items():
+                if isinstance(v, dict):
+                    ne = {k2: _redact(v2) for k2, v2 in v.items() if _email_like(v2)}
+                    if ne:
+                        nested[f] = ne
             emf.update(ef)
+            # which owner-id fields are POPULATED (redacted) — shows where the owner actually is
+            owner_ids = {f: _redact(r.get(f)) for f in _OWNER_IDS
+                         if r.get(f) not in (None, "", {})}
             per.append({"ref": r.get("key_alias") or r.get("key_name") or r.get("user_id"),
                         "email_fields": ef,
-                        "email_samples": {f: _redact(r.get(f)) for f in ef}})
+                        "email_samples": {f: _redact(r.get(f)) for f in ef},
+                        "nested_emails": nested,
+                        "owner_ids": owner_ids})
         return {"count": len(rows), "fields": sorted(first.keys()),
                 "email_fields_found": sorted(emf), "per_row": per}
 
