@@ -63,10 +63,6 @@ function updateSeries(chart,labels,next){
   td.num{text-align:right;font-variant-numeric:tabular-nums}
   .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
   .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
-  .windows{display:flex;gap:4px;margin-left:8px}
-  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
-    border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
-  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
   .span-2{grid-column:span 2}
   .span-full{grid-column:1/-1}   /* span every column, whatever the count */
   @media(max-width:720px){.span-2{grid-column:span 1}}
@@ -149,7 +145,7 @@ function updateSeries(chart,labels,next){
         {headers:tok?{Authorization:"Bearer "+tok}:{}})
         .then(function(r){return r.ok?r.json():null;})
         .then(function(n){ if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
-          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp],["vllm",n.vllm]].forEach(function(x){
             if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
               .forEach(function(a){a.style.display="none";});
           });
@@ -179,6 +175,19 @@ function updateSeries(chart,labels,next){
 .windows button:hover{color:var(--fg);border-color:var(--muted)}
 .windows button:disabled{opacity:.5;cursor:default}
 .windows button.active{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+.windows .wsep{width:1px;height:18px;background:var(--line);margin:0 5px;align-self:center;display:inline-block}
+</style>
+<style>
+/* backend nav logos (Ollama / llama.cpp / vLLM): an equal-height icon before the label.
+   The two mono llama marks tint to the link colour (theme- + hover-aware) via CSS mask;
+   vLLM keeps its 2-colour brand mark. Same 15px box → equal visual height in the menu. */
+#sidebar-nav a.navlogo::before{content:"";display:inline-block;width:15px;height:15px;
+  vertical-align:-3px;margin-right:6px}
+#sidebar-nav a.nl-ollama::before,#sidebar-nav a.nl-llamacpp::before{
+  background-color:currentColor;-webkit-mask:center/contain no-repeat;mask:center/contain no-repeat}
+#sidebar-nav a.nl-ollama::before{-webkit-mask-image:url("/assets/logos/ollama.svg");mask-image:url("/assets/logos/ollama.svg")}
+#sidebar-nav a.nl-llamacpp::before{-webkit-mask-image:url("/assets/logos/llamacpp.svg");mask-image:url("/assets/logos/llamacpp.svg")}
+#sidebar-nav a.nl-vllm::before{background:url("/assets/logos/vllm.svg") center/contain no-repeat}
 </style>
 </head>
 <body>
@@ -186,7 +195,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.3</div>
+      <div id="sidebar-brand-ver">v1.7.0</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -195,8 +204,9 @@ function updateSeries(chart,labels,next){
     <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
-    <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
-    <a href="/llamacpp" style="padding-left:26px">🐫 llama.cpp</a>
+    <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
+    <a href="/llamacpp" class="navlogo nl-llamacpp" style="padding-left:26px">llama.cpp</a>
+    <a href="/vllm" class="navlogo nl-vllm" style="padding-left:26px">vLLM</a>
     <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
     <a href="/alerts" style="padding-left:26px">🔔 Alerts</a>
   </nav>
@@ -205,16 +215,16 @@ function updateSeries(chart,labels,next){
 <div id="main-area">
 <header>
   <h1>GPU/CPU</h1>
-  <div class="windows" id="windows">
-    <button id="nav-left" title="shift earlier">◀</button>
-    <button data-w="15m">15m</button>
-    <button data-w="1h" class="active">1h</button>
-    <button data-w="24h">24h</button>
-    <button data-w="30d">30d</button>
-    <button data-w="12mo">12mo</button>
-    <button data-w="month">MTD</button>
-    <button id="nav-right" title="shift later" disabled>▶</button>
-    <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
+  <div class="windows" id="windows" role="group" aria-label="time window and range">
+    <button id="nav-left" title="shift earlier" aria-label="shift window earlier">◀</button>
+    <button data-w="15m" aria-pressed="false">15m</button>
+    <button data-w="1h" class="active" aria-pressed="true">1h</button>
+    <button data-w="24h" aria-pressed="false">24h</button>
+    <button data-w="30d" aria-pressed="false">30d</button>
+    <button data-w="12mo" aria-pressed="false">12mo</button>
+    <button data-w="month" aria-pressed="false">MTD</button>
+    <button id="nav-right" title="shift later" disabled aria-label="shift window later">▶</button>
+    <span class="wsep" aria-hidden="true"></span><button id="nav-live" title="jump to now (live)" disabled aria-label="jump to now, live">● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
     <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
@@ -235,8 +245,8 @@ function updateSeries(chart,labels,next){
 
   <section class="card span-full" id="card-appcpu">
     <h2>CPU usage by app (stacked) — <span id="appcpu-win">1h</span>
-      <span class="info" title="Per-process CPU % of the top-10 apps over time, stacked. Per-app GPU usage is not exposed by nvidia-smi in this setup — the aggregate GPU util is charted above.">ⓘ</span></h2>
-    <div class="chart-wrap" style="height:280px"><canvas id="appcpu-chart"></canvas></div>
+      <span class="info" title="Top-10 apps' CPU over time, stacked and normalized to % of TOTAL capacity (raw per-process %CPU ÷ core count), so the stack tops out at 100%. Hover a band for its raw top-style load (band × cores). Per-app GPU usage is not exposed by nvidia-smi in this setup — the aggregate GPU util is charted above.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:280px"><canvas id="appcpu-chart" role="img" aria-label="CPU usage by app over time, stacked as percent of total capacity"></canvas></div>
   </section>
 
   <section class="card span-full" id="card-percpu" style="display:none">
@@ -248,7 +258,7 @@ function updateSeries(chart,labels,next){
   <section class="card span-full" id="card-cpucores-stack" style="display:none">
     <h2>CPU cores usage (stacked) — <span id="cpucores-n">0</span> cores
       <span class="info" title="Per-core CPU over time, stacked. Each band is that core's share of total capacity (core% ÷ core-count), so the bands sum to OVERALL CPU utilisation (Y axis 0–100%). Hover a band for its real per-core load. Live-only: buffered in the browser over ~10 min at the 5 s poll, not persisted. Click a legend label to toggle a core.">ⓘ</span></h2>
-    <div class="chart-wrap" style="height:300px"><canvas id="cpucores-chart"></canvas></div>
+    <div class="chart-wrap" style="height:300px"><canvas id="cpucores-chart" role="img" aria-label="CPU usage per core over time, stacked"></canvas></div>
   </section>
 
   <section class="card span-full" id="card-charts">
@@ -313,7 +323,7 @@ function mkChart(canvas, cfg){
     const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
     h.append(nm,cur);
     const wrap=document.createElement("div");wrap.className="chart-wrap";
-    const cv=document.createElement("canvas");cv.id=cfg.id;wrap.appendChild(cv);
+    const cv=document.createElement("canvas");cv.id=cfg.id;cv.setAttribute("role","img");cv.setAttribute("aria-label",cfg.label||cfg.id);wrap.appendChild(cv);
     card.append(h,wrap);grid.appendChild(card);
     _charts[cfg.id]=mkChart(cv,cfg);
   }
@@ -359,7 +369,7 @@ function buildPerCpu(coreIds){
     const cur=document.createElement("span");cur.className="cur";cur.textContent="—";
     h.append(nm,cur);
     const wrap=document.createElement("div");wrap.className="chart-wrap";
-    const cv=document.createElement("canvas");wrap.appendChild(cv);
+    const cv=document.createElement("canvas");cv.setAttribute("role","img");cv.setAttribute("aria-label","CPU core "+cid+" utilisation");wrap.appendChild(cv);
     card.append(h,wrap);grid.appendChild(card);
     _percpuCharts.push({chart:mkPerCpuChart(cv),cur:cur});
   }
@@ -442,22 +452,32 @@ const appCpuChart=new Chart(document.getElementById("appcpu-chart"),{
   type:"line", data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
+      // Bands are each app's SHARE of total capacity (raw %CPU ÷ cores), so the
+      // stack tops at 100. Tooltip recovers the raw top-style %CPU (band × cores).
+      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "
+        +Math.round(c.parsed.y*_appCpuN)+"% ("+Number(c.parsed.y).toFixed(1)+"% of total)"}}},
     scales:{
       x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
-      y:{stacked:true,beginAtZero:true,grid:{color:"#30363d33"},
-         ticks:{color:cssv("--muted"),font:{size:9},callback:v=>v+"%"}}}}
+      y:{stacked:true,beginAtZero:true,max:100,grid:{color:"#30363d33"},
+         ticks:{color:cssv("--muted"),font:{size:9},stepSize:20,callback:v=>v+"%"}}}}
 });
+let _appCpuN=1;   // logical-core count for this window — divisor that keeps the stack ≤100%
 async function loadAppCpu(){
   document.getElementById("appcpu-win").textContent=WIN;
   const d=await api("/api/procseries?kind=cpu&window="+WIN);
   if(!d) return;
   const pts=d.points||[], apps=d.apps||[];
+  // Per-process %CPU is top-style: relative to ONE core, so N processes can sum to
+  // cores×100. Divide by the core count (authoritative ncpu from the same DB; fall
+  // back to the per-core card's count, else 1) so the stacked bands share one 0–100 axis.
+  _appCpuN=(d.ncpu&&d.ncpu>0)?d.ncpu:(_cpuCoreN>1?_cpuCoreN:1);
+  const n=_appCpuN;
   updateSeries(appCpuChart, pts.map(axisT(pts)), apps.map((a,i)=>({_k:a, label:a,
     // an app with no sample in a bucket (process absent / not in top-N then) is 0,
     // NOT null: on a STACKED area a null gets span-gapped into a straight diagonal
     // across the gap, producing the huge phantom bands. A flat 0 draws correctly.
-    data:pts.map(p=>p[a]==null?0:p[a]),
+    data:pts.map(p=>(p[a]==null?0:p[a])/n),
     borderColor:PROC_COLORS[i%PROC_COLORS.length],
     backgroundColor:PROC_COLORS[i%PROC_COLORS.length]+"66",
     // stacked area: fill to the previous dataset (not to zero) so each band shows
@@ -572,8 +592,8 @@ document.getElementById("nav-live").addEventListener("click",()=>{
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
-    document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
-    b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
+    document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
     document.getElementById("win-label").textContent=WIN; loadSeries(); loadAppCpu(); loadPerCpu();
   });
 });

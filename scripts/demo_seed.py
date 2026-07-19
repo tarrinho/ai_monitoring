@@ -224,8 +224,15 @@ def seed_model_user(now, days=14):
 
 async def _demo_model_prices(_session):
     """$/token for the demo models so the model×user chart computes a cost (no real
-    LiteLLM to price against)."""
+    LiteLLM to price against). Single blended rate per model (already averaged)."""
     return {m: p for m, p in DEMO_MU_MODELS}
+
+
+async def _demo_price_detail(_session):
+    """The three per-type rates (per 1M) for the demo models — same in/out/cache (blended),
+    so the Settings model-costs card shows the breakdown un-doubled."""
+    return {m: {"in": round(p * 1e6, 4), "out": round(p * 1e6, 4),
+                "cache": round(p * 1e6, 4)} for m, p in DEMO_MU_MODELS}
 
 
 async def _demo_owner_map(_session):
@@ -329,6 +336,7 @@ if __name__ == "__main__":
     A._key_owner_map = _demo_owner_map       # nice owner emails for the model×user series
     from collectors import litellm as _ll    # price the demo models (no real LiteLLM)
     _ll.model_prices = _demo_model_prices
+    _ll.model_price_detail = _demo_price_detail   # 3 per-type rates for the model-costs card
     # keep ?token=&theme= in the URL (no cookie-strip redirect) so screenshots
     # can pin the theme and the page JS can read the token from the query.
     A._maybe_cookie_redirect = lambda *a, **k: None

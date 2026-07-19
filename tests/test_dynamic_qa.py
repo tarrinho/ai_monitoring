@@ -3,6 +3,9 @@
 # live, unconfigured backends degrade gracefully, and each collector parses
 # real JSON responses correctly.
 import asyncio
+import pathlib
+
+ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 import re
 import time
 
@@ -17,7 +20,7 @@ import db
 import auth
 import alerts
 import anomaly
-from collectors import host, litellm, ollama, llamacpp, gpu, procs
+from collectors import host, litellm, ollama, llamacpp, gpu, procs, vllm
 
 
 # ------------------------------------------------------------- app endpoints --
@@ -1098,6 +1101,66 @@ def test_db_cpu_core_series_windowed(tmp_path, monkeypatch):
     db.insert_cpu_core_series(now, [])
 
 
+def test_db_ncpu_counts_logical_cores_in_window(tmp_path, monkeypatch):
+    """db.ncpu returns the logical-core count from per-core samples, so the client can
+    normalize top-style per-process %CPU (÷ cores) and keep the stacked per-app chart
+    ≤100%. 0 when the window holds no per-core data (caller then skips normalization)."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "nc.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(30):
+        db.insert_cpu_core_series(now - 1800 + i * 60, [10.0, 20.0, 30.0, 40.0])
+    assert db.ncpu("1h") == 4                       # four distinct cores in window
+    assert db.ncpu("1h", end=now - 7200) == 0       # window before any sample → 0
+    assert db.ncpu("15m") == 4                       # shorter window still sees them
+
+
+def test_procseries_cpu_exposes_ncpu_for_normalization(tmp_path, monkeypatch):
+    """The /api/procseries cpu response carries `ncpu` so the stacked per-app CPU chart
+    can divide each process %CPU by the core count and top out at 100%. RAM omits it."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "ps.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(20):
+        db.insert_cpu_core_series(now - 1200 + i * 60, [5.0, 5.0, 5.0, 5.0, 5.0, 5.0])
+        db.insert_proc_series(now - 1200 + i * 60, "cpu",
+                              [{"app": "proc", "cpu": 350.0}], "cpu")
+    import app as _app
+
+    class _Req:
+        def __init__(self, q):
+            self.query = q
+    monkeypatch.setattr(_app, "_q_end", lambda r: now)
+    import asyncio
+    cpu = asyncio.run(_app.procseries_handler(_Req({"kind": "cpu", "window": "15m"})))
+    import json as _json
+    body = _json.loads(cpu.body.decode())
+    assert body["ncpu"] == 6                          # six cores → divisor of 6
+    ram = asyncio.run(_app.procseries_handler(_Req({"kind": "ram", "window": "15m"})))
+    assert "ncpu" not in _json.loads(ram.body.decode())
+
+
+def test_db_ncpu_reads_rollup_for_long_windows(tmp_path, monkeypatch):
+    """ncpu tiers like cpu_core_series: a 24h+ window counts cores from the 1m/1h rollup,
+    not the raw table (which a long window has aged out of), so the per-app normalization
+    divisor is still correct over long ranges. Empty DB → 0 (caller skips normalization)."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "ncr.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    assert db.ncpu("1h") == 0                              # nothing recorded yet
+    for i in range(120):
+        db.insert_cpu_core_series(now - 3600 + i * 30, [25.0, 75.0, 50.0])
+    db.rollup()                                            # populate the 1m rollup
+    assert db.ncpu("24h") == 3                             # counted from the 1m rollup
+    assert db.ncpu("12mo") == 3                            # 1h-rollup tier also sees them
+
+
 def test_db_cpu_core_series_rollup_and_prune(tmp_path, monkeypatch):
     """Long windows read the 1m/1h rollups (not the raw table), and all three per-core
     tables are pruned on the same tiers as the other series."""
@@ -1981,6 +2044,112 @@ async def test_llamacpp_kvcache_and_busy(monkeypatch):
         await srv.close()
 
 
+async def test_llamacpp_reports_cpu_threads(monkeypatch):
+    """/props carries the thread counts llama.cpp runs with, and they are what tell an
+    operator whether idle CPU cores are idle BY DESIGN (layers on the GPU) or starved by a
+    low --threads. llama.cpp has moved these between the top level,
+    default_generation_settings and params across builds, so all three are read."""
+    for shape in ("top", "gen", "params"):
+        async def health(_):
+            return web.json_response({"status": "ok"})
+
+        async def props(_, _shape=shape):
+            body = {"total_slots": 1, "default_generation_settings": {"n_ctx": 4096}}
+            vals = {"n_threads": 10, "n_threads_batch": 20}
+            if _shape == "top":
+                body.update(vals)
+            elif _shape == "gen":
+                body["default_generation_settings"].update(vals)
+            else:
+                body["params"] = vals
+            return web.json_response(body)
+
+        async def slots(_):
+            return web.json_response([])
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_get("/props", props)
+        app.router.add_get("/slots", slots)
+        srv = TestServer(app)
+        await srv.start_server()
+        try:
+            monkeypatch.setattr(config, "LLAMACPP_BASE_URL",
+                                str(srv.make_url("")).rstrip("/"))
+            monkeypatch.setattr(config, "LLAMACPP_API_KEY", None)
+            async with aiohttp.ClientSession() as s:
+                out = await llamacpp.sample(s)
+            assert out["n_threads"] == 10, f"shape={shape}"
+            assert out["n_threads_batch"] == 20, f"shape={shape}"
+        finally:
+            await srv.close()
+
+
+async def test_llamacpp_threads_partial_and_absent(monkeypatch):
+    """Real builds report these inconsistently. Only n_threads present must NOT suppress
+    it, and a /props with neither must leave both None while the backend stays available —
+    'unknown threads' is not 'backend down'."""
+    async def health(_):
+        return web.json_response({"status": "ok"})
+
+    async def slots(_):
+        return web.json_response([])
+
+    async def props_partial(_):
+        return web.json_response({"total_slots": 1, "n_threads": 10})   # no batch value
+
+    async def props_none(_):
+        return web.json_response({"total_slots": 1})                    # neither reported
+
+    for handler, want_t, want_b in ((props_partial, 10, None), (props_none, None, None)):
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_get("/props", handler)
+        app.router.add_get("/slots", slots)
+        srv = TestServer(app)
+        await srv.start_server()
+        try:
+            monkeypatch.setattr(config, "LLAMACPP_BASE_URL",
+                                str(srv.make_url("")).rstrip("/"))
+            monkeypatch.setattr(config, "LLAMACPP_API_KEY", None)
+            async with aiohttp.ClientSession() as s:
+                out = await llamacpp.sample(s)
+            assert out["available"] is True          # unknown threads ≠ unhealthy backend
+            assert out["n_threads"] == want_t
+            assert out["n_threads_batch"] == want_b
+        finally:
+            await srv.close()
+
+
+async def test_llamacpp_threads_reach_api_data():
+    """The KPI reads these off /api/data, so the fields must survive the snapshot into the
+    endpoint — a collector field that never reaches the browser is invisible in practice."""
+    # /api/data serves the SNAPSHOT (_latest), which _sample_once builds by copying each
+    # backend's dict wholesale — so seed the snapshot the way the sampling loop would.
+    appmod._latest = {"ts": 1.0, "collectors": {
+        "host": {"available": True, "ncpu": 20, "cpu_pct": 1.0},
+        "llamacpp": {"available": True, "status": "ok", "n_slots": 1, "slots_active": 0,
+                     "ctx_size": 4096, "n_threads": 10, "n_threads_batch": 20}}}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/data")).json()
+        lc = (d.get("latest") or {}).get("collectors", {}).get("llamacpp", {})
+        assert lc.get("n_threads") == 10 and lc.get("n_threads_batch") == 20
+        # host.ncpu is the other half of the comparison the KPI renders
+        assert (d.get("latest") or {}).get("collectors", {}).get("host", {}).get("ncpu") == 20
+    finally:
+        await c.close()
+
+
+def test_llamacpp_first_num_rejects_zero_and_junk():
+    """A build that reports 0/null/"" threads has NOT reported a thread count; treating 0
+    as a real reading would show "0 threads" and read as 'starved' when it is simply
+    absent. Only a positive integer counts."""
+    assert llamacpp._first_num(None, 0, "", 12) == 12      # skips the non-answers
+    assert llamacpp._first_num(0) is None
+    assert llamacpp._first_num(None, "abc") is None
+    assert llamacpp._first_num("8") == 8                    # string digits are fine
+
+
 async def test_llamacpp_nested_timings_parsed(monkeypatch):
     # newer llama.cpp nests generation timings under a "timings" object instead
     # of the slot top level — the collector must read both (else tok/s + KV%
@@ -2286,7 +2455,7 @@ async def test_nav_endpoint_shape():
     c = await _client()
     try:
         d = await (await c.get("/api/nav")).json()
-        assert set(d) == {"litellm", "spend", "ollama", "llamacpp", "gpu", "admin"}
+        assert set(d) == {"litellm", "spend", "ollama", "llamacpp", "vllm", "gpu", "admin"}
         assert all(isinstance(v, bool) for v in d.values())
         # GPU/CPU page hosts universal CPU views → the link is always shown, even with no
         # GPU configured (as here); only the on-page GPU cards degrade to "No GPU detected".
@@ -4050,7 +4219,8 @@ async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
         h = await (await c.get("/", headers=hdr)).text()
         assert "🔀 LiteLLM" not in h and "LiteLLM</a>" not in h   # sidebar link gone
         assert "Spend &amp; Quota</a>" not in h
-        assert "🦙 Ollama" not in h and "🐫 llama.cpp" not in h
+        # backend nav LINKS stripped (anchor's class attr; the CSS rule `a.nl-ollama` stays)
+        assert 'class="navlogo nl-ollama"' not in h and 'class="navlogo nl-llamacpp"' not in h
         assert "🖥️ GPU/CPU</a>" in h            # GPU/CPU always shown (universal CPU views)
         assert "details →" in h                                    # details link kept
     finally:
@@ -4071,7 +4241,7 @@ async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
             "litellm": {"available": True}, "ollama": {"available": True},
             "llamacpp": {"available": True}, "gpu": {"available": True}}})
         h2 = await (await c2.get("/", headers=hdr)).text()
-        assert "🔀 LiteLLM" in h2 and "🦙 Ollama" in h2 and "🖥️ GPU/CPU</a>" in h2
+        assert "🔀 LiteLLM" in h2 and 'class="navlogo nl-ollama"' in h2 and "🖥️ GPU/CPU</a>" in h2
         assert "Spend &amp; Quota</a>" in h2
     finally:
         await c2.close()
@@ -5101,8 +5271,8 @@ def test_add_estimated_cost_splits_and_totals():
 
 
 async def test_model_prices_parses_model_info(monkeypatch):
-    """litellm.model_prices reads input+output cost per token from /model/info and only
-    keeps models with a non-zero price."""
+    """litellm.model_prices reads input+output cost per token from /model/info, AVERAGES
+    them (not sum — the anti-double-count fix), and only keeps models with a non-zero price."""
     async def fake_fetch(session, url, headers=None, timeout_s=None):
         return ({"data": [
             {"model_name": "azure_ai/gpt-5-mini",
@@ -5113,7 +5283,7 @@ async def test_model_prices_parses_model_info(monkeypatch):
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
     pr = await litellm.model_prices(None)
-    assert round(pr["azure_ai/gpt-5-mini"], 12) == 2.25e-06   # in + out
+    assert round(pr["azure_ai/gpt-5-mini"], 12) == 1.125e-06   # (in + out) / 2
     assert "free-local" not in pr                             # 0-priced dropped
     assert litellm.price_for("gpt-5-mini", pr) == pr["azure_ai/gpt-5-mini"]   # prefix-tolerant
 
@@ -6876,3 +7046,445 @@ async def test_spend_require_admin_gates_viewer(monkeypatch):
         await c.close()
 
 
+
+
+async def test_model_prices_averages_input_output_not_doubled(monkeypatch):
+    """model_prices AVERAGES input+output per-token cost (not SUM): a model priced with
+    input==output (one blended rate the operator set) reads ONCE, not doubled — the fix for
+    the 'costs show doubled' bug. A model with only one side priced keeps that value."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://x")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "k")
+    payload = {"data": [
+        {"model_name": "blend",
+         "model_info": {"input_cost_per_token": 2e-7, "output_cost_per_token": 2e-7}},
+        {"model_name": "inonly",
+         "model_info": {"input_cost_per_token": 1.2e-5, "output_cost_per_token": 0}},
+        {"model_name": "real",
+         "model_info": {"input_cost_per_token": 1.4e-6, "output_cost_per_token": 2.2e-6}},
+    ]}
+
+    async def _fake(session, url, **kw):
+        return payload, None
+    monkeypatch.setattr(litellm, "fetch_json", _fake)
+    litellm._PRICES_CACHE = {}
+    p = await litellm.model_prices(None)
+    assert p["blend"] == 2e-7                      # averaged (was 4e-7 doubled)
+    assert p["inonly"] == 1.2e-5                   # single side kept (not halved)
+    assert abs(p["real"] - 1.8e-6) < 1e-15         # (1.4+2.2)/2 e-6
+
+
+# ── QA: cost controls end-to-end (the doubling fix + overrides + per-type display) ──
+async def test_cost_controls_no_double_end_to_end(monkeypatch):
+    """QA of the Model-costs controls: LiteLLM priced input==output==X ⇒ the card shows the
+    three per-type rates AND a blended effective rate of X (NOT 2X), and est cost =
+    tokens × X. A pinned override wins. Guards the whole cost path against the doubling bug."""
+    monkeypatch.setattr(appmod, "_litellm_configured", lambda: True)
+    X = 0.257e-6                                   # €0.257 / 1M tokens (per token)
+    NAME = "azure_ai/gpt-5.4-mini"
+
+    async def _prices(_s):                         # model_prices already AVERAGES upstream
+        return {NAME: X}
+
+    async def _detail(_s):                         # the 3 raw per-type rates (per 1M)
+        return {NAME: {"in": 0.257, "out": 0.257, "cache": 0.257}}
+
+    async def _range(_s, *a, **k):
+        return [{"model": NAME, "tokens": 6_000_000, "reqs": 10}]
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "model_price_detail", _detail)
+    monkeypatch.setattr(litellm, "per_model_range", _range)
+    db.init()
+    c = await _client()
+    try:
+        d = await (await c.get("/api/admin/model-kinds")).json()
+        m = next(x for x in d["models"] if x["model"] == NAME)
+        # per-type breakdown shown (un-doubled)
+        assert m["in_1m"] == 0.257 and m["out_1m"] == 0.257 and m["cache_1m"] == 0.257
+        # blended effective rate = X, NOT 2X (the doubling fix)
+        assert round(m["eff_cost_1m"], 3) == 0.257
+        # est cost = tokens × rate = 6M × 0.257/1M = €1.542 (not €3.084 doubled)
+        assert abs(6_000_000 * m["eff_cost_1m"] / 1e6 - 1.542) < 1e-6
+    finally:
+        await c.close()
+
+
+async def test_cost_controls_override_pins_rate(monkeypatch):
+    """A pinned per-model cost override wins over LiteLLM's price (bypasses it entirely) —
+    the escape hatch when LiteLLM's price is wrong. eff_cost_1m reflects the override."""
+    monkeypatch.setattr(appmod, "_litellm_configured", lambda: True)
+    NAME = "azure_ai/gpt-5-mini"
+
+    async def _prices(_s):
+        return {NAME: 0.194e-6}                    # LiteLLM says 0.194/1M
+
+    async def _range(_s, *a, **k):
+        return [{"model": NAME, "tokens": 22_000_000, "reqs": 30}]
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "model_price_detail", lambda _s: _aret({}))
+    monkeypatch.setattr(litellm, "per_model_range", _range)
+    db.init()
+    db.model_cost_price_set(NAME, 0.30, time.time())    # pin €0.30/1M
+    c = await _client()
+    try:
+        d = await (await c.get("/api/admin/model-kinds")).json()
+        m = next(x for x in d["models"] if x["model"] == NAME)
+        assert m["cost_overridden"] is True and m["cost_1m"] == 0.30
+        assert round(m["eff_cost_1m"], 3) == 0.30       # override wins over LiteLLM's 0.194
+    finally:
+        await c.close()
+        db.model_cost_price_delete(NAME)
+
+
+async def _aret(v):
+    return v
+
+
+# ── vLLM backend ──────────────────────────────────────────────────────────────
+def _vllm_stub_app(metrics_text: str | None = None, models_ok: bool = True):
+    app = web.Application()
+
+    async def health(_):
+        return web.Response(text="")                 # vLLM returns an EMPTY 200 body
+
+    async def models(_):
+        if not models_ok:
+            return web.Response(status=500)
+        return web.json_response({"data": [{"id": "Qwen/Qwen3-Coder"}]})
+    app.router.add_get("/health", health)
+    app.router.add_get("/v1/models", models)
+    if metrics_text is not None:
+        async def metrics(_):
+            return web.Response(text=metrics_text, content_type="text/plain")
+        app.router.add_get("/metrics", metrics)
+    return app
+
+
+_VLLM_METRICS = (
+    'vllm:num_requests_running{model_name="Q"} 3.0\n'
+    'vllm:num_requests_waiting{model_name="Q"} 7.0\n'
+    'vllm:gpu_cache_usage_perc{model_name="Q"} 0.42\n'
+    'vllm:time_to_first_token_seconds_sum{model_name="Q"} 12.5\n'
+    'vllm:time_to_first_token_seconds_count{model_name="Q"} 50.0\n'
+    'vllm:num_preemptions_total{model_name="Q"} 2\n'
+    'this line is malformed\n'
+)
+
+
+def test_vllm_parse_prom_sums_and_skips_junk():
+    """The parser must fold label sets together and SKIP unparseable lines — a metrics
+    format change has to degrade the panel, never raise and kill the collector loop."""
+    m = vllm.parse_prom('a{x="1"} 2\na{x="2"} 3\nbroken\n# comment\nb 5\n')
+    assert m["a"] == 5.0            # summed across label sets
+    assert m["b"] == 5.0
+    assert "broken" not in m
+    assert vllm.parse_prom("") == {}
+
+
+def test_vllm_avg_and_pick_helpers():
+    """Histogram average comes from the _sum/_count pair; _pick accepts vLLM's renamed
+    series (the V1 engine dropped the `vllm:` prefix on some) instead of pinning one."""
+    m = {"h_sum": 12.5, "h_count": 50.0, "num_requests_running": 4.0}
+    assert vllm._avg(m, "h") == 0.25
+    assert vllm._avg({"h_sum": 1.0, "h_count": 0.0}, "h") is None   # no divide-by-zero
+    assert vllm._pick(m, "vllm:num_requests_running", "num_requests_running") == 4.0
+    assert vllm._pick(m, "nope") is None
+
+
+async def test_vllm_sample_reads_metrics(monkeypatch):
+    srv = TestServer(_vllm_stub_app(_VLLM_METRICS))
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_API_KEY", None)
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["available"] is True and out["metrics_available"] is True
+        assert out["model"] == "Qwen/Qwen3-Coder"
+        assert out["running"] == 3.0 and out["waiting"] == 7.0
+        assert out["kv_cache_pct"] == 42.0          # 0-1 fraction rendered as a percent
+        assert out["ttft_avg"] == 0.25
+        assert out["preemptions"] == 2.0
+    finally:
+        await srv.close()
+
+
+async def test_vllm_metrics_disabled_or_absent_still_available(monkeypatch):
+    """VLLM_METRICS_ENABLED=0, or a server with no /metrics, must still report the backend
+    as UP with its model — 'no live counters' is not 'backend down'. metrics_available
+    tells the UI to explain the sparse panel instead of showing a wall of dashes."""
+    # (a) flag off
+    srv = TestServer(_vllm_stub_app(_VLLM_METRICS))
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_API_KEY", None)
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", False)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["available"] is True and out["metrics_available"] is False
+        assert out["model"] == "Qwen/Qwen3-Coder" and out["waiting"] is None
+    finally:
+        await srv.close()
+    # (b) no /metrics route at all
+    srv2 = TestServer(_vllm_stub_app(None))
+    await srv2.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv2.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["available"] is True and out["metrics_available"] is False
+    finally:
+        await srv2.close()
+
+
+async def test_vllm_unconfigured_and_down(monkeypatch):
+    """No URL -> unconfigured (link hidden, not an error). URL set but unreachable ->
+    available False with a real error, never an exception."""
+    monkeypatch.setattr(config, "VLLM_BASE_URL", None)
+    async with aiohttp.ClientSession() as s:
+        assert (await vllm.sample(s)).get("available") is False
+    monkeypatch.setattr(config, "VLLM_BASE_URL", "http://127.0.0.1:59996")
+    monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+    async with aiohttp.ClientSession() as s:
+        out = await vllm.sample(s)
+    assert out["available"] is False and "conn" in str(out.get("error"))
+
+
+async def test_vllm_page_and_nav(monkeypatch):
+    """The /vllm page is auth-gated like every other dashboard, and its nav entry appears
+    only when a base URL is configured (same auto-hide contract as ollama/llamacpp)."""
+    monkeypatch.setattr(config, "VLLM_BASE_URL", "http://vllm:8000")
+    c = await _client()
+    try:
+        assert (await c.get("/vllm")).status == 200
+        nav = await (await c.get("/api/nav")).json()
+        assert nav.get("vllm") is True
+    finally:
+        await c.close()
+    monkeypatch.setattr(config, "VLLM_BASE_URL", None)
+    appmod._backend_latest["vllm"] = {"available": False, "error": "unconfigured"}
+    c2 = await _client()
+    try:
+        assert (await (await c2.get("/api/nav")).json()).get("vllm") is False
+    finally:
+        await c2.close()
+
+
+def test_vllm_series_are_separate_from_llamacpp():
+    """REGRESSION: the vLLM page was seeded from the llama.cpp template and inherited its
+    tok/slots/kvcache series, so with BOTH engines running it plotted llama.cpp's numbers
+    under a vLLM label. vLLM must own vrun/vwait/vkv, and the two must not cross."""
+    snap = {"collectors": {
+        "llamacpp": {"available": True, "predicted_per_second": 99.0,
+                     "slots_active": 1, "kv_cache_pct": 11.0},
+        "vllm": {"available": True, "running": 3, "waiting": 7, "kv_cache_pct": 42.0}}}
+    row = appmod._metrics_row(snap)
+    assert (row["vrun"], row["vwait"], row["vkv"]) == (3, 7, 42.0)   # vLLM's own
+    assert row["tok"] == 99.0 and row["kvcache"] == 11.0             # llama.cpp untouched
+    assert row["vkv"] != row["kvcache"], "vLLM must not chart llama.cpp's KV cache"
+
+
+def test_vllm_metrics_row_none_when_down():
+    """A down/unconfigured vLLM must yield None (a gap in the chart), never 0 — a real 0
+    queue and 'no data' mean opposite things to anyone reading the graph."""
+    row = appmod._metrics_row({"collectors": {"vllm": {"available": False}}})
+    assert row["vrun"] is None and row["vwait"] is None and row["vkv"] is None
+
+
+def test_vllm_metric_columns_persist_and_read_back(tmp_path, monkeypatch):
+    """The new columns must exist on the raw + rollup tables (via the idempotent
+    ALTER-TABLE migration) and survive a write/read round-trip, or the page's charts stay
+    empty no matter what the collector reports."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "v.db"))
+    db.init()
+    for col in ("vrun", "vwait", "vkv"):
+        assert col in db._METRIC_COLS
+        for tbl in ("metrics", "metrics_1m", "metrics_1h"):
+            with db._connect() as conn:
+                cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
+            assert col in cols, f"{col} missing from {tbl}"
+    now = time.time()
+    db.insert_metrics(now, {"vrun": 3, "vwait": 7, "vkv": 42.0})
+    pts = db.series("1h", max_points=10)
+    assert pts and any(p.get("vwait") == 7 for p in pts)
+
+
+async def test_vllm_exported_to_prometheus():
+    """vLLM must appear in /metrics: the up-gauge plus the queue/cache/latency series an
+    external alert would actually fire on."""
+    import metrics_prom
+    snap = {"ts": 1.0, "collectors": {"vllm": {
+        "available": True, "running": 3, "waiting": 7, "kv_cache_pct": 42.0,
+        "ttft_avg": 0.25, "preemptions": 2}}}
+    body = metrics_prom.render(snap, {"users": 0, "sessions": 0, "alerts": 0})
+    assert "aimon_vllm_requests_waiting 7" in body
+    assert "aimon_vllm_kv_cache_percent 42" in body
+    assert "aimon_vllm_preemptions_total 2" in body
+    assert 'aimon_backend_up{backend="vllm"} 1' in body or "vllm" in body
+
+
+async def test_vllm_v1_metric_names_resolve(monkeypatch):
+    """FIELD BUG: on a live vLLM V1 engine kv_cache_pct and tpot_avg came back None while
+    ttft_avg worked — V1 renamed gpu_cache_usage_perc -> kv_cache_usage_perc and
+    time_per_output_token_seconds -> inter_token_latency_seconds. Both spellings must
+    resolve, or those KPIs read '—' against a perfectly healthy server."""
+    v1 = ('vllm:kv_cache_usage_perc{model_name="Q"} 0.37\n'
+          'vllm:inter_token_latency_seconds_sum{model_name="Q"} 5.0\n'
+          'vllm:inter_token_latency_seconds_count{model_name="Q"} 100.0\n'
+          'vllm:e2e_request_latency_seconds_sum{model_name="Q"} 210.0\n'
+          'vllm:e2e_request_latency_seconds_count{model_name="Q"} 100.0\n'
+          'vllm:prefix_cache_queries_total{model_name="Q"} 200.0\n'
+          'vllm:prefix_cache_hits_total{model_name="Q"} 150.0\n')
+    srv = TestServer(_vllm_stub_app(v1))
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_API_KEY", None)
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["kv_cache_pct"] == 37.0, "V1 kv_cache_usage_perc must resolve"
+        assert out["tpot_avg"] == 0.05, "V1 inter_token_latency_seconds must resolve"
+        assert out["e2e_avg"] == 2.1
+        assert out["prefix_hit_pct"] == 75.0        # 150/200 counters, not a gauge
+    finally:
+        await srv.close()
+
+
+async def test_vllm_v0_names_still_work(monkeypatch):
+    """The V1 aliases must not break a V0 engine — both generations have to parse."""
+    v0 = ('vllm:gpu_cache_usage_perc{model_name="Q"} 0.5\n'
+          'vllm:time_per_output_token_seconds_sum{model_name="Q"} 4.0\n'
+          'vllm:time_per_output_token_seconds_count{model_name="Q"} 100.0\n')
+    srv = TestServer(_vllm_stub_app(v0))
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["kv_cache_pct"] == 50.0 and out["tpot_avg"] == 0.04
+    finally:
+        await srv.close()
+
+
+def test_vllm_latency_series_persisted():
+    """The new latency/cache charts need their own columns, else the graphs stay empty."""
+    for col in ("vttft", "vtpot", "ve2e", "vqueue", "vhit"):
+        assert col in db._METRIC_COLS, f"{col} missing from the metrics schema"
+    row = appmod._metrics_row({"collectors": {"vllm": {
+        "available": True, "ttft_avg": 0.25, "tpot_avg": 0.05,
+        "e2e_avg": 2.1, "queue_avg": 0.01, "prefix_hit_pct": 75.0}}})
+    assert row["vttft"] == 0.25 and row["ve2e"] == 2.1 and row["vhit"] == 75.0
+
+
+def test_vllm_kv_cache_scales_without_guessing_units():
+    """vLLM documents its *_perc cache series as a 0-1 FRACTION ("1 means 100 percent"),
+    so a known series is scaled unconditionally. The previous magnitude guess (`<= 1.5`)
+    turned a genuine 0.5 reading into 50% — a silent 100x error in the alarming
+    direction."""
+    src = (ROOT_DIR / "collectors" / "vllm.py").read_text(encoding="utf-8")
+    # check the ASSIGNMENT, not the file: the comment above it deliberately names the
+    # old `<= 1.5` guess to explain why it is gone, so a naive substring search matches
+    # the explanation and passes/fails for the wrong reason.
+    line = next(ln for ln in src.splitlines() if 'out["kv_cache_pct"]' in ln)
+    assert "1.5" not in line, f"magnitude guess is back: {line.strip()}"
+    assert "min(kv, 1.0) * 100" in line, f"fraction not scaled unconditionally: {line.strip()}"
+
+
+def test_vllm_token_rates_from_cumulative_counters():
+    """Token counters are cumulative since server start — they only rise and say nothing
+    about now. They must be differentiated into tokens/sec, with no rate on the first
+    sample (no baseline) and NONE on a counter reset (vLLM restart), never a negative."""
+    vllm._prev_tokens.update({"ts": None, "prompt": None, "gen": None})
+    assert vllm._token_rates(1000, 100) == (None, None)      # first sample: no baseline
+    vllm._prev_tokens["ts"] -= 10.0                          # pretend 10s elapsed
+    p, g = vllm._token_rates(1500, 200)
+    assert p is not None and 40 < p < 60, p                  # ~500 tok / 10s
+    assert g is not None and 5 < g < 15, g
+    vllm._prev_tokens["ts"] -= 10.0
+    assert vllm._token_rates(5, 1) == (None, None)           # counter reset -> no spike
+
+
+async def test_vllm_multi_model_is_disclosed(monkeypatch):
+    """parse_prom SUMS across label sets. That is right for one model and silently
+    merges two, so the collector reports which models it saw and flags multi_model —
+    otherwise a blended figure reads as a single model's."""
+    two = ('vllm:num_requests_running{model_name="A"} 1.0\n'
+           'vllm:num_requests_running{model_name="B"} 2.0\n')
+    srv = TestServer(_vllm_stub_app(two))
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["running"] == 3.0                    # summed, as before
+        assert out["multi_model"] is True
+        assert out["metrics_models"] == ["A", "B"]      # and says which
+    finally:
+        await srv.close()
+    one = 'vllm:num_requests_running{model_name="A"} 1.0\n'
+    srv2 = TestServer(_vllm_stub_app(one))
+    await srv2.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv2.make_url("")).rstrip("/"))
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["multi_model"] is False
+    finally:
+        await srv2.close()
+
+
+def test_vllm_queue_depth_alert():
+    """`waiting` is the saturation signal (running = busy, waiting = queued), so it needs
+    a threshold — a dashboard only helps if someone is looking at it."""
+    import alerts as _alerts
+    snap = {"collectors": {"vllm": {"available": True, "waiting": 7.0}}}
+    config.ALERT_VLLM_WAITING = 5.0
+    try:
+        keys = [k for k, _ in _alerts.evaluate(snap)]
+        assert "vllm_queue" in keys
+        snap["collectors"]["vllm"]["waiting"] = 2.0
+        assert "vllm_queue" not in [k for k, _ in _alerts.evaluate(snap)]
+        config.ALERT_VLLM_WAITING = 0.0                 # 0 disables, like the others
+        snap["collectors"]["vllm"]["waiting"] = 999.0
+        assert "vllm_queue" not in [k for k, _ in _alerts.evaluate(snap)]
+    finally:
+        config.ALERT_VLLM_WAITING = 0.0
+
+
+async def test_vllm_awaiting_traffic_distinguished_from_broken(monkeypatch):
+    """FIELD CASE: after a vLLM restart with no requests served, /metrics exposes only
+    GAUGES — Prometheus clients create counters/histograms on first observation. Every
+    token/latency/cache field then reads None, which is indistinguishable from a broken
+    exporter if the UI just prints "—". The collector must flag the difference: one means
+    "wait for a request", the other means "go debug"."""
+    gauges_only = ('vllm:num_requests_running{model_name="Q"} 0.0\n'
+                   'vllm:num_requests_waiting{model_name="Q"} 0.0\n')
+    srv = TestServer(_vllm_stub_app(gauges_only))
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "VLLM_METRICS_ENABLED", True)
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["available"] is True and out["metrics_available"] is True
+        assert out["awaiting_traffic"] is True          # idle, NOT broken
+        assert out["running"] == 0.0 and out["ttft_avg"] is None
+    finally:
+        await srv.close()
+    # once traffic has flowed the counters exist and the flag clears
+    with_traffic = gauges_only + 'vllm:prompt_tokens_total{model_name="Q"} 500\n'
+    srv2 = TestServer(_vllm_stub_app(with_traffic))
+    await srv2.start_server()
+    try:
+        monkeypatch.setattr(config, "VLLM_BASE_URL", str(srv2.make_url("")).rstrip("/"))
+        async with aiohttp.ClientSession() as s:
+            out = await vllm.sample(s)
+        assert out["awaiting_traffic"] is False and out["prompt_tokens"] == 500
+    finally:
+        await srv2.close()

@@ -6,6 +6,15 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-07-19
+
+Minor release rolling up this line's work: a **vLLM backend** dashboard; a **Spend →
+Cost per model & user over time** chart; **GPU/CPU** page (per-core grid + 100%-normalized
+stacked cores, always-on menu); a unified **month-to-date** time window across all pages;
+**external vs internal** token colouring on Usage-over-time; per-model **3-value** cost
+breakdown + the input/output **cost-doubling fix**; optional **`MONITOR_SPEND_REQUIRE_ADMIN`**
+gate; **`MONITOR_CURRENCY`**; Settings shows only cards for present backends.
+
 ### Added
 - **GPU page → "CPU usage per core" grid.** One live sparkline per logical CPU (0–100%,
   current % coloured amber ≥70 / red ≥90), from a new `cpu_per_core` field on the host
@@ -62,6 +71,15 @@ Versioning: [SemVer](https://semver.org/).
   live-only — so the metrics tiers aren't inflated for data nobody queries historically).
 
 ### Fixed
+- **GPU/CPU → "CPU usage by app (stacked)" no longer exceeds 100%.** The stacked
+  per-app chart plotted top-style per-process `%CPU` (each value is relative to ONE
+  core, so N busy processes could sum to `cores × 100`), with no axis cap — the stack
+  blew past 100%. Each band is now the app's share of *total* capacity (raw `%CPU ÷
+  cores`) on a fixed 0–100 axis, matching the *CPU cores (stacked)* card. The divisor
+  is an authoritative `ncpu` returned by `/api/procseries?kind=cpu` (distinct cores in
+  the window, from the per-core samples), so it's independent of client load order; the
+  tooltip recovers the raw top-style load as `band × cores`. Regression tests
+  `test_db_ncpu_counts_logical_cores_in_window` + `test_procseries_cpu_exposes_ncpu_for_normalization`.
 - **Stale image tags in deploy examples bumped to current.** `deploy/k8s/*.yaml`,
   `deploy/prometheus-example/` (compose default + README), and the README offline-install
   snippet still referenced old image tags (`:1.4.0` / `:1.0.0`); all now track the current

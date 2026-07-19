@@ -101,7 +101,7 @@ boot and logs the result.
 
 Each exposes `sample()` returning `{available, …}` and degrades to
 `{available: False, error}` on failure. Sources are all **native JSON / procfs**
-— no Prometheus:
+— each backend's own native endpoint (no Prometheus server/exporter/agent):
 
 - `host` — `/proc/stat` (delta CPU%), `/proc/meminfo`, `statvfs`, loadavg. Also emits
   `cpu_per_core: [%, …]` — the same delta maths applied to each `cpuN` line, one entry
@@ -111,6 +111,9 @@ Each exposes `sample()` returning `{available, …}` and degrades to
   by CPU% (delta) and RSS. `pid: host` to see host processes.
 - `gpu` — `nvidia-smi`/`rocm-smi` locally, **or remote** via SSH (`GPU_SSH`) or
   an HTTP agent (`GPU_METRICS_URL`); util/VRAM/power/temp/throttle.
+- `vllm` — `/health` + `/v1/models` (status, loaded model) and vLLM's own `/metrics`
+  (Prometheus text) for queue depth, KV-cache %, TTFT, throughput and preemptions;
+  gated by `VLLM_METRICS_ENABLED`, degrading to the JSON-only view when off.
 - `litellm` — `/health/liveliness`, `/v1/models`, `/health/backlog` (in-flight),
   and `/spend/logs` → latency (avg/p50/p95/p99/SLO), rates, tokens, cost, cache,
   TTFT, per-model + per-key aggregation, recent failures. `spend_mode=lite` swaps

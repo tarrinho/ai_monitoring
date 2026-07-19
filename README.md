@@ -22,9 +22,9 @@
 
 **LLM usage, cost, and infrastructure observability for a self-hosted LLM stack.**
 Track **spend, token throughput, and per-API-key usage** through **LiteLLM**,
-alongside the **GPU / host / Ollama / llama.cpp / container** health that inference
-actually runs on — all in one aiohttp app. Collectors poll each backend's **native
-JSON** endpoints (no Prometheus, no exporters, no agents), store to SQLite with
+alongside the **GPU / host / Ollama / llama.cpp / vLLM / container** health that inference
+actually runs on — all in one aiohttp app. Collectors poll each backend's **own native
+endpoints** (no Prometheus server, no exporters, no agents), store to SQLite with
 tiered rollups, and serve live dashboards that **lead with the cost & usage
 numbers**, not just system metrics.
 
@@ -75,11 +75,11 @@ appear when a LiteLLM backend is configured (otherwise `/spend` is hidden and
 returns 404).
 
 - **Zero external deps to monitor** — reads `/proc`, Ollama `/api/*`, LiteLLM
-  `/spend/logs` + `/health/*`, llama.cpp `/slots`, `nvidia-smi` (local or over
-  SSH), and the Docker socket (read-only) for container health. aiohttp + a
+  `/spend/logs` + `/health/*`, llama.cpp `/slots`, vLLM `/metrics`, `nvidia-smi`
+  (local or over SSH), and the Docker socket (read-only) for container health. aiohttp + a
   couple pure-python libs; nothing else.
-- **Eight dashboards** — Overview, LiteLLM, GPU, Ollama, llama.cpp, Alerts,
-  Spend & Quota, Settings. Collapsible sidebar, day/night, time-window + pan,
+- **Nine dashboards** — Overview, LiteLLM, GPU, Ollama, llama.cpp, vLLM,
+  Alerts, Spend & Quota, Settings. Collapsible sidebar, day/night, time-window + pan,
   CSV export.
 - **Retention up to years** — raw 24h, 1-minute + 1-hour rollups (configurable,
   default 1 year) so charts stay fast and the DB stays bounded.
@@ -133,6 +133,7 @@ attaches a cosign-signed image manifest (`*.txt` + `*.txt.bundle`).
 | `/gpu` | util, VRAM used/%/total, power, temp, throttle, per-GPU table, tokens/watt — local `nvidia-smi`/`rocm-smi` **or a remote GPU box over SSH / HTTP agent** |
 | `/ollama` | running/installed models, RAM/VRAM, %-on-GPU, per-model params/quant/unload-countdown, over-time charts |
 | `/llamacpp` | tokens/s, active/total slots, busy %, KV-cache %, context size, status, loaded-model card, over-time charts |
+| `/vllm` | **running / waiting** requests (queue depth), **GPU KV-cache %**, **TTFT** + per-token latency, prompt/generation token counters and **preemptions** (>0 = vLLM evicting under memory pressure). Read from vLLM's own `/metrics`; with `VLLM_METRICS_ENABLED=0` the page still shows status + loaded model and says why the counters are absent |
 | `/alerts` | configured channel, thresholds, active breaches, **"Send test alert"**, fired-alert history |
 | `/settings` (admin) | Operator tuning applied **live** (no restart): alerts, sampling, retention, LiteLLM/circuit-breaker knobs — drag-to-arrange cards, layout saved in the DB. A **Teams** board — one line per user (**email · team · per-user budget · keys**), ranked by usage, click a name for **ID · username · email · team · keys**; reassign a key's **team** or **user** as a local override (existing users only; LiteLLM untouched). A **Model costs** board — mark each model **real** (external paid) or **estimated** (self-hosted), driving the Spend cost split |
 
@@ -264,6 +265,17 @@ target, and client IP. Admins review it in the *Activity log* on `/admin/users`;
 rows are kept for `MONITOR_AUDIT_RETENTION_DAYS` (default 90).
 
 ### Backends (each optional)
+
+The self-hosted inference servers AI-Monitoring speaks to natively:
+
+<p>
+  <img src="web/assets/logos/ollama.svg" alt="Ollama" height="34" hspace="14">
+  <img src="web/assets/logos/llamacpp.svg" alt="llama.cpp" height="34" hspace="14">
+  <img src="web/assets/logos/vllm.svg" alt="vLLM" height="34" hspace="14">
+</p>
+
+_Logos © their respective projects ([Ollama](https://github.com/ollama/ollama), [llama.cpp](https://github.com/ggml-org/llama.cpp), [vLLM](https://github.com/vllm-project/media-kit)) — used to identify the integrations._
+
 | Var | Example | Meaning |
 |-----|---------|---------|
 | `LITELLM_BASE_URL` / `LITELLM_MASTER_KEY` | `http://host:4000` / `sk-…` | LiteLLM proxy + master key (for `/spend`,`/health`) |
@@ -281,6 +293,8 @@ rows are kept for `MONITOR_AUDIT_RETENTION_DAYS` (default 90).
 | `SLO_LATENCY_MS` | `2000` | latency SLO target (% of requests under it) |
 | `OLLAMA_BASE_URL` | `http://host:11434` | Ollama (no key needed) |
 | `LLAMACPP_BASE_URL` / `LLAMACPP_API_KEY` | `http://host:8080` / *(opt)* | llama.cpp server |
+| `VLLM_BASE_URL` / `VLLM_API_KEY` | `http://host:8000` / *(opt)* | vLLM (OpenAI-compatible) server |
+| `VLLM_METRICS_ENABLED` | `1` | read vLLM's own `/metrics` for queue depth, KV-cache %, TTFT, throughput and preemptions. Needs **no** Prometheus server/exporter/agent — it is vLLM reporting its own state, like llama.cpp's `/slots`. `0` = JSON endpoints only (status + model, no counters) |
 | `GPU_METRICS_FILE` / `GPU_FILE_MAX_AGE` | `/gpu/gpu.csv` / `30` | **LOCAL host GPU, safest**: host writes `nvidia-smi` CSV to a file (see `deploy/gpu-metrics.service`); monitor reads it **read-only** — no SSH/network/shell. Stale file (> max-age) → panel hides |
 | `GPU_SSH` / `GPU_SSH_PORT` / `GPU_SSH_KEY` | `user@gpuhost` / `22` / `/keys/id` | **remote** GPU via agentless SSH `nvidia-smi` |
 | `GPU_METRICS_URL` | `http://gpuhost:9835/gpu` | **remote** GPU via an HTTP agent returning `{gpus:[…]}` |
@@ -355,6 +369,7 @@ endpoint returning `{"gpus":[{util,vram_used,vram_total,power,temp,…}]}`.
 | `ALERT_CPU_PCT` / `ALERT_MEM_PCT` / `ALERT_DISK_PCT` | `0` | host CPU / mem / disk % ≥ value |
 | `ALERT_GPU_PCT` / `ALERT_VRAM_PCT` | `0` | GPU util / VRAM % ≥ value |
 | `ALERT_LLM_WAIT_MS` / `ALERT_BACKLOG` | `0` | LiteLLM avg wait / in-flight backlog ≥ value |
+| `ALERT_VLLM_WAITING` | `0` | vLLM **queued** requests ≥ value. `running` means busy; `waiting` means requests are queuing — the saturation signal |
 | `ALERT_ON_BACKEND_DOWN` | `1` | a configured backend goes down |
 | `ALERT_REPEAT_MIN` | `30` | cooldown before a still-firing alert re-notifies |
 | `ALERT_WEBHOOK_URL` | *(empty)* | delivery target — `POST {source, text}` |
@@ -445,10 +460,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.6.3-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.7.0-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.6.3-armv7 ai-monitoring:1.6.3
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.7.0-armv7 ai-monitoring:1.7.0
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```

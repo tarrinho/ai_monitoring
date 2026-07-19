@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.6.3"
+VERSION = "AI-Monitoring_1.7.0"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -214,6 +214,17 @@ OLLAMA_BASE_URL = _str("OLLAMA_BASE_URL")               # e.g. http://host:11434
 LLAMACPP_BASE_URL = _str("LLAMACPP_BASE_URL")           # e.g. http://host:8080
 LLAMACPP_API_KEY  = _str("LLAMACPP_API_KEY")            # optional Bearer
 
+# vLLM (OpenAI-compatible server). /health + /v1/models are JSON; the operational
+# signal an operator actually watches — queue depth, KV-cache pressure, TTFT,
+# throughput — is only on vLLM's OWN /metrics endpoint (Prometheus text format).
+# Reading it needs no Prometheus server, exporter or agent: it is vLLM serving its
+# own state, exactly like llama.cpp serving /slots. Set VLLM_METRICS_ENABLED=0 to
+# stay strictly on the JSON endpoints (up/down + model list only).
+VLLM_BASE_URL     = _str("VLLM_BASE_URL")               # e.g. http://host:8000
+VLLM_API_KEY      = _str("VLLM_API_KEY")                # optional Bearer
+VLLM_METRICS_ENABLED = (_str("VLLM_METRICS_ENABLED", "1") or "1").lower() in (
+    "1", "true", "yes", "on")
+
 # Container liveness / alive-time via the Docker Engine API. Comma-separated
 # container names to watch; empty = feature off. Requires the Docker socket
 # mounted into the monitor (see docker-compose.yml) + membership in its group.
@@ -249,6 +260,9 @@ ALERT_GPU_PCT       = _float("ALERT_GPU_PCT", 0.0)
 ALERT_VRAM_PCT      = _float("ALERT_VRAM_PCT", 0.0)     # vram_used/vram_total
 ALERT_LLM_WAIT_MS   = _float("ALERT_LLM_WAIT_MS", 0.0)  # LiteLLM avg wait
 ALERT_BACKLOG       = _float("ALERT_BACKLOG", 0.0)      # LiteLLM queue depth
+# vLLM queue depth: `running` means busy, but `waiting` means requests are QUEUED —
+# the saturation signal. 0 disables, like every other threshold here.
+ALERT_VLLM_WAITING  = _float("ALERT_VLLM_WAITING", 0.0)
 ALERT_ON_BACKEND_DOWN = _str("ALERT_ON_BACKEND_DOWN", "1") not in ("0", "false", "")
 ALERT_REPEAT_MIN    = _float("ALERT_REPEAT_MIN", 30.0)  # re-notify cooldown
 
@@ -293,6 +307,7 @@ def redacted_summary() -> dict:
         "litellm_key": "set" if LITELLM_MASTER_KEY else "absent",
         "ollama": OLLAMA_BASE_URL or "(unconfigured)",
         "llamacpp": LLAMACPP_BASE_URL or "(unconfigured)",
+        "vllm": VLLM_BASE_URL or "(unconfigured)",
         "gpu_mode": ("ssh:" + GPU_SSH) if GPU_SSH else (
             "http" if GPU_METRICS_URL else "local"),
         "dashboard_auth": "token" if DASHBOARD_TOKEN else "open",

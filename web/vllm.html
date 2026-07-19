@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI-Monitoring · llama.cpp</title>
+<title>AI-Monitoring · vLLM</title>
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
@@ -38,7 +38,9 @@
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px}
   .kpi{background:var(--panel2);border-radius:8px;padding:10px 12px}
   .kpi .v{font-size:22px;font-weight:600}
+  .kpi .v.warn{color:var(--warn)} .kpi .v.bad{color:var(--bad)}
   .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
+  .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
   table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
   th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
   th{color:var(--muted);font-weight:500}
@@ -178,7 +180,7 @@
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
 <div id="main-area">
 <header>
-  <h1>llama.cpp</h1>
+  <h1>vLLM</h1>
   <span class="badge" id="l-status"></span>
   <div class="windows" id="windows" role="group" aria-label="time window and range">
     <button id="nav-left" title="shift earlier" aria-label="shift window earlier">◀</button>
@@ -209,7 +211,7 @@
   </section>
 
   <section class="card" id="card-charts" style="grid-column:1/-1">
-    <h2>llama.cpp over time — <span id="win-label">24h</span>
+    <h2>vLLM over time — <span id="win-label">24h</span>
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>
     <div class="chart-grid" id="chart-grid"></div>
@@ -228,17 +230,55 @@ const _timers = [];
 window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
 
 let HOST_NCPU=0;
-function kpi(label,val){
-  return `<div class="kpi"><div class="v">${escapeHtml(val)}</div>`
+function kpi(label,val,cls){
+  return `<div class="kpi"><div class="v ${cls||""}">${escapeHtml(val)}</div>`
        + `<div class="l">${escapeHtml(label)}</div></div>`;
 }
 function badge(el, up, txt){ el.className="badge "+(up?"ok":"bad"); el.textContent=up?(txt||"live"):"down"; }
 function baseName(p){ if(!p) return "—"; const s=String(p); const i=s.lastIndexOf("/"); return i>=0?s.slice(i+1):s; }
 
+// vLLM's OWN series. These were llama.cpp's (tok/slots/kvcache) when this page was
+// seeded from that template — which plotted llama.cpp's numbers under a vLLM label
+// whenever both engines ran side by side.
 const CHARTS = [
-  {id:"c-tok",   key:"tok",     label:"Tokens/s",   color:"#7ee787"},
-  {id:"c-slots", key:"slots",   label:"Busy slots", color:"#79c0ff"},
-  {id:"c-kv",    key:"kvcache", label:"KV cache %", color:"#f778ba", max:100},
+  {id:"c-run",   key:"vrun",   label:"Running requests",      color:"#7ee787",
+   desc:"Requests actively being decoded right now. Sustained level shows how busy the "
+       +"engine is — compare against Waiting to see whether it is keeping up with demand."},
+  {id:"c-wait",  key:"vwait",  label:"Waiting (queue depth)", color:"#f0883e",
+   desc:"Requests queued waiting for a decode slot. Rising here while Running stays flat "
+       +"means the server is over capacity (saturation), not just slow."},
+  {id:"c-kv",    key:"vkv",    label:"KV cache %",            color:"#f778ba", max:100,
+   desc:"Fraction of the KV cache (GPU memory holding attention state) in use. As it "
+       +"approaches 100% vLLM must preempt or swap sequences to free room."},
+  // latency trio: TTFT is what a user feels first, per-token drives the stream speed,
+  // e2e is the whole request. Charting all three separates "slow to start" from
+  // "slow to stream".
+  {id:"c-ttft",  key:"vttft",  label:"TTFT (s)",              color:"#58a6ff", unit:"s",
+   desc:"Time To First Token — how long until the user sees the first token. The latency "
+       +"felt first; spikes point to slow prompt prefill or queueing."},
+  {id:"c-tpot",  key:"vtpot",  label:"Per-token (s)",         color:"#bc8cff", unit:"s",
+   desc:"Average time between generated tokens (TPOT) — it sets the streaming speed once "
+       +"generation has started."},
+  {id:"c-e2e",   key:"ve2e",   label:"End-to-end (s)",        color:"#39c5cf", unit:"s",
+   desc:"Full request latency from prompt to last token (TTFT plus all generation) — the "
+       +"total wait a caller experiences."},
+  // queue wait rising while running is flat = saturation, not slowness
+  {id:"c-queue", key:"vqueue", label:"Queue wait (s)",        color:"#ffa657", unit:"s",
+   desc:"Time a request spends queued before decoding begins. Rising queue wait is a "
+       +"saturation signal, distinct from slow per-token inference."},
+  // prefix-cache hits are why a repeated system prompt gets cheap — higher is better
+  {id:"c-hit",   key:"vhit",   label:"Prefix cache hit %",    color:"#e3b341", max:100,
+   desc:"Share of prompt tokens served from the prefix cache (reused system prompts). "
+       +"Higher is cheaper and faster; a drop means prompts are being recomputed."},
+  // Throughput. The raw counters are cumulative since server start and only ever rise,
+  // so they are differentiated into tokens/sec — the number an inference server is
+  // actually judged on, and the one that was missing entirely.
+  {id:"c-ptps",  key:"vptps",  label:"Prompt tokens/s",       color:"#79c0ff",
+   desc:"Prompt (input) tokens processed per second — prefill throughput, differentiated "
+       +"from vLLM's cumulative-since-start counter."},
+  {id:"c-gtps",  key:"vgtps",  label:"Generated tokens/s",    color:"#3fb950",
+   desc:"Output tokens produced per second — the headline generation throughput an "
+       +"inference server is ultimately judged on."},
 ];
 const _charts = {};
 function mkChart(canvas, cfg){
@@ -258,6 +298,9 @@ function mkChart(canvas, cfg){
     const card=document.createElement("div");card.className="mini";card.id=cfg.id+"-card";
     const h=document.createElement("h3");
     const nm=document.createElement("span");nm.textContent=cfg.label;
+    // per-graph info tooltip: what the graph is for + how to read it
+    if(cfg.desc){ const info=document.createElement("span"); info.className="info";
+      info.textContent="ⓘ"; info.title=cfg.desc; nm.append(" ",info); }
     const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
     h.append(nm,cur);
     const wrap=document.createElement("div");wrap.className="chart-wrap";
@@ -289,44 +332,93 @@ async function api(path){
   }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
 }
 
-function renderKpis(lc){
+// Collector errors are raw Python exception names ("conn: ClientConnectorError",
+// "TimeoutError"). Printing those verbatim tells an operator nothing about what to DO,
+// and reads as the dashboard itself being broken. Translate the known ones into an
+// action; fall back to the raw string so an unknown error is never swallowed.
+function friendlyErr(e){
+  const raw=String(e||"").trim();
+  if(!raw || raw==="unconfigured")
+    return "Not configured — set VLLM_BASE_URL (e.g. http://host:8000) to monitor vLLM.";
+  if(/ClientConnectorError|ConnectionRefused|ClientOSError|Cannot connect/i.test(raw))
+    return "Can't reach the server — check VLLM_BASE_URL and that the container is running "
+          +"(use the container name or host IP, not localhost, from inside Docker).";
+  if(/Timeout/i.test(raw))
+    return "Timed out — the server is slow to respond or unreachable at that address.";
+  if(/http 401|http 403/i.test(raw))
+    return "Rejected (auth) — set VLLM_API_KEY to match the server's --api-key.";
+  if(/http 404/i.test(raw))
+    return "Endpoint not found — check the port and that this is a vLLM OpenAI-compatible server.";
+  if(/http 5\d\d/i.test(raw))
+    return "The server returned an error response — check the vLLM container logs.";
+  return raw;   // unknown: show it rather than hide it
+}
+function renderKpis(v){
   const b=document.getElementById("l-badge");
   const st=document.getElementById("l-status");
-  if(!lc || lc.available===false){
+  if(!v || v.available===false){
     badge(b,false);
     st.textContent="";
     setHtml(document.getElementById("l-kpis"),
-      `<div class="unavail">${escapeHtml((lc&&lc.error)||"unconfigured")}</div>`);
+      `<div class="unavail" title="${escapeHtml(String((v&&v.error)||"unconfigured"))}">`
+      +`${escapeHtml(friendlyErr(v&&v.error))}</div>`);
     setHtml(document.getElementById("l-model"),
-      `<div class="unavail">Set LLAMACPP_BASE_URL (e.g. http://host:8080) to see the loaded model.</div>`);
+      `<div class="unavail">Set VLLM_BASE_URL (e.g. http://host:8000) to see the loaded model.</div>`);
     return;
   }
-  const loading = (lc.status||"").toLowerCase()==="loading";
-  badge(b,!loading,loading?"loading":(lc.status||"live"));
-  st.className="badge "+(loading?"bad":"ok"); st.textContent=lc.status||"ok";
+  badge(b,true,v.status||"live");
+  st.className="badge ok"; st.textContent=v.status||"ok";
+  // Waiting is the headline: running tells you it is busy, WAITING tells you it is
+  // over capacity. Preemptions >0 means vLLM is evicting sequences under memory
+  // pressure — the signal that a context/batch setting needs lowering.
+  const wait=v.waiting, warnWait=(wait!=null&&wait>0);
   setHtml(document.getElementById("l-kpis"),
-    kpi("Tokens/s", lc.predicted_per_second!=null?lc.predicted_per_second:"—")
-    +kpi("Slots active", (lc.slots_active!=null?lc.slots_active:0)+" / "+(lc.n_slots!=null?lc.n_slots:"—"))
-    +kpi("Busy", lc.slots_busy_pct!=null?lc.slots_busy_pct+"%":"—")
-    +kpi("KV cache", lc.kv_cache_pct!=null?lc.kv_cache_pct+"%":"—")
-    +kpi("Context", lc.ctx_size!=null?lc.ctx_size.toLocaleString():"—")
-    // CPU threads llama.cpp runs with, next to host cores: this is what tells you whether
-    // idle cores are idle BY DESIGN (work offloaded to the GPU) or starved by a low
-    // --threads. "gen / batch" = -t / -tb. "—" when the build's /props omits them.
-    +kpi("CPU threads", (lc.n_threads!=null?lc.n_threads:"—")
-         +" / "+(lc.n_threads_batch!=null?lc.n_threads_batch:"—")
-         +(HOST_NCPU?` <span class="sub">of ${HOST_NCPU} cores</span>`:""))
-    +kpi("Status", lc.status||"—"));
+    kpi("Running", v.running!=null?v.running:"—")
+    +kpi("Waiting", wait!=null?wait:"—", warnWait?"warn":"")
+    +kpi("KV cache", v.kv_cache_pct!=null?v.kv_cache_pct+"%":"—")
+    +kpi("TTFT", v.ttft_avg!=null?v.ttft_avg+"s":"—")
+    +kpi("Per-token", v.tpot_avg!=null?v.tpot_avg+"s":"—")
+    +kpi("End-to-end", v.e2e_avg!=null?v.e2e_avg+"s":"—")
+    +kpi("Queue wait", v.queue_avg!=null?v.queue_avg+"s":"—")
+    +kpi("Prefix cache", v.prefix_hit_pct!=null?v.prefix_hit_pct+"%":"—")
+    +kpi("Tokens/s", v.generation_tps!=null?v.generation_tps:"—")
+    +kpi("Swapped", v.swapped!=null?v.swapped:"—", (v.swapped>0)?"warn":"")
+    +kpi("Preemptions", v.preemptions!=null?v.preemptions:"—", (v.preemptions>0)?"warn":"")
+    +kpi("Status", v.status||"—"));
+  // When metrics are off/unreachable the panel must say WHY it is sparse, rather than
+  // showing a wall of "—" that reads as a broken backend.
+  const multi = v.multi_model
+    ? `<div class="unavail">⚠ /metrics reports ${(v.metrics_models||[]).length} models `
+      +`(${(v.metrics_models||[]).join(", ")}) — the figures above are SUMMED across them, `
+      +`not per-model.</div>`
+    : "";
+  // vLLM is up and reachable but has served nothing since it restarted: only gauges
+  // exist yet. Say that, instead of rendering the same wall of "—" that an unreachable
+  // /metrics produces — the two need completely different responses from the operator.
+  const idle = v.awaiting_traffic
+    ? `<div class="unavail">vLLM is up and /metrics is readable, but it has served `
+      +`<b>no requests since it (re)started</b> — token, latency and cache counters are `
+      +`only created on the first request, so they read "—" until traffic flows. `
+      +`Running/waiting are live.</div>`
+    : "";
+  const note = v.metrics_available
+    ? ""
+    : `<div class="unavail">Live counters need vLLM's own /metrics endpoint — `
+      +`unreachable or disabled (VLLM_METRICS_ENABLED=0). Showing model + status only.</div>`;
   setHtml(document.getElementById("l-model"),
-    `<table><tr><th>Model</th><th class="num">Context</th>`
-    +`<th class="num">Slots</th><th class="num">Active</th>`
-    +`<th class="num">KV %</th><th class="num">tok/s</th></tr>`
-    +`<tr><td class="mono" title="${escapeHtml(lc.model||"")}">${escapeHtml(baseName(lc.model))}</td>`
-    +`<td class="num">${lc.ctx_size!=null?lc.ctx_size.toLocaleString():"—"}</td>`
-    +`<td class="num">${lc.n_slots!=null?lc.n_slots:"—"}</td>`
-    +`<td class="num">${lc.slots_active!=null?lc.slots_active:0}</td>`
-    +`<td class="num">${lc.kv_cache_pct!=null?lc.kv_cache_pct+"%":"—"}</td>`
-    +`<td class="num">${lc.predicted_per_second!=null?lc.predicted_per_second:"—"}</td></tr></table>`);
+    idle + multi + note
+    +`<table><tr><th>Model</th><th class="num">Running</th><th class="num">Waiting</th>`
+    +`<th class="num">KV %</th><th class="num">Prompt tok/s</th><th class="num">Gen tok/s</th>`
+    +`<th class="num">Prompt total</th><th class="num">Gen total</th></tr>`
+    +`<tr><td class="mono" title="${escapeHtml(v.model||"")}">${escapeHtml(baseName(v.model))}</td>`
+    +`<td class="num">${v.running!=null?v.running:"—"}</td>`
+    +`<td class="num">${wait!=null?wait:"—"}</td>`
+    +`<td class="num">${v.kv_cache_pct!=null?v.kv_cache_pct+"%":"—"}</td>`
+    +`<td class="num">${v.prompt_tps!=null?v.prompt_tps:"—"}</td>`
+    +`<td class="num">${v.generation_tps!=null?v.generation_tps:"—"}</td>`
+    +`<td class="num" title="cumulative since vLLM started">${v.prompt_tokens!=null?Math.round(v.prompt_tokens).toLocaleString():"—"}</td>`
+    +`<td class="num" title="cumulative since vLLM started">${v.generation_tokens!=null?Math.round(v.generation_tokens).toLocaleString():"—"}</td>`
+    +`</tr></table>`);
 }
 
 async function loadSeries(){
@@ -396,7 +488,7 @@ async function tick(){
     const c=(d.latest||{}).collectors||{};
     // host core count, so "CPU threads" can be shown against the cores available
     HOST_NCPU=(c.host&&c.host.ncpu)||0;
-    renderKpis(c.llamacpp);
+    renderKpis(c.vllm);
     const t=(d.latest||{}).ts?new Date(d.latest.ts*1000).toLocaleTimeString():"—";
     document.getElementById("updated").textContent="updated "+t;
   }

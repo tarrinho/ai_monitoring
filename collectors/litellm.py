@@ -656,7 +656,11 @@ async def model_prices(session: aiohttp.ClientSession) -> dict:
         name = m.get("model_name") or lp.get("model") or ""
         ic = _fnum(lp.get("input_cost_per_token") or info.get("input_cost_per_token") or 0)
         oc = _fnum(lp.get("output_cost_per_token") or info.get("output_cost_per_token") or 0)
-        rate = ic + oc                    # per-token blended (in+out) — a rough estimate
+        # Blended per-token rate applied to TOTAL tokens. AVERAGE input+output (not SUM) so a
+        # model priced with input==output (a single blended rate the operator set) reads once,
+        # not doubled; a model with only one side priced (self-hosted, input-only) keeps that
+        # value. Summing here was the "costs show doubled" bug.
+        rate = (ic + oc) / 2 if (ic > 0 and oc > 0) else (ic + oc)
         if name and rate > 0:
             out[name] = rate
     if out:

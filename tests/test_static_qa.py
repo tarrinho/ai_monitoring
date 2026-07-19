@@ -3,6 +3,7 @@
 # secrets, dashboard security (§17), version consistency (§0a), fail-fast
 # config, and container hardening.
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -389,7 +390,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.6.3"
+    assert config.VERSION == "AI-Monitoring_1.7.0"
 
 
 def test_ux_improvements_present():
@@ -786,6 +787,51 @@ def test_trivyignore_accepts_hostpid_with_reason():
     low = body.lower()
     assert "hostpid" in low and ("by design" in low or "accepted" in low), \
         "every .trivyignore entry must document why it is accepted"
+
+
+def test_vllm_kpis_use_class_arg_not_embedded_markup():
+    """Regression: the vLLM KPI values (Waiting/Swapped/Preemptions) used to embed a
+    `<span class="c-warn">` inside kpi(), whose `escapeHtml(val)` then rendered the tag as
+    literal text ('<span class="">0…'). kpi() takes a class arg and the callers pass a bare
+    value, so the number shows and the warn colour is applied via a styled `.v.warn`."""
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    assert "function kpi(label,val,cls)" in html, "kpi() must accept a class arg"
+    assert re.search(r"<div class=\"v \$\{cls\|\|\"\"\}\">", html), "kpi() must apply cls to .v"
+    assert "kpi(\"Waiting\", wait!=null?wait:\"—\", warnWait?\"warn\":\"\")" in html
+    # no KPI call embeds raw span markup that escapeHtml would leak as text
+    assert not re.search(r'kpi\([^)]*<span', html), "kpi() must not receive <span> markup"
+    # the warn class it applies is actually styled
+    assert ".kpi .v.warn{color:var(--warn)}" in html
+
+
+def test_vllm_every_graph_has_a_tooltip():
+    """Every chart on the vLLM page must carry an info tooltip explaining its goal: each
+    CHARTS entry has a `desc`, and the builder renders it as an `.info` element."""
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    chart_ids = re.findall(r'\{id:"(c-[a-z0-9]+)"', html)
+    assert len(chart_ids) >= 10, f"expected the full vLLM chart set, found {chart_ids}"
+    # one desc per chart config
+    assert html.count("desc:") >= len(chart_ids), "every CHARTS entry needs a desc"
+    # the builder turns desc into an info tooltip element, and .info is styled
+    assert 'info.className="info"' in html and "info.title=cfg.desc" in html, \
+        "builder must render cfg.desc as an .info tooltip"
+    assert ".info{" in html, "vLLM page must style .info"
+
+
+def test_backend_logos_are_published():
+    """Every /assets/logos/*.svg the dashboards reference (nav mask-image, README row)
+    must be in the publish ALLOW-list, or the publisher drops it and the shipped pages
+    render broken icons. Regression for the logos-missing-from-ALLOW gap (rules §9a)."""
+    referenced = set()
+    for f in (ROOT / "web").glob("*.html"):
+        referenced.update(re.findall(r"/assets/logos/([\w.-]+\.svg)", f.read_text(encoding="utf-8")))
+    assert referenced, "expected at least one referenced backend logo"
+    pub = ROOT / "deploy" / "publish-github.sh"
+    if not pub.exists():           # publish script is not always vendored
+        return
+    allow = pub.read_text(encoding="utf-8")
+    for svg in sorted(referenced):
+        assert f"logos/{svg}" in allow, f"publish ALLOW-list missing web/assets/logos/{svg}"
 
 
 def test_trivyignore_is_published():
@@ -1189,7 +1235,7 @@ def test_dashboard_inline_scripts_parse():
 
     _INLINE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.S)
     for f in ("spend.html", "litellm.html", "settings.html", "index.html",
-              "alerts.html", "gpu.html"):
+              "alerts.html", "gpu.html", "vllm.html"):
         txt = (ROOT / "web" / f).read_text(encoding="utf-8")
         for i, m in enumerate(_INLINE.finditer(txt)):
             code = m.group(1)
@@ -1209,17 +1255,96 @@ def test_all_pages_have_consistent_time_window_with_mtd():
     """Every dashboard page carries the same header time-window control (15m/1h/24h/30d/
     12mo + month-to-date), a month-aware `wsecs` helper (no stale WSECS[WIN]), and the
     unified prettier pill styling."""
-    HEADER_PAGES = ("index", "gpu", "ollama", "llamacpp", "litellm")
+    HEADER_PAGES = ("index", "gpu", "ollama", "llamacpp", "litellm", "vllm")
     for name in HEADER_PAGES:
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         for w in ("15m", "1h", "24h", "30d", "12mo", "month"):
             assert f'data-w="{w}"' in html, f"{name}: missing window {w}"
-        assert 'data-w="month">MTD' in html, f"{name}: month button not labelled MTD"
+        # month button labelled MTD (aria-pressed attr may sit between data-w and >)
+        assert re.search(r'data-w="month"[^>]*>MTD', html), f"{name}: month button not labelled MTD"
+        # a11y: window buttons are a select group — each carries aria-pressed so the
+        # active window is announced, not signalled by colour alone; active one is "true".
+        wbtns = re.findall(r'<button data-w="[^"]*"[^>]*>', html)
+        assert wbtns and all("aria-pressed=" in b for b in wbtns), \
+            f"{name}: window buttons missing aria-pressed"
+        assert sum('aria-pressed="true"' in b for b in wbtns) == 1, \
+            f"{name}: exactly one window button must be aria-pressed=true"
         assert "function wsecs(" in html, f"{name}: missing month-aware wsecs() helper"
         assert "WSECS[WIN]" not in html, f"{name}: stale WSECS[WIN] (not month-aware)"
         assert "unified time-window control" in html, f"{name}: missing unified pill styling"
     # spend uses the same pill styling too (its windows are card-scoped / coarser)
     assert "unified time-window control" in (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+
+
+def test_no_duplicate_windows_css_block():
+    """Regression: the header time-window widget's CSS used to be defined twice per page
+    (an old faint-active block + the newer solid-accent one), the first dead-overridden
+    but its `margin-left` leaking. Exactly one `.windows{` selector per page now."""
+    for name in ("gpu", "index", "litellm", "llamacpp", "ollama", "vllm", "spend"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert html.count(".windows{") == 1, f"{name}: duplicate/dead .windows CSS block"
+
+
+def test_gpu_stacked_cpu_charts_normalized_to_100():
+    """Both stacked CPU charts on the GPU/CPU page (per-app + per-core) express each band
+    as a share of TOTAL capacity so the stack tops at 100%, not top-style per-process %CPU
+    (relative to one core → could sum to cores×100). Guards the >100% regression: a fixed
+    `max:100` axis, division by the core count, and a tooltip that recovers the raw load."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    # two stacked-area charts, both capped at 100%
+    assert html.count("stacked:true,beginAtZero:true,max:100") == 2, \
+        "both stacked CPU charts must pin the axis at max:100"
+    # per-app chart divides each process %CPU by the core count (from ncpu)
+    assert "_appCpuN=(d.ncpu&&d.ncpu>0)?d.ncpu:(_cpuCoreN>1?_cpuCoreN:1)" in html, \
+        "per-app chart must derive its divisor from ncpu"
+    assert "(p[a]==null?0:p[a])/n" in html, "per-app data must be divided by the core count"
+    # per-core chart divides each core% by N so the N bands sum to the overall load
+    assert "return (v==null?0:v)/n;" in html, "per-core bands must be core% ÷ N"
+    # both tooltips recover the raw top-style load (band × cores) + show the share
+    assert "c.parsed.y*_appCpuN" in html and "c.parsed.y*_cpuCoreN" in html, \
+        "tooltips must recover raw load as band × cores"
+    assert html.count('% of total)') >= 2, "tooltips must label the share as % of total"
+
+
+def test_appcpu_info_tooltip_describes_normalization():
+    """The per-app CPU card's info tooltip must explain the axis is normalized to % of
+    total (not raw per-process %CPU) — else the 0–100 axis silently misleads."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert "normalized to % of TOTAL capacity" in html
+    assert "band × cores" in html
+
+
+def test_chart_canvases_are_labelled_for_screen_readers():
+    """a11y: every static chart <canvas> exposes role=img + a text aria-label, so a
+    screen reader announces what the (otherwise opaque) chart shows instead of nothing.
+    Dynamically-built canvases get the same via cv.setAttribute in their JS builders."""
+    for name in ("gpu", "index", "litellm", "spend"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        canvases = re.findall(r"<canvas[^>]*>", html)
+        assert canvases, f"{name}: expected static canvases"
+        for c in canvases:
+            assert 'role="img"' in c and "aria-label=" in c, f"{name}: unlabelled canvas {c}"
+    # JS chart builders label the canvases they create
+    for name in ("gpu", "index", "litellm", "llamacpp", "ollama", "vllm"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'setAttribute("role","img")' in html or 'setAttribute("role", "img")' in html, \
+            f"{name}: dynamic canvas builder must label its canvas"
+
+
+def test_window_controls_are_grouped_and_labelled():
+    """a11y/UX: the header time-window control is a labelled group (role=group), the
+    icon-only pan buttons carry aria-labels (not title alone), and a visual divider
+    (.wsep) separates the window selector from the live/pan cluster."""
+    for name in ("gpu", "index", "litellm", "llamacpp", "ollama", "vllm"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'role="group"' in html, f"{name}: window control not a role=group"
+        for btn in ("nav-left", "nav-right", "nav-live"):
+            m = re.search(rf'<button id="{btn}"[^>]*>', html)
+            assert m and "aria-label=" in m.group(0), f"{name}: {btn} missing aria-label"
+        assert 'class="wsep"' in html and ".windows .wsep{" in html, \
+            f"{name}: missing window/pan divider"
+    # spend has no pan controls but its window group is still labelled
+    assert 'role="group"' in (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
 
 
 def test_usage_over_time_tokens_split_external_internal():
@@ -1294,13 +1419,53 @@ def test_config_tunables_exclude_secrets_and_switches():
 # ══════════════════════════════════════════════════════════════════════════════
 # Extra QA — 1.0.5 UI + packaging regressions
 # ══════════════════════════════════════════════════════════════════════════════
-_PAGES = ["index", "gpu", "litellm", "ollama", "llamacpp", "alerts"]
-_WINDOWED = ["index", "gpu", "litellm", "llamacpp", "ollama"]   # have the window nav
-_LLM_PAGES = ["litellm", "ollama", "llamacpp"]                  # default window = 24h
+_PAGES = ["index", "gpu", "litellm", "ollama", "llamacpp", "vllm", "alerts"]
+_WINDOWED = ["index", "gpu", "litellm", "llamacpp", "ollama", "vllm"]   # have the window nav
+_LLM_PAGES = ["litellm", "ollama", "llamacpp", "vllm"]                  # default window = 24h
 
 
 def _page(name):
     return (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+
+
+def test_backend_nav_logos_present_and_wired():
+    """The three LLM-backend nav entries use their official logos: the SVG assets exist,
+    every page's sidebar carries the logo classes (no leftover emoji), the two mono llama
+    marks tint via CSS mask (theme-aware), and vLLM keeps its 2-colour brand mark."""
+    for f in ("ollama", "llamacpp", "vllm"):
+        p = ROOT / "web" / "assets" / "logos" / f"{f}.svg"
+        assert p.exists(), f"logo asset {f}.svg missing"
+        assert "<svg" in p.read_text(encoding="utf-8"), f"{f}.svg is not an SVG"
+    for name in ("index", "gpu", "litellm", "ollama", "llamacpp", "vllm", "spend",
+                 "alerts", "settings", "admin", "account"):
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        assert 'class="navlogo nl-ollama"' in html, f"{name}: Ollama nav logo missing"
+        assert 'class="navlogo nl-llamacpp"' in html, f"{name}: llama.cpp nav logo missing"
+        assert 'class="navlogo nl-vllm"' in html, f"{name}: vLLM nav logo missing"
+        assert "🦙 Ollama" not in html and "⚡ vLLM" not in html, f"{name}: stale emoji nav"
+        # mono llamas → currentColor via mask (theme+hover safe); vLLM → its own colours
+        assert 'mask-image:url("/assets/logos/ollama.svg")' in html
+        assert 'nl-vllm::before{background:url("/assets/logos/vllm.svg")' in html
+
+
+def test_vllm_page_static_invariants():
+    """QA for the vLLM dashboard page: title/header, XSS-safe rendering (escapeHtml +
+    DOMPurify, a single innerHTML sink), timer cleanup on unload, the shared header
+    time-window control (incl. MTD) + range wiring, and the vLLM KPI hooks."""
+    html = _page("vllm")
+    assert "<title>AI-Monitoring · vLLM</title>" in html and "<h1>vLLM</h1>" in html
+    # XSS-safe: escapeHtml helper + DOMPurify.sanitize, exactly one innerHTML sink
+    assert "function escapeHtml" in html and "DOMPurify.sanitize" in html
+    assert html.count(".innerHTML") == 1, "vllm.html must have a single innerHTML sink"
+    # interval timers are tracked and cleared on unload (no leak)
+    assert "_timers" in html and 'addEventListener("beforeunload"' in html
+    # unified header window control incl. month-to-date + range wiring
+    for w in ("15m", "1h", "24h", "30d", "12mo", "month"):
+        assert f'data-w="{w}"' in html, f"vllm: missing window {w}"
+    assert "function wsecs(" in html and "WSECS[WIN]" not in html   # month-aware
+    assert 'id="range-dates"' in html and "function fmtRange(" in html
+    # vLLM-specific KPIs surfaced (queue pressure / KV cache — the headline signals)
+    assert "waiting" in html and "kv_cache" in html
 
 
 def test_sidebar_gpu_between_overview_and_litellm():
@@ -1346,7 +1511,7 @@ def test_llm_pages_default_to_24h_window():
     for name in _LLM_PAGES:
         html = _page(name)
         assert 'let WIN = "24h";' in html, f"{name}: default WIN must be 24h"
-        assert '<button data-w="24h" class="active">24h</button>' in html, \
+        assert 'data-w="24h" class="active"' in html, \
             f"{name}: the 24h button must be the active one"
         assert '<button data-w="1h" class="active">' not in html, \
             f"{name}: the 1h button must no longer be active"
@@ -1423,6 +1588,22 @@ def test_gpu_stacked_per_app_cpu_chart():
         "absent app must map to 0 (not null) on the stacked chart"
     assert re.search(r'spanGaps:\s*false', html), \
         "stacked appcpu chart must not spanGaps (0-fill instead)"
+
+
+def test_llamacpp_page_shows_cpu_threads_against_core_count():
+    """A thread count means nothing on its own — "10 threads" only answers "why are cores
+    idle?" when read against the cores available. The KPI must render both, and degrade to
+    "—" when the build's /props omits them rather than implying zero threads."""
+    html = (ROOT / "web" / "llamacpp.html").read_text(encoding="utf-8")
+    assert "CPU threads" in html
+    assert "n_threads" in html and "n_threads_batch" in html
+    # the core count is sourced from the same snapshot and shown alongside
+    assert "HOST_NCPU" in html
+    assert re.search(r'HOST_NCPU\s*=\s*\(c\.host&&c\.host\.ncpu\)', html), \
+        "core count must come from the host collector on the same snapshot"
+    # absent values render as an em dash, never as 0
+    assert re.search(r'lc\.n_threads!=null\?lc\.n_threads:"—"', html)
+    assert re.search(r'lc\.n_threads_batch!=null\?lc\.n_threads_batch:"—"', html)
 
 
 def test_team_rollup_refuses_to_score_mixed_cap_periods():
@@ -1802,3 +1983,115 @@ def test_prometheus_example_stack_shipped():
     allow = _publish_allow_list()
     if allow is not None:
         assert "deploy/prometheus-example/docker-compose.yml" in allow
+
+
+def test_keytime_card_states_its_window_semantics():
+    """"Top 10 API keys over time" plots a ROLLING window count (LITELLM_SPEND_WINDOW_MIN),
+    not a running total, so a line legitimately FALLS when a key goes quiet. Without that
+    stated the chart reads as broken data — the sibling delta card already says it is
+    cumulative, so one card explaining itself and the other not is the actual trap."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert 'id="keytime-sub"' in html
+    assert "rolling window, not a running" in html
+    assert "goes quiet" in html
+    # the window length comes from the collector, not a hard-coded 15
+    assert "_spendWinMin" in html
+    assert re.search(r'spend_window_min', html)
+    # lite mode reports no per-key requests → cumulative spend, which only rises
+    assert "only rises" in html
+
+
+def test_test_db_path_is_per_process():
+    """The suite's SQLite path must be unique per process. It was fixed, so two pytest
+    runs on one machine shared a file while the autouse fixture DELETEs users/tokens
+    before every test — each run wiped the other's fixtures mid-test and produced
+    unrelated 401 / KeyError('csrf') failures that looked like real auth bugs."""
+    src = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    assert "MONITOR_DB_PATH" in src
+    assert "getpid()" in src, "test DB path must be per-process to survive concurrent runs"
+
+
+def test_auth_reset_fixture_clears_every_lockout_map():
+    """The autouse reset must clear BOTH lockout tiers plus token sessions. The per-account
+    maps were added after the fixture was written and went unreset, so a test that failed
+    logins for a user left that account locked for every later test — making the suite pass
+    or fail on collection order alone."""
+    src = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    for name in ("_auth_fails", "_auth_locked_until",      # per-IP
+                 "_user_fails", "_user_locked_until",      # per-account
+                 "_token_sessions"):
+        assert re.search(rf'{name}\.clear\(\)', src), f"{name} is never reset between tests"
+
+
+def test_publish_allowlist_covers_every_collector_and_page():
+    """§9a publish parity: a new backend's collector + dashboard must be added to the
+    publish ALLOW-list or it silently never reaches the public repo — the app would ship
+    with a nav link to a page that isn't there. vLLM was added and initially missed."""
+    allow = _publish_allow_list()
+    if allow is None:
+        pytest.skip("publisher not checked out")
+    allow = set(allow)
+    import glob as _glob
+    for f in _glob.glob(str(ROOT / "collectors" / "*.py")):
+        name = "collectors/" + os.path.basename(f)
+        if os.path.basename(f) == "__init__.py" or name in allow:
+            continue
+        assert False, f"{name} is not in the publish ALLOW-list"
+    for f in _glob.glob(str(ROOT / "web" / "*.html")):
+        name = "web/" + os.path.basename(f)
+        assert name in allow, f"{name} is not in the publish ALLOW-list"
+
+
+def test_vllm_page_has_no_llamacpp_identity_left():
+    """REGRESSION: the page was seeded from the llama.cpp template and its chart card was
+    still titled "llama.cpp over time" in production. Any llama.cpp product name outside
+    the shared sidebar/CSS is a leftover."""
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    assert "vLLM over time" in html
+    body = "\n".join(ln for ln in html.splitlines()
+                     if 'href="/llamacpp"' not in ln and "nl-llamacpp" not in ln
+                     and "logos/llamacpp" not in ln and "were llama.cpp" not in ln)
+    assert "llama.cpp over time" not in body
+    # throughput + memory-pressure fields are surfaced
+    assert "Prompt tokens/s" in html and "Generated tokens/s" in html
+    assert "Swapped" in html
+    # cumulative totals are labelled as such, not passed off as current values
+    assert "cumulative since vLLM started" in html
+    # summed multi-model figures are disclosed
+    assert "SUMMED across them" in html
+
+
+def test_vllm_page_explains_idle_vs_unreachable_metrics():
+    """"No traffic yet" and "cannot read /metrics" both produce empty fields but need
+    opposite responses from an operator, so the page must not render them identically."""
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    assert "awaiting_traffic" in html
+    assert "no requests since it (re)started" in html
+    assert "only created on the first request" in html
+
+
+def test_vllm_page_translates_raw_collector_errors():
+    """Collector errors are raw Python exception names ("conn: ClientConnectorError",
+    "TimeoutError"). Shown verbatim they read as the dashboard being broken and tell an
+    operator nothing about what to fix, so the page maps the known ones to an action —
+    while still showing an UNKNOWN error rather than swallowing it."""
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    assert "function friendlyErr" in html
+    # the raw string is used as the fallback, so nothing is hidden
+    assert re.search(r'return raw;', html), "unknown errors must still be shown"
+    # and preserved on hover for diagnosis
+    assert re.search(r'title="\$\{escapeHtml\(String\(\(v&&v\.error\)', html)
+    # the cases that actually occur
+    for pattern in ("ClientConnectorError", "Timeout", "http 401", "http 404"):
+        assert pattern in html, f"no mapping for {pattern}"
+    # each maps to something actionable, not a class name
+    assert "VLLM_BASE_URL" in html and "VLLM_API_KEY" in html
+
+
+def test_vllm_empty_charts_auto_hide():
+    """§12: a chart with no data must hide its tile rather than render an empty axis —
+    an empty plot reads as a broken chart. Inherited convention; assert it survived the
+    page being seeded from another template."""
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    assert re.search(r'pts\.some\(p=>p\[cfg\.key\]!=null\)\?"":"none"', html), \
+        "empty vLLM chart tiles must auto-hide"

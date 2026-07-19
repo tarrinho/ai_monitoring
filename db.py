@@ -243,6 +243,11 @@ _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
                 "p50", "p95", "p99",
                 # Ollama
                 "orun", "oram", "ovram",
+                # vLLM — its own columns, NOT the llama.cpp ones. Both engines can run
+                # side by side, so charting vLLM on `tok`/`slots`/`kvcache` would plot
+                # llama.cpp's numbers under a vLLM label.
+                "vrun", "vwait", "vkv", "vttft", "vtpot", "ve2e", "vqueue", "vhit",
+                "vptps", "vgtps",
                 # stack-wide concurrent LLM work
                 "conc"]
 
@@ -732,6 +737,30 @@ def cpu_core_series(window: str, max_points: int = 200,
         return {"cores": cores, "points": pts}
     except Exception:
         return {"cores": [], "points": []}
+
+
+def ncpu(window: str = "1h", end: float | None = None) -> int:
+    """Logical-core count over the window, from the per-core samples. Used to
+    normalize top-style per-process %CPU (relative to ONE core, so up to
+    n_cores×100%) down to a share of TOTAL capacity (0–100). 0 when no per-core
+    data exists (caller then leaves the value un-normalized)."""
+    secs = window_secs(window)
+    end = end or time.time()
+    start = end - secs
+    if secs <= WINDOWS["1h"]:
+        table, tc = "cpu_core_series", "ts"
+    elif secs <= WINDOWS["24h"]:
+        table, tc = "cpu_core_series_1m", "bucket"
+    else:
+        table, tc = "cpu_core_series_1h", "bucket"
+    try:
+        with _connect() as conn:
+            r = conn.execute(
+                f"SELECT COUNT(DISTINCT core) FROM {table} WHERE {tc}>=? AND {tc}<=?",
+                (start, end)).fetchone()
+        return int(r[0]) if r and r[0] else 0
+    except Exception:
+        return 0
 
 
 def record_alert(ts: float, akey: str, kind: str, msg: str = "") -> None:

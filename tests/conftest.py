@@ -4,8 +4,12 @@ import sys
 # Project root on path so tests import app/config/db/collectors.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Isolate the test DB from any real /data path.
-os.environ.setdefault("MONITOR_DB_PATH", "/tmp/ai-monitoring-test.db")
+# Isolate the test DB from any real /data path — and from ANOTHER pytest run on the
+# same machine. The path used to be fixed, so two concurrent runs shared one SQLite
+# file while the autouse reset fixture DELETEs users/tokens/sessions before every
+# test: each run wiped the other's fixtures mid-test, surfacing as unrelated 401s and
+# `KeyError: 'csrf'` far from the real cause. Per-PID makes concurrent runs disjoint.
+os.environ.setdefault("MONITOR_DB_PATH", f"/tmp/ai-monitoring-test-{os.getpid()}.db")
 
 # Neutralize the production .env: config.py calls load_dotenv(), which would
 # otherwise pull the real dashboard token / backend URLs into the test process
@@ -64,4 +68,12 @@ def _reset_auth_state():
     _auth._sessions.clear()
     _app._auth_fails.clear()
     _app._auth_locked_until.clear()
+    # Per-ACCOUNT lockout + token sessions. These maps were added after this fixture
+    # was written and were never cleared, so a test that failed logins for a user left
+    # that account LOCKED for every later test — the suite then passed or failed
+    # depending purely on collection order (a locked account answers 401 with no csrf
+    # in the body, which surfaced as `KeyError: 'csrf'` far from the real cause).
+    _app._user_fails.clear()
+    _app._user_locked_until.clear()
+    _app._token_sessions.clear()
     yield

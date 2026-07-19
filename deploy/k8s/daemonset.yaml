@@ -23,7 +23,7 @@ spec:
       # nodeSelector: { nvidia.com/gpu.present: "true" }
       containers:
         - name: ai-monitoring
-          image: ghcr.io/tarrinho/ai_monitoring:1.6.3
+          image: ghcr.io/tarrinho/ai_monitoring:1.7.0
           ports:
             - { name: http, containerPort: 9925 }
           securityContext:

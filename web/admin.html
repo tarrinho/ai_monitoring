@@ -73,13 +73,25 @@
     #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
   }
 </style>
+<style>
+/* backend nav logos (Ollama / llama.cpp / vLLM): an equal-height icon before the label.
+   The two mono llama marks tint to the link colour (theme- + hover-aware) via CSS mask;
+   vLLM keeps its 2-colour brand mark. Same 15px box → equal visual height in the menu. */
+#sidebar-nav a.navlogo::before{content:"";display:inline-block;width:15px;height:15px;
+  vertical-align:-3px;margin-right:6px}
+#sidebar-nav a.nl-ollama::before,#sidebar-nav a.nl-llamacpp::before{
+  background-color:currentColor;-webkit-mask:center/contain no-repeat;mask:center/contain no-repeat}
+#sidebar-nav a.nl-ollama::before{-webkit-mask-image:url("/assets/logos/ollama.svg");mask-image:url("/assets/logos/ollama.svg")}
+#sidebar-nav a.nl-llamacpp::before{-webkit-mask-image:url("/assets/logos/llamacpp.svg");mask-image:url("/assets/logos/llamacpp.svg")}
+#sidebar-nav a.nl-vllm::before{background:url("/assets/logos/vllm.svg") center/contain no-repeat}
+</style>
 </head>
 <body>
 <div id="sidebar">
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.3</div>
+      <div id="sidebar-brand-ver">v1.7.0</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -88,8 +100,9 @@
     <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
-    <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
-    <a href="/llamacpp" style="padding-left:26px">🐫 llama.cpp</a>
+    <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
+    <a href="/llamacpp" class="navlogo nl-llamacpp" style="padding-left:26px">llama.cpp</a>
+    <a href="/vllm" class="navlogo nl-vllm" style="padding-left:26px">vLLM</a>
     <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
     <a href="/alerts" style="padding-left:26px">🔔 Alerts</a>
   </nav>
@@ -301,7 +314,7 @@
     /* hide nav links for unconfigured backends (same as the dashboards) */
     fetch("/api/nav").then(function(r){return r.ok?r.json():null;}).then(function(n){
       if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
-      [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+      [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp],["vllm",n.vllm]].forEach(function(x){
         if(!x[1])document.querySelectorAll('#sidebar-nav a[href="/'+x[0]+'"]').forEach(function(a){a.style.display="none";});
       });
     }).catch(function(){});

@@ -90,10 +90,6 @@ function updateSeries(chart,labels,next){
   .teamcard .tsub{font-size:11px;color:var(--muted);margin-top:8px;display:flex;justify-content:space-between;gap:8px}
 
   /* window toggle */
-  .windows{display:flex;gap:4px}
-  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
-    border-radius:6px;padding:4px 11px;font-size:12px;cursor:pointer}
-  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
   .chart-wrap{height:230px;margin-top:10px}
   /* custom cost-over-time legend — hover a label to list its models (title tooltip) */
   .ctlegend{display:flex;flex-wrap:wrap;gap:16px;font-size:11.5px;color:var(--muted)}
@@ -214,7 +210,7 @@ function updateSeries(chart,labels,next){
         {headers:tok?{Authorization:"Bearer "+tok}:{}})
         .then(function(r){return r.ok?r.json():null;})
         .then(function(n){ if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
-          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp],["vllm",n.vllm]].forEach(function(x){
             if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
               .forEach(function(a){a.style.display="none";});
           });
@@ -244,6 +240,19 @@ function updateSeries(chart,labels,next){
 .windows button:hover{color:var(--fg);border-color:var(--muted)}
 .windows button:disabled{opacity:.5;cursor:default}
 .windows button.active{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+.windows .wsep{width:1px;height:18px;background:var(--line);margin:0 5px;align-self:center;display:inline-block}
+</style>
+<style>
+/* backend nav logos (Ollama / llama.cpp / vLLM): an equal-height icon before the label.
+   The two mono llama marks tint to the link colour (theme- + hover-aware) via CSS mask;
+   vLLM keeps its 2-colour brand mark. Same 15px box → equal visual height in the menu. */
+#sidebar-nav a.navlogo::before{content:"";display:inline-block;width:15px;height:15px;
+  vertical-align:-3px;margin-right:6px}
+#sidebar-nav a.nl-ollama::before,#sidebar-nav a.nl-llamacpp::before{
+  background-color:currentColor;-webkit-mask:center/contain no-repeat;mask:center/contain no-repeat}
+#sidebar-nav a.nl-ollama::before{-webkit-mask-image:url("/assets/logos/ollama.svg");mask-image:url("/assets/logos/ollama.svg")}
+#sidebar-nav a.nl-llamacpp::before{-webkit-mask-image:url("/assets/logos/llamacpp.svg");mask-image:url("/assets/logos/llamacpp.svg")}
+#sidebar-nav a.nl-vllm::before{background:url("/assets/logos/vllm.svg") center/contain no-repeat}
 </style>
 </head>
 <body>
@@ -251,7 +260,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.3</div>
+      <div id="sidebar-brand-ver">v1.7.0</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -260,8 +269,9 @@ function updateSeries(chart,labels,next){
     <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
-    <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
-    <a href="/llamacpp" style="padding-left:26px">🐫 llama.cpp</a>
+    <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
+    <a href="/llamacpp" class="navlogo nl-llamacpp" style="padding-left:26px">llama.cpp</a>
+    <a href="/vllm" class="navlogo nl-vllm" style="padding-left:26px">vLLM</a>
     <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
     <a href="/alerts" style="padding-left:26px">🔔 Alerts</a>
   </nav>
@@ -273,10 +283,10 @@ function updateSeries(chart,labels,next){
     <h1>Spend &amp; Quota</h1>
     <div class="sub">LLM cost &amp; usage · per-key budgets</div>
   </div>
-  <div class="windows" id="sp-windows" title="time window — applies to every chart on this page">
-    <button data-w="30d" class="active">30d</button>
-    <button data-w="12mo">12mo</button>
-    <button data-w="month">MTD</button>
+  <div class="windows" id="sp-windows" role="group" aria-label="time window" title="time window — applies to every chart on this page">
+    <button data-w="30d" class="active" aria-pressed="true">30d</button>
+    <button data-w="12mo" aria-pressed="false">12mo</button>
+    <button data-w="month" aria-pressed="false">MTD</button>
   </div>
   <span id="updated">connecting…</span>
   <button id="theme-btn" class="badge" title="toggle day / night"
@@ -291,7 +301,7 @@ function updateSeries(chart,labels,next){
     <h2>Usage over time</h2>
     <div class="hint" style="margin-top:2px">requests &amp; tokens per day — daily cost needs LiteLLM Enterprise; per-key spend is below</div>
     <div id="split-note" class="hint" style="margin-top:6px"></div>
-    <div class="chart-wrap"><canvas id="spend-chart"></canvas></div>
+    <div class="chart-wrap"><canvas id="spend-chart" role="img" aria-label="Usage over time: requests and tokens per day"></canvas></div>
     <div class="years" id="years"></div>
   </section>
 
@@ -305,7 +315,7 @@ function updateSeries(chart,labels,next){
     </div>
     <div id="cost-time-legend" class="ctlegend" style="margin-top:6px"></div>
     <div id="cost-time-note" class="hint" style="margin-top:6px"></div>
-    <div class="chart-wrap"><canvas id="cost-time-chart"></canvas></div>
+    <div class="chart-wrap"><canvas id="cost-time-chart" role="img" aria-label="Cost over time"></canvas></div>
   </section>
 
   <section class="card" id="card-cost" aria-label="Cost by user">
@@ -316,7 +326,7 @@ function updateSeries(chart,labels,next){
         <button data-by="team">by team</button>
       </span></h2>
     <div class="hint" style="margin-top:2px">cumulative spend to date (LiteLLM per-key totals) — real cash, all-time · <b>click a user to see the keys they used</b></div>
-    <div class="chart-wrap"><canvas id="cost-chart"></canvas></div>
+    <div class="chart-wrap"><canvas id="cost-chart" role="img" aria-label="Cost by user"></canvas></div>
     <div id="cost-detail"></div>
   </section>
 
@@ -328,7 +338,7 @@ function updateSeries(chart,labels,next){
   <section class="card" id="card-model-cost-time" aria-label="Cost per model over time" style="display:none">
     <h2>Cost per model over time
       <span class="hint">real (solid) vs estimated (dashed) cost per model, per bucket · top 10 + Other · click a legend label to toggle</span></h2>
-    <div class="chart-wrap"><canvas id="model-cost-chart"></canvas></div>
+    <div class="chart-wrap"><canvas id="model-cost-chart" role="img" aria-label="Cost per model over time"></canvas></div>
     <div id="model-cost-note" class="hint" style="margin-top:8px"></div>
   </section>
 
@@ -343,7 +353,7 @@ function updateSeries(chart,labels,next){
         <button data-g="model" class="active">by model</button>
         <button data-g="user">by user</button>
       </span></div>
-    <div class="chart-wrap"><canvas id="model-user-cost-chart"></canvas></div>
+    <div class="chart-wrap"><canvas id="model-user-cost-chart" role="img" aria-label="Cost per model and user over time"></canvas></div>
   </section>
 
   <section class="card" id="card-keys" aria-label="Per-key budgets">
@@ -772,8 +782,8 @@ async function loadSpendSeries(){
 }
 document.querySelectorAll("#sp-windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
-    document.querySelectorAll("#sp-windows button").forEach(x=>x.classList.remove("active"));
-    b.classList.add("active"); SPWIN=b.dataset.w;
+    document.querySelectorAll("#sp-windows button").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); SPWIN=b.dataset.w;
     loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries();   // one window, all charts
   });
 });

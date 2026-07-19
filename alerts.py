@@ -166,6 +166,7 @@ def thresholds_status() -> dict:
         "disk_pct": config.ALERT_DISK_PCT, "gpu_pct": config.ALERT_GPU_PCT,
         "vram_pct": config.ALERT_VRAM_PCT, "llm_wait_ms": config.ALERT_LLM_WAIT_MS,
         "backlog": config.ALERT_BACKLOG, "backend_down": config.ALERT_ON_BACKEND_DOWN,
+        "vllm_waiting": config.ALERT_VLLM_WAITING,
         "anomaly_factor": config.ANOMALY_FACTOR,
         "key_budget_hr": config.ANOMALY_KEY_BUDGET_HR,
         "repeat_min": config.ALERT_REPEAT_MIN,
@@ -209,12 +210,17 @@ def evaluate(snap: dict) -> list[tuple[str, str]]:
             (ll.get("wait_avg_ms") or 0) >= config.ALERT_LLM_WAIT_MS:
         out.append(("wait", f"LLM wait {ll['wait_avg_ms']}ms ≥ "
                             f"{config.ALERT_LLM_WAIT_MS}ms"))
+    vl = snap.get("collectors", {}).get("vllm", {}) or {}
+    if config.ALERT_VLLM_WAITING and vl.get("available") and \
+            (vl.get("waiting") or 0) >= config.ALERT_VLLM_WAITING:
+        out.append(("vllm_queue", f"vLLM queue {vl['waiting']:.0f} waiting ≥ "
+                                  f"{config.ALERT_VLLM_WAITING:.0f}"))
     if config.ALERT_BACKLOG and ll.get("available") and \
             (ll.get("backlog") or 0) >= config.ALERT_BACKLOG:
         out.append(("backlog", f"LLM queue backlog {ll['backlog']} ≥ "
                               f"{config.ALERT_BACKLOG}"))
     if config.ALERT_ON_BACKEND_DOWN:
-        for name in ("litellm", "ollama", "llamacpp", "gpu"):
+        for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
             b = c.get(name, {})
             # "configured but down" = available False and not the unconfigured note
             if b and b.get("available") is False and \

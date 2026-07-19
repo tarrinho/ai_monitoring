@@ -66,10 +66,7 @@ function updateSeries(chart,labels,next){
   td.num{text-align:right;font-variant-numeric:tabular-nums}
   .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
   .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
-  .windows{display:flex;gap:4px;margin-left:8px}
-  .windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
-    border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
-  .windows button.active{color:var(--fg);border-color:var(--accent);background:#1f6feb22}
+  .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
   /* single-column grid → every card fills the row (no implicit extra column from
      `span 2`, which is what left cards at partial width on wide screens) */
   .span-2{grid-column:1/-1}
@@ -137,7 +134,7 @@ function updateSeries(chart,labels,next){
         {headers:tok?{Authorization:"Bearer "+tok}:{}})
         .then(function(r){return r.ok?r.json():null;})
         .then(function(n){ if(!n)return;if(n.admin){var _se=document.getElementById("nav-settings");if(_se)_se.style.display="";}
-          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp]].forEach(function(x){
+          [["spend",n.spend],["litellm",n.litellm],["gpu",n.gpu],["ollama",n.ollama],["llamacpp",n.llamacpp],["vllm",n.vllm]].forEach(function(x){
             if(!x[1]) document.querySelectorAll('a[href="/'+x[0]+'"]')
               .forEach(function(a){a.style.display="none";});
           });
@@ -167,6 +164,19 @@ function updateSeries(chart,labels,next){
 .windows button:hover{color:var(--fg);border-color:var(--muted)}
 .windows button:disabled{opacity:.5;cursor:default}
 .windows button.active{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+.windows .wsep{width:1px;height:18px;background:var(--line);margin:0 5px;align-self:center;display:inline-block}
+</style>
+<style>
+/* backend nav logos (Ollama / llama.cpp / vLLM): an equal-height icon before the label.
+   The two mono llama marks tint to the link colour (theme- + hover-aware) via CSS mask;
+   vLLM keeps its 2-colour brand mark. Same 15px box → equal visual height in the menu. */
+#sidebar-nav a.navlogo::before{content:"";display:inline-block;width:15px;height:15px;
+  vertical-align:-3px;margin-right:6px}
+#sidebar-nav a.nl-ollama::before,#sidebar-nav a.nl-llamacpp::before{
+  background-color:currentColor;-webkit-mask:center/contain no-repeat;mask:center/contain no-repeat}
+#sidebar-nav a.nl-ollama::before{-webkit-mask-image:url("/assets/logos/ollama.svg");mask-image:url("/assets/logos/ollama.svg")}
+#sidebar-nav a.nl-llamacpp::before{-webkit-mask-image:url("/assets/logos/llamacpp.svg");mask-image:url("/assets/logos/llamacpp.svg")}
+#sidebar-nav a.nl-vllm::before{background:url("/assets/logos/vllm.svg") center/contain no-repeat}
 </style>
 </head>
 <body>
@@ -174,7 +184,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.3</div>
+      <div id="sidebar-brand-ver">v1.7.0</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -183,8 +193,9 @@ function updateSeries(chart,labels,next){
     <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
-    <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
-    <a href="/llamacpp" style="padding-left:26px">🐫 llama.cpp</a>
+    <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
+    <a href="/llamacpp" class="navlogo nl-llamacpp" style="padding-left:26px">llama.cpp</a>
+    <a href="/vllm" class="navlogo nl-vllm" style="padding-left:26px">vLLM</a>
     <a href="/settings" id="nav-settings" style="display:none">⚙️ Settings</a>
     <a href="/alerts" style="padding-left:26px">🔔 Alerts</a>
   </nav>
@@ -193,16 +204,16 @@ function updateSeries(chart,labels,next){
 <div id="main-area">
 <header>
   <h1>LiteLLM</h1>
-  <div class="windows" id="windows">
-    <button id="nav-left" title="shift earlier">◀</button>
-    <button data-w="15m">15m</button>
-    <button data-w="1h">1h</button>
-    <button data-w="24h" class="active">24h</button>
-    <button data-w="30d">30d</button>
-    <button data-w="12mo">12mo</button>
-    <button data-w="month">MTD</button>
-    <button id="nav-right" title="shift later" disabled>▶</button>
-    <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
+  <div class="windows" id="windows" role="group" aria-label="time window and range">
+    <button id="nav-left" title="shift earlier" aria-label="shift window earlier">◀</button>
+    <button data-w="15m" aria-pressed="false">15m</button>
+    <button data-w="1h" aria-pressed="false">1h</button>
+    <button data-w="24h" class="active" aria-pressed="true">24h</button>
+    <button data-w="30d" aria-pressed="false">30d</button>
+    <button data-w="12mo" aria-pressed="false">12mo</button>
+    <button data-w="month" aria-pressed="false">MTD</button>
+    <button id="nav-right" title="shift later" disabled aria-label="shift window later">▶</button>
+    <span class="wsep" aria-hidden="true"></span><button id="nav-live" title="jump to now (live)" disabled aria-label="jump to now, live">● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
     <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
@@ -246,57 +257,60 @@ function updateSeries(chart,labels,next){
   </section>
 
   <section class="card span-2" id="card-keys">
-    <h2>Top 10 API keys by requests <span class="badge" id="keys-win"></span></h2>
-    <div class="chart-wrap" style="height:240px"><canvas id="keys-chart"></canvas></div>
+    <h2>Top 10 API keys by requests <span class="badge" id="keys-win"></span>
+      <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 keys — requests in window' below.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:240px"><canvas id="keys-chart" role="img" aria-label="Requests by API key"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-userkeys">
-    <h2>Top 10 API users by requests <span class="badge" id="userkeys-win"></span></h2>
+    <h2>Top 10 API users by requests <span class="badge" id="userkeys-win"></span>
+      <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 users — requests in window' below.">ⓘ</span></h2>
     <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
       keys aggregated per owner (username = email local part; a key with no resolved owner is shown by its key)</div>
-    <div class="chart-wrap" style="height:240px"><canvas id="user-keys-chart"></canvas></div>
+    <div class="chart-wrap" style="height:240px"><canvas id="user-keys-chart" role="img" aria-label="Requests by user"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-keytime">
     <h2>Top 10 API keys over time <span id="keytime-metric" class="badge">by requests</span> — <span id="keytime-win">24h</span></h2>
-    <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart"></canvas></div>
+    <div class="sub" id="keytime-sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px"></div>
+    <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart" role="img" aria-label="Requests over time by key"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-keydelta">
     <h2>Top 10 API keys — requests in window <span id="keydelta-win" class="badge"></span></h2>
     <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
       cumulative requests during the window (running total from the window start), so a key with no new activity stays flat at 0</div>
-    <div class="chart-wrap" style="height:260px"><canvas id="keydelta-chart"></canvas></div>
+    <div class="chart-wrap" style="height:260px"><canvas id="keydelta-chart" role="img" aria-label="Cumulative requests by key"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-userdelta">
     <h2>Top 10 API users — requests in window <span id="userdelta-win" class="badge"></span></h2>
     <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
       cumulative requests during the window, aggregated per user (sum of each owner's keys)</div>
-    <div class="chart-wrap" style="height:260px"><canvas id="userdelta-chart"></canvas></div>
+    <div class="chart-wrap" style="height:260px"><canvas id="userdelta-chart" role="img" aria-label="Cumulative requests by user"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-corr">
     <h2>Concurrency vs p95 latency — <span id="corr-win">24h</span></h2>
-    <div class="chart-wrap" style="height:170px"><canvas id="corr-chart"></canvas></div>
+    <div class="chart-wrap" style="height:170px"><canvas id="corr-chart" role="img" aria-label="Request rate versus latency"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-impact">
     <h2>Load vs resource impact — <span id="impact-win">24h</span>
       <span class="info" title="Request rate vs GPU util, KV-cache, and the llama.cpp process CPU % and RAM % (RSS / host memory) — the per-execution cost signals for a GPU-served LLM. Dedicated CPU + RAM over-time charts are below.">ⓘ</span></h2>
-    <div class="chart-wrap" style="height:190px"><canvas id="impact-chart"></canvas></div>
+    <div class="chart-wrap" style="height:190px"><canvas id="impact-chart" role="img" aria-label="Serving impact: request rate versus GPU, CPU and RAM"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-svc-cpu">
     <h2>LLM serving CPU over time — <span id="svc-cpu-win">24h</span>
       <span class="info" title="Per-process CPU % of the LLM serving processes (llama-server, ollama) over the window.">ⓘ</span></h2>
-    <div class="chart-wrap" style="height:170px"><canvas id="svc-cpu-chart"></canvas></div>
+    <div class="chart-wrap" style="height:170px"><canvas id="svc-cpu-chart" role="img" aria-label="LLM serving CPU over time"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-svc-ram">
     <h2>LLM serving RAM over time — <span id="svc-ram-win">24h</span>
       <span class="info" title="Resident memory (RSS) of the LLM serving processes over the window.">ⓘ</span></h2>
-    <div class="chart-wrap" style="height:170px"><canvas id="svc-ram-chart"></canvas></div>
+    <div class="chart-wrap" style="height:170px"><canvas id="svc-ram-chart" role="img" aria-label="LLM serving RAM over time"></canvas></div>
   </section>
 
   <section class="card span-full" id="card-charts">
@@ -332,6 +346,7 @@ function servedBy(model){
 let _procs = null;
 let _hostMemTotal = 0;   // host total RAM (bytes) → serving-process RSS as a %
 let _spendMode = "full"; // lite mode has no per-key requests → key charts show spend
+let _spendWinMin = null;  // LITELLM_SPEND_WINDOW_MIN, for the key-chart sub-line
 function svcProc(backend){
   const p=_procs||{}, cpu=p.top_cpu||[], ram=p.top_ram||[];
   const names = backend==="llama.cpp" ? ["llama-server","llama-cpp","llama_cpp"]
@@ -403,7 +418,7 @@ function mkChart(canvas, cfg){
     const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
     h.append(nm,cur);
     const wrap=document.createElement("div");wrap.className="chart-wrap";
-    const cv=document.createElement("canvas");cv.id=cfg.id;wrap.appendChild(cv);
+    const cv=document.createElement("canvas");cv.id=cfg.id;cv.setAttribute("role","img");cv.setAttribute("aria-label",cfg.label||cfg.id);wrap.appendChild(cv);
     card.append(h,wrap);grid.appendChild(card);
     _charts[cfg.id]=mkChart(cv,cfg);
   }
@@ -835,6 +850,15 @@ async function loadKeyTime(){
   // lite mode ranks keys by spend (no per-key request counts) → label accordingly
   const km=document.getElementById("keytime-metric");
   if(km) km.textContent = _spendMode==="lite" ? "by spend" : "by requests";
+  // A falling line here is normal in full mode and alarming-looking without this note:
+  // each point is a ROLLING window count, not a running total, so it decays toward 0
+  // when a key goes quiet. In lite mode the value is cumulative spend and only rises.
+  const ksub=document.getElementById("keytime-sub");
+  if(ksub) ksub.textContent = _spendMode==="lite"
+    ? "cumulative spend to date per key — only rises (lite mode reports no per-key request counts)"
+    : "requests in the trailing "+(_spendWinMin||15)+" min (rolling window, not a running "
+      +"total) — a line falls when that key goes quiet, and reaches 0 after "
+      +(_spendWinMin||15)+" min of no traffic";
   if(!d){ return; }
   const pts=d.points||[]; const labels=d.labels||[];
   updateSeries(keyTimeChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
@@ -910,8 +934,8 @@ document.getElementById("nav-live").addEventListener("click",()=>{
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
-    document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
-    b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
+    document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
     document.getElementById("win-label").textContent=WIN;
     loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadCorr(); loadImpact(); loadModels();
   });
@@ -930,6 +954,7 @@ async function tick(){
     _procs = c.procs || null;
     _hostMemTotal = (c.host && c.host.mem_total) || 0;
     _spendMode = (c.litellm && c.litellm.spend_mode) || "full";
+    _spendWinMin = (c.litellm && c.litellm.spend_window_min) || null;
     renderKpis(c.litellm);
     renderKeys(c.litellm);
     renderUserKeys(c.litellm);

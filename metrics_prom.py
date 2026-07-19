@@ -82,7 +82,7 @@ def render(latest: dict, extra: dict | None = None) -> str:
         o.gauge("aimon_host_cpus", h.get("ncpu"))
 
     # backend reachability — one family for all backends
-    for name in ("gpu", "litellm", "ollama", "llamacpp", "containers"):
+    for name in ("gpu", "litellm", "ollama", "llamacpp", "vllm", "containers"):
         b = c.get(name, {})
         o.gauge("aimon_backend_up", 1 if b.get("available") else 0,
                 {"backend": name}, "1 if the backend is reachable")
@@ -120,6 +120,17 @@ def render(latest: dict, extra: dict | None = None) -> str:
         o.gauge("aimon_llamacpp_kv_cache_percent", lc.get("kv_cache_pct"))
         o.gauge("aimon_llamacpp_slots_active", lc.get("slots_active"))
         o.gauge("aimon_llamacpp_slots_total", lc.get("n_slots"))
+
+    vl = c.get("vllm", {})
+    if vl.get("available"):
+        # Queue depth is the one an alert should watch: running means busy, WAITING
+        # means over capacity. Preemptions >0 means eviction under memory pressure.
+        o.gauge("aimon_vllm_requests_running", vl.get("running"))
+        o.gauge("aimon_vllm_requests_waiting", vl.get("waiting"),
+                help="vLLM queued requests waiting for a slot")
+        o.gauge("aimon_vllm_kv_cache_percent", vl.get("kv_cache_pct"))
+        o.gauge("aimon_vllm_ttft_seconds", vl.get("ttft_avg"))
+        o.gauge("aimon_vllm_preemptions_total", vl.get("preemptions"))
 
     ol = c.get("ollama", {})
     if ol.get("available"):

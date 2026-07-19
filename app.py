@@ -30,7 +30,7 @@ import auth
 import alerts
 import anomaly
 import metrics_prom
-from collectors import host, litellm, ollama, llamacpp, gpu, procs, containers
+from collectors import host, litellm, ollama, llamacpp, vllm, gpu, procs, containers
 
 _notifier = alerts.Notifier()
 # last-known up/down state per backend, for transition (event) detection
@@ -67,6 +67,7 @@ _backend_latest: dict = {
     "litellm": {"available": False, "error": "starting"},
     "ollama": {"available": False, "error": "starting"},
     "llamacpp": {"available": False, "error": "starting"},
+    "vllm": {"available": False, "error": "starting"},
     "containers": {"available": False, "error": "starting"},
 }
 
@@ -111,6 +112,7 @@ async def _sample_once(session: aiohttp.ClientSession) -> dict:
                        "litellm": _backend_latest["litellm"],
                        "ollama": _backend_latest["ollama"],
                        "llamacpp": _backend_latest["llamacpp"],
+                       "vllm": _backend_latest["vllm"],
                        "containers": _backend_latest["containers"]},
     }
 
@@ -124,6 +126,7 @@ def _metrics_row(snap: dict) -> dict:
     c = snap["collectors"]
     h, g = c.get("host", {}), c.get("gpu", {})
     ol, ll, lc = c.get("ollama", {}), c.get("litellm", {}), c.get("llamacpp", {})
+    vl = c.get("vllm", {})
     host_ok = h.get("available")
     gpu_ok = g.get("available")
     vram_used = g.get("vram_used") if gpu_ok else (
@@ -160,6 +163,18 @@ def _metrics_row(snap: dict) -> dict:
         "orun": ol.get("models_running") if ol.get("available") else None,
         "oram": ol.get("ram_used") if ol.get("available") else None,
         "ovram": ol.get("vram_used") if ol.get("available") else None,
+        # vLLM series — separate from llama.cpp's tok/slots/kvcache so both
+        # engines can be charted independently when they run side by side.
+        "vrun": vl.get("running") if vl.get("available") else None,
+        "vwait": vl.get("waiting") if vl.get("available") else None,
+        "vkv": vl.get("kv_cache_pct") if vl.get("available") else None,
+        "vttft": vl.get("ttft_avg") if vl.get("available") else None,
+        "vtpot": vl.get("tpot_avg") if vl.get("available") else None,
+        "ve2e": vl.get("e2e_avg") if vl.get("available") else None,
+        "vqueue": vl.get("queue_avg") if vl.get("available") else None,
+        "vhit": vl.get("prefix_hit_pct") if vl.get("available") else None,
+        "vptps": vl.get("prompt_tps") if vl.get("available") else None,
+        "vgtps": vl.get("generation_tps") if vl.get("available") else None,
         "conc": _concurrency(ll, lc),
     }
 
@@ -253,7 +268,7 @@ def _track_events(snap: dict) -> None:
     """Record up/down transitions for configured backends (uptime history)."""
     c = snap["collectors"]
     ts = snap["ts"]
-    for name in ("litellm", "ollama", "llamacpp", "gpu"):
+    for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
         b = c.get(name, {})
         # only track backends that are actually configured (not the "unconfigured"
         # note); a configured backend is either up or down-with-a-real-error.
@@ -582,7 +597,7 @@ def _is_master_token_auth(request: web.Request) -> bool:
 
 
 # HTML pages that require auth (static assets + /healthz + /login stay open).
-_PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/alerts",
+_PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/vllm", "/alerts",
           "/admin/users", "/account", "/settings")
 # Reachable without a session: the login page/handlers and public assets.
 _OPEN = ("/healthz", "/login", "/logout", "/metrics")
@@ -905,6 +920,10 @@ async def ollama_page_handler(request: web.Request) -> web.Response:
 
 async def llamacpp_page_handler(request: web.Request) -> web.Response:
     return _page(request, _WEB / "llamacpp.html", "/llamacpp")
+
+
+async def vllm_page_handler(request: web.Request) -> web.Response:
+    return _page(request, _WEB / "vllm.html", "/vllm")
 
 
 async def alerts_page_handler(request: web.Request) -> web.Response:
@@ -1400,9 +1419,14 @@ async def procseries_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "1h")
     if window not in db.VALID_WINDOWS:
         window = "1h"
-    return web.json_response({"kind": kind, "window": window,
-                              **db.proc_series(kind, window,
-                                               end=_q_end(request))})
+    end = _q_end(request)
+    resp = {"kind": kind, "window": window,
+            **db.proc_series(kind, window, end=end)}
+    # ncpu lets the client normalize top-style per-process %CPU (relative to ONE
+    # core) into a share of total capacity so the stacked per-app chart tops at 100%.
+    if kind == "cpu":
+        resp["ncpu"] = db.ncpu(window, end=end)
+    return web.json_response(resp)
 
 
 async def cpuseries_handler(request: web.Request) -> web.Response:
@@ -1466,7 +1490,7 @@ def _litellm_configured() -> bool:
 # server-side (anchored on the name so the Overview "details →" /litellm link stays).
 _NAV_LINK_NAME = {
     "/litellm": "LiteLLM", "/spend": "Spend", "/ollama": "Ollama",
-    "/llamacpp": "llama.cpp", "/gpu": "GPU",
+    "/llamacpp": "llama.cpp", "/vllm": "vLLM", "/gpu": "GPU",
 }
 
 
@@ -1484,6 +1508,8 @@ def _hidden_nav_paths(role: str | None = None) -> set[str]:
         hidden.add("/ollama")
     if not _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)):
         hidden.add("/llamacpp")
+    if not _configured("vllm", bool(config.VLLM_BASE_URL)):
+        hidden.add("/vllm")
     # /gpu is the "GPU/CPU" page — it hosts the per-core + stacked CPU views (host/procs,
     # present on every server), so the link is ALWAYS shown even with no GPU; the GPU cards
     # on the page degrade to "No GPU detected" while the CPU cards render.
@@ -1501,6 +1527,7 @@ async def nav_handler(request: web.Request) -> web.Response:
             config.SPEND_REQUIRE_ADMIN and role != "admin"),
         "ollama": _configured("ollama", bool(config.OLLAMA_BASE_URL)),
         "llamacpp": _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)),
+        "vllm": _configured("vllm", bool(config.VLLM_BASE_URL)),
         "gpu": True,   # GPU/CPU page: CPU views are universal → always shown (GPU degrades)
         # Settings link: real admin only — the shared URL token is NOT admin here.
         "admin": (role == "admin" and not _is_master_token_auth(request))
@@ -3019,6 +3046,8 @@ async def _on_startup(app: web.Application) -> None:
         asyncio.create_task(_backend_loop(
             "llamacpp", llamacpp.sample, session, config.HTTP_TIMEOUT + 5)),
         asyncio.create_task(_backend_loop(
+            "vllm", vllm.sample, session, config.HTTP_TIMEOUT + 5)),
+        asyncio.create_task(_backend_loop(
             "containers", containers.sample, session, config.HTTP_TIMEOUT + 5)),
     ]
     app[_SAMPLER] = asyncio.create_task(_sampling_loop(app))
@@ -3053,6 +3082,7 @@ def build_app() -> web.Application:
     app.router.add_get("/gpu", gpu_page_handler)
     app.router.add_get("/ollama", ollama_page_handler)
     app.router.add_get("/llamacpp", llamacpp_page_handler)
+    app.router.add_get("/vllm", vllm_page_handler)
     app.router.add_get("/alerts", alerts_page_handler)
     # multi-user login + admin user management
     app.router.add_get("/login", login_page_handler)

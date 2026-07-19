@@ -13,6 +13,20 @@ import config
 from collectors import fetch_json, unconfigured
 
 
+def _first_num(*vals):
+    """First value that is a real positive number, else None. llama.cpp reports absent
+    settings as null/0/"" depending on build, and a 0-thread reading would be misread as
+    'starved' — so only a genuine positive count counts as reported."""
+    for v in vals:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
 def _headers() -> dict[str, str] | None:
     if config.LLAMACPP_API_KEY:
         return {"Authorization": f"Bearer {config.LLAMACPP_API_KEY}"}
@@ -38,14 +52,27 @@ async def sample(session: aiohttp.ClientSession) -> dict:
         "n_slots": None,
         "slots_active": 0,
         "predicted_per_second": None,
+        # CPU threads llama.cpp was started with. Without these you cannot tell an idle
+        # CPU that is idle BY DESIGN (layers offloaded to the GPU) from one starved by a
+        # low --threads — the question the per-core grid otherwise leaves unanswered.
+        "n_threads": None,
+        "n_threads_batch": None,
     }
 
     props, perr = await fetch_json(session, f"{base}/props", headers=h)
     if perr is None and props:
         dm = props.get("default_generation_settings", {}) or {}
+        pr = props.get("params") or {}          # some builds nest the run params here
         out["model"] = props.get("model_path") or props.get("model") or dm.get("model")
         out["ctx_size"] = dm.get("n_ctx") or props.get("n_ctx")
         out["n_slots"] = props.get("total_slots") or props.get("n_slots")
+        # llama.cpp has moved these between top level / default_generation_settings /
+        # params across builds, so read all three rather than pin one shape.
+        out["n_threads"] = _first_num(
+            props.get("n_threads"), dm.get("n_threads"), pr.get("n_threads"))
+        out["n_threads_batch"] = _first_num(
+            props.get("n_threads_batch"), dm.get("n_threads_batch"),
+            pr.get("n_threads_batch"))
 
     slots, serr = await fetch_json(session, f"{base}/slots", headers=h)
     if serr is None and isinstance(slots, list):
