@@ -21,8 +21,8 @@
 [![build-scan](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tarrinho/ai_monitoring/badges/build-scan.json)](https://github.com/tarrinho/ai_monitoring/actions/workflows/ci.yml)
 
 **LLM usage, cost, and infrastructure observability for a self-hosted LLM stack.**
-Track **spend, token throughput, and per-API-key usage** through **LiteLLM**,
-alongside the **GPU / host / Ollama / llama.cpp / vLLM / container** health that inference
+Track **spend, token throughput, and per-API-key usage** through **LiteLLM** (🔀),
+alongside the **GPU / host / Ollama** (<img src="web/assets/logos/ollama.svg" alt="Ollama logo" height="14">) **/ llama.cpp** (<img src="web/assets/logos/llamacpp.svg" alt="llama.cpp logo" height="14">) **/ vLLM** (<img src="web/assets/logos/vllm.svg" alt="vLLM logo" height="14">) **/ container** health that inference
 actually runs on — all in one aiohttp app. Collectors poll each backend's **own native
 endpoints** (no Prometheus server, no exporters, no agents), store to SQLite with
 tiered rollups, and serve live dashboards that **lead with the cost & usage

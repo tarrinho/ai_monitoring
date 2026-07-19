@@ -2254,3 +2254,74 @@ console.log(JSON.stringify({r0, r3, rNeg, apiCalls, noElsThrew}));
         f"countdown must clamp at 0, never go negative: {r['rNeg']!r}"
     assert r["apiCalls"] == 0, "paintRecheck must not issue any network request"
     assert r["noElsThrew"] is False, "paintRecheck must no-op when no .recheck elements exist"
+
+
+def test_vllm_help_popover_click_toggle_behavior():
+    """Behavioral: run the REAL click-help wiring from vllm.html. Help must OPEN on
+    click (not hover), close on a second click, allow only one popover open at a
+    time, expose an accessible aria-expanded state, stopPropagation so the
+    document outside-click handler doesn't instantly re-close it, and closeAllInfo
+    must clear everything. Skipped if node is absent."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
+    close_fn = re.search(r"function closeAllInfo\(\)\{[\s\S]*?\n\}", html)
+    block = re.search(r'const info=document\.createElement\("button"\);'
+                      r'[\s\S]*?nm\.append\(" ",info,pop\);', html)
+    assert close_fn and block, "could not extract the click-help wiring"
+    harness = """
+const ALL = [];
+function el(tag){
+  const classes = new Set(); const attrs = {}; const listeners = {};
+  const node = { tagName: tag, type: "", textContent: "",
+    classList: { add:c=>classes.add(c), remove:c=>classes.delete(c), contains:c=>classes.has(c) },
+    _classes: classes, _attrs: attrs, _listeners: listeners,
+    setAttribute:(k,v)=>{ attrs[k]=String(v); }, getAttribute:k=>(k in attrs?attrs[k]:null),
+    addEventListener:(ev,fn)=>{ (listeners[ev]=listeners[ev]||[]).push(fn); },
+    append:(...xs)=>{}, };
+  Object.defineProperty(node,"className",{ get:()=>[...classes].join(" "),
+    set:v=>{ classes.clear(); String(v).split(/\\s+/).filter(Boolean).forEach(c=>classes.add(c)); } });
+  ALL.push(node); return node;
+}
+function matches(n,sel){
+  const am = sel.match(/\\[([\\w-]+)="([^"]*)"\\]/);
+  const cls = sel.replace(/\\[[^\\]]*\\]/,"").split(".").filter(Boolean);
+  for(const c of cls) if(!n._classes.has(c)) return false;
+  if(am) return n._attrs[am[1]] === am[2];
+  return true;
+}
+const document = { createElement: el, querySelectorAll: sel => ALL.filter(n=>matches(n,sel)),
+  addEventListener:()=>{} };
+"""
+    make = ('function makeInfo(cfg, nm){\n' + block.group(0) +
+            '\n  return {info, pop};\n}\n')
+    driver = """
+function clickWith(node){ let stopped=0;
+  (node._listeners.click||[]).forEach(f=>f({stopPropagation:()=>{stopped++;}})); return stopped; }
+const A = makeInfo({label:"Queue", id:"c-q", desc:"queue depth explanation"}, el("span"));
+const B = makeInfo({label:"KV",    id:"c-k", desc:"kv cache explanation"},    el("span"));
+const start = !A.pop._classes.has("open") && !B.pop._classes.has("open");
+const stoppedA = clickWith(A.info);                                   // open A
+const openedA  = A.pop._classes.has("open") && A.info.getAttribute("aria-expanded")==="true";
+clickWith(B.info);                                                    // open B, must close A
+const oneAtATime = !A.pop._classes.has("open") && B.pop._classes.has("open");
+clickWith(B.info);                                                    // toggle B off
+const toggledOff = !B.pop._classes.has("open") && B.info.getAttribute("aria-expanded")==="false";
+clickWith(A.info); closeAllInfo();                                    // global dismiss
+const allClosed = document.querySelectorAll(".info-pop.open").length === 0;
+console.log(JSON.stringify({ start, openedA, oneAtATime, toggledOff, allClosed,
+  stoppedA, desc: A.pop.textContent, tag: A.info.tagName }));
+"""
+    script = harness + close_fn.group(0) + "\n" + make + driver
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    r = json.loads(out.stdout)
+    assert r["start"], "popovers must start closed"
+    assert r["openedA"], "click must open the popover and set aria-expanded=true"
+    assert r["oneAtATime"], "opening one popover must close any other (one at a time)"
+    assert r["toggledOff"], "a second click must close it and reset aria-expanded"
+    assert r["allClosed"], "closeAllInfo must clear every open popover"
+    assert r["stoppedA"] >= 1, "click handler must stopPropagation (else outside-click re-closes it)"
+    assert r["desc"] == "queue depth explanation", "popover must carry the graph's desc"
+    assert r["tag"] == "button", "the help trigger must be a real <button> (keyboard/focus)"
