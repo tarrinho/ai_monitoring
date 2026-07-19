@@ -337,6 +337,20 @@ def _parse_spend_bytes(raw: bytes, window_start: float,
     return _parse_spend(logs, window_start, max_rows)
 
 
+def _parse_backfill_bytes(raw: bytes) -> list[dict]:
+    """json.loads + shape-normalize + per-(day,model,key) fold for the one-time spend
+    rollup backfill — ALL off the event loop (runs in a worker thread; deserializing a
+    multi-day payload would otherwise freeze the loop)."""
+    import json
+    try:
+        logs = json.loads(raw)
+    except Exception:
+        return []
+    if isinstance(logs, dict):
+        logs = logs.get("data") or logs.get("logs") or []
+    return _fold_model_user(logs) if isinstance(logs, list) else []
+
+
 # Host load-per-core, fed in by the sampling loop each tick (the collector runs
 # in its own decoupled loop and has no host data otherwise).
 _LOAD_PER_CORE: float = 0.0
@@ -491,6 +505,50 @@ async def per_model_daily_cost(session: aiohttp.ClientSession, start_date: str,
     return out if saw_daily else None
 
 
+async def per_model_daily_tokens(session: aiohttp.ClientSession, start_date: str,
+                                 end_date: str,
+                                 kind_overrides: dict | None = None) -> dict | None:
+    """Per-DAY token split by cost kind — EXTERNAL (real/paid) vs INTERNAL (reference/
+    self-hosted) — from `/global/activity/model`'s per-model `daily_data`. Returns
+    {canonical_date: {"ext": tokens, "int": tokens}}, or None with no per-model daily
+    breakdown. Unlike the cost variant this needs NO price: every token counts, priced
+    or not (it's a usage split, not a cost split)."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    pm, err = await fetch_json(
+        session,
+        f"{base}/global/activity/model?start_date={start_date}&end_date={end_date}",
+        headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None or not isinstance(pm, list):
+        return None
+    out: dict = {}
+    saw = False
+    for m in pm:
+        if not isinstance(m, dict):
+            continue
+        kind = classify_model(m.get("model") or "", kind_overrides)["cost_kind"]
+        if kind not in ("real", "reference"):
+            continue                       # unattributed / unknown → no usage bucket
+        key = "ext" if kind == "real" else "int"
+        daily = m.get("daily_data") or m.get("daily") or m.get("data") or []
+        if not isinstance(daily, list):
+            continue
+        for dd in daily:
+            if not isinstance(dd, dict):
+                continue
+            date = _norm_date(dd.get("date") or dd.get("day") or dd.get("start_date") or "")
+            toks = int(dd.get("total_tokens") or dd.get("sum_total_tokens")
+                       or dd.get("tokens") or 0)
+            if not date or toks <= 0:
+                continue
+            saw = True
+            b = out.setdefault(date, {"ext": 0, "int": 0})
+            b[key] += toks
+    return out if saw else None
+
+
 async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str,
                                  end_date: str, prices: dict,
                                  kind_overrides: dict | None = None) -> dict | None:
@@ -510,15 +568,17 @@ async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str
         return None
     models: list = []
     dates: set[str] = set()
+    unpriced: set[str] = set()
     saw = False
+    n_actual = n_est = 0            # how each day's value was obtained (cash vs estimate)
     for m in pm:
         if not isinstance(m, dict):
             continue
         name = m.get("model") or ""
         rate = price_for(name, prices)
         kind = classify_model(name, kind_overrides)["cost_kind"]
-        if rate <= 0 or kind not in ("real", "reference") or not name:
-            continue                       # unpriced / unattributed → no $ line
+        if kind not in ("real", "reference") or not name:
+            continue                       # unattributed → no $ line
         daily = m.get("daily_data") or m.get("daily") or m.get("data") or []
         if not isinstance(daily, list):
             continue
@@ -527,12 +587,34 @@ async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str
             if not isinstance(dd, dict):
                 continue
             date = _norm_date(dd.get("date") or dd.get("day") or dd.get("start_date") or "")
-            toks = int(dd.get("total_tokens") or dd.get("sum_total_tokens")
-                       or dd.get("tokens") or 0)
-            if not date or toks <= 0:
+            if not date:
                 continue
+            # Prefer LiteLLM's OWN per-model cash when the payload carries it: the
+            # headline cost is actual spend, so a tokens x price estimate here would be a
+            # parallel number that can never sum to it. Fall back to the estimate only
+            # when no real figure is reported.
+            val = _num_or_none(dd.get("spend"))
+            if val is None:
+                val = _num_or_none(dd.get("total_spend"))
+            if val is None:
+                val = _num_or_none(dd.get("cost"))
+            if val is not None:
+                n_actual += 1
+            else:
+                toks = int(dd.get("total_tokens") or dd.get("sum_total_tokens")
+                           or dd.get("tokens") or 0)
+                # No reported cash AND no known price → we cannot value this day. Skipping
+                # is what silently shrank the chart below the real total, so it is counted
+                # and surfaced as `unpriced` instead of vanishing.
+                if toks <= 0:
+                    continue
+                if rate <= 0:
+                    unpriced.add(name)
+                    continue
+                val = toks * rate
+                n_est += 1
             saw = True
-            dmap[date] = dmap.get(date, 0.0) + toks * rate
+            dmap[date] = dmap.get(date, 0.0) + val
             dates.add(date)
         if dmap:
             models.append({"model": name, "kind": kind,
@@ -541,7 +623,14 @@ async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str
     if not saw:
         return None
     models.sort(key=lambda x: -x["total"])
-    return {"models": models, "dates": sorted(dates)}
+    basis = ("actual" if n_actual and not n_est
+             else "estimated" if n_est and not n_actual
+             else "mixed" if n_actual and n_est else "none")
+    return {"models": models, "dates": sorted(dates), "cost_basis": basis,
+            # models that cost real money but could not be valued — the chart total is
+            # short by whatever they spent, and the UI must say so rather than imply
+            # the breakdown is complete
+            "unpriced": sorted(unpriced)}
 
 
 async def model_prices(session: aiohttp.ClientSession) -> dict:
@@ -576,6 +665,38 @@ async def model_prices(session: aiohttp.ClientSession) -> dict:
     # endpoint answered but priced nothing (momentary empty / mid-reload) → last-good,
     # so the Cost-over-time card doesn't blink off between polls.
     return dict(_PRICES_CACHE)
+
+
+async def model_price_detail(session: aiohttp.ClientSession) -> dict:
+    """{model: {"in", "out", "cache"}} — the THREE per-type rates (input / output /
+    cached-read) in currency per 1M tokens, from LiteLLM `/model/info`. For DISPLAY: the
+    Settings model-costs card shows the breakdown instead of the summed blend (which reads
+    double). Empty on error / unconfigured. Zeros are kept so an all-unset model still lists."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return {}
+    d, err = await fetch_json(session, f"{base.rstrip('/')}/model/info",
+                              headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
+    if err is not None:
+        return {}
+    rows = (d.get("data") or d.get("model_list")) if isinstance(d, dict) else d
+    out: dict = {}
+    for m in rows if isinstance(rows, list) else []:
+        if not isinstance(m, dict):
+            continue
+        lp = m.get("litellm_params") or {}
+        info = m.get("model_info") or {}
+        name = m.get("model_name") or lp.get("model") or ""
+        if not name:
+            continue
+        ic = _fnum(lp.get("input_cost_per_token") or info.get("input_cost_per_token") or 0)
+        oc = _fnum(lp.get("output_cost_per_token") or info.get("output_cost_per_token") or 0)
+        cc = _fnum(lp.get("cache_read_input_token_cost")
+                   or info.get("cache_read_input_token_cost") or 0)
+        if ic or oc or cc:
+            out[name] = {"in": round(ic * 1e6, 4), "out": round(oc * 1e6, 4),
+                         "cache": round(cc * 1e6, 4)}
+    return out
 
 
 def price_for(model: str, prices: dict) -> float:
@@ -662,6 +783,18 @@ def _rows_of(d):
             if isinstance(d.get(k), list):
                 return d[k]
     return None
+
+
+def _num_or_none(raw) -> float | None:
+    """float(raw), or None when the field is absent/blank/non-numeric. Used to tell
+    'LiteLLM reported no cash for this row' apart from 'it reported 0.00' — the first
+    must fall back to a tokens x price estimate, the second is a real zero."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _norm_date(raw) -> str:
@@ -1242,18 +1375,34 @@ def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[di
         else:
             real, ref = total, 0.0
         budget = float((budget_map or {}).get(alias) or k.get("budget") or 0)
-        burn = real / day                                    # real $/day so far
-        projected = burn * month_len
+        # `spend` and the cap must cover the same period. LiteLLM resets a key's spend
+        # only when it carries budget_duration/budget_reset_at; otherwise BOTH the spend
+        # and its max_budget are lifetime, and comparing them is correct (over the
+        # lifetime cap is a real condition). What is NOT valid without a reset is the
+        # MONTHLY framing: projecting an all-time total to "month-end", or dividing it by
+        # the day of the month to get a $/day burn. Those are period figures, so they are
+        # only produced for keys that actually have a period.
+        resets = bool(k.get("budget_duration") or k.get("budget_reset_at"))
+        burn: float | None = None
+        projected: float | None = None
         pct: float | None = None
         days: float | None = None
-        status = "none"      # NO budget defined — still listed, just no cap maths
+        status = "none"      # no budget defined — still listed, just no cap maths
+        cap_basis = None
         if budget > 0:
-            pct = real / budget * 100
-            remaining = budget - real
-            days = (remaining / burn) if burn > 0 else 999.0
+            cap_basis = "window" if resets else "lifetime"
+            pct = real / budget * 100            # same period on both sides → valid
+            if resets:
+                burn = real / day
+                projected = burn * month_len
+                remaining = budget - real
+                days = (remaining / burn) if burn > 0 else 999.0
             # near/over the cap now = critical; merely on pace to exceed = warning
+            # (the pace test only applies where a projection exists)
             status = ("bad" if pct >= 90
-                      else "warn" if pct >= 70 or projected > budget else "ok")
+                      else "warn" if pct >= 70 or (projected is not None
+                                                   and projected > budget)
+                      else "ok")
         rows.append({
             "key": str(alias), "role": k.get("role", "viewer"),
             "team": k.get("team") or "",
@@ -1264,10 +1413,14 @@ def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[di
             "total": round(real + ref, 2),
             "budget": round(budget, 2) if budget > 0 else None,
             "pct": round(pct, 1) if pct is not None else None,
-            "burn": round(burn, 2),
+            "burn": round(burn, 2) if burn is not None else None,
             "days_to_cap": round(days, 1) if days is not None else None,
-            "projected": round(projected, 2),
+            "projected": round(projected, 2) if projected is not None else None,
             "status": status,
+            # "window"   → spend resets with the budget, cap maths shown
+            # "lifetime" → budget set but spend is all-time, so no % / projection
+            # None       → no budget defined
+            "cap_basis": cap_basis,
         })
     # A key with no budget gets an IMPLIED baseline = the month's TOP SPENDER, purely
     # so its bar renders and is comparable to the others. It is NOT a budget: status
@@ -1335,6 +1488,65 @@ async def _heavy_sample(session: aiohttp.ClientSession, base: str,
     return hv
 
 
+def _fold_model_user(logs: list) -> list[dict]:
+    """Aggregate raw /spend/logs rows into per-(day, model, key) cost + tokens for the
+    persisted spend rollup. `day` is the UTC date of the request's startTime; `key` is the
+    hashed api-key (owner resolved downstream), `alias` its key_alias when present. The
+    monitor's own /health-check pseudo-key is dropped. Pure + sync (runs in the parse
+    thread). Returns [] when there's nothing to record."""
+    mu: dict[tuple, dict] = {}
+    for row in logs:
+        if not isinstance(row, dict):
+            continue
+        st = _parse_ts(row.get("startTime") or row.get("start_time"))
+        if st is None:
+            continue
+        meta = row.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        kid = str(row.get("api_key") or meta.get("user_api_key") or "?")
+        if not kid or kid == "?" or "health-check" in kid.lower():
+            continue
+        model = str(row.get("model") or row.get("model_name") or "?")
+        spend = float(row.get("response_cost",
+                      row.get("spend", row.get("cost", 0))) or 0)
+        tok = int(row.get("total_tokens", 0) or 0)
+        day = datetime.fromtimestamp(st, tz=timezone.utc).strftime("%Y-%m-%d")
+        alias = str(row.get("key_alias") or row.get("api_key_alias")
+                    or meta.get("user_api_key_alias") or "")
+        e = mu.setdefault((day, model, kid), {"alias": alias, "cost": 0.0, "tokens": 0})
+        e["cost"] += spend
+        e["tokens"] += tok
+        if alias and not e["alias"]:
+            e["alias"] = alias
+    return [{"day": d, "model": m, "key": k, "alias": v["alias"],
+             "cost": round(v["cost"], 6), "tokens": v["tokens"]}
+            for (d, m, k), v in mu.items()]
+
+
+async def model_user_backfill(session: aiohttp.ClientSession, days: int) -> list[dict]:
+    """ONE-TIME seed for the spend rollup: pull /spend/logs over the last `days` days
+    (bounded by the same byte cap as the live sampler) and aggregate to per-(day,model,key)
+    rows. Heavy but runs once at first start. Returns [] if LiteLLM is unset/unreachable or
+    the pull fails — the chart then just grows forward from live samples."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return []
+    base = base.rstrip("/")
+    start = datetime.fromtimestamp(
+        time.time() - max(1, days) * 86400, tz=timezone.utc).strftime("%Y-%m-%d")
+    raw, err = await _fetch_spend_raw(
+        session, f"{base}/spend/logs?start_date={start}", _headers(),
+        config.LITELLM_SPEND_TIMEOUT, config.LITELLM_SPEND_MAX_BYTES)
+    if err is not None or not raw:
+        _dbg(f"model_user_backfill: /spend/logs err={err} -> no seed")
+        return []
+    # Parse + fold OFF the event loop (json.loads on a multi-day payload is the exact CPU
+    # spike the anti-freeze design keeps off the loop; see _heavy_sample / _parse_spend_bytes).
+    rows = await asyncio.to_thread(_parse_backfill_bytes, raw)
+    _dbg(f"model_user_backfill: {len(rows)} (day,model,key) rows")
+    return rows
+
+
 def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, int, int]:
     """Pure, synchronous aggregation of /spend/logs rows -> derived latency / cost
     / per-model / per-key fields. Runs in a worker thread (see _heavy_sample) so
@@ -1343,6 +1555,11 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
     so this only sheds work that would be filtered out regardless."""
     res: dict = {}
     total = len(logs)
+    # Per-(day, model, key) cost/token rollup for the persisted "cost per model & user over
+    # time" chart. Folded over the FULL day pulled (BEFORE the max_rows cap below), so
+    # re-aggregating each sample yields the day's running total — the DB UPSERT-REPLACE is
+    # then idempotent (no double-count). Owner/user is resolved later from `key`/`alias`.
+    res["mu_rows"] = _fold_model_user(logs)
     if total > max_rows:
         logs = sorted(
             logs,

@@ -33,20 +33,46 @@ async def _client():
     app = c.app
     for _t in app.get(appmod._BACKENDS, []) or []:
         _t.cancel()
-    _s = app.get(appmod._SAMPLER)
-    if _s is not None:
-        _s.cancel()
+    for _key in (appmod._SAMPLER, appmod._MU_BACKFILL):    # sampler + one-time backfill task
+        _t = app.get(_key)
+        if _t is not None:
+            _t.cancel()
     return c
 
 
 async def test_healthz_open_and_ok():
+    """/healthz stays OPEN and 200 (the container HEALTHCHECK depends on it), but an
+    ANONYMOUS caller gets liveness only — no build version (see
+    test_healthz_hides_version_from_anonymous)."""
     c = await _client()
     try:
         r = await c.get("/healthz")
         assert r.status == 200
         body = await r.json()
-        assert body["version"] == config.VERSION
+        assert "version" not in body        # no CVE-matching hint for anonymous callers
         assert body["status"] in ("ok", "starting")
+    finally:
+        await c.close()
+
+
+async def test_healthz_hides_version_from_anonymous(monkeypatch):
+    """/healthz must stay an OPEN 200 liveness probe, but the build version + sample count
+    are AUTHENTICATED-only. An open endpoint naming the exact version lets an attacker
+    match known CVEs for free — the `Server` header omits it for the same reason. A valid
+    token still sees both (operators need them)."""
+    tok = "healthz-probe-token-123456"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", tok)
+    c = await _client()
+    try:
+        r = await c.get("/healthz")                       # anonymous
+        assert r.status == 200                            # probe must never be gated
+        anon = await r.json()
+        assert anon["status"] in ("ok", "starting")
+        assert "version" not in anon and "samples" not in anon
+        authed = await (await c.get(
+            "/healthz", headers={"Authorization": f"Bearer {tok}"})).json()
+        assert authed["version"] == config.VERSION
+        assert "samples" in authed
     finally:
         await c.close()
 
@@ -1048,6 +1074,143 @@ def test_db_proc_series_multiline(tmp_path, monkeypatch):
     assert set(ram["apps"]) == {"python", "node"}
 
 
+def test_db_cpu_core_series_windowed(tmp_path, monkeypatch):
+    """Per-core CPU% is PERSISTED and read back per window, so the GPU/CPU grid can honour
+    the window + pan controls. Regression: the grid used to buffer live samples in the
+    browser and ignored the window entirely (picking 12:14–13:14 still showed 'now')."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "cc.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(60):                                  # 1/min across a full hour
+        db.insert_cpu_core_series(now - 3600 + i * 60, [float(i), 50.0, 90.0, 0.0])
+    out = db.cpu_core_series("1h", max_points=12)
+    assert out["cores"] == [0, 1, 2, 3]
+    assert 2 <= len(out["points"]) <= 12                 # bucketed across the window
+    assert all(abs(p["2"] - 90.0) < 0.1 for p in out["points"])   # flat core stays 90
+    assert out["points"][0]["0"] < out["points"][-1]["0"]         # rising core rises
+    # every bucket timestamp falls INSIDE the requested window (the actual bug)
+    assert all(now - 3600 <= p["t"] <= now for p in out["points"])
+    # panning to a window that ended before any data returns nothing (not "now")
+    assert db.cpu_core_series("1h", end=now - 7200)["points"] == []
+    # empty per-core (first tick / core-count change) is a no-op, never an exception
+    db.insert_cpu_core_series(now, [])
+
+
+def test_db_cpu_core_series_rollup_and_prune(tmp_path, monkeypatch):
+    """Long windows read the 1m/1h rollups (not the raw table), and all three per-core
+    tables are pruned on the same tiers as the other series."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "cc2.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(120):
+        db.insert_cpu_core_series(now - 3600 + i * 30, [25.0, 75.0])
+    db.rollup()
+    with db._connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM cpu_core_series_1m").fetchone()[0] > 0
+    day = db.cpu_core_series("24h", max_points=10)       # served from the 1m rollup
+    assert day["cores"] == [0, 1] and day["points"]
+    db.prune_key_series()                                 # tiered prune covers all three
+    with db._connect() as c:
+        for t in ("cpu_core_series", "cpu_core_series_1m", "cpu_core_series_1h"):
+            c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+
+
+def test_db_cpu_core_series_prune_drops_old_and_keeps_recent(tmp_path, monkeypatch):
+    """Retention actually DELETES: raw per-core rows past the raw horizon go, recent ones
+    stay. (The earlier test only proved prune() didn't raise — that would still pass if
+    the per-core tables were silently never pruned and grew forever.)"""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "ccp.db"))
+    db.init()
+    now = 4_100_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    old_ts = now - (cfg.ROLLUP_RAW_HOURS * 3600) - 7200      # well past the raw horizon
+    db.insert_cpu_core_series(old_ts, [11.0, 22.0])
+    db.insert_cpu_core_series(now - 60, [33.0, 44.0])
+    with db._connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM cpu_core_series").fetchone()[0] == 4
+    db.prune_key_series()        # the TIERED series prune (db.prune() is samples-only)
+    with db._connect() as c:
+        left = c.execute("SELECT DISTINCT ts FROM cpu_core_series").fetchall()
+    assert len(left) == 1 and abs(left[0][0] - (now - 60)) < 1, \
+        "prune must drop rows past the raw horizon and keep recent ones"
+
+
+def test_db_cpu_core_series_rollup_averages_per_core(tmp_path, monkeypatch):
+    """The 1-minute rollup must average EACH CORE independently — a bug that averaged
+    across cores would make every core read the same value on 24h+ windows."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "ccr.db"))
+    db.init()
+    now = 4_100_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    base = (now // 60) * 60                       # inside one 1-minute bucket
+    for off in (5, 15, 25):                       # core0 -> 0/50/100 (avg 50), core1 flat 10
+        db.insert_cpu_core_series(base + off, [{5: 0.0, 15: 50.0, 25: 100.0}[off], 10.0])
+    db.rollup()
+    with db._connect() as c:
+        got = dict(c.execute(
+            "SELECT core, pct FROM cpu_core_series_1m WHERE bucket=?", (base,)).fetchall())
+    assert abs(got[0] - 50.0) < 0.01, f"core0 should average to 50, got {got.get(0)}"
+    assert abs(got[1] - 10.0) < 0.01, f"core1 must stay 10, got {got.get(1)}"
+
+
+def test_db_cpu_core_series_handles_core_count_change(tmp_path, monkeypatch):
+    """Core count can change within a window (hotplug / container CPU-limit change). The
+    reader must expose every core it saw and not crash or mis-align series."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "cch.db"))
+    db.init()
+    now = 4_100_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(10):                            # first half: 2 cores
+        db.insert_cpu_core_series(now - 1800 + i * 60, [10.0, 20.0])
+    for i in range(10):                            # second half: 4 cores
+        db.insert_cpu_core_series(now - 900 + i * 60, [10.0, 20.0, 30.0, 40.0])
+    out = db.cpu_core_series("1h", max_points=20)
+    assert out["cores"] == [0, 1, 2, 3]            # union of everything seen
+    # cores 2/3 simply have no value in the early buckets — absent, never a wrong number
+    early = [p for p in out["points"] if p["t"] < now - 1000]
+    assert early and all("2" not in p for p in early)
+
+
+async def test_cpuseries_endpoint_is_auth_gated(monkeypatch):
+    """/api/cpuseries exposes host telemetry, so it must sit behind the same auth gate as
+    the other /api/* endpoints — not be reachable anonymously."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "cpuseries-tok-123456")
+    c = await _client()
+    try:
+        assert (await c.get("/api/cpuseries?window=1h")).status == 401
+        assert (await c.get("/api/cpuseries?window=1h&token=WRONGWRONGWRONG")).status == 401
+        ok = await c.get("/api/cpuseries?window=1h",
+                         headers={"Authorization": "Bearer cpuseries-tok-123456"})
+        assert ok.status == 200 and "cores" in await ok.json()
+    finally:
+        await c.close()
+
+
+def test_perf_db_cpu_core_series_read_bounded(tmp_path, monkeypatch):
+    """Per-core is the highest-cardinality series here (one row per core per tick). Guard
+    the windowed read on a big-but-realistic table: 64 cores x 1500 ticks = 96k rows."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "ccperf.db"))
+    db.init()
+    now = time.time()
+    rows = [(now - (1_500 - t) * 2.0, core, float((t + core) % 100))
+            for t in range(1_500) for core in range(64)]
+    with db._connect() as conn:
+        conn.executemany(
+            "INSERT INTO cpu_core_series(ts,core,pct) VALUES (?,?,?)", rows)
+    el = _best(lambda: db.cpu_core_series("1h", max_points=200))
+    out = db.cpu_core_series("1h", max_points=200)
+    assert len(out["cores"]) == 64 and out["points"]
+    assert el < 2.0, f"per-core windowed read over 96k rows too slow: {el:.3f}s"
+
+
 def test_db_proc_series_densifies_absent_app_to_zero(tmp_path, monkeypatch):
     # an app present only in SOME buckets must read 0 (not be missing) in the others,
     # so the stacked chart draws a flat 0 instead of a phantom diagonal across the gap.
@@ -1084,6 +1247,23 @@ async def test_procseries_endpoint():
         await c.close()
 
 
+async def test_cpuseries_endpoint():
+    """/api/cpuseries serves the per-core series for a WINDOW (this is what makes the
+    GPU/CPU grid respect the window + pan controls instead of showing live-only data)."""
+    c = await _client()
+    try:
+        r = await c.get("/api/cpuseries?window=1h")
+        assert r.status == 200
+        d = await r.json()
+        assert d["window"] == "1h" and "cores" in d and "points" in d
+        # unknown window falls back to 1h rather than erroring
+        assert (await (await c.get("/api/cpuseries?window=nope")).json())["window"] == "1h"
+        # honours the pan offset without blowing up
+        assert (await c.get("/api/cpuseries?window=1h&end=9000000")).status == 200
+    finally:
+        await c.close()
+
+
 # --------------------------------------------------------------- host live ----
 def test_host_sample_live():
     h = host.sample("/")
@@ -1092,6 +1272,35 @@ def test_host_sample_live():
     assert h["mem_total"] > 0
     assert 0 <= h["mem_pct"] <= 100
     assert h["ncpu"] >= 1
+
+
+def test_host_per_core_cpu_delta():
+    """host.sample exposes cpu_per_core: [] on the first tick (no delta yet), then one
+    0–100 % value per logical CPU on the next tick. Feeds the GPU page's per-core grid."""
+    host._prev_cpu_cores = None                      # force a clean first tick
+    first = host.sample("/")
+    assert first["cpu_per_core"] == []               # no previous sample to diff against
+    second = host.sample("/")
+    pc = second["cpu_per_core"]
+    assert isinstance(pc, list) and len(pc) == second["ncpu"]
+    assert all(isinstance(x, (int, float)) and 0 <= x <= 100 for x in pc)
+
+
+def test_host_per_core_parses_proc_stat(monkeypatch):
+    """_read_cpu_cores reads the cpuN lines (not the aggregate) and stops at the first
+    non-cpu line; _per_core_pct diffs two snapshots into per-core %."""
+    stat = ("cpu  100 0 100 800 0 0 0 0 0 0\n"      # aggregate — must be skipped
+            "cpu0 10 0 10 80 0 0 0 0 0 0\n"
+            "cpu1 20 0 20 60 0 0 0 0 0 0\n"
+            "intr 12345\nctxt 999\n")               # non-cpu — must stop here
+    import io
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.StringIO(stat))
+    cores = host._read_cpu_cores()
+    assert len(cores) == 2                            # cpu0, cpu1 — not the aggregate
+    host._prev_cpu_cores = [(50, 40), (50, 40)]       # prior totals/idle
+    # cpu0 now (100,80): d_total=50, d_idle=40 → (1-40/50)*100 = 20%
+    pct = host._per_core_pct(cores)
+    assert pct[0] == 20.0
 
 
 # --------------------------------------------------------------- gpu ----------
@@ -2079,6 +2288,9 @@ async def test_nav_endpoint_shape():
         d = await (await c.get("/api/nav")).json()
         assert set(d) == {"litellm", "spend", "ollama", "llamacpp", "gpu", "admin"}
         assert all(isinstance(v, bool) for v in d.values())
+        # GPU/CPU page hosts universal CPU views → the link is always shown, even with no
+        # GPU configured (as here); only the on-page GPU cards degrade to "No GPU detected".
+        assert d["gpu"] is True
     finally:
         await c.close()
 
@@ -2287,6 +2499,37 @@ def test_apply_daily_cost_month_granularity():
     assert series["points"][0]["real_cost"] == 1.0 and series["points"][0]["est_cost"] == 2.0
     assert series["points"][1]["real_cost"] == 0.75 and series["points"][1]["est_cost"] == 1.5
     assert series["years"][0]["real_cost"] == 1.75 and series["years"][0]["est_cost"] == 3.5
+
+
+def test_anchor_real_to_actual_overwrites_reconstruction_with_cash():
+    """The real series must show LiteLLM's ACTUAL cash (`spend` on each point/year), not
+    the tokens×price rebuild — else the card's real total won't match per-key spend. The
+    estimated (self-hosted) series is untouched."""
+    series = {"points": [{"spend": 2.00, "real_cost": 5.55, "est_cost": 0.40},
+                         {"spend": 2.43, "real_cost": 6.66, "est_cost": 0.60}],
+              "years": [{"year": 2026, "spend": 4.43, "real_cost": 12.21}],
+              "est_cost_total": 1.00}
+    appmod.anchor_real_to_actual(series)
+    # real_cost is now the actual cash, NOT the 5.55/6.66 reconstruction
+    assert series["points"][0]["real_cost"] == 2.00
+    assert series["points"][1]["real_cost"] == 2.43
+    assert series["real_cost_total"] == 4.43            # matches the real spend elsewhere
+    assert series["years"][0]["real_cost"] == 4.43
+    assert series["cost_basis"] == "actual-real"
+    # estimated (self-hosted) reconstruction is left alone
+    assert series["points"][0]["est_cost"] == 0.40 and series["points"][1]["est_cost"] == 0.60
+
+
+def test_anchor_real_to_actual_noop_without_cash():
+    """Free-tier LiteLLM reports no per-day $ (spend 0) — anchoring must NOT wipe the
+    reconstruction to 0; the estimate is the only cost figure available, so keep it."""
+    series = {"points": [{"spend": 0.0, "real_cost": 1.20, "est_cost": 0.30}],
+              "years": [{"year": 2026, "spend": 0.0, "real_cost": 1.20}],
+              "real_cost_total": 1.20, "est_cost_total": 0.30}
+    appmod.anchor_real_to_actual(series)
+    assert series["points"][0]["real_cost"] == 1.20     # reconstruction preserved
+    assert series["real_cost_total"] == 1.20
+    assert series.get("cost_basis") != "actual-real"
 
 
 async def test_per_model_daily_cost_honors_override_and_normalizes_dates(monkeypatch):
@@ -2617,6 +2860,122 @@ async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
         await c.close()
 
 
+async def test_spend_series_real_anchored_to_actual_cash(monkeypatch):
+    """When LiteLLM reports actual daily cash, the 'real (external)' series must equal that
+    cash (so the card agrees with per-key spend / Cost-by-user), NOT the tokens×price
+    reconstruction. The estimated (self-hosted) series stays the reconstruction."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-tok-anc1")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def _daily(session, s, e):   # actual cash: 2.00 + 2.43 = 4.43
+        return [{"date": "2026-07-07", "requests": 5, "tokens": 2000, "spend": 2.00},
+                {"date": "2026-07-08", "requests": 9, "tokens": 4000, "spend": 2.43}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
+
+    async def _pm(session, s, e, ov=None):
+        return [{"model": "gpt-4o", "tokens": 1000, "cost_kind": "real"},
+                {"model": "ollama/qwen", "tokens": 5000, "cost_kind": "reference"}]
+
+    async def _pmd(session, s, e, prices, ov=None):   # reconstruction real would be 9.99
+        return {"2026-07-07": {"real": 4.44, "est": 0.20},
+                "2026-07-08": {"real": 5.55, "est": 0.30}}
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _pm)
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _pmd)
+    hdr = {"Authorization": "Bearer sp-tok-anc1"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
+        assert d.get("cost_basis") == "actual-real"
+        pts = {time.strftime("%Y-%m-%d", time.gmtime(p["t"])): p for p in d["points"]}
+        assert pts["2026-07-07"]["real_cost"] == 2.00     # actual cash, not 4.44 rebuild
+        assert pts["2026-07-08"]["real_cost"] == 2.43
+        assert d["real_cost_total"] == 4.43               # == the real spend shown elsewhere
+        assert d["real_cost_lifetime"] == 4.43            # all in 2026 → lifetime == window here
+        # estimated (self-hosted) is still the reconstruction
+        assert pts["2026-07-07"]["est_cost"] == 0.20 and pts["2026-07-08"]["est_cost"] == 0.30
+    finally:
+        await c.close()
+
+
+async def test_spend_series_lifetime_exceeds_window_with_old_history(monkeypatch):
+    """The 30d window can't show usage older than 30 days, but the lifetime real total sums
+    the FULL pulled history — so a card whose window total is small still reconciles with
+    per-key spend via `real_cost_lifetime`."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-tok-life1")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    old = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 400 * 86400))  # >1yr ago
+
+    async def _daily(session, s, e):     # 10.00 old + 2.43 recent = 12.43 lifetime
+        return [{"date": old, "requests": 3, "tokens": 9000, "spend": 10.00},
+                {"date": today, "requests": 9, "tokens": 4000, "spend": 2.43}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001}
+
+    async def _pm(session, s, e, ov=None):
+        return [{"model": "gpt-4o", "tokens": 1000, "cost_kind": "real"}]
+
+    async def _pmd(session, s, e, prices, ov=None):
+        return {old: {"real": 10.00, "est": 0.0}, today: {"real": 2.43, "est": 0.0}}
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _pm)
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _pmd)
+    hdr = {"Authorization": "Bearer sp-tok-life1"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
+        # 30d window sees only today's 2.43; lifetime sums both → 12.43 (matches per-key spend)
+        assert d["real_cost_total"] == 2.43
+        assert d["real_cost_lifetime"] == 12.43
+    finally:
+        await c.close()
+
+
+async def test_spend_series_anchors_real_even_on_blended_fallback(monkeypatch):
+    """No per-model daily breakdown → the code takes the BLENDED estimate path. Even there,
+    the real series must still be anchored to actual cash (the blended rebuild only feeds
+    the estimated/self-hosted series), and lifetime real must equal actual spend."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-tok-bl1")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def _daily(session, s, e):     # actual cash 1.11 + 3.32 = 4.43
+        return [{"date": "2026-07-07", "requests": 5, "tokens": 2000, "spend": 1.11},
+                {"date": "2026-07-08", "requests": 9, "tokens": 4000, "spend": 3.32}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
+
+    async def _pm(session, s, e, ov=None):   # gives a reference (self-hosted) rate for est
+        return [{"model": "gpt-4o", "tokens": 1000, "cost_kind": "real"},
+                {"model": "ollama/qwen", "tokens": 5000, "cost_kind": "reference"}]
+
+    async def _no_daily_cost(session, s, e, prices, ov=None):
+        return {}                            # → blended fallback
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _pm)
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _no_daily_cost)
+    hdr = {"Authorization": "Bearer sp-tok-bl1"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
+        assert d.get("cost_basis") == "actual-real"       # anchored, despite blended est
+        assert d["real_cost_total"] == 4.43               # actual cash, not blended rebuild
+        assert d["real_cost_lifetime"] == 4.43
+        assert d["est_cost_total"] > 0                     # self-hosted estimate still present
+    finally:
+        await c.close()
+
+
 async def test_spend_page_served_and_gated(monkeypatch):
     """The Spend & Quota page renders open and is auth-gated once a token is set."""
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")  # spend needs LiteLLM
@@ -2689,8 +3048,18 @@ def test_budget_rows_ranks_and_flags():
     rows = litellm.budget_rows(top, bmap, 15, 30)
     assert [r["key"] for r in rows] == ["a", "b", "c", "d"]   # d listed, ranked last
     assert [r["status"] for r in rows] == ["bad", "warn", "ok", "none"]
-    assert rows[0]["pct"] == 95.0 and rows[0]["projected"] > 0
-    assert rows[0]["days_to_cap"] >= 0
+    # these keys carry no budget_duration, so LiteLLM never resets their spend: the cap
+    # comparison is still valid (lifetime spend vs a lifetime cap) but the MONTHLY
+    # projection is not, and is therefore withheld rather than invented.
+    assert rows[0]["pct"] == 95.0 and rows[0]["projected"] is None
+    assert rows[0]["cap_basis"] == "lifetime"
+    # a key whose budget DOES reset gets the period figures
+    per = litellm.budget_rows(
+        [{"alias": "p", "cost": 10.0, "budget": 50.0, "budget_duration": "30d"}],
+        {"p": 50.0}, 10, 30)[0]
+    assert per["cap_basis"] == "window" and per["projected"] > 0 and per["burn"] > 0
+    # days_to_cap needs a burn rate, which needs a period — None on lifetime keys
+    assert rows[0]["days_to_cap"] is None and per["days_to_cap"] >= 0
 
 
 def test_budget_rows_lists_every_key_no_top_n_cap():
@@ -2723,18 +3092,144 @@ async def test_lite_spend_keeps_all_keys_not_top_10(monkeypatch):
 
 
 def test_budget_rows_presents_keys_with_no_budget():
-    """A key with no budget defined is NEVER dropped — its spend/burn are shown,
-    with no cap maths (budget/pct/days_to_cap are None, status 'none')."""
+    """A key with no budget defined is NEVER dropped — its spend is shown, with no cap
+    maths (budget/pct/days_to_cap None, status 'none'). `burn` is also None: this key's
+    spend never resets, so an all-time total divided by the day of the month is not a
+    $/day rate — reporting one was the bug, "—" is the honest answer."""
     rows = litellm.budget_rows([{"alias": "nobudget", "cost": 500}], {}, 10, 30)
     assert len(rows) == 1
     r = rows[0]
     assert r["key"] == "nobudget" and r["status"] == "none"
     assert r["budget"] is None and r["pct"] is None and r["days_to_cap"] is None
-    assert r["spent"] == 500 and r["burn"] == 50.0      # spend + burn still reported
+    assert r["spent"] == 500 and r["burn"] is None      # spend shown; no bogus $/day
     # summary counts the gap so it can be surfaced, not hidden
     s = appmod._budget_summary(rows)
     assert s["unbudgeted"] == 1 and s["unbudgeted_spend"] == 500
     assert s["budgeted"] == 0 and s["budget"] == 0 and s["pct"] == 0
+
+
+async def test_per_model_series_prefers_actual_cash_over_price_estimate(monkeypatch):
+    """The headline cost is LiteLLM's ACTUAL cash, so the per-model chart must use the
+    reported per-model cash where it exists — otherwise it is a parallel tokens x price
+    estimate that can never sum to the headline. Estimate only fills the gaps."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-CHANGE_ME")
+    payload = [
+        # reports real cash 7.77 — tokens x price would say 1000 * 0.001 = 1.00
+        {"model": "gpt-4o", "daily_data": [
+            {"date": "2026-07-01", "total_tokens": 1000, "spend": 7.77}]},
+        # no cash reported, but priced → estimate is the correct fallback
+        {"model": "ollama/qwen", "daily_data": [
+            {"date": "2026-07-01", "total_tokens": 1000}]},
+    ]
+
+    async def _fetch(session, url, headers=None, timeout_s=None):
+        return payload, None
+    monkeypatch.setattr(litellm, "fetch_json", _fetch)
+    out = await litellm.per_model_daily_series(
+        None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001, "ollama/qwen": 0.0001})
+    tot = {m["model"]: m["total"] for m in out["models"]}
+    assert tot["gpt-4o"] == 7.77, "must use reported cash, not the price estimate"
+    assert abs(tot["ollama/qwen"] - 0.10) < 0.001      # estimated fallback
+    assert out["cost_basis"] == "mixed"
+
+
+async def test_per_model_series_surfaces_unpriced_instead_of_dropping(monkeypatch):
+    """A model with no known price and no reported cash used to be skipped entirely, so
+    real money vanished from the chart while still counting in the headline — a direct
+    cause of the breakdown not adding up. It must now be reported via `unpriced`."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-CHANGE_ME")
+    payload = [
+        {"model": "gpt-4o", "daily_data": [
+            {"date": "2026-07-01", "total_tokens": 1000, "spend": 5.0}]},
+        {"model": "mystery-model", "daily_data": [       # unpriced, no cash reported
+            {"date": "2026-07-01", "total_tokens": 9999}]},
+    ]
+
+    async def _fetch(session, url, headers=None, timeout_s=None):
+        return payload, None
+    monkeypatch.setattr(litellm, "fetch_json", _fetch)
+    out = await litellm.per_model_daily_series(
+        None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001})
+    assert "mystery-model" in out["unpriced"], "unvaluable model must be surfaced"
+    assert all(m["model"] != "mystery-model" for m in out["models"])   # no fake $ invented
+
+
+def test_bucket_model_series_carries_cost_provenance():
+    """bucket_model_series dropped `cost_basis`/`unpriced`, so the UI could not tell an
+    actual-cash breakdown from an estimate, nor that models were missing from it. Those
+    signals must survive bucketing or the chart silently under-reports."""
+    series = {
+        "models": [{"model": "gpt-4o", "kind": "real", "total": 5.0,
+                    "daily": {"2026-07-01": 5.0}}],
+        "dates": ["2026-07-01"],
+        "cost_basis": "mixed",
+        "unpriced": ["mystery-model"],
+    }
+    out = appmod.bucket_model_series(series, "30d", appmod._date_epoch("2026-07-02"))
+    assert out["cost_basis"] == "mixed"
+    assert out["unpriced"] == ["mystery-model"]
+
+
+def test_num_or_none_distinguishes_missing_from_zero(monkeypatch):
+    """A reported 0.00 is a real zero (use it); an absent/blank field means 'not reported'
+    (fall back to the estimate). Conflating them would either invent cost or hide it."""
+    assert litellm._num_or_none(0) == 0.0            # real zero, not "missing"
+    assert litellm._num_or_none("1.25") == 1.25
+    assert litellm._num_or_none(None) is None
+    assert litellm._num_or_none("") is None
+    assert litellm._num_or_none("abc") is None
+
+
+def test_budget_summary_month_figures_come_from_mtd_not_lifetime():
+    """A key's LiteLLM `spend` is lifetime cumulative, so using it for the monthly summary
+    reported the all-time total as "this month" and inflated burn / projected / budget-%
+    by lifetime÷month. With a true month-to-date figure the month numbers derive from IT,
+    and the all-time total is reported separately as `spent_lifetime`.
+
+    Worked example: lifetime 100, of which 10 is this month; day 18 of 31; budget 50/mo."""
+    rows = litellm.budget_rows([{"alias": "team-a", "cost": 100.0, "budget": 50.0}],
+                               {"team-a": 50.0}, 18, 31)
+    s = appmod._budget_summary(rows, mtd_real=10.0, month_day=18, month_len=31)
+    assert s["basis"] == "mtd"
+    assert s["spent"] == 10.0                 # the MONTH's cash, not the lifetime 100
+    assert s["spent_lifetime"] == 100.0       # all-time still available for the sub-line
+    assert abs(s["burn"] - 10.0 / 18) < 0.01          # was 100/18 = 5.56
+    assert abs(s["projected"] - (10.0 / 18) * 31) < 0.1   # was 172.22
+    assert abs(s["pct"] - 20.0) < 0.1                  # was 200% -> false "over budget"
+    assert s["over"] is False
+
+
+def test_budget_summary_falls_back_to_lifetime_and_says_so():
+    """When the daily series is unavailable there is no way to know the month's share, so
+    the summary keeps the lifetime total but flags basis='lifetime' — the UI then labels
+    the card "all-time" instead of silently calling an all-time number "this month"."""
+    rows = litellm.budget_rows([{"alias": "team-a", "cost": 100.0, "budget": 50.0}],
+                               {"team-a": 50.0}, 18, 31)
+    s = appmod._budget_summary(rows)                  # no mtd_real
+    assert s["basis"] == "lifetime"
+    assert s["spent"] == 100.0 and s["spent_lifetime"] == 100.0
+
+
+async def test_mtd_real_spend_sums_only_the_current_month(monkeypatch):
+    """_mtd_real_spend must total ONLY the current month's daily rows — pulling in
+    previous months would recreate the very over-count it exists to fix."""
+    now = time.time()
+    this_month = time.strftime("%Y-%m", time.gmtime(now))
+    prev = "2000-01"                                   # unambiguously a different month
+
+    async def _daily(session, start, end):
+        return [{"date": f"{prev}-15", "spend": 999.0, "requests": 1, "tokens": 1},
+                {"date": f"{this_month}-01", "spend": 4.0, "requests": 1, "tokens": 1},
+                {"date": f"{this_month}-02", "spend": 6.0, "requests": 1, "tokens": 1}]
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    assert await appmod._mtd_real_spend(None, now) == 10.0     # 999 from Jan 2000 excluded
+
+    async def _none(session, start, end):
+        return None
+    monkeypatch.setattr(litellm, "spend_activity", _none)
+    assert await appmod._mtd_real_spend(None, now) is None      # -> caller falls back
 
 
 def test_unbudgeted_keys_get_implied_baseline_from_top_spender():
@@ -3538,9 +4033,10 @@ async def test_master_token_hides_and_blocks_alerts_and_settings(monkeypatch):
 
 
 async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
-    """Unconfigured-backend sidebar links (LiteLLM/Spend/Ollama/llama.cpp/GPU) are
-    dropped SERVER-side, not only by the client /api/nav fetch — so a slow/failed
-    fetch can't leave a dead link visible (the reported token-session symptom). The
+    """Unconfigured-backend sidebar links (LiteLLM/Spend/Ollama/llama.cpp) are dropped
+    SERVER-side, not only by the client /api/nav fetch — so a slow/failed fetch can't
+    leave a dead link visible (the reported token-session symptom). The GPU/CPU link is
+    EXEMPT — it hosts universal CPU views, so it's always shown even with no GPU. The
     Overview 'details →' /litellm link is anchored on its name and left intact."""
     TOK = "navstrip-tok-123"
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", TOK)
@@ -3555,7 +4051,7 @@ async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
         assert "🔀 LiteLLM" not in h and "LiteLLM</a>" not in h   # sidebar link gone
         assert "Spend &amp; Quota</a>" not in h
         assert "🦙 Ollama" not in h and "🐫 llama.cpp" not in h
-        assert "🖥️ GPU" not in h
+        assert "🖥️ GPU/CPU</a>" in h            # GPU/CPU always shown (universal CPU views)
         assert "details →" in h                                    # details link kept
     finally:
         await c.close()
@@ -3575,7 +4071,7 @@ async def test_unconfigured_backend_links_stripped_serverside(monkeypatch):
             "litellm": {"available": True}, "ollama": {"available": True},
             "llamacpp": {"available": True}, "gpu": {"available": True}}})
         h2 = await (await c2.get("/", headers=hdr)).text()
-        assert "🔀 LiteLLM" in h2 and "🦙 Ollama" in h2 and "🖥️ GPU" in h2
+        assert "🔀 LiteLLM" in h2 and "🦙 Ollama" in h2 and "🖥️ GPU/CPU</a>" in h2
         assert "Spend &amp; Quota</a>" in h2
     finally:
         await c2.close()
@@ -6187,3 +6683,196 @@ async def test_keydelta_endpoint_returns_timeline(monkeypatch):
         assert series[-1] == 30                 # cumulative ends at the window total
     finally:
         await c.close()
+
+
+# ── cost per model & user over time: rollup + backfill + series endpoint ─────────
+def test_fold_model_user_aggregates_and_drops_healthcheck():
+    """_fold_model_user sums cost/tokens per (day,model,key), keeps the alias, and drops
+    the monitor's own /health-check pseudo-key (would otherwise dominate)."""
+    now = time.time()
+    logs = [
+        {"startTime": now, "api_key": "hA", "key_alias": "pedro", "model": "gpt-5-mini",
+         "response_cost": 0.10, "total_tokens": 1000},
+        {"startTime": now, "api_key": "hA", "key_alias": "pedro", "model": "gpt-5-mini",
+         "response_cost": 0.05, "total_tokens": 500},
+        {"startTime": now, "api_key": "hB", "key_alias": "ana", "model": "gpt-5.4-mini",
+         "response_cost": 0.02, "total_tokens": 200},
+        {"startTime": now, "api_key": "litellm-health-check-x", "model": "gpt-5-mini",
+         "response_cost": 9.9, "total_tokens": 9},
+    ]
+    rows = litellm._fold_model_user(logs)
+    by = {(r["model"], r["alias"]): r for r in rows}
+    assert by[("gpt-5-mini", "pedro")]["cost"] == 0.15
+    assert by[("gpt-5-mini", "pedro")]["tokens"] == 1500
+    assert by[("gpt-5.4-mini", "ana")]["cost"] == 0.02
+    assert not any("health-check" in r["key"] for r in rows)
+
+
+def test_spend_model_user_upsert_is_idempotent(tmp_path, monkeypatch):
+    """The sampler re-aggregates the whole day each tick and UPSERT-REPLACEs, so applying
+    the same rows twice must NOT double-count (that's the no-high-water-mark guarantee)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mu.db"))
+    db.init()
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    rows = [{"day": day, "model": "gpt-5-mini", "key": "hA", "alias": "pedro",
+             "cost": 0.15, "tokens": 1500}]
+    db.spend_model_user_upsert(rows, now)
+    db.spend_model_user_upsert(rows, now)                    # twice
+    got = db.spend_model_user_rows(3, now)
+    assert round(sum(r["cost"] for r in got), 6) == 0.15     # replaced, not summed
+
+
+def test_bucket_model_user_series_topn_and_owner_resolution(tmp_path, monkeypatch):
+    """bucket_model_user_series resolves key→owner (admin override > live email > alias),
+    builds one shared label axis, folds beyond top-N into 'Other', and derives cost as
+    tokens × the OVERRIDE-aware price (not the stored response_cost)."""
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    # tokens carry the cost; response_cost deliberately WRONG to prove it's ignored
+    rows = [
+        {"day": day, "model": "gpt-5-mini", "key": "hA", "alias": "pedro-key",
+         "cost": 999.0, "tokens": 1_000_000},
+        {"day": day, "model": "gpt-5.4-mini", "key": "hB", "alias": "ana-key",
+         "cost": 999.0, "tokens": 2_000_000},
+    ]
+    prices = {"gpt-5-mini": 2e-6, "gpt-5.4-mini": 1e-6}          # $/token
+    kind_ov = {"gpt-5-mini": "real", "gpt-5.4-mini": "real"}
+    omap = {"ovr": {"ana-key": "ana@x.io"}, "live": {"pedro-key": "pedro@x.io"}}
+    out = appmod.bucket_model_user_series(rows, omap, prices, kind_ov, "14d", now)
+    assert out["available"] is True and out["labels"] == [day]
+    by = {s["label"]: s for s in out["series"]}
+    assert "gpt-5-mini · pedro@x.io" in by                       # live email resolved
+    assert "gpt-5.4-mini · ana@x.io" in by                       # admin override wins
+    assert by["gpt-5-mini · pedro@x.io"]["total"] == 2.0         # 1e6 tok × 2e-6, NOT 999
+    assert by["gpt-5.4-mini · ana@x.io"]["total"] == 2.0         # 2e6 tok × 1e-6
+    # top-N fold
+    many = [{"day": day, "model": f"m{i}", "key": f"k{i}", "alias": f"a{i}",
+             "cost": 0.0, "tokens": (i + 1) * 1_000_000} for i in range(20)]
+    p2 = {f"m{i}": 1e-6 for i in range(20)}
+    k2 = {f"m{i}": "real" for i in range(20)}
+    o2 = appmod.bucket_model_user_series(many, {"ovr": {}, "live": {}}, p2, k2, "14d", now, top_n=12)
+    assert len(o2["series"]) == 13 and o2["series"][-1]["model"] == "Other"
+
+
+def test_bucket_model_user_series_excludes_reference_and_unpriced(tmp_path):
+    """A stacked cost view shows REAL (paid) models only — self-hosted/reference cost is
+    imputed and would dominate — and drops unpriced models (rate 0)."""
+    day = "2026-07-10"
+    now = time.mktime(time.strptime(day, "%Y-%m-%d")) + 86400
+    rows = [
+        {"day": day, "model": "azure/real", "key": "k1", "alias": "u1", "cost": 0.0, "tokens": 1_000_000},
+        {"day": day, "model": "llama/ref", "key": "k2", "alias": "u2", "cost": 0.0, "tokens": 50_000_000},
+        {"day": day, "model": "azure/unpriced", "key": "k3", "alias": "u3", "cost": 0.0, "tokens": 1_000_000},
+    ]
+    prices = {"azure/real": 1e-6, "llama/ref": 1e-5}            # unpriced absent → rate 0
+    kind_ov = {"azure/real": "real", "llama/ref": "reference", "azure/unpriced": "real"}
+    out = appmod.bucket_model_user_series(rows, {"ovr": {}, "live": {}}, prices, kind_ov, "14d", now)
+    models = {s["model"] for s in out["series"]}
+    assert models == {"azure/real"}                            # ref + unpriced excluded
+
+
+def test_bucket_model_user_series_share_axis(tmp_path):
+    """The chart's % share is derived client-side; the endpoint always returns absolute €
+    costs on a stable axis so both abs and share views work off one payload."""
+    day = "2026-07-10"
+    rows = [
+        {"day": day, "model": "m", "key": "k1", "alias": "u1", "cost": 0.0, "tokens": 3_000_000},
+        {"day": day, "model": "m", "key": "k2", "alias": "u2", "cost": 0.0, "tokens": 1_000_000},
+    ]
+    out = appmod.bucket_model_user_series(
+        rows, {"ovr": {}, "live": {}}, {"m": 1e-6}, {"m": "real"}, "14d",
+        time.mktime(time.strptime(day, "%Y-%m-%d")) + 86400)
+    costs = {s["user"]: s["costs"][0] for s in out["series"]}
+    assert costs["u1"] == 3.0 and costs["u2"] == 1.0        # absolute, not normalized
+
+
+def test_prune_spend_model_user(tmp_path, monkeypatch):
+    """Rows older than the 1-year retention are pruned; recent rows stay."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mu2.db"))
+    db.init()
+    now = time.time()
+    old = time.strftime("%Y-%m-%d", time.gmtime(now - 400 * 86400))
+    new = time.strftime("%Y-%m-%d", time.gmtime(now))
+    db.spend_model_user_upsert(
+        [{"day": old, "model": "m", "key": "k", "alias": "u", "cost": 1.0, "tokens": 1},
+         {"day": new, "model": "m", "key": "k", "alias": "u", "cost": 2.0, "tokens": 1}], now)
+    removed = db.prune_spend_model_user()
+    left = db.spend_model_user_rows(500, now)
+    assert removed == 1 and [r["day"] for r in left] == [new]
+
+
+async def test_model_user_series_endpoint(monkeypatch):
+    """/api/spend/model-user-series serves the stacked series from the local rollup, with
+    NO /spend/logs pull at render (reads DB + a cached owner map)."""
+    monkeypatch.setattr(appmod, "_litellm_configured", lambda: True)
+
+    async def _fake_owner_map(_session):
+        return {"ovr": {}, "live": {"pedro-key": "pedro@x.io"}}
+    monkeypatch.setattr(appmod, "_key_owner_map", _fake_owner_map)
+
+    async def _fake_prices(_session):
+        return {"gpt-5-mini": 2e-6}                       # $/token (override-aware upstream)
+    monkeypatch.setattr(litellm, "model_prices", _fake_prices)
+    appmod._MU_SERIES_CACHE.clear()                       # module-level cache: isolate test
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    db.init()
+    db.spend_model_user_upsert(
+        [{"day": day, "model": "gpt-5-mini", "key": "hA", "alias": "pedro-key",
+          "cost": 999.0, "tokens": 1_000_000}], now)      # cost wrong on purpose
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/model-user-series?window=14d")).json()
+        assert d["available"] is True
+        s = next(s for s in d["series"] if s["label"].startswith("gpt-5-mini · pedro@x.io"))
+        assert s["total"] == 2.0                          # 1e6 tok × 2e-6, not response_cost
+        # F3: result is TTL-cached — adding usage does NOT change the reply within the TTL,
+        # but clearing the cache reflects it (the 5s poll can't rescan the window each time).
+        db.spend_model_user_upsert(
+            [{"day": day, "model": "gpt-5-mini", "key": "hZ", "alias": "pedro-key",
+              "cost": 0.0, "tokens": 5_000_000}], now)
+        d2 = await (await c.get("/api/spend/model-user-series?window=14d")).json()
+        assert next(x["total"] for x in d2["series"]
+                    if x["label"].startswith("gpt-5-mini · pedro@x.io")) == 2.0   # cached
+        appmod._MU_SERIES_CACHE.clear()
+        d3 = await (await c.get("/api/spend/model-user-series?window=14d")).json()
+        assert next(x["total"] for x in d3["series"]
+                    if x["label"].startswith("gpt-5-mini · pedro@x.io")) == 12.0  # 6e6 × 2e-6
+    finally:
+        await c.close()
+
+
+# ── F1: optional admin-gate on the Spend surface (MONITOR_SPEND_REQUIRE_ADMIN) ──
+def test_hidden_nav_hides_spend_for_nonadmin_when_required(monkeypatch):
+    """With SPEND_REQUIRE_ADMIN on, the Spend sidebar link is stripped for non-admins
+    (no dead 403 link); admins keep it. Off = never hidden on that account."""
+    monkeypatch.setattr(appmod, "_litellm_configured", lambda: True)
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    assert "/spend" in appmod._hidden_nav_paths("viewer")
+    assert "/spend" not in appmod._hidden_nav_paths("admin")
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", False)
+    assert "/spend" not in appmod._hidden_nav_paths("viewer")   # default: viewers keep it
+
+
+async def test_spend_require_admin_gates_viewer(monkeypatch):
+    """MONITOR_SPEND_REQUIRE_ADMIN=1: a logged-in VIEWER is 403'd on /spend and
+    /api/spend/*; default off leaves viewers with access."""
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(appmod, "_litellm_configured", lambda: True)
+    db.user_create("vv", "v@x.io", auth.hash_password("viewerpw12"), "viewer", time.time())
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "vv", "password": "viewerpw12"},
+                     allow_redirects=False)
+        # default off: viewer reaches the Spend API (not 403)
+        monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", False)
+        assert (await c.get("/api/spend/model-user-series")).status != 403
+        # turned on: viewer is forbidden on both page and API
+        monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+        assert (await c.get("/api/spend/model-user-series")).status == 403
+        assert (await c.get("/spend")).status == 403
+    finally:
+        await c.close()
+
+

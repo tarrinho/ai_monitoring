@@ -103,7 +103,10 @@ Each exposes `sample()` returning `{available, …}` and degrades to
 `{available: False, error}` on failure. Sources are all **native JSON / procfs**
 — no Prometheus:
 
-- `host` — `/proc/stat` (delta CPU%), `/proc/meminfo`, `statvfs`, loadavg.
+- `host` — `/proc/stat` (delta CPU%), `/proc/meminfo`, `statvfs`, loadavg. Also emits
+  `cpu_per_core: [%, …]` — the same delta maths applied to each `cpuN` line, one entry
+  per logical CPU (`[]` on the first tick and across a core-count change, since neither
+  can be diffed). Feeds the GPU/CPU dashboard's per-core grid.
 - `procs` — per-PID `/proc/*/stat` + `statm`, aggregated by executable → top-N
   by CPU% (delta) and RSS. `pid: host` to see host processes.
 - `gpu` — `nvidia-smi`/`rocm-smi` locally, **or remote** via SSH (`GPU_SSH`) or
@@ -141,3 +144,11 @@ window 24h on the LiteLLM/Ollama/llama.cpp pages), one DOMPurify-sanitised
 `innerHTML` sink (§17). The Overview takes live snapshots over the `/api/stream`
 SSE channel and falls back to a 5s poll on any stream error; the windowed
 time-series are always fetched on demand.
+
+**Live-only series (deliberately not persisted).** The GPU/CPU page's *per-core CPU*
+grid buffers `host.cpu_per_core` **in the browser** over a rolling window (~10 min at
+the 5 s poll) instead of writing it to the metrics DB. Per-core usage is high-cardinality
+(one series per logical CPU × every host) and only useful live, so persisting it would
+inflate the storage tiers for data nobody queries historically — the same trade-off
+`htop`/`btop` make. The consequence is intentional: the grid resets on reload, not on
+poll. Aggregate `cpu_pct` *is* persisted, so long-range CPU history is unaffected.

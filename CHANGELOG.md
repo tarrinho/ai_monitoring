@@ -6,6 +6,85 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **GPU page → "CPU usage per core" grid.** One live sparkline per logical CPU (0–100%,
+  current % coloured amber ≥70 / red ≥90), from a new `cpu_per_core` field on the host
+  collector (`/proc/stat` `cpuN` lines). Scales to any core count. Buffered in the browser
+  over a rolling ~10-min window from the 5 s poll — a live view (like htop/btop), so it is
+  deliberately **not** persisted to the series DB; charts update in place (poll-safe).
+- **Spend → "Cost per model & user over time" card.** A stacked-area chart (below *Cost
+  per model over time*) showing each model's cost broken down by the **user** driving it,
+  over time. Top 12 `model × user` bands + "Other"; toggles for window (**14d / 30d /
+  12mo**), **€ total vs % share**, and grouping bands **by model vs by user**; legend
+  labels toggle a band. Built to sidestep the `/spend/logs` freeze risk: a new local
+  `spend_model_user_daily` rollup is written by the sampler from data it *already* pulls
+  (an idempotent UPSERT-REPLACE per `(day, model, key)` — the whole-day pull means no
+  double-count, no high-water mark), seeded once at first run by a bounded **14-day**
+  backfill (`MONITOR_SPEND_MU_BACKFILL_DAYS`), then grown forward. Daily granularity,
+  pruned to 1 year. The chart reads purely from the local DB — **no `/spend/logs` pull at
+  render**. Backed by `GET /api/spend/model-user-series` (LiteLLM-gated) + the pure
+  `bucket_model_user_series`; users resolved with the same precedence as the by-user board
+  (admin key→user override > LiteLLM owner email > key alias).
+- **GPU page → "GPU/CPU"** with a new **CPU cores usage (stacked)** card at the bottom:
+  one stacked band per logical core over time (combined height = total load across
+  cores), fed from the same client-side per-core buffer as the per-core sparklines;
+  legend-click toggles a core.
+- **`MONITOR_SPEND_REQUIRE_ADMIN` — optional admin-gate for Spend.** Off by default;
+  when set, the `/spend` page + `/api/spend/*` are admin-only and the Spend nav link is
+  hidden for viewers (per-user cost attribution incl. emails can be sensitive).
+- **Model×user series is TTL-cached server-side** (~45s): the daily rollup can't change
+  faster than the sampler writes, so the 5s auto-refresh no longer rescans the full
+  window each poll.
+- **`MONITOR_CURRENCY` — currency symbol for money values.** Set e.g.
+  `MONITOR_CURRENCY=€` and every cost/spend/budget value renders with it (default `$`).
+  Injected as a nonce'd `window.CUR` global into each page (CSP-safe); display label only,
+  no FX conversion. A `node --check` guard test now parses every inline dashboard script
+  so a currency/label edit can't ship an `Uncaught SyntaxError`.
+
+### Security
+- **`/healthz` no longer discloses the build version to anonymous callers.** The open
+  liveness probe returned `{"status", "version", "samples"}` to anyone who could reach it,
+  handing an attacker an exact version to match known CVEs against (the `Server` header
+  already omits it for that reason). `/healthz` stays open and returns 200 — the container
+  HEALTHCHECK and external monitors only read the HTTP status / `status` field — but
+  `version` and `samples` are now returned only to an authenticated caller. Found by the
+  DAST pass; regression test `test_healthz_hides_version_from_anonymous`.
+
+### Documentation
+- **Every env var is now documented.** A doc audit found **21** settings config reads but
+  the README never listed (the whole auth-hardening group, the Docker socket-proxy vars,
+  cost-attribution + pricing, retention/debug knobs) and **2** absent from `.env.example`
+  (`MONITOR_INTERNAL_MODEL_FAMILIES`, `MONITOR_KEY_BUDGETS`). Coverage is now **80/80 in
+  both**, with new *Auth hardening* and *Cost attribution & pricing* subsections and
+  copy-pasteable examples for the JSON-valued vars and the reverse-proxy setup.
+- **ARCHITECTURE.md** documents the host collector's `cpu_per_core` field and records why
+  the per-core series is browser-buffered rather than persisted (high-cardinality,
+  live-only — so the metrics tiers aren't inflated for data nobody queries historically).
+
+### Fixed
+- **Stale image tags in deploy examples bumped to current.** `deploy/k8s/*.yaml`,
+  `deploy/prometheus-example/` (compose default + README), and the README offline-install
+  snippet still referenced old image tags (`:1.4.0` / `:1.0.0`); all now track the current
+  version so a copy-paste deploy pulls the right image.
+- **Spend → "Cost over time" real series now shows actual cash.** The "real (external)"
+  bars/totals were a `tokens × price` reconstruction that drifted from the real spend shown
+  elsewhere (per-key `spend`, *Cost by user*) — it missed cache-read discounts and dropped
+  any real model with no price in the table, so the card read lower. The real series is now
+  anchored to LiteLLM's actual daily `spend`; the *estimated (self-hosted)* series stays the
+  reconstruction (free self-hosted usage has no cash figure). Falls back to the full
+  estimate on free-tier LiteLLM that reports no per-day `$`. Relabelled the card and the
+  year box so "real" reads as actual cash, not an estimate.
+- **Cost over time — no more 1-year clip + clearer periods.** The card pulled only a
+  rolling 365 days, so on a deployment with older usage its totals read below the real
+  lifetime spend. It now pulls the full history of daily aggregates (one small row/day,
+  reach via `MONITOR_SPEND_ACTIVITY_DAYS`, default ~5y) and shows a **lifetime real**
+  figure that reconciles with per-key spend / *Cost by user*. Disambiguated the two totals
+  that both read "real": the legend total is the **chart window** (last 30 days / 12
+  months), the top-right box is **year-to-date + lifetime** — spelled out in the card note.
+- **External-model cost accuracy.** Per-model cost overrides (Settings → Model costs, and
+  the `MONITOR_MODEL_COSTS` env) pin a model's effective `$/1M` when LiteLLM's own price is
+  wrong; removed the old spend-anchoring that misattributed cost across models.
+
 ## [1.6.1] — 2026-07-15
 
 ### Added

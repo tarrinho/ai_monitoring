@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.6.2"
+VERSION = "AI-Monitoring_1.6.3"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -60,6 +60,10 @@ DASHBOARD_TOKEN = _str("MONITOR_DASHBOARD_TOKEN")  # optional
 # explicit choice — validate() turns a missing token into a FATAL boot error unless
 # MONITOR_ALLOW_OPEN=1 is set. Prevents a forgotten token silently exposing metrics.
 ALLOW_OPEN = (_str("MONITOR_ALLOW_OPEN", "0") or "0").lower() in ("1", "true", "yes", "on")
+# Restrict the Spend & Quota surface (the /spend page + /api/spend/* API) to admins.
+# OFF by default (viewers keep access — unchanged behavior). Turn ON if per-user cost
+# attribution (which user spent how much, incl. emails) should not be visible to viewers.
+SPEND_REQUIRE_ADMIN = (_str("MONITOR_SPEND_REQUIRE_ADMIN", "0") or "0").lower() in ("1", "true", "yes", "on")
 # Security F3: the session cookie carries the bearer token, so it must be marked
 # Secure (HTTPS-only) by default. Set MONITOR_COOKIE_ALLOW_INSECURE=1 ONLY for local
 # plain-HTTP testing, where the browser would otherwise drop a Secure cookie.
@@ -179,6 +183,15 @@ LITELLM_SPEND_MODE = (_str("LITELLM_SPEND_MODE", "full") or "full").lower()
 # running. (The deployment-probing /health call is not used at all — removed.)
 LITELLM_LOAD_SHED = _float("LITELLM_LOAD_SHED", 0.0)  # load-per-core threshold
 LITELLM_SPEND_MAX_ROWS = _int("LITELLM_SPEND_MAX_ROWS", 20000)
+# One-time seed for the "cost per model & user over time" chart: how many days of
+# /spend/logs history to backfill at first run (0 = no backfill, chart grows forward).
+SPEND_MU_BACKFILL_DAYS = _int("MONITOR_SPEND_MU_BACKFILL_DAYS", 14)
+# Cost-over-time reach: how many days of the cheap daily aggregates (/global/activity +
+# /global/spend/report — one small row per day) to pull. The 30d/12mo CHART only ever
+# renders its own window, but the per-year + LIFETIME totals sum the full pull, so this
+# must span the deployment's history for the card's "lifetime" figure to match per-key
+# spend. Default ~5y covers any realistic install; raise it for an older LiteLLM.
+SPEND_ACTIVITY_DAYS = _int("MONITOR_SPEND_ACTIVITY_DAYS", 1826)
 # Heavy calls (/health, /spend/logs) get a longer timeout than the 4s default —
 # on a busy proxy the whole-day /spend/logs query easily exceeds 4s, and a 4s
 # timeout there means it ALWAYS times out and the latency/cost/key panels stay

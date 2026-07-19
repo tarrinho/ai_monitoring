@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI-Monitoring · GPU</title>
+<title>AI-Monitoring · GPU/CPU</title>
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
@@ -77,6 +77,24 @@ function updateSeries(chart,labels,next){
     display:flex;justify-content:space-between}
   .mini h3 .cur{color:var(--fg);font-variant-numeric:tabular-nums}
   .mini .chart-wrap{height:150px;margin:0}
+  /* per-core CPU grid: many small sparklines, denser than the GPU minis. The column
+     max is CAPPED (not 1fr) + left-packed, so a FEW cores render at a natural tile size
+     instead of stretching to fill the whole row. */
+  .percpu-grid{grid-template-columns:repeat(auto-fit,minmax(158px,196px));gap:10px;justify-content:start}
+  .percpu-grid .mini{padding:8px 9px}
+  .percpu-grid .mini h3{font-size:11px;margin-bottom:2px}
+  .percpu-grid .mini .chart-wrap{height:70px}
+  .percpu-grid .mini .cur.c-warn{color:var(--warn)} .percpu-grid .mini .cur.c-bad{color:var(--bad)}
+  /* shrink the per-core tiles as the core count grows, so 32/64/128-core boxes stay
+     scannable instead of filling the screen (applied by buildPerCpu based on N). */
+  .percpu-grid.dense{grid-template-columns:repeat(auto-fit,minmax(116px,150px));gap:8px}
+  .percpu-grid.dense .mini{padding:6px 7px}
+  .percpu-grid.dense .mini h3{font-size:10px;margin-bottom:1px}
+  .percpu-grid.dense .mini .chart-wrap{height:50px}
+  .percpu-grid.xdense{grid-template-columns:repeat(auto-fit,minmax(90px,116px));gap:6px}
+  .percpu-grid.xdense .mini{padding:4px 6px}
+  .percpu-grid.xdense .mini h3{font-size:9px;margin-bottom:1px}
+  .percpu-grid.xdense .mini .chart-wrap{height:38px}
   .unavail{color:var(--muted);font-style:italic;padding:6px 0}
   a{color:var(--accent)}
 
@@ -152,19 +170,29 @@ function updateSeries(chart,labels,next){
   });
 })();
 </script>
+<style>
+/* unified time-window control — prettier pills (consistent across pages) */
+.windows{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+  border-radius:7px;padding:4px 11px;font-size:12px;font-weight:500;line-height:1.5;cursor:pointer;
+  transition:background .14s ease,color .14s ease,border-color .14s ease}
+.windows button:hover{color:var(--fg);border-color:var(--muted)}
+.windows button:disabled{opacity:.5;cursor:default}
+.windows button.active{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+</style>
 </head>
 <body>
 <div id="sidebar">
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.2</div>
+      <div id="sidebar-brand-ver">v1.6.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">🏠 Overview</a>
-    <a href="/gpu">🖥️ GPU</a>
+    <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
     <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
@@ -176,7 +204,7 @@ function updateSeries(chart,labels,next){
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
 <div id="main-area">
 <header>
-  <h1>GPU</h1>
+  <h1>GPU/CPU</h1>
   <div class="windows" id="windows">
     <button id="nav-left" title="shift earlier">◀</button>
     <button data-w="15m">15m</button>
@@ -184,6 +212,7 @@ function updateSeries(chart,labels,next){
     <button data-w="24h">24h</button>
     <button data-w="30d">30d</button>
     <button data-w="12mo">12mo</button>
+    <button data-w="month">MTD</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
@@ -208,6 +237,18 @@ function updateSeries(chart,labels,next){
     <h2>CPU usage by app (stacked) — <span id="appcpu-win">1h</span>
       <span class="info" title="Per-process CPU % of the top-10 apps over time, stacked. Per-app GPU usage is not exposed by nvidia-smi in this setup — the aggregate GPU util is charted above.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:280px"><canvas id="appcpu-chart"></canvas></div>
+  </section>
+
+  <section class="card span-full" id="card-percpu" style="display:none">
+    <h2>CPU usage per core — <span id="percpu-n">0</span> cores
+      <span class="info" title="Per-core CPU utilisation, one live sparkline per logical CPU (from /proc/stat cpuN). Buffered in the browser over ~10 min at the 5 s poll — a live view, not persisted history.">ⓘ</span></h2>
+    <div class="chart-grid percpu-grid" id="percpu-grid"></div>
+  </section>
+
+  <section class="card span-full" id="card-cpucores-stack" style="display:none">
+    <h2>CPU cores usage (stacked) — <span id="cpucores-n">0</span> cores
+      <span class="info" title="Per-core CPU over time, stacked. Each band is that core's share of total capacity (core% ÷ core-count), so the bands sum to OVERALL CPU utilisation (Y axis 0–100%). Hover a band for its real per-core load. Live-only: buffered in the browser over ~10 min at the 5 s poll, not persisted. Click a legend label to toggle a core.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:300px"><canvas id="cpucores-chart"></canvas></div>
   </section>
 
   <section class="card span-full" id="card-charts">
@@ -282,6 +323,118 @@ function fmtT(t){ if(!t) return ""; return new Date(t*1000).toLocaleTimeString([
 // so a 12mo view with only days of history shows distinct day labels.
 function axisT(pts){ const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean); const span=ts.length>1?Math.max(...ts)-Math.min(...ts):0; return function(p){ const t=(p&&typeof p==="object")?p.t:p; if(!t) return ""; const d=new Date(t*1000); return span>180*86400?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):span>2*86400?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }; }
 
+// ── Per-core CPU usage — one sparkline per logical CPU, plus the stacked view below.
+// Served from the PERSISTED cpu_core_series (/api/cpuseries), so both honour the same
+// window + pan controls as every other chart here. (They used to buffer live samples
+// client-side, which silently ignored the window selector: picking 12:14–13:14 still
+// showed "the last few minutes of now".)
+let _percpuPts=[];                        // windowed points [{t,"0":v,"1":v,…}]
+let _percpuCoreIds=[];                    // core ids present in the window
+const _percpuCharts=[];                   // {chart,cur} per rendered core
+function mkPerCpuChart(canvas){
+  return new Chart(canvas,{type:"line",
+    data:{labels:[],datasets:[{data:[],borderColor:cssv("--accent"),
+      backgroundColor:cssv("--accent")+"22",borderWidth:1.4,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false},
+        tooltip:{callbacks:{label:c=>" "+Number(c.parsed.y).toFixed(0)+"%"}}},
+      scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:3,font:{size:8}},grid:{display:false}},
+              y:{min:0,max:100,ticks:{color:cssv("--muted"),font:{size:8},maxTicksLimit:3,callback:v=>v+"%"},
+                 grid:{color:"#30363d33"}}}}
+  });
+}
+function buildPerCpu(coreIds){
+  const n=coreIds.length;
+  const grid=document.getElementById("percpu-grid"); grid.textContent="";
+  // shrink tiles as cores grow so high-core-count machines stay scannable
+  grid.classList.remove("dense","xdense");
+  if(n>32) grid.classList.add("xdense"); else if(n>16) grid.classList.add("dense");
+  _percpuCharts.length=0;
+  _percpuCoreIds=coreIds.slice();
+  document.getElementById("percpu-n").textContent=n;
+  for(const cid of coreIds){
+    const card=document.createElement("div");card.className="mini";
+    const h=document.createElement("h3");
+    const nm=document.createElement("span");nm.textContent="core "+cid;
+    const cur=document.createElement("span");cur.className="cur";cur.textContent="—";
+    h.append(nm,cur);
+    const wrap=document.createElement("div");wrap.className="chart-wrap";
+    const cv=document.createElement("canvas");wrap.appendChild(cv);
+    card.append(h,wrap);grid.appendChild(card);
+    _percpuCharts.push({chart:mkPerCpuChart(cv),cur:cur});
+  }
+}
+// Fetch the per-core series for the CURRENT window (and pan offset), then draw both
+// the per-core grid and the stacked view from it.
+async function loadPerCpu(){
+  const d=await api("/api/cpuseries?window="+WIN);
+  if(!d) return;
+  _percpuCoreIds=d.cores||[];
+  _percpuPts=d.points||[];
+  renderPerCpuGrid();
+  renderCpuCoresStack();
+}
+function renderPerCpuGrid(){
+  const card=document.getElementById("card-percpu");
+  if(!_percpuCoreIds.length||!_percpuPts.length){ card.style.display="none"; return; }
+  card.style.display="";
+  const ids=_percpuCoreIds;
+  // rebuild only when the SET of cores changes (hotplug / different host)
+  if(_percpuCharts.length!==ids.length) buildPerCpu(ids);
+  const labels=_percpuPts.map(axisT(_percpuPts));
+  for(let i=0;i<_percpuCharts.length;i++){
+    const key=String(ids[i]), cc=_percpuCharts[i];
+    cc.chart.data.labels=labels;
+    cc.chart.data.datasets[0].data=_percpuPts.map(p=>(p[key]==null?null:p[key]));
+    cc.chart.update("none");                                    // in place — no rebuild
+    const v=lastNonNull(_percpuPts,key);
+    cc.cur.textContent=(v==null?"—":Math.round(v)+"%");
+    cc.cur.className="cur"+(v>=90?" c-bad":v>=70?" c-warn":"");
+  }
+}
+
+// Stacked CPU-cores usage over time — same windowed dataset as the per-core grid
+// (_percpuPts from /api/cpuseries), one stacked band per logical core. Total height =
+// combined load across
+// each band is a core's SHARE of total capacity (core% ÷ core-count), so the stack sums
+// to OVERALL CPU utilisation (0–100%). updateSeries keeps the user's legend toggles.
+function _coreColor(i,n){ return "hsl("+Math.round(i/Math.max(1,n)*360)+",65%,55%)"; }
+let _cpuCoreN=1;                              // current core count — recovers each band's
+                                             // real per-core load in the tooltip (band × N)
+const cpuCoresChart=new Chart(document.getElementById("cpucores-chart"),{
+  type:"line", data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:9}}},
+      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "
+        +Math.round(c.parsed.y*_cpuCoreN)+"% ("+Number(c.parsed.y).toFixed(1)+"% of total)"}}},
+    scales:{
+      x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{display:false}},
+      y:{stacked:true,beginAtZero:true,max:100,grid:{color:"#30363d33"},
+         ticks:{color:cssv("--muted"),font:{size:9},stepSize:20,callback:v=>v+"%"}}}}
+});
+function renderCpuCoresStack(){
+  const card=document.getElementById("card-cpucores-stack");
+  if(!_percpuPts.length||!_percpuCoreIds.length){ card.style.display="none"; return; }
+  card.style.display="";
+  const ids=_percpuCoreIds, n=ids.length;
+  _cpuCoreN=n;
+  document.getElementById("cpucores-n").textContent=n;
+  const labels=_percpuPts.map(axisT(_percpuPts));
+  const ds=[];
+  for(let i=0;i<n;i++){
+    const col=_coreColor(i,n);
+    // Each core's SHARE of total capacity = core% ÷ N, so the N bands sum to the overall
+    // CPU % (0–100). 0 (not null) for an absent sample: on a STACKED area a null span-gaps
+    // into a phantom diagonal band (same reason the per-app CPU stack fills with 0).
+    ds.push({_k:"core"+ids[i], label:"core "+ids[i],
+      data:_percpuPts.map(function(p){ var v=p[String(ids[i])]; return (v==null?0:v)/n; }),
+      borderColor:col, backgroundColor:col+"cc", borderWidth:.7, pointRadius:0,
+      tension:.2, fill:true});
+  }
+  updateSeries(cpuCoresChart, labels, ds);
+}
+
 // Stacked per-app CPU% over time (top-10 apps, one colour each).
 const PROC_COLORS=["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff","#ff7b72",
   "#39c5cf","#ffa657","#7ee787","#d2a8ff"];
@@ -318,9 +471,10 @@ function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
+function wsecs(w){return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
 let WIN = "1h";
 async function api(path){
-  if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
+  if(TIMEEND && /\/api\/(series|keyseries|procseries|cpuseries)/.test(path))
     path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
   try{
     const sep=path.includes("?")?"&":"?";
@@ -382,7 +536,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadAppCpu(); }
+function rangedReload(){ loadSeries(); loadAppCpu(); loadPerCpu(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -397,7 +551,7 @@ function updateRangeUI(){
   const lbl=document.getElementById("range-lbl");
   // absolute window bounds shown at the top — start → end, refreshed on every
   // pan (◀ ▶) and window change.
-  const _end=TIMEEND||now, _start=_end-WSECS[WIN];
+  const _end=TIMEEND||now, _start=_end-wsecs(WIN);
   const _dt=document.getElementById("range-dates");
   if(_dt) _dt.textContent = fmtRange(_start)+"  →  "+fmtRange(_end);
   if(!TIMEEND){ lbl.textContent="live"; return; }
@@ -405,11 +559,11 @@ function updateRangeUI(){
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
 document.getElementById("nav-left").addEventListener("click",()=>{
-  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-WSECS[WIN];
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(WIN);
   updateRangeUI(); rangedReload();
 });
 document.getElementById("nav-right").addEventListener("click",()=>{
-  if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
+  if(!TIMEEND) return; TIMEEND+=wsecs(WIN);
   if(TIMEEND>=Date.now()/1000) TIMEEND=null;
   updateRangeUI(); rangedReload();
 });
@@ -420,7 +574,7 @@ document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>x.classList.remove("active"));
     b.classList.add("active"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
-    document.getElementById("win-label").textContent=WIN; loadSeries(); loadAppCpu();
+    document.getElementById("win-label").textContent=WIN; loadSeries(); loadAppCpu(); loadPerCpu();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -438,6 +592,7 @@ async function tick(){
   }
   await loadSeries();
   await loadAppCpu();
+  await loadPerCpu();
 }
 updateRangeUI();
 tick();

@@ -202,19 +202,29 @@ function updateSeries(chart,labels,next){
   });
 })();
 </script>
+<style>
+/* unified time-window control — prettier pills (consistent across pages) */
+.windows{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.windows button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+  border-radius:7px;padding:4px 11px;font-size:12px;font-weight:500;line-height:1.5;cursor:pointer;
+  transition:background .14s ease,color .14s ease,border-color .14s ease}
+.windows button:hover{color:var(--fg);border-color:var(--muted)}
+.windows button:disabled{opacity:.5;cursor:default}
+.windows button.active{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+</style>
 </head>
 <body>
 <div id="sidebar">
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.2</div>
+      <div id="sidebar-brand-ver">v1.6.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">🏠 Overview</a>
-    <a href="/gpu">🖥️ GPU</a>
+    <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
     <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
@@ -235,6 +245,7 @@ function updateSeries(chart,labels,next){
     <button data-w="24h">24h</button>
     <button data-w="30d">30d</button>
     <button data-w="12mo">12mo</button>
+    <button data-w="month">MTD</button>
     <button id="nav-right" title="shift later" disabled>▶</button>
     <button id="nav-live" title="jump to now (live)" disabled>● Live</button>
     <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
@@ -848,6 +859,7 @@ function renderLlamacpp(c){
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
+function wsecs(w){return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
 let WIN = "1h";
 
 async function api(path){
@@ -954,7 +966,7 @@ function updateRangeUI(){
   const lbl=document.getElementById("range-lbl");
   // absolute window bounds shown at the top — start → end, refreshed on every
   // pan (◀ ▶) and window change.
-  const _end=TIMEEND||now, _start=_end-WSECS[WIN];
+  const _end=TIMEEND||now, _start=_end-wsecs(WIN);
   const _dt=document.getElementById("range-dates");
   if(_dt) _dt.textContent = fmtRange(_start)+"  →  "+fmtRange(_end);
   if(!TIMEEND){ lbl.textContent="live"; return; }
@@ -962,11 +974,11 @@ function updateRangeUI(){
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
 document.getElementById("nav-left").addEventListener("click",()=>{
-  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-WSECS[WIN];
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(WIN);
   updateRangeUI(); rangedReload();
 });
 document.getElementById("nav-right").addEventListener("click",()=>{
-  if(!TIMEEND) return; TIMEEND+=WSECS[WIN];
+  if(!TIMEEND) return; TIMEEND+=wsecs(WIN);
   if(TIMEEND>=Date.now()/1000) TIMEEND=null;
   updateRangeUI(); rangedReload();
 });

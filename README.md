@@ -189,6 +189,31 @@ secrets are never logged or persisted. `0` / empty disables a feature.
 | `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` / `MONITOR_ADMIN_EMAIL` | *(empty)* | seed the first **admin** account on an empty users table (idempotent) |
 | `MONITOR_SESSION_TTL_S` | `604800` | login session lifetime (seconds; default 7 days) |
 | `MONITOR_ALLOW_OPEN` | `0` | `1` = run with **no** auth (loopback / behind an auth proxy only) |
+| `MONITOR_RETENTION_SAMPLES` | `8640` | in-memory ring of recent samples (12 h at the 5 s cadence) |
+| `MONITOR_HTTP_MAX_BYTES` | `16777216` | hard cap on a single collector response body — stops a compromised/MITM'd backend OOM-ing the monitor |
+| `MONITOR_DEBUG` | `0` | `1` = log each collector's availability + error to `docker logs` (diagnose a blank panel) |
+| `MONITOR_CURRENCY` | `$` | currency symbol shown before money values on the dashboards |
+
+#### Auth hardening
+
+Brute-force and session limits. The two lockouts are independent: the **per-IP** one stops
+a single source spraying tokens, the **per-account** one protects one username even when
+the attacker rotates IPs.
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `MONITOR_AUTH_MAX_FAILS` / `MONITOR_AUTH_WINDOW_S` / `MONITOR_AUTH_LOCKOUT_S` | `10` / `300` / `900` | per-**IP** lockout: N bad tokens within the window ⇒ that IP gets `429` for the lockout |
+| `MONITOR_AUTH_USER_MAX_FAILS` / `MONITOR_AUTH_USER_LOCKOUT_S` | `10` / `300` | per-**account** lockout, independent of the IP one |
+| `MONITOR_AUTH_TRUSTED_PROXY` | `0` | `1` = read the real client IP from `X-Forwarded-For`. **Set this behind a reverse proxy** — otherwise every request looks like the proxy's IP and one attacker locks out all users. Leave `0` when directly exposed (the header is spoofable) |
+| `MONITOR_SESSION_MAX` | `2000` | ceiling on concurrent server-side sessions (oldest-expiring evicted) |
+| `MONITOR_COOKIE_ALLOW_INSECURE` | `0` | `1` = drop the `Secure` flag on the session cookie — **local plain-HTTP testing only** |
+| `MONITOR_SPEND_REQUIRE_ADMIN` | `0` | `1` = restrict `/spend` + `/api/spend/*` to admins (per-user cost attribution includes emails) |
+
+```bash
+# behind Caddy/nginx/Cloudflare — trust the forwarded IP so lockouts target real clients
+MONITOR_AUTH_TRUSTED_PROXY=1
+# the proxy must APPEND to X-Forwarded-For (not replace it); the rightmost hop is trusted
+```
 
 ### Users & access
 External users log in with their own **username + password** instead of sharing a
@@ -219,7 +244,8 @@ generic JSON POST) — when an alert fires it is delivered to every enabled user
 webhook plus the operator-set global `ALERT_WEBHOOK_URL`. User URLs are SSRF-guarded
 (private / loopback / metadata addresses are refused); see
 `MONITOR_WEBHOOK_HTTPS_ONLY` / `MONITOR_WEBHOOK_ALLOW_HOSTS` /
-`MONITOR_WEBHOOK_ALLOW_PRIVATE`.
+`MONITOR_WEBHOOK_ALLOW_PRIVATE`, and `MONITOR_WEBHOOK_MAX_RECIPIENTS` (default `50`)
+which bounds the fan-out so one alert can't trigger unbounded outbound requests.
 
 Seed the first admin via `MONITOR_ADMIN_USER` / `MONITOR_ADMIN_PASSWORD` /
 `MONITOR_ADMIN_EMAIL`, then manage everyone else from `/admin/users`. Passwords are
@@ -250,6 +276,7 @@ rows are kept for `MONITOR_AUDIT_RETENTION_DAYS` (default 90).
 | `LITELLM_SPEND_TIMEOUT` | `20` | timeout (s) for the heavy `/health` + `/spend/logs` calls; the 4s default is too short for a busy proxy's whole-day query and blanks the panels |
 | `LITELLM_CB_THRESHOLD` / `LITELLM_CB_COOLDOWN` | `3` / `300` | circuit breaker — after N consecutive heavy-call failures, stop calling for the cooldown (s), then probe once. Stops the monitor hammering (and freezing) a struggling proxy; auto-recovers |
 | `LITELLM_SPEND_MAX_BYTES` | `67108864` | refuse a `/spend/logs` response larger than this (bytes) before deserializing |
+| `MONITOR_SPEND_ACTIVITY_DAYS` | `1826` | how far back (days) the **Cost over time** card pulls the cheap daily aggregates (one small row/day). The 30d/12mo chart only renders its own window; this reach makes the card's **year-to-date + lifetime** real totals span the deployment's history so they reconcile with per-key spend. Raise it for an install older than ~5y |
 | `LITELLM_DEBUG` | `0` | `1` = verbose per-call logging to `docker logs` (diagnose empty panels) |
 | `SLO_LATENCY_MS` | `2000` | latency SLO target (% of requests under it) |
 | `OLLAMA_BASE_URL` | `http://host:11434` | Ollama (no key needed) |
@@ -258,8 +285,33 @@ rows are kept for `MONITOR_AUDIT_RETENTION_DAYS` (default 90).
 | `GPU_SSH` / `GPU_SSH_PORT` / `GPU_SSH_KEY` | `user@gpuhost` / `22` / `/keys/id` | **remote** GPU via agentless SSH `nvidia-smi` |
 | `GPU_METRICS_URL` | `http://gpuhost:9835/gpu` | **remote** GPU via an HTTP agent returning `{gpus:[…]}` |
 | `MONITOR_CONTAINERS` | *(empty = all)* | **Containers** card: liveness + alive-time via the Docker API. **Empty → auto-discovers ALL host containers**; a comma-separated list restricts to those names. Needs the Docker socket mounted (compose does this) + `DOCKER_GID` set to the host `docker` group id so the non-root monitor can read it. **Note:** mounting `docker.sock` grants Docker control — the monitor only issues read-only GETs, but treat it accordingly. |
+| `MONITOR_DOCKER_API_URL` | `http://docker-socket-proxy:2375` | **preferred**: reach Docker through a read-only socket **proxy** over TCP. When set, the raw host socket is *not* mounted, so a monitor compromise can't reach the full Docker API |
+| `MONITOR_DOCKER_SOCKET` | `/var/run/docker.sock` | legacy direct-socket fallback, used only when `MONITOR_DOCKER_API_URL` is empty |
 
 *(No GPU vars → local `nvidia-smi`/`rocm-smi`; no GPU present → the GPU dashboard hides.)*
+
+#### Cost attribution & pricing
+
+How a model's spend is classified and priced. **REAL** = external cash that counts against a
+budget; **REFERENCE** = self-hosted, an imputed value shown but never billed.
+
+| Var | Example | Meaning |
+|-----|---------|---------|
+| `MONITOR_INTERNAL_PROVIDERS` | `ollama,llamacpp,vllm,…` | provider prefixes treated as **self-hosted** (reference cost). Set **empty** if you price local models yourself and want them counted as real budgetable spend |
+| `MONITOR_INTERNAL_MODEL_FAMILIES` | `gemma,qwen,mistral,llama,…` | open-weight **families** that are self-hosted even without a provider prefix (a bare `qwen2.5`). Matched as a substring of the model name |
+| `MONITOR_MODEL_COSTS` | `{"provider/model": 0.20}` | per-model price override in **USD per 1M tokens** — highest precedence, pins a model's rate when LiteLLM's own price is wrong (e.g. it ignores a cache-read discount) |
+| `MONITOR_KEY_BUDGETS` | `{"team-a-key": 500}` | per-key **monthly** budgets, used until a real `max_budget` is read from LiteLLM `/key/info` |
+| `MONITOR_SPEND_MU_BACKFILL_DAYS` | `14` | one-time seed for the *cost per model & user* chart: days of `/spend/logs` history to backfill on first run (`0` = none, chart grows forward) |
+
+```bash
+# Price two external models yourself (USD per 1M tokens) and cap two keys per month.
+# Keep REAL figures in your own .env — never commit them.
+MONITOR_MODEL_COSTS='{"azure/gpt-4o-mini": 0.15, "anthropic/claude-sonnet": 3.00}'
+MONITOR_KEY_BUDGETS='{"team-research": 500, "team-support": 150}'
+
+# Treat a bare open-weight model as self-hosted (reference cost, never billed):
+MONITOR_INTERNAL_MODEL_FAMILIES=gemma,qwen,mistral,llama
+```
 
 ### GPU setup
 
@@ -393,10 +445,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.0.0-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.6.3-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.0.0-armv7 ai-monitoring:1.0.0
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.6.3-armv7 ai-monitoring:1.6.3
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```
@@ -524,7 +576,7 @@ pip install -r requirements-dev.txt && pytest
 ## Development
 
 This project was built with AI assistance (Claude Code). All code is human-reviewed and
-gated by an extensive CI pipeline that runs on every push: 400+ tests, ruff / semgrep /
+gated by an extensive CI pipeline that runs on every push: 500+ tests, ruff / semgrep /
 bandit static analysis, gitleaks + trufflehog secret scanning, Trivy CVE scans
 (filesystem + image), and cosign image signing.
 

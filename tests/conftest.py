@@ -51,10 +51,16 @@ def _reset_auth_state():
             # test DB persists across runs, so without this a user's tokens pile
             # up until create hits the cap (400). Reset them like users/sessions.
             conn.execute("DELETE FROM api_tokens")
+            # The per-(day,model,key) spend rollup is shared too: rows written by one
+            # test would otherwise inflate another's model×user series. Reset it (+ its
+            # one-time backfill marker) like the other shared tables.
+            conn.execute("DELETE FROM spend_model_user_daily")
+            conn.execute("DELETE FROM settings WHERE key = 'spend_mu_backfill'")
     except Exception:
         pass
     _app._users_seen["checked"] = 0.0
     _app._users_seen["any"] = False
+    _app._MU_SERIES_CACHE.clear()          # module-level series cache — isolate per test
     _auth._sessions.clear()
     _app._auth_fails.clear()
     _app._auth_locked_until.clear()

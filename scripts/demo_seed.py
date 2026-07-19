@@ -44,6 +44,11 @@ def make_snap(ts):
     req = max(0.2, wave(ts, 7.5, 5, 260, 1))
     return {"ts": ts, "collectors": {
         "host": {"available": True, "cpu_pct": round(cpu, 1), "mem_pct": round(mem, 1),
+                 # per-core %: 20 logical cores with staggered waves so the GPU/CPU page's
+                 # stacked "CPU cores usage" card has a lively, distinct band per core.
+                 "cpu_per_core": [round(max(0, min(100,
+                     wave(ts, 28 + (i * 7) % 46, 34, 120 + i * 13, i * 0.4))), 1)
+                     for i in range(20)],
                  "mem_used": int(mem / 100 * 128) * 2**30, "mem_total": 128 * 2**30,
                  "mem_avail": int((100 - mem) / 100 * 128) * 2**30,
                  "disk": {"pct": 61.4, "used": 880 * 2**30, "total": 1400 * 2**30},
@@ -191,6 +196,43 @@ def seed_history():
     db.record_event(now - 1800, "llamacpp", True, "up")
 
 
+# ── model × user spend rollup (the new Spend chart) ──────────────────────────
+# Real (paid) models with a $/token price, and a handful of users driving them.
+DEMO_MU_MODELS = [("azure_ai/gpt-5-mini", 0.20e-6), ("azure_ai/gpt-4o", 5.0e-6),
+                  ("azure_ai/gpt-5.4-mini", 0.15e-6)]
+DEMO_MU_USERS = [("langgraph-agent", "ana@demo.ai"), ("coder-ide", "pedro@demo.ai"),
+                 ("batch-eval", "sam@demo.ai"), ("rag-indexer", "lee@demo.ai")]
+
+
+def seed_model_user(now, days=14):
+    """Seed the per-(day,model,key) rollup so the 'Cost per model & user over time'
+    chart has 14 days of realistic stacked data. Cost is derived at read time from
+    tokens × price (see the demo model_prices override), so we only store tokens."""
+    rows = []
+    for d in range(days):
+        day = time.strftime("%Y-%m-%d", time.gmtime(now - d * 86400))
+        for mi, (model, _p) in enumerate(DEMO_MU_MODELS):
+            for ui, (alias, _email) in enumerate(DEMO_MU_USERS):
+                base = 4_000_000 / (mi + 1) / (ui + 1)
+                tok = int(max(0, base * (0.6 + 0.4 * math.sin((d + mi + ui) / 3.0))))
+                if tok <= 0:
+                    continue
+                rows.append({"day": day, "model": model, "key": f"sk-demo-{mi}-{ui}",
+                             "alias": alias, "cost": 0.0, "tokens": tok})
+    db.spend_model_user_upsert(rows, now)
+
+
+async def _demo_model_prices(_session):
+    """$/token for the demo models so the model×user chart computes a cost (no real
+    LiteLLM to price against)."""
+    return {m: p for m, p in DEMO_MU_MODELS}
+
+
+async def _demo_owner_map(_session):
+    """alias → owner email, so the demo chart's series read 'model · person@demo.ai'."""
+    return {"ovr": {}, "live": {alias: email for alias, email in DEMO_MU_USERS}}
+
+
 # keep the live loop producing the same synthetic data (don't clobber _latest)
 async def _fake_sample(session):
     return make_snap(time.time())
@@ -260,7 +302,15 @@ def _demo_spend_series(now, window):
         daily.append({"date": date, "spend": round(spend, 2),
                       "real": round(real, 2), "reference": round(spend - real, 2),
                       "requests": int(spend * 8), "tokens": int(spend * 9000)})
-    return {"window": window, "available": True, **A.window_and_years(daily, window, now)}
+    out = {"window": window, "available": True, **A.window_and_years(daily, window, now)}
+    # split each point's tokens into EXTERNAL (paid) vs INTERNAL (self-hosted) so the
+    # usage-over-time bar shows the two colours in the demo (internal/self-hosted dominates).
+    for j, p in enumerate(out.get("points", [])):
+        tot = int(p.get("tokens") or 0)
+        ext = int(tot * (0.34 + 0.06 * math.sin(j / 5.0)))
+        p["tokens_ext"], p["tokens_int"] = ext, tot - ext
+    out["tokens_split"] = True
+    return out
 
 
 if __name__ == "__main__":
@@ -271,10 +321,14 @@ if __name__ == "__main__":
     _seeded = auth.bootstrap_admin()
     if _seeded:
         print(f"seeded admin user '{_seeded}'")
+    seed_model_user(time.time())            # 14d of model×user rollup for the new chart
     A._sample_once = _fake_sample
     A._budgets_source = _demo_budgets
     A._spend_series_source = _demo_spend_series
     A._serve_page = _serve_with_theme
+    A._key_owner_map = _demo_owner_map       # nice owner emails for the model×user series
+    from collectors import litellm as _ll    # price the demo models (no real LiteLLM)
+    _ll.model_prices = _demo_model_prices
     # keep ?token=&theme= in the URL (no cookie-strip redirect) so screenshots
     # can pin the theme and the page JS can read the token from the query.
     A._maybe_cookie_redirect = lambda *a, **k: None

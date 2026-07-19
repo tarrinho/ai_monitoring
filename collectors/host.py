@@ -9,6 +9,9 @@ import os
 
 _PROC = "/proc"
 _prev_cpu: tuple[int, int] | None = None  # (total, idle) from last sample
+# Per-core previous (total, idle) jiffies — parallel to _prev_cpu, for the per-core
+# usage sparklines on the GPU page. Delta-based like the aggregate.
+_prev_cpu_cores: list[tuple[int, int]] | None = None
 
 
 def _read_cpu() -> tuple[int, int] | None:
@@ -19,6 +22,44 @@ def _read_cpu() -> tuple[int, int] | None:
         return sum(nums), idle
     except Exception:
         return None
+
+
+def _read_cpu_cores() -> list[tuple[int, int]]:
+    """Per-core (total, idle) jiffies from the `cpu0`,`cpu1`,… lines of /proc/stat.
+    The per-core lines are contiguous right after the aggregate `cpu` line, so we stop
+    at the first non-cpu line. Returns [] on any error (per-core is best-effort)."""
+    out: list[tuple[int, int]] = []
+    try:
+        with open(f"{_PROC}/stat") as f:
+            for ln in f:
+                if not ln.startswith("cpu"):
+                    break                     # cpu* lines are first; nothing after
+                parts = ln.split()
+                tag = parts[0]
+                if tag == "cpu" or not tag[3:].isdigit():
+                    continue                  # aggregate line (handled by _read_cpu)
+                nums = [int(x) for x in parts[1:]]
+                idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+                out.append((sum(nums), idle))
+    except Exception:
+        return []
+    return out
+
+
+def _per_core_pct(cur: list[tuple[int, int]]) -> list[float]:
+    """Delta CPU% per core vs the previous sample. [] until a second sample exists or
+    if the core count changed (hotplug) — a mismatched length can't be diffed."""
+    global _prev_cpu_cores
+    pct: list[float] = []
+    if cur and _prev_cpu_cores and len(cur) == len(_prev_cpu_cores):
+        for (tot, idle), (ptot, pidle) in zip(cur, _prev_cpu_cores):
+            d_total = tot - ptot
+            d_idle = idle - pidle
+            pct.append(round(max(0.0, min(100.0, (1 - d_idle / d_total) * 100)), 1)
+                       if d_total > 0 else 0.0)
+    if cur:
+        _prev_cpu_cores = cur
+    return pct
 
 
 def _read_meminfo() -> dict[str, int]:
@@ -134,6 +175,8 @@ def sample(disk_path: str = "/") -> dict:
     if cur:
         _prev_cpu = cur
 
+    per_core = _per_core_pct(_read_cpu_cores())
+
     mem = _read_meminfo()
     mem_total = mem.get("MemTotal", 0)
     mem_avail = mem.get("MemAvailable", 0)
@@ -142,6 +185,7 @@ def sample(disk_path: str = "/") -> dict:
     return {
         "available": True,
         "cpu_pct": round(cpu_pct, 1),
+        "cpu_per_core": per_core,          # [] on first tick / hotplug; per-core % otherwise
         "load": _loadavg(),
         "mem_total": mem_total,
         "mem_used": mem_used,

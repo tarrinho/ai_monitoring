@@ -389,7 +389,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.6.2"
+    assert config.VERSION == "AI-Monitoring_1.6.3"
 
 
 def test_ux_improvements_present():
@@ -862,6 +862,22 @@ def test_spend_has_cost_per_model_over_time_card():
     assert 'borderDash:est?[5,3]:[]' in html
 
 
+def test_cost_over_time_reads_actual_cash_and_shows_lifetime():
+    """The Cost over time card must present its REAL series as actual LiteLLM cash (not a
+    'tokens × price' estimate) and expose a lifetime figure so it reconciles with per-key
+    spend. Guards the anchor-to-actual relabelling + the lifetime line."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    # real series is actual cash — the misleading 'estimated' framing is gone
+    assert '<h2>Cost over time</h2>' in html, "stale 'estimated' badge on the card title"
+    assert 'estimated cost this year' not in html.lower()
+    assert 'actual LiteLLM cash' in html
+    # lifetime real is rendered from the server field so window/YTD totals don't look wrong
+    assert 'real_cost_lifetime' in html
+    assert 'lifetime real' in html
+    # the note disambiguates the window total vs the year-to-date/lifetime box
+    assert 'chart window' in html and 'year-to-date + lifetime' in html
+
+
 def test_all_dashboard_charts_update_in_place_not_rebuilt():
     """Every dashboard polls on an interval; multi-series charts must refresh via
     updateSeries() — updating dataset VALUES in place (and preserving the user's legend
@@ -1126,6 +1142,28 @@ def test_settings_page_exists_with_tunables_and_teams():
     assert not re.search(r"innerHTML\s*=", html), "settings page must not use innerHTML"
 
 
+def test_spend_model_user_cost_time_card():
+    """Spend page carries the 'Cost per model & user over time' stacked-area card: its
+    section + canvas, the window/mode/group toggles, a loader hitting the local-rollup
+    endpoint, and the shared updateSeries helper (never a full datasets rebuild in the
+    caller). Money rendered via CUR."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert 'id="card-model-user-cost-time"' in html
+    assert 'id="model-user-cost-chart"' in html
+    assert "/api/spend/model-user-series" in html
+    assert "loadModelUserCostSeries" in html and "renderModelUserCostTime" in html
+    assert "updateSeries(modelUserChart" in html          # in-place refresh, keep toggles
+    # window is the page-level control (#sp-windows in the header, drives every chart);
+    # the card keeps only its own display toggles
+    assert 'id="mu-mode"' in html and 'id="mu-group"' in html
+    assert "window=\"+SPWIN" in html                         # model×user follows the page window
+    assert "stacked:true" in html                          # it's a STACKED area chart
+    # placed AFTER 'cost per model over time', BEFORE the per-key budgets table
+    assert (html.index('id="card-model-cost-time"')
+            < html.index('id="card-model-user-cost-time"')
+            < html.index('id="card-keys"'))
+
+
 def test_dashboards_use_currency_global_not_hardcoded_dollar():
     """Money is rendered via the injected `window.CUR` currency global (default $), not a
     hardcoded `"$"` — so MONITOR_CURRENCY can switch it (e.g. to €) with no code change."""
@@ -1150,7 +1188,8 @@ def test_dashboard_inline_scripts_parse():
     import tempfile
 
     _INLINE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.S)
-    for f in ("spend.html", "litellm.html", "settings.html", "index.html", "alerts.html"):
+    for f in ("spend.html", "litellm.html", "settings.html", "index.html",
+              "alerts.html", "gpu.html"):
         txt = (ROOT / "web" / f).read_text(encoding="utf-8")
         for i, m in enumerate(_INLINE.finditer(txt)):
             code = m.group(1)
@@ -1166,6 +1205,55 @@ def test_dashboard_inline_scripts_parse():
             assert r.returncode == 0, f"{f} inline script #{i} has a JS syntax error:\n{r.stderr}"
 
 
+def test_all_pages_have_consistent_time_window_with_mtd():
+    """Every dashboard page carries the same header time-window control (15m/1h/24h/30d/
+    12mo + month-to-date), a month-aware `wsecs` helper (no stale WSECS[WIN]), and the
+    unified prettier pill styling."""
+    HEADER_PAGES = ("index", "gpu", "ollama", "llamacpp", "litellm")
+    for name in HEADER_PAGES:
+        html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
+        for w in ("15m", "1h", "24h", "30d", "12mo", "month"):
+            assert f'data-w="{w}"' in html, f"{name}: missing window {w}"
+        assert 'data-w="month">MTD' in html, f"{name}: month button not labelled MTD"
+        assert "function wsecs(" in html, f"{name}: missing month-aware wsecs() helper"
+        assert "WSECS[WIN]" not in html, f"{name}: stale WSECS[WIN] (not month-aware)"
+        assert "unified time-window control" in html, f"{name}: missing unified pill styling"
+    # spend uses the same pill styling too (its windows are card-scoped / coarser)
+    assert "unified time-window control" in (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+
+
+def test_usage_over_time_tokens_split_external_internal():
+    """The Spend 'Usage over time' bar colours tokens by EXTERNAL (paid) vs INTERNAL
+    (self-hosted): two stacked datasets, distinct colours, fed from tokens_ext/tokens_int
+    with a graceful fallback to a single 'Tokens' bar when the split isn't available."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert "External tokens" in html and "Internal tokens" in html   # two datasets
+    assert 'stack:"tok"' in html                                     # stacked into one bar
+    assert "p.tokens_ext" in html and "p.tokens_int" in html         # fed from the split
+    assert "d.tokens_split" in html                                  # gated on availability
+    # distinct colours (external vs internal), not the same token colour
+    assert 'backgroundColor:cssv("--accent")' in html and 'backgroundColor:cssv("--ok")' in html
+
+
+def test_settings_hides_cards_for_absent_backends():
+    """Settings shows only cards that make sense: config groups gate on the backend they
+    need (GPU group → GPU present; LiteLLM group + Teams + Model-costs → LiteLLM present),
+    read from the live collectors (nav.gpu is always true now). Default-present so a failed
+    probe never hides real config."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    assert "function fetchPresence" in html and "function applyPresence" in html
+    # group → backend map + the render-time filter that drops absent-backend groups
+    assert 'GROUP_BACKEND={GPU:"gpu", LiteLLM:"litellm"}' in html
+    assert "GROUP_BACKEND[s.group]" in html and "_present[b]!==false" in html
+    # static LiteLLM cards removed when no LiteLLM; their loaders skipped
+    assert '"teams-card","models-card"' in html
+    assert "if(_present.litellm){ loadTeams(); loadModels(); }" in html
+    # presence read from collectors, treating only unconfigured as absent
+    assert 'c.available===false && c.error==="unconfigured"' in html
+    # safe default: present unless proven absent
+    assert "var _present={gpu:true, litellm:true}" in html
+
+
 def test_settings_model_cost_override_ui():
     """Model-costs card exposes each model's $/1M cost and lets an admin PIN it (per-model
     cost input + action=cost / cost_reset), so an unreliable LiteLLM price can be corrected
@@ -1174,7 +1262,11 @@ def test_settings_model_cost_override_ui():
     assert '"min mcost"' in html                             # the per-model cost input (JS-built)
     assert 'action:"cost"' in html and "usd_1m" in html      # Save posts a cost override
     assert 'action:"cost_reset"' in html                     # Reset clears it
-    assert "eff_cost_1m" in html and "cost_1m" in html        # shows effective + set $/1M
+    assert "m.cost_1m" in html                                # the set override value
+    # the card breaks the cost into the THREE LiteLLM per-type rates (input/output/cache),
+    # instead of a single summed blend (which read double)
+    assert "m.in_1m" in html and "m.out_1m" in html and "m.cache_1m" in html
+    assert '"mcosts"' in html and 'mcell(' in html
 
 
 def test_config_tunables_exclude_secrets_and_switches():
@@ -1218,10 +1310,26 @@ def test_sidebar_gpu_between_overview_and_litellm():
         # nav labels carry an icon prefix (e.g. "🏠 Overview"), so anchor on the
         # closing text, not "href=…>Label", which the icon now sits between.
         o = html.find('Overview</a>')
-        g = html.find('GPU</a>')
+        g = html.find('GPU/CPU</a>')
         ll = html.find('LiteLLM</a>')
         assert o >= 0 and g >= 0 and ll >= 0, f"{name}: nav links missing"
         assert o < g < ll, f"{name}: sidebar order must be Overview < GPU < LiteLLM"
+
+
+def test_gpu_page_titled_gpu_cpu_and_has_cpu_cores_stack():
+    """GPU page is titled 'GPU/CPU' and carries a stacked CPU-cores-usage card at the
+    BOTTOM (after the GPU-metrics charts), fed from the per-core buffer via updateSeries."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert "<title>AI-Monitoring · GPU/CPU</title>" in html
+    assert "<h1>GPU/CPU</h1>" in html
+    assert 'id="card-cpucores-stack"' in html and 'id="cpucores-chart"' in html
+    assert "renderCpuCoresStack" in html and "updateSeries(cpuCoresChart" in html
+    assert "stacked:true" in html                              # it's a STACKED chart
+    # grouped with the CPU cores: directly below the per-core sparkline grid, above the
+    # GPU-metrics-over-time card
+    assert (html.index('id="card-percpu"')
+            < html.index('id="card-cpucores-stack"')
+            < html.index('id="card-charts"'))
 
 
 def test_metrics_over_time_is_full_width():
@@ -1315,6 +1423,104 @@ def test_gpu_stacked_per_app_cpu_chart():
         "absent app must map to 0 (not null) on the stacked chart"
     assert re.search(r'spanGaps:\s*false', html), \
         "stacked appcpu chart must not spanGaps (0-fill instead)"
+
+
+def test_team_rollup_refuses_to_score_mixed_cap_periods():
+    """The by-team rollup summed every key's spend and divided by the summed budgets with
+    no regard for period. A team mixing a key whose spend RESETS with one whose spend is
+    ALL-TIME therefore added two different periods and scored the result — enough to paint
+    a team 'Critical' off meaningless arithmetic. It must withhold the % and say why."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    # grouping records each contributing key's basis
+    assert re.search(r'bases\[r\.cap_basis\]', html), "team rollup must track cap_basis"
+    # and refuses a single % when they disagree
+    assert re.search(r'mixed\s*=\s*bs\.length\s*>\s*1', html)
+    assert re.search(r'!mixed', html), "team % must be withheld when periods are mixed"
+    # the card explains the withheld % rather than looking like a missing budget
+    assert "mixed periods" in html
+    assert "cannot be added and scored" in html
+
+
+def test_per_key_lifetime_cap_still_shows_real_percent_and_status():
+    """REGRESSION: an interim version replaced a lifetime-cap key's % and status pill with
+    the literal text "All-time", which HID a key that was over its cap — it rendered
+    "All-time" instead of "Critical". A lifetime cap is a real cap (spend and cap are both
+    all-time), so the number and status must always render; only the basis is annotated."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert "cap_basis" in html
+    # the status pill must render the real label, never be swapped for a basis word
+    assert re.search(r'>\$\{SLBL\[r\.status\]\}<', html), \
+        "status pill must always show the real status label"
+    assert '"All-time":SLBL[r.status]' not in html, "status must not be masked by basis"
+    # the percentage itself is still rendered (not replaced by a basis word)
+    assert re.search(r'\$\{ipct\}%', html), "per-key % must always render"
+    # and the two different percentages are explained rather than left to look contradictory
+    assert "answer different questions" in html
+
+
+def test_spend_model_chart_discloses_cost_provenance():
+    """The cost summary uses LiteLLM's actual cash while the per-model chart may be a
+    tokens × price estimate — and a model with no price cannot be charted at all. The card
+    must state its basis AND name the models missing from it, otherwise the breakdown
+    looks complete while being short of the headline."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert 'id="model-cost-note"' in html
+    assert "cost_basis" in html and "unpriced" in html
+    # the warning must say the missing spend IS counted in the summary above
+    assert re.search(r'could not be priced', html)
+    assert re.search(r'NOT in this chart', html)
+
+
+def test_sampling_loop_persists_per_core_cpu():
+    """The per-core charts are only windowed because the sampling loop WRITES per-core
+    samples every tick. If that call is dropped, the DB/API/UI all still pass their own
+    tests while the charts quietly go empty — so pin the wiring here."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "db.insert_cpu_core_series(" in src, \
+        "sampling loop must persist host.cpu_per_core"
+    assert re.search(r'db\.insert_cpu_core_series\(\s*snap\[.ts.\]\s*,[^)]*cpu_per_core',
+                     src), "per-core must be written with the snapshot's own timestamp"
+    # and the tiered prune must cover the per-core tables (retention, not unbounded growth)
+    dbsrc = (ROOT / "db.py").read_text(encoding="utf-8")
+    for tbl in ("cpu_core_series", "cpu_core_series_1m", "cpu_core_series_1h"):
+        assert re.search(rf'DELETE FROM {tbl} WHERE', dbsrc), f"{tbl} is never pruned"
+
+
+def test_gpu_per_core_charts_honour_the_window():
+    """REGRESSION: the per-core grid + stacked-cores chart used to buffer live samples in
+    the browser, so they ignored the page's window/pan controls entirely — selecting
+    12:14–13:14 still rendered 'the last few minutes of now'. Both must now be driven by
+    the windowed /api/cpuseries endpoint and redraw when the window or pan changes."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert "/api/cpuseries" in html and "loadPerCpu" in html
+    # the client-side rolling buffer is gone
+    assert "_percpuBuf" not in html, "per-core still uses the live client buffer"
+    assert "PERCPU_MAX_PTS" not in html
+    # both views read the windowed points, not wall-clock 'now'
+    assert "_percpuPts" in html
+    assert "Date.now()/1000,cores:" not in html, "still timestamping with wall-clock now"
+    # window switch AND pan both refresh the per-core data
+    assert re.search(r'loadSeries\(\);\s*loadAppCpu\(\);\s*loadPerCpu\(\);', html), \
+        "window/pan handlers must reload the per-core series"
+    # pan offset (`end=`) is forwarded for cpuseries like the other series endpoints
+    assert re.search(r'series\|keyseries\|procseries\|cpuseries', html), \
+        "api() must attach the pan `end=` param to /api/cpuseries"
+
+
+def test_gpu_per_core_cpu_grid():
+    """The GPU page shows a per-core CPU usage grid: one sparkline per logical CPU, built
+    dynamically from the windowed /api/cpuseries payload (see
+    test_gpu_per_core_charts_honour_the_window for the window/pan contract)."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert 'id="card-percpu"' in html and 'id="percpu-grid"' in html
+    assert "renderPerCpuGrid" in html and "buildPerCpu" in html
+    # driven by the persisted, windowed series
+    assert "/api/cpuseries" in html
+    assert "mkPerCpuChart" in html
+    # updates values in place (poll-safe); the global rebuild ban is enforced elsewhere
+    assert re.search(r'datasets\[0\]\.data=', html), "per-core charts must update in place"
+    # placed above the GPU-metrics time-series card
+    assert html.index('id="card-percpu"') < html.index('id="card-charts"')
 
 
 def test_procs_reader_exposes_top10():

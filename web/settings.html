@@ -120,6 +120,13 @@
   .srow.tteam .lbl,.srow.tmodel .lbl{flex:1 1 90px}
   .srow .tin{width:104px;flex:0 0 auto} .srow .bin{width:56px;flex:0 0 auto}
   .srow .min{width:auto;max-width:130px;flex:0 0 auto}
+  /* model-costs: narrow the name + kind select to make room for the 3 per-type rate cells */
+  .srow.tmodel .lbl{flex:0 1 116px;max-width:116px}
+  .srow.tmodel select.min{max-width:92px}
+  .srow.tmodel .mcosts{display:flex;gap:11px;align-items:center;flex:1 1 auto;min-width:0}
+  .srow.tmodel .mc{display:flex;flex-direction:column;line-height:1.12;min-width:0}
+  .srow.tmodel .mck{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+  .srow.tmodel .mcv{font-size:12px;font-variant-numeric:tabular-nums;color:var(--fg);white-space:nowrap}
   .srow .ksync{margin-left:0;font-size:13px}
   /* Teams — ONE line per user: email · team · budget · actions · keys(scroll) */
   .ublock{border-top:1px solid var(--line)} .ublock:first-child{border-top:0}
@@ -226,13 +233,13 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.6.2</div>
+      <div id="sidebar-brand-ver">v1.6.3</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">🏠 Overview</a>
-    <a href="/gpu">🖥️ GPU</a>
+    <a href="/gpu">🖥️ GPU/CPU</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
     <a href="/ollama" style="padding-left:26px">🦙 Ollama</a>
@@ -288,6 +295,25 @@
 
   var CSRF="";
   var _knownEmails=[];   // existing users (emails LiteLLM reported) — the only allowed reassign targets
+  // Which backends are actually present → only show settings cards that make sense (no GPU
+  // → no GPU card; no LiteLLM → no LiteLLM/Teams/Model-costs cards). Default true so a
+  // failed probe never hides real config. `/api/nav`.gpu is always true now (the GPU/CPU
+  // page hosts universal CPU views), so presence is read from the live collectors instead.
+  var _present={gpu:true, litellm:true};
+  var GROUP_BACKEND={GPU:"gpu", LiteLLM:"litellm"};   // config-group → backend it needs
+  function fetchPresence(cb){
+    fetch("/api/data").then(function(r){return r.ok?r.json():null;}).then(function(d){
+      var col=((d&&d.latest)||{}).collectors||{};
+      function present(n){ var c=col[n]||{}; return !(c.available===false && c.error==="unconfigured"); }
+      _present.gpu=present("gpu"); _present.litellm=present("litellm");
+    }).catch(function(){}).then(function(){ if(cb)cb(); });
+  }
+  function applyPresence(){   // drop the static LiteLLM cards when there's no LiteLLM
+    if(!_present.litellm){
+      ["teams-card","models-card"].forEach(function(id){
+        var e=document.getElementById(id); if(e)e.remove(); });
+    }
+  }
   function fmt(v){return (typeof v==="number"&&!Number.isInteger(v))?String(v):String(v);}
   function post(params){
     return fetch("/api/admin/settings",{method:"POST",
@@ -387,6 +413,8 @@
   }
 
   function render(list){
+    // drop config groups whose backend isn't present (e.g. the GPU group on a GPU-less box)
+    list=(list||[]).filter(function(s){ var b=GROUP_BACKEND[s.group]; return !b || _present[b]!==false; });
     var groups={},order=[];
     list.forEach(function(s){ if(!groups[s.group]){groups[s.group]=[];order.push(s.group);} groups[s.group].push(s); });
     var b=board(); initBoard();
@@ -787,12 +815,26 @@
     sel.value=m.kind;
     // Cost per model — USD per 1M tokens. Shows the effective rate (LiteLLM/env) as a hint;
     // type a value + Save to PIN it when LiteLLM's price is wrong. Blank = fall back.
+    // Three LiteLLM per-type rates (currency per 1M tokens): input / output / cache-read.
+    // Read-only breakdown that REPLACES the single summed blend (which read double).
+    var costs=document.createElement("div"); costs.className="mcosts";
+    costs.title="LiteLLM price per 1M tokens — input / output / cache-read";
+    function mcell(k,v){
+      var c=document.createElement("span"); c.className="mc";
+      var kk=document.createElement("span"); kk.className="mck"; kk.textContent=k;
+      var vv=document.createElement("span"); vv.className="mcv";
+      vv.textContent=(v==null?"—":CUR+(+v).toLocaleString(undefined,{maximumFractionDigits:4}));
+      c.appendChild(kk); c.appendChild(vv); return c;
+    }
+    costs.appendChild(mcell("in",m.in_1m));
+    costs.appendChild(mcell("out",m.out_1m));
+    costs.appendChild(mcell("cch",m.cache_1m));
     var cost=document.createElement("input"); cost.type="number"; cost.className="min mcost";
-    cost.step="any"; cost.min="0"; cost.style.width="90px";
-    cost.title="Cost override — USD per 1M tokens. Pins this model's cost when LiteLLM's price "
-      +"is wrong/unreliable. Leave blank to use LiteLLM's own price (or the MONITOR_MODEL_COSTS env).";
+    cost.step="any"; cost.min="0"; cost.style.width="62px";
+    cost.title="Cost override — "+CUR+" per 1M tokens. Pins this model's blended cost when "
+      +"LiteLLM's price is wrong/unreliable. Leave blank to use LiteLLM's own price (the 3 rates).";
     if(m.cost_1m!=null){ cost.value=m.cost_1m; if(m.cost_overridden) cost.classList.add("mod"); }
-    else cost.placeholder=(m.eff_cost_1m?(m.eff_cost_1m+"/1M"):CUR+"/1M");   // effective rate as hint
+    else cost.placeholder="pin";                              // 3 cells show the live rates now
     var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save kind + cost";
     function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
       save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
@@ -814,7 +856,8 @@
         say("reset",true); setTimeout(loadModels,900);
       }).catch(function(){say("reset failed",false);});
     });
-    row.appendChild(sel); row.appendChild(cost); row.appendChild(save); row.appendChild(reset);
+    row.appendChild(sel); row.appendChild(costs); row.appendChild(cost);
+    row.appendChild(save); row.appendChild(reset);
     return row;
   }
   function loadModels(){
@@ -854,10 +897,20 @@
       .then(function(){ load(); initBoardStatic(); }).catch(function(){ load(); });
   });
 
+  function boot(){
+    fetchPresence(function(){
+      applyPresence();
+      loadLayout(function(){
+        load();                                    // render() filters GPU/LiteLLM groups
+        if(_present.litellm){ loadTeams(); loadModels(); }   // LiteLLM-only cards
+        initBoardStatic();
+      });
+    });
+  }
   fetch("/api/me").then(function(r){return r.ok?r.json():null;}).then(function(d){
     if(d){CSRF=d.csrf||"";document.getElementById("whoami").textContent=d.user?("Signed in as "+d.user):"";}
-    loadLayout(function(){ load(); loadTeams(); loadModels(); initBoardStatic(); });
-  }).catch(function(){ loadLayout(function(){load();loadTeams();loadModels();initBoardStatic();}); });
+    boot();
+  }).catch(function(){ boot(); });
 })();
 </script>
 <script>

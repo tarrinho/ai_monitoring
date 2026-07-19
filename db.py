@@ -74,6 +74,21 @@ CREATE TABLE IF NOT EXISTS proc_series_1m (bucket REAL, kind TEXT, app TEXT, val
 CREATE TABLE IF NOT EXISTS proc_series_1h (bucket REAL, kind TEXT, app TEXT, val REAL,
     PRIMARY KEY(bucket,kind,app));
 
+-- Per-CORE CPU% over time (one series per logical CPU), so the GPU/CPU page's
+-- per-core grid honours the same window + pan controls as every other chart.
+-- Same shape and cardinality as proc_series (top-10 apps x 2 kinds = 20 rows/tick,
+-- vs one row per core), so it reuses the identical rollup + retention tiers.
+CREATE TABLE IF NOT EXISTS cpu_core_series (
+    ts   REAL NOT NULL,
+    core INTEGER NOT NULL,
+    pct  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cpu_core_series_ts ON cpu_core_series(ts);
+CREATE TABLE IF NOT EXISTS cpu_core_series_1m (bucket REAL, core INTEGER, pct REAL,
+    PRIMARY KEY(bucket,core));
+CREATE TABLE IF NOT EXISTS cpu_core_series_1h (bucket REAL, core INTEGER, pct REAL,
+    PRIMARY KEY(bucket,core));
+
 -- Dashboard user accounts (username + scrypt password hash). role: 'admin' can
 -- manage users; 'viewer' can only read the dashboards. Passwords are NEVER stored
 -- in plaintext; pw_hash is a self-describing scrypt string (see auth.hash_password).
@@ -193,7 +208,29 @@ CREATE TABLE IF NOT EXISTS key_user_ovr (key TEXT PRIMARY KEY, user_name TEXT NO
 -- key_teams (admin OVERRIDES); this is what LiteLLM reported.
 CREATE TABLE IF NOT EXISTS team_detect (key TEXT PRIMARY KEY, team TEXT, "user" TEXT,
     user_name TEXT, budget REAL, spent REAL, updated REAL);
+
+-- Per-(day, model, key) COST + TOKENS rollup that powers the "cost per model & user over
+-- time" chart (Spend page). Written by the sampler each tick via UPSERT-REPLACE: the
+-- /spend/logs pull returns the WHOLE day, so re-aggregating and replacing today's rows is
+-- idempotent (no double-count, no high-water mark). `key` is LiteLLM's hashed api-key;
+-- `alias` is its key_alias — the READ path resolves either to an owner/user. Daily
+-- granularity, pruned to 1 year (SPEND_MU_RETENTION_DAYS). Seeded once at first run by a
+-- bounded 14-day backfill, then grown forward by the sampler.
+CREATE TABLE IF NOT EXISTS spend_model_user_daily (
+    day     TEXT NOT NULL,
+    model   TEXT NOT NULL,
+    key     TEXT NOT NULL,
+    alias   TEXT,
+    cost    REAL NOT NULL,
+    tokens  REAL NOT NULL,
+    updated REAL,
+    PRIMARY KEY(day, model, key)
+);
+CREATE INDEX IF NOT EXISTS idx_smud_day ON spend_model_user_daily(day);
 """
+
+# Retention for the per-(day,model,key) spend rollup — 1 year of daily buckets.
+SPEND_MU_RETENTION_DAYS = 366
 
 # Columns charted over time (order must match _METRIC_COLS in queries).
 _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
@@ -215,6 +252,28 @@ _METRIC_TABLES = ["metrics", "metrics_1m", "metrics_1h"]
 # Named windows -> seconds.
 WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "30d": 2592000,
            "12mo": 31536000}
+
+
+def month_start(ref: float | None = None) -> float:
+    """UTC epoch of 00:00 on the 1st of `ref`'s month (default: now)."""
+    ref = time.time() if ref is None else ref
+    lt = time.gmtime(ref)
+    return ref - ((lt.tm_mday - 1) * 86400 + lt.tm_hour * 3600
+                  + lt.tm_min * 60 + lt.tm_sec)
+
+
+def window_secs(window: str, ref: float | None = None) -> float:
+    """Seconds spanned by a window. Fixed durations come from WINDOWS; the special
+    'month' window is MONTH-TO-DATE (from the 1st of the current UTC month), so its
+    length grows through the month — used to reconcile against a provider's monthly bill."""
+    if window == "month":
+        ref = time.time() if ref is None else ref
+        return max(60.0, ref - month_start(ref))
+    return float(WINDOWS.get(window, WINDOWS["1h"]))
+
+
+# Every window the API/series layer accepts (WINDOWS + the dynamic 'month').
+VALID_WINDOWS = frozenset(WINDOWS) | {"month"}
 
 
 @contextmanager
@@ -312,7 +371,7 @@ def series(window: str, max_points: int = 300,
 
     `end` (epoch) shifts the window back in time for pan/scroll; defaults to now.
     """
-    secs = WINDOWS.get(window, WINDOWS["1h"])
+    secs = window_secs(window)
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
@@ -371,7 +430,7 @@ def key_series(window: str, max_points: int = 300,
     Returns {"labels": [...top-N labels...], "points": [{t, <label>: v, ...}]}.
     Each label becomes its own line on the chart. `end` shifts the window back.
     """
-    secs = WINDOWS.get(window, WINDOWS["1h"])
+    secs = window_secs(window)
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
@@ -417,7 +476,7 @@ def key_series_window_delta(window: str, top_n: int = 10,
     (daily reset), the end value is used instead of a negative delta.
 
     Returns {"labels": [...], "deltas": [...]} aligned by index (bar chart)."""
-    secs = WINDOWS.get(window, WINDOWS["1h"])
+    secs = window_secs(window)
     end = end or time.time()
     start = end - secs
     if secs <= WINDOWS["1h"]:
@@ -460,7 +519,7 @@ def key_delta_series(window: str, max_points: int = 300, top_n: int = 10,
     bucket's own value instead). Same tiering as `key_series`.
 
     Returns {"labels": [...], "points": [{t, <label>: cumulative, ...}]} for the chart."""
-    secs = WINDOWS.get(window, WINDOWS["1h"])
+    secs = window_secs(window)
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
@@ -524,6 +583,9 @@ def prune_key_series() -> None:
             conn.execute("DELETE FROM proc_series_1m WHERE bucket < ?", (min_cut,))
             conn.execute("DELETE FROM key_series_1h WHERE bucket < ?", (hour_cut,))
             conn.execute("DELETE FROM proc_series_1h WHERE bucket < ?", (hour_cut,))
+            conn.execute("DELETE FROM cpu_core_series WHERE ts < ?", (raw_cut,))
+            conn.execute("DELETE FROM cpu_core_series_1m WHERE bucket < ?", (min_cut,))
+            conn.execute("DELETE FROM cpu_core_series_1h WHERE bucket < ?", (hour_cut,))
             # keep alert/anomaly history for the full hour-rollup horizon (1y)
             conn.execute("DELETE FROM anomalies WHERE ts < ?", (hour_cut,))
             conn.execute("DELETE FROM alert_log WHERE ts < ?", (hour_cut,))
@@ -576,7 +638,7 @@ def proc_series(kind: str, window: str, max_points: int = 200,
                 top_n: int = 10, end: float | None = None) -> dict[str, Any]:
     """Multi-series per-app values for the top-N apps of a metric in the window.
     Returns {"apps": [...], "points": [{t, <app>: v, ...}]}. `end` shifts back."""
-    secs = WINDOWS.get(window, WINDOWS["1h"])
+    secs = window_secs(window)
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
@@ -617,6 +679,59 @@ def proc_series(kind: str, window: str, max_points: int = 200,
         return {"apps": top, "points": pts}
     except Exception:
         return {"apps": [], "points": []}
+
+
+def insert_cpu_core_series(ts: float, per_core: list | None) -> None:
+    """Store this tick's per-core CPU%. `per_core` is host.sample()'s `cpu_per_core`
+    (index = logical CPU id); an empty list (first tick / core-count change) is a no-op."""
+    if not per_core:
+        return
+    rows = [(ts, i, float(v or 0)) for i, v in enumerate(per_core)]
+    try:
+        with _connect() as conn:
+            conn.executemany(
+                "INSERT INTO cpu_core_series(ts,core,pct) VALUES (?,?,?)", rows)
+    except Exception:
+        pass
+
+
+def cpu_core_series(window: str, max_points: int = 200,
+                    end: float | None = None) -> dict[str, Any]:
+    """Per-core CPU% over the window, bucketed like every other chart series.
+    Returns {"cores": [0,1,…], "points": [{t, "0": v, "1": v, …}]} — core ids are
+    stringified so the payload is plain JSON. `end` shifts the window back (pan).
+
+    Reads the raw table inside 1h, the 1-minute rollup to 24h, the 1-hour rollup
+    beyond — the same tiering proc_series uses, so long windows stay cheap."""
+    secs = window_secs(window)
+    end = end or time.time()
+    start = end - secs
+    bsize = max(1.0, secs / max_points)
+    if secs <= WINDOWS["1h"]:
+        table, tc = "cpu_core_series", "ts"
+    elif secs <= WINDOWS["24h"]:
+        table, tc = "cpu_core_series_1m", "bucket"
+    else:
+        table, tc = "cpu_core_series_1h", "bucket"
+    try:
+        with _connect() as conn:
+            cores = [int(r[0]) for r in conn.execute(
+                f"SELECT DISTINCT core FROM {table} "
+                f"WHERE {tc}>=? AND {tc}<=? ORDER BY core", (start, end))]
+            if not cores:
+                return {"cores": [], "points": []}
+            rows = conn.execute(
+                f"SELECT CAST(({tc}-?)/? AS INT) bkt, AVG({tc}), core, AVG(pct) "
+                f"FROM {table} WHERE {tc}>=? AND {tc}<=? "
+                f"GROUP BY bkt, core ORDER BY bkt", (start, bsize, start, end)).fetchall()
+        buckets: dict[int, dict] = {}
+        for bkt, avg_ts, core, pct in rows:
+            b = buckets.setdefault(bkt, {"t": avg_ts})
+            b[str(int(core))] = round(pct, 1)
+        pts = [buckets[k] for k in sorted(buckets)]
+        return {"cores": cores, "points": pts}
+    except Exception:
+        return {"cores": [], "points": []}
 
 
 def record_alert(ts: float, akey: str, kind: str, msg: str = "") -> None:
@@ -775,6 +890,14 @@ def rollup() -> None:
                     f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, kind, app, "
                     f"AVG(val) FROM proc_series WHERE ts >= ? "
                     f"GROUP BY bucket, kind, app", (now - look,))
+            # cpu_core_series (per-core CPU%)
+            for tbl, bsize, look in (("cpu_core_series_1m", 60, 2 * 3600),
+                                     ("cpu_core_series_1h", 3600, 3 * 86400)):
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {tbl}(bucket,core,pct) "
+                    f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, core, "
+                    f"AVG(pct) FROM cpu_core_series WHERE ts >= ? "
+                    f"GROUP BY bucket, core", (now - look,))
     except Exception:
         pass
 
@@ -1016,6 +1139,60 @@ def settings_delete(key: str) -> bool:
         return (cur.rowcount or 0) > 0
     except Exception:
         return False
+
+
+# ── per-(day,model,key) spend rollup: "cost per model & user over time" ───────
+def spend_model_user_upsert(rows: list[dict[str, Any]], now: float) -> None:
+    """REPLACE the per-(day,model,key) cost/token totals for the given rows. Idempotent:
+    the sampler re-aggregates the whole day each tick and passes the running full-day
+    totals, so an UPSERT that OVERWRITES (not adds) can't double-count. `rows` items carry
+    day/model/key/alias/cost/tokens. No-op on empty / error (best-effort telemetry)."""
+    if not rows:
+        return
+    try:
+        payload = [(str(r["day"])[:10], str(r["model"])[:200], str(r["key"])[:200],
+                    str(r.get("alias") or "")[:120], float(r.get("cost") or 0),
+                    float(r.get("tokens") or 0), now) for r in rows]
+    except (KeyError, TypeError, ValueError):
+        return
+    try:
+        with _connect() as conn:
+            conn.executemany(
+                "INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,updated) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(day,model,key) DO UPDATE SET "
+                "alias=excluded.alias, cost=excluded.cost, tokens=excluded.tokens, "
+                "updated=excluded.updated", payload)
+    except Exception:
+        pass
+
+
+def spend_model_user_rows(days_back: int, end: float | None = None) -> list[dict[str, Any]]:
+    """Raw per-(day,model,key) rows within the last `days_back` days (inclusive). The
+    caller resolves key/alias → owner and buckets into the chart series. Empty on error."""
+    end = end or time.time()
+    start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT day, model, key, alias, cost, tokens FROM spend_model_user_daily "
+                "WHERE day >= ? ORDER BY day", (start_day,)).fetchall()
+        return [{"day": r[0], "model": r[1], "key": r[2], "alias": r[3] or "",
+                 "cost": float(r[4] or 0), "tokens": float(r[5] or 0)} for r in rows]
+    except Exception:
+        return []
+
+
+def prune_spend_model_user() -> int:
+    """Drop rollup rows older than the 1-year retention. Returns rows removed."""
+    cutoff = time.strftime(
+        "%Y-%m-%d", time.gmtime(time.time() - SPEND_MU_RETENTION_DAYS * 86400))
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM spend_model_user_daily WHERE day < ?", (cutoff,))
+            return cur.rowcount or 0
+    except Exception:
+        return 0
 
 
 # ── per-key team overrides (Settings page → Teams) ────────────────────────────

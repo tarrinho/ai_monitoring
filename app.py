@@ -49,6 +49,7 @@ _INDEX = _WEB / "index.html"
 # Typed app-state keys (aiohttp recommends web.AppKey over string keys).
 _SESSION: web.AppKey = web.AppKey("session", aiohttp.ClientSession)
 _SAMPLER: web.AppKey = web.AppKey("sampler", asyncio.Task)
+_MU_BACKFILL: web.AppKey = web.AppKey("mu_backfill", asyncio.Task)
 _BACKENDS: web.AppKey = web.AppKey("backends", list)
 
 # In-memory ring of recent merged snapshots (newest last).
@@ -311,15 +312,25 @@ async def _sampling_loop(app: web.Application) -> None:
             # feed host load-per-core to LiteLLM so it can auto-shed heavy calls
             litellm.note_load(_load_per_core(snap))
             _ring.append(snap)
+            _ll = snap["collectors"].get("litellm", {})
+            # The per-(model,user) spend rollup rows are bulky and belong in their own daily
+            # table, not the full-snapshot `samples` blob — pop BEFORE db.insert so they
+            # don't bloat every sample row.
+            _mu_rows = _ll.pop("mu_rows", None) if isinstance(_ll, dict) else None
             db.insert(snap["ts"], snap["collectors"])
             db.insert_metrics(snap["ts"], _metrics_row(snap))
-            _ll = snap["collectors"].get("litellm", {})
             if _ll.get("available"):
                 db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])
+                if _mu_rows:
+                    db.spend_model_user_upsert(_mu_rows, snap["ts"])
             _pr = snap["collectors"].get("procs", {})
             if _pr.get("available"):
                 db.insert_proc_series(snap["ts"], "cpu", _pr.get("top_cpu") or [], "cpu")
                 db.insert_proc_series(snap["ts"], "ram", _pr.get("top_ram") or [], "ram")
+            _ho = snap["collectors"].get("host", {})
+            if _ho.get("available"):
+                # per-core CPU% — persisted so the GPU/CPU grid honours window + pan
+                db.insert_cpu_core_series(snap["ts"], _ho.get("cpu_per_core"))
             _track_events(snap)
             _track_model_events(snap)
             anoms = _detect_anomalies(snap)
@@ -339,6 +350,7 @@ async def _sampling_loop(app: web.Application) -> None:
                 db.prune()
                 db.prune_metrics()
                 db.prune_key_series()
+                db.prune_spend_model_user()
                 db.audit_prune(snap["ts"] - config.AUDIT_RETENTION_DAYS * 86400)
                 last_prune = snap["ts"]
         except asyncio.CancelledError:
@@ -726,6 +738,13 @@ async def _auth_mw(request: web.Request, handler):
         if p.startswith("/api/"):
             return web.json_response({"error": "forbidden"}, status=403)
         return web.Response(text="403 — admin access required", status=403)
+    # Optional: restrict the Spend surface (page + /api/spend/*) to admins, since per-user
+    # cost attribution can be sensitive. Off by default → viewers keep access (unchanged).
+    if (config.SPEND_REQUIRE_ADMIN and role != "admin"
+            and (p == "/spend" or p.startswith("/api/spend/") or p == "/api/spend")):
+        if p.startswith("/api/"):
+            return web.json_response({"error": "forbidden"}, status=403)
+        return web.Response(text="403 — admin access required", status=403)
     return await handler(request)
 
 
@@ -857,7 +876,7 @@ def _page(request: web.Request, path: Path, dest: str) -> web.Response:
     # so their link is hidden too — no dead link that just 403s.
     return _serve_page(path, _fwd_prefix(request), user=user, role=role,
                        show_alerts=sess is not None,
-                       hidden_nav=_hidden_nav_paths())
+                       hidden_nav=_hidden_nav_paths(role))
 
 
 async def index_handler(request: web.Request) -> web.Response:
@@ -1349,7 +1368,7 @@ async def data_handler(request: web.Request) -> web.Response:
 
 async def series_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "1h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "1h"
     try:
         pts = int(request.query.get("points", "300"))
@@ -1379,16 +1398,26 @@ async def procseries_handler(request: web.Request) -> web.Response:
     if kind not in ("cpu", "ram"):
         kind = "cpu"
     window = request.query.get("window", "1h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "1h"
     return web.json_response({"kind": kind, "window": window,
                               **db.proc_series(kind, window,
                                                end=_q_end(request))})
 
 
+async def cpuseries_handler(request: web.Request) -> web.Response:
+    """Per-core CPU% over the selected window (GPU/CPU page's per-core grid). Honours
+    the same `window` + `end` (pan) params as the other series endpoints."""
+    window = request.query.get("window", "1h")
+    if window not in db.VALID_WINDOWS:
+        window = "1h"
+    return web.json_response({"window": window,
+                              **db.cpu_core_series(window, end=_q_end(request))})
+
+
 async def keyseries_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "1h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "1h"
     try:
         pts = int(request.query.get("points", "200"))
@@ -1405,7 +1434,7 @@ async def keydelta_handler(request: web.Request) -> web.Response:
     the key's window total and an idle key is a flat 0 line. Top-N ranked by total
     net requests over the window."""
     window = request.query.get("window", "1h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "1h"
     try:
         pts = int(request.query.get("points", "200"))
@@ -1441,7 +1470,7 @@ _NAV_LINK_NAME = {
 }
 
 
-def _hidden_nav_paths() -> set[str]:
+def _hidden_nav_paths(role: str | None = None) -> set[str]:
     """Backend dashboards whose sidebar link is omitted server-side because their
     backend isn't configured — defence-in-depth so a slow/failed client `/api/nav`
     fetch can't leave a dead link visible. Same flags the fetch uses (Spend tracks
@@ -1449,14 +1478,15 @@ def _hidden_nav_paths() -> set[str]:
     hidden: set[str] = set()
     if not _configured("litellm", bool(config.LITELLM_BASE_URL)):
         hidden.add("/litellm")
-    if not _litellm_configured():
-        hidden.add("/spend")
+    if not _litellm_configured() or (config.SPEND_REQUIRE_ADMIN and role != "admin"):
+        hidden.add("/spend")           # no LiteLLM, or admin-only Spend and not an admin
     if not _configured("ollama", bool(config.OLLAMA_BASE_URL)):
         hidden.add("/ollama")
     if not _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)):
         hidden.add("/llamacpp")
-    if not _configured("gpu", bool(config.GPU_SSH or config.GPU_METRICS_URL)):
-        hidden.add("/gpu")
+    # /gpu is the "GPU/CPU" page — it hosts the per-core + stacked CPU views (host/procs,
+    # present on every server), so the link is ALWAYS shown even with no GPU; the GPU cards
+    # on the page degrade to "No GPU detected" while the CPU cards render.
     return hidden
 
 
@@ -1466,10 +1496,12 @@ async def nav_handler(request: web.Request) -> web.Response:
     _, role, _ = _auth_ctx(request)
     return web.json_response({
         "litellm": _configured("litellm", bool(config.LITELLM_BASE_URL)),
-        "spend": _litellm_configured(),   # Spend & Quota — hidden with no LiteLLM
+        # Spend & Quota — hidden with no LiteLLM, and (when SPEND_REQUIRE_ADMIN) for non-admins
+        "spend": _litellm_configured() and not (
+            config.SPEND_REQUIRE_ADMIN and role != "admin"),
         "ollama": _configured("ollama", bool(config.OLLAMA_BASE_URL)),
         "llamacpp": _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)),
-        "gpu": _configured("gpu", bool(config.GPU_SSH or config.GPU_METRICS_URL)),
+        "gpu": True,   # GPU/CPU page: CPU views are universal → always shown (GPU degrades)
         # Settings link: real admin only — the shared URL token is NOT admin here.
         "admin": (role == "admin" and not _is_master_token_auth(request))
                  or not _auth_enabled(),
@@ -1482,15 +1514,15 @@ async def litellm_models_handler(request: web.Request) -> web.Response:
     15m/1h/24h/30d/12mo — including prior days — instead of only the collector's
     fixed rolling window (which is today-only / last-15-min)."""
     window = request.query.get("window", "24h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "24h"
     now = time.time()
-    secs = db.WINDOWS[window]
     # /global/activity/model is day-granular: open at the day the window starts,
     # close tomorrow so today is fully covered. A rolling 24h thus spans yesterday
     # + today (the reported gap). Sub-day windows collapse to today (endpoint's
-    # finest granularity is a day).
-    start = time.strftime("%Y-%m-%d", time.gmtime(now - secs))
+    # finest granularity is a day). 'month' = from the 1st of the current UTC month.
+    win_start = db.month_start(now) if window == "month" else now - db.window_secs(window)
+    start = time.strftime("%Y-%m-%d", time.gmtime(win_start))
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
     rows = await litellm.per_model_range(request.app[_SESSION], start, end,
                                          db.model_kind_overrides())
@@ -1553,26 +1585,72 @@ def _key_budget_map() -> dict:
     return m
 
 
-def _budget_summary(rows: list) -> dict:
-    spent = sum(r["spent"] for r in rows)                     # real cash, all keys
+async def _mtd_real_spend(session, now: float) -> float | None:
+    """Month-to-date REAL cash, summed from LiteLLM's daily aggregates.
+
+    Needed because a key's `spend` from /global/spend/keys is LIFETIME cumulative — it
+    cannot answer "how much this month", so using it for the monthly summary reported the
+    all-time total as if it were the current month (and inflated burn / projected /
+    budget-% by lifetime÷month). The daily series is the only source that can.
+    Returns None when the daily data is unavailable, so the caller can fall back."""
+    lt = time.gmtime(now)
+    start = time.strftime("%Y-%m-01", lt)
+    end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    try:
+        daily = await litellm.spend_activity(session, start, end)
+    except Exception:
+        return None
+    if not daily:
+        return None
+    pref = time.strftime("%Y-%m", lt)
+    return round(sum(float(r.get("spend") or 0) for r in daily
+                     if str(r.get("date") or "").startswith(pref)), 2)
+
+
+def _budget_summary(rows: list, mtd_real: float | None = None,
+                    month_day: int = 1, month_len: int = 30) -> dict:
+    """Aggregate spend/budget summary.
+
+    `mtd_real` is the true month-to-date cash (see _mtd_real_spend). When present the
+    monthly figures — headline spend, $/day burn, projected month-end, and budget-% —
+    are derived from IT, and the lifetime total is reported separately as
+    `spent_lifetime`. When it is None we fall back to the lifetime total and say so via
+    `basis`, so the UI never labels an all-time number "this month"."""
+    lifetime = sum(r["spent"] for r in rows)
+    basis = "mtd" if mtd_real is not None else "lifetime"
+    spent = mtd_real if mtd_real is not None else lifetime
     reference = sum(r.get("reference", 0.0) for r in rows)    # self-hosted
     budgeted = [r for r in rows if r.get("budget")]
     unbudgeted = [r for r in rows if not r.get("budget")]
     # cap maths only over keys that actually HAVE a budget
     budget = sum(r["budget"] for r in budgeted)
     b_spent = sum(r["spent"] for r in budgeted)
-    b_burn = sum(r["burn"] for r in budgeted)
-    b_projected = sum(r["projected"] for r in budgeted)
-    remaining = budget - b_spent
+    if mtd_real is not None:
+        # Month figures from the month's OWN cash. The daily series is global (not
+        # per-key), so cap maths is aggregate: this month's spend vs the summed monthly
+        # caps — which is exactly the "am I on track this month" question.
+        day = max(1, int(month_day))
+        burn = spent / day
+        projected = burn * max(1, int(month_len))
+        cap_spent = spent
+    else:
+        # burn/projected are None on keys whose spend never resets (no comparable
+        # period), so they contribute nothing rather than crashing the sum
+        burn = sum(r["burn"] or 0.0 for r in rows)
+        projected = sum(r["projected"] or 0.0 for r in budgeted)
+        cap_spent = b_spent
+    remaining = budget - cap_spent
     return {
         "spent": round(spent, 2), "reference": round(reference, 2),
+        "spent_lifetime": round(lifetime, 2),      # all-time, as Cost-by-key reports it
+        "basis": basis,                            # "mtd" | "lifetime" — UI labels from this
         "total": round(spent + reference, 2), "budget": round(budget, 2),
-        "pct": round(b_spent / budget * 100, 1) if budget > 0 else 0,
-        "projected": round(b_projected, 2),
-        "burn": round(sum(r["burn"] for r in rows), 2),
+        "pct": round(cap_spent / budget * 100, 1) if budget > 0 else 0,
+        "projected": round(projected, 2),
+        "burn": round(burn, 2),
         "remaining": round(remaining, 2),
-        "days_to_cap": round(remaining / b_burn, 1) if b_burn > 0 else None,
-        "over": b_projected > budget if budget > 0 else False,
+        "days_to_cap": round(remaining / burn, 1) if burn > 0 else None,
+        "over": projected > budget if budget > 0 else False,
         "keys": len(rows), "budgeted": len(budgeted),
         "unbudgeted": len(unbudgeted),
         "unbudgeted_spend": round(sum(r["spent"] for r in unbudgeted), 2),
@@ -1642,7 +1720,12 @@ async def budgets_handler(request: web.Request) -> web.Response:
     keys = merge_key_budgets(live, snap.get("top_keys") or [], _key_budget_map())
     _apply_team_overrides(keys)          # admin-assigned team wins over LiteLLM's
     rows = litellm.budget_rows(keys, _resolve_budget_map(keys), lt.tm_mday, mlen)
-    return web.json_response({"keys": rows, "summary": _budget_summary(rows),
+    # per-key `spend` is LIFETIME, so the monthly figures come from the daily series
+    mtd = await _mtd_real_spend(request.app[_SESSION], now)
+    return web.json_response({"keys": rows,
+                              "summary": _budget_summary(rows, mtd_real=mtd,
+                                                         month_day=lt.tm_mday,
+                                                         month_len=mlen),
                               "available": bool(rows),
                               "budget_source": "litellm" if live else
                                                ("env" if _key_budget_map() else "none"),
@@ -2019,10 +2102,12 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
     Admin-only (via the /api/admin/* gate)."""
     ov = db.model_kind_overrides()
     prices = {}
+    detail = {}
     try:
         prices = await litellm.model_prices(request.app[_SESSION])
+        detail = await litellm.model_price_detail(request.app[_SESSION])
     except Exception:
-        prices = {}
+        prices, detail = {}, {}
     # Union of every model we can name: LiteLLM-priced models, the models the proxy
     # currently serves (/v1/models — works even without an admin key), the recent
     # per-model activity, and any model that already carries an override. This keeps
@@ -2065,7 +2150,12 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
                        # EFFECTIVE rate actually used (override → env → LiteLLM price).
                        "cost_1m": cost_ov.get(name),
                        "eff_cost_1m": round(eff_cpt * 1_000_000.0, 6) if eff_cpt else 0.0,
-                       "cost_overridden": name in all_cost})
+                       "cost_overridden": name in all_cost,
+                       # the three LiteLLM per-type rates (currency per 1M) for the card's
+                       # input / output / cache breakdown — None when LiteLLM doesn't price it
+                       "in_1m": (detail.get(name) or {}).get("in"),
+                       "out_1m": (detail.get(name) or {}).get("out"),
+                       "cache_1m": (detail.get(name) or {}).get("cache")})
     # most-used first; unused models fall to the bottom, alphabetical as the tiebreak
     models.sort(key=lambda m: (-int(m["tokens"]), str(m["model"]).lower()))
     return web.json_response({"models": models,
@@ -2177,7 +2267,8 @@ def bucket_model_series(series: dict, window: str, now: float, top_n: int = 10) 
         labels.reverse()
         bucket = lambda d: d[:7]                 # date → YYYY-MM  # noqa: E731
     else:
-        cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - 2592000))   # last 30d
+        cutoff_ts = db.month_start(now) if window == "month" else now - 2592000  # month | 30d
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts))
         labels = sorted(d for d in series.get("dates", []) if d >= cutoff)
         bucket = lambda d: d                     # noqa: E731
     lidx = {lab: i for i, lab in enumerate(labels)}
@@ -2203,7 +2294,84 @@ def bucket_model_series(series: dict, window: str, now: float, top_n: int = 10) 
                        "total": round(sum(other), 2),
                        "costs": [round(c, 4) for c in other]})
     return {"window": window, "available": bool(models), "labels": labels,
-            "models": models}
+            "models": models,
+            # carry provenance through to the UI: whether these figures are LiteLLM's own
+            # cash or a tokens x price estimate, and which models could not be valued at
+            # all. Without these the chart looks complete even when it is short of the
+            # cash headline by whatever the unpriced models actually spent.
+            "cost_basis": series.get("cost_basis", "estimated"),
+            "unpriced": series.get("unpriced") or []}
+
+
+def _owner_of(row: dict, omap: dict) -> str:
+    """Resolve a rollup row's (alias/key) to a display owner/user, using the SAME
+    precedence as the by-user board: admin key→user override wins, then LiteLLM's resolved
+    owner email, then the key alias, then a short hash of the key, then 'unassigned'."""
+    alias = str(row.get("alias") or "")
+    ovr, live = omap.get("ovr", {}), omap.get("live", {})
+    return (ovr.get(alias) or live.get(alias) or alias
+            or litellm._short_key(row.get("key")) or "unassigned")
+
+
+def bucket_model_user_series(rows: list, omap: dict, prices: dict, kind_ov: dict,
+                             window: str, now: float, top_n: int = 12) -> dict:
+    """Fold per-(day,model,key) rollup rows into per-(model × user) cost series over the
+    window's granularity (14d/30d → daily, 12mo → monthly), on one shared label axis.
+    Cost = tokens × the model's EFFECTIVE (override-aware) price — the SAME basis as 'Cost
+    per model over time', so the two charts agree and honor per-model cost overrides (never
+    LiteLLM's raw response_cost, which ignores the overrides). REAL (paid) models only:
+    self-hosted/reference cost is imputed and would dominate a stacked view. Keeps the
+    top-N (model,user) combos by windowed cost, rest → 'Other'. Chart-ready:
+    {window, available, labels, series:[{label, model, user, total, costs[]}]}."""
+    if window == "12mo":
+        labels, lt = [], time.gmtime(now)
+        y, mo = lt.tm_year, lt.tm_mon
+        for _ in range(12):
+            labels.append(f"{y:04d}-{mo:02d}")
+            mo -= 1
+            if mo == 0:
+                mo, y = 12, y - 1
+        labels.reverse()
+        bkt = lambda d: d[:7]                                     # noqa: E731
+    else:
+        cutoff_ts = (db.month_start(now) if window == "month"
+                     else now - (30 if window == "30d" else 14) * 86400)
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts))
+        bkt = lambda d: d                                        # noqa: E731
+        labels = sorted({r["day"] for r in rows if r.get("day", "") >= cutoff})
+    lidx = {lab: i for i, lab in enumerate(labels)}
+    series: dict[tuple, dict] = {}
+    for r in rows:
+        i = lidx.get(bkt(r.get("day", "")))
+        if i is None:
+            continue
+        model = str(r.get("model") or "?")
+        if litellm.classify_model(model, kind_ov)["cost_kind"] != "real":
+            continue                          # real cash only; skip self-hosted/reference
+        rate = litellm.price_for(model, prices)
+        if rate <= 0:
+            continue                          # unpriced → no cost line (same as sibling)
+        user = _owner_of(r, omap)
+        s = series.setdefault((model, user),
+                              {"model": model, "user": user,
+                               "label": f"{model} · {user}", "costs": [0.0] * len(labels)})
+        s["costs"][i] += float(r.get("tokens") or 0) * rate
+    out = []
+    for s in series.values():
+        tot = round(sum(s["costs"]), 2)
+        if tot > 0:
+            out.append({**s, "total": tot, "costs": [round(c, 4) for c in s["costs"]]})
+    out.sort(key=lambda x: -x["total"])
+    keep, rest = out[:top_n], out[top_n:]
+    if rest:
+        other = [0.0] * len(labels)
+        for r in rest:
+            for i, c in enumerate(r["costs"]):
+                other[i] += c
+        keep.append({"model": "Other", "user": f"{len(rest)} more",
+                     "label": f"Other ({len(rest)})", "total": round(sum(other), 2),
+                     "costs": [round(c, 4) for c in other]})
+    return {"window": window, "available": bool(keep), "labels": labels, "series": keep}
 
 
 def bucket_spend(daily: list, window: str) -> dict:
@@ -2384,6 +2552,49 @@ def apply_daily_cost(series: dict, daily_cost: dict) -> dict:
     return series
 
 
+def apply_daily_tokens(series: dict, daily_tokens: dict) -> dict:
+    """Fold per-day token split (daily_tokens: {canonical_date: {ext,int}}) onto each chart
+    point, so the Usage-over-time bar can colour EXTERNAL (paid) vs INTERNAL (self-hosted)
+    tokens. Matches apply_daily_cost's bucketing (day or month by granularity)."""
+    gran = series.get("granularity", "day")
+    for p in series.get("points", []):
+        pref = time.strftime("%Y-%m-%d" if gran == "day" else "%Y-%m",
+                             time.gmtime(p.get("t", 0)))
+        n = len(pref)
+        ext = sum(t["ext"] for dt, t in daily_tokens.items() if dt[:n] == pref)
+        internal = sum(t["int"] for dt, t in daily_tokens.items() if dt[:n] == pref)
+        p["tokens_ext"] = int(ext)
+        p["tokens_int"] = int(internal)
+    series["tokens_split"] = True
+    return series
+
+
+def anchor_real_to_actual(series: dict) -> dict:
+    """Replace the RECONSTRUCTED 'real (external)' cost with LiteLLM's ACTUAL daily cash
+    (each point/year already carries `spend` from bucket_spend). The tokens×price rebuild
+    drifts from what LiteLLM billed — it misses cache-read discounts and drops any real
+    model with no price in the table — so the card's real total wouldn't match the real
+    spend shown elsewhere (per-key `spend`, Cost-by-user). Anchoring to `spend` makes them
+    agree. The 'estimated (self-hosted)' series is LEFT as the reconstruction: free
+    self-hosted usage has no cash figure, so its imputed value is the only number to show.
+
+    Only applied when actual per-day cash is present; free-tier LiteLLM that reports no
+    per-day $ keeps the full reconstruction (real included) so the chart still populates."""
+    pts = series.get("points", [])
+    if not any((p.get("spend") or 0) > 0 for p in pts):
+        return series                       # no actual cash → keep the estimate
+    rt = 0.0
+    for p in pts:
+        p["real_cost"] = round(p.get("spend") or 0.0, 2)
+        rt += p["real_cost"]
+    for yr in series.get("years", []):
+        yr["real_cost"] = round(yr.get("spend") or 0.0, 2)
+    series["real_cost_total"] = round(rt, 2)
+    series["cost_basis"] = "actual-real"
+    series["cost_available"] = (rt > 0 or (series.get("est_cost_total") or 0) > 0)
+    return series
+
+
 def cost_model_split(per_model: list) -> dict:
     """Model names grouped by effective cost bucket (real external vs reference
     self-hosted), for the cost-over-time legend tooltip. Only models with usage in the
@@ -2403,8 +2614,9 @@ def window_and_years(daily_full: list, window: str, now: float) -> dict:
     """Chart points respect the selected window (last 30 days daily, or 12 months
     monthly), but the per-year totals ALWAYS reflect the full year — so '2026 total'
     is year-to-date, not just the 30-day window's slice."""
-    if window == "30d":
-        cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - 2592000))
+    if window in ("30d", "month"):
+        cutoff_ts = db.month_start(now) if window == "month" else now - 2592000
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts))
         wdaily = [r for r in daily_full if r["date"] >= cutoff]
     else:
         wdaily = daily_full
@@ -2417,13 +2629,18 @@ async def spend_series_handler(request: web.Request) -> web.Response:
     """Spend over time: daily buckets for 30d, monthly for 12mo, plus per-year
     year-to-date totals. Backed by LiteLLM /global/activity."""
     window = request.query.get("window", "30d")
-    if window not in ("30d", "12mo"):
+    if window not in ("30d", "12mo", "month"):
         window = "30d"
     now = time.time()
     if _spend_series_source is not None:
         return web.json_response(_spend_series_source(now, window))
-    # always pull a full year so the per-year rollup is complete, regardless of window
-    start = time.strftime("%Y-%m-%d", time.gmtime(now - 31536000))
+    # Pull the deployment's full history of daily aggregates (one small row per day) so the
+    # per-year + lifetime totals are complete — not just a rolling year. The CHART still
+    # renders only its own 30d/12mo window (window_and_years slices it); the extra rows just
+    # feed the year rollup + the card's lifetime real figure so it reconciles with per-key
+    # spend. Horizon is configurable (default ~5y) for an older install.
+    start = time.strftime("%Y-%m-%d",
+                          time.gmtime(now - config.SPEND_ACTIVITY_DAYS * 86400))
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
     try:
         daily = await litellm.spend_activity(request.app[_SESSION], start, end)
@@ -2462,7 +2679,22 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                     real_cpt, ref_cpt = _COST_RATES
                 add_estimated_cost(out, real_cpt, ref_cpt)
                 out["cost_basis"] = "blended"
+            # Anchor the REAL series to LiteLLM's actual daily cash (the reconstruction
+            # above only splits/estimates; `spend` is what was billed) so the card's real
+            # total matches per-key spend / Cost-by-user. Estimated (self-hosted) stays the
+            # reconstruction. No-op on free tier with no per-day $.
+            anchor_real_to_actual(out)
+            # Lifetime totals over the FULL pulled history (every year, not the window) so
+            # the card can show a figure that reconciles with per-key spend / Cost-by-user.
+            yrs = out.get("years", [])
+            out["real_cost_lifetime"] = round(sum(y.get("real_cost", 0.0) for y in yrs), 2)
+            out["est_cost_lifetime"] = round(sum(y.get("est_cost", 0.0) for y in yrs), 2)
             out["cost_models"] = cost_model_split(per_model or [])
+            # per-day EXTERNAL vs INTERNAL token split, so the usage bar can 2-colour it
+            daily_tok = await litellm.per_model_daily_tokens(
+                request.app[_SESSION], start, end, overrides)
+            if daily_tok:
+                apply_daily_tokens(out, daily_tok)
         except Exception as ce:     # cost is best-effort; usage chart must still render
             print(f"[warn] spend/series cost estimate: {type(ce).__name__}: {ce}",
                   file=sys.stderr)
@@ -2494,7 +2726,7 @@ async def spend_model_series_handler(request: web.Request) -> web.Response:
     if not _litellm_configured():
         raise web.HTTPNotFound()
     window = request.query.get("window", "30d")
-    if window not in ("30d", "12mo"):
+    if window not in ("30d", "12mo", "month"):
         window = "30d"
     now = time.time()
     start = time.strftime("%Y-%m-%d", time.gmtime(now - 31536000))   # full year
@@ -2511,6 +2743,63 @@ async def spend_model_series_handler(request: web.Request) -> web.Response:
         return web.json_response({"window": window, "available": False,
                                   "labels": [], "models": []})
     return web.json_response(bucket_model_series(series, window, now))
+
+
+async def _key_owner_map(session: aiohttp.ClientSession) -> dict:
+    """{'ovr': {alias→user}, 'live': {alias→owner-email}} for resolving rollup rows to a
+    user, mirroring the by-user board: admin key→user overrides (local, cheap) layered over
+    LiteLLM's resolved owner (cached /key/list). Either lookup may be empty — the resolver
+    falls back to the alias/short-key."""
+    ovr = db.key_user_overrides()
+    live: dict = {}
+    try:
+        kb = await litellm.key_budgets(session) or {}
+        live = {alias: (v.get("user_name") or "") for alias, v in kb.items()}
+    except Exception:
+        live = {}
+    return {"ovr": ovr, "live": live}
+
+
+# Short TTL cache for the model×user series. The rollup is DAILY buckets that only change
+# when the sampler writes (≤ heavy interval), so serving a cached payload for a few seconds
+# adds no staleness beyond what already exists — it just spares a full-window DB scan +
+# owner resolution + price fetch on the 5s auto-refresh poll (per open Spend tab). Keyed by
+# window (data is global, not per-user); at most 3 entries.
+_MU_SERIES_CACHE: dict[str, tuple[float, dict]] = {}
+_MU_SERIES_TTL = 45.0
+
+
+async def spend_model_user_series_handler(request: web.Request) -> web.Response:
+    """Cost per model × user over time (Spend page). Reads the local per-(day,model,key)
+    rollup — NO /spend/logs pull at render — resolves each key to an owner, and folds into
+    stacked series (14d/30d daily, 12mo monthly). LiteLLM-gated like the rest of Spend;
+    result is TTL-cached (see _MU_SERIES_CACHE) so the 5s poll doesn't rescan every time."""
+    if not _litellm_configured():
+        raise web.HTTPNotFound()
+    window = request.query.get("window", "14d")
+    if window not in ("14d", "30d", "12mo", "month"):
+        window = "14d"
+    now = time.time()
+    hit = _MU_SERIES_CACHE.get(window)
+    if hit and now - hit[0] < _MU_SERIES_TTL:
+        return web.json_response(hit[1])
+    days = (int((now - db.month_start(now)) / 86400) + 1 if window == "month"
+            else 366 if window == "12mo" else (30 if window == "30d" else 14))
+    rows = db.spend_model_user_rows(days, now)
+    if not rows:
+        payload = {"window": window, "available": False, "labels": [], "series": []}
+    else:
+        try:
+            omap = await _key_owner_map(request.app[_SESSION])
+        except Exception:
+            omap = {"ovr": {}, "live": {}}
+        # SAME effective price as the 'Cost per model over time' chart: price + overrides.
+        prices = await litellm.model_prices(request.app[_SESSION])
+        _apply_cost_overrides(prices)
+        kind_ov = db.model_kind_overrides()
+        payload = bucket_model_user_series(rows, omap, prices, kind_ov, window, now)
+    _MU_SERIES_CACHE[window] = (now, payload)
+    return web.json_response(payload)
 
 
 async def alerts_handler(request: web.Request) -> web.Response:
@@ -2545,7 +2834,7 @@ async def anomalies_handler(request: web.Request) -> web.Response:
 
 async def uptime_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "24h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "24h"
     return web.json_response({
         "window": window,
@@ -2596,7 +2885,7 @@ async def events_handler(request: web.Request) -> web.Response:
 async def export_handler(request: web.Request) -> web.Response:
     """Export a window's series as CSV or JSON for offline analysis."""
     window = request.query.get("window", "24h")
-    if window not in db.WINDOWS:
+    if window not in db.VALID_WINDOWS:
         window = "24h"
     fmt = request.query.get("format", "csv").lower()
     pts = db.series(window, 1000)
@@ -2614,12 +2903,19 @@ async def export_handler(request: web.Request) -> web.Response:
 
 
 async def healthz_handler(request: web.Request) -> web.Response:
+    """Liveness probe — ALWAYS open and 200 (the container HEALTHCHECK + any external
+    monitor depend on it, and both only read the HTTP status / `status` field).
+
+    Build details are disclosed to AUTHENTICATED callers only: naming the exact version to
+    an anonymous client hands an attacker a free CVE-matching hint, which is the same
+    reason the `Server` header carries no version. Unauthenticated callers get liveness
+    and nothing else."""
     ok = _latest.get("ts", 0) > 0 or len(_ring) == 0
-    return web.json_response(
-        {"status": "ok" if ok else "starting", "version": config.VERSION,
-         "samples": len(_ring)},
-        status=200,
-    )
+    body: dict = {"status": "ok" if ok else "starting"}
+    if _auth_ctx(request)[0]:
+        body["version"] = config.VERSION
+        body["samples"] = len(_ring)
+    return web.json_response(body, status=200)
 
 
 def _metrics_authed(request: web.Request) -> bool:
@@ -2678,6 +2974,34 @@ async def metrics_handler(request: web.Request) -> web.Response:
 
 
 # --------------------------------------------------------------- lifecycle ----
+async def _spend_mu_backfill_once(session: aiohttp.ClientSession) -> None:
+    """Seed the per-(model,user) spend rollup with the last N days, ONCE (guarded by a
+    settings marker so later restarts never re-pull). Runs in the background after a short
+    delay so it never blocks startup or the first live sample. Best-effort: any failure
+    just leaves the chart to grow forward from live samples. If LiteLLM isn't configured
+    yet, we do NOT mark it done — so a later boot (once configured) still backfills."""
+    try:
+        if config.SPEND_MU_BACKFILL_DAYS <= 0:
+            return
+        if db.settings_all().get("spend_mu_backfill"):
+            return                                          # already seeded
+        if not (config.LITELLM_BASE_URL and config.LITELLM_MASTER_KEY):
+            return                                          # retry on a later boot
+        await asyncio.sleep(15)                             # let the dashboard start first
+        rows = await litellm.model_user_backfill(session, config.SPEND_MU_BACKFILL_DAYS)
+        now = time.time()
+        if rows:
+            db.spend_model_user_upsert(rows, now)
+        db.settings_set("spend_mu_backfill", str(int(now)), now)
+        print(f"[startup] spend model×user backfill: seeded {len(rows)} rows "
+              f"({config.SPEND_MU_BACKFILL_DAYS}d window)", file=sys.stderr)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[startup] spend model×user backfill skipped: {type(e).__name__}: {e}",
+              file=sys.stderr)
+
+
 async def _on_startup(app: web.Application) -> None:
     session = app[_SESSION] = aiohttp.ClientSession()
     # Apply persisted operator overrides (Settings page) over the env defaults.
@@ -2698,10 +3022,11 @@ async def _on_startup(app: web.Application) -> None:
             "containers", containers.sample, session, config.HTTP_TIMEOUT + 5)),
     ]
     app[_SAMPLER] = asyncio.create_task(_sampling_loop(app))
+    app[_MU_BACKFILL] = asyncio.create_task(_spend_mu_backfill_once(session))
 
 
 async def _on_cleanup(app: web.Application) -> None:
-    tasks = [app.get(_SAMPLER), *(app.get(_BACKENDS) or [])]
+    tasks = [app.get(_SAMPLER), app.get(_MU_BACKFILL), *(app.get(_BACKENDS) or [])]
     for task in tasks:
         if task:
             task.cancel()
@@ -2768,12 +3093,14 @@ def build_app() -> web.Application:
     app.router.add_get("/api/keyseries", keyseries_handler)
     app.router.add_get("/api/keydelta", keydelta_handler)
     app.router.add_get("/api/procseries", procseries_handler)
+    app.router.add_get("/api/cpuseries", cpuseries_handler)
     app.router.add_get("/api/anomalies", anomalies_handler)
     app.router.add_get("/api/nav", nav_handler)
     app.router.add_get("/api/litellm/models", litellm_models_handler)
     app.router.add_get("/api/budgets", budgets_handler)
     app.router.add_get("/api/spend/series", spend_series_handler)
     app.router.add_get("/api/spend/model-series", spend_model_series_handler)
+    app.router.add_get("/api/spend/model-user-series", spend_model_user_series_handler)
     app.router.add_get("/api/alerts", alerts_handler)
     app.router.add_post("/api/alerts/test", alerts_test_handler)
     app.router.add_get("/api/export", export_handler)
@@ -2812,7 +3139,7 @@ def startup_selfcheck() -> list[str]:
     for need in ("/", "/spend", "/litellm", "/gpu", "/ollama", "/alerts", "/api/data",
                  "/api/series", "/api/uptime", "/api/keyseries",
                  "/api/keydelta",
-                 "/api/procseries", "/api/anomalies", "/api/nav",
+                 "/api/procseries", "/api/cpuseries", "/api/anomalies", "/api/nav",
                  "/api/litellm/models", "/api/budgets", "/api/spend/series",
                  "/api/alerts", "/api/export", "/healthz"):
         if need not in paths:
