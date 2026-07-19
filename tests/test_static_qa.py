@@ -390,7 +390,47 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.7.0"
+    assert config.VERSION == "AI-Monitoring_1.7.1"
+
+
+def test_all_version_surfaces_match_config_version():
+    """Regression for the version-drift blind spot: every image tag / chart version /
+    sidebar badge across deploy manifests, compose files, the Helm chart, and the README
+    offline-install snippet must equal config.VERSION — these lagged in past releases
+    (deploy/k8s + prometheus-example + README were the repeat offenders). Derives the
+    version from config so it can't go stale itself."""
+    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.7.1"
+    other = re.compile(r"(?:ai[-_]monitoring|ai_monitoring):(\d+\.\d+\.\d+)")
+
+    def stale_tags(text):
+        return {m for m in other.findall(text) if m != ver}
+
+    surfaces = [
+        ROOT / "docker-compose.yml",
+        ROOT / "deploy" / "docker-compose.server.yml",
+        ROOT / "deploy" / "k8s" / "ai-monitoring.yaml",
+        ROOT / "deploy" / "k8s" / "daemonset.yaml",
+        ROOT / "deploy" / "prometheus-example" / "docker-compose.yml",
+        ROOT / "deploy" / "prometheus-example" / "README.md",
+        ROOT / "README.md",
+    ]
+    for p in surfaces:
+        if not p.exists():
+            continue
+        bad = stale_tags(p.read_text(encoding="utf-8"))
+        assert not bad, f"{p.relative_to(ROOT)}: stale image tag(s) {bad}, expected {ver}"
+
+    # Helm chart version + appVersion
+    chart = ROOT / "deploy" / "helm" / "ai-monitoring" / "Chart.yaml"
+    if chart.exists():
+        c = chart.read_text(encoding="utf-8")
+        assert re.search(rf'(?m)^version:\s*{re.escape(ver)}\b', c), "Helm chart version stale"
+        assert re.search(rf'(?m)^appVersion:\s*"{re.escape(ver)}"', c), "Helm appVersion stale"
+
+    # every dashboard's sidebar badge reads the same vX.Y.Z
+    for pg in (ROOT / "web").glob("*.html"):
+        for m in re.findall(r'sidebar-brand-ver">v(\d+\.\d+\.\d+)', pg.read_text(encoding="utf-8")):
+            assert m == ver, f"{pg.name}: sidebar-brand-ver v{m} != {ver}"
 
 
 def test_ux_improvements_present():
@@ -804,6 +844,23 @@ def test_vllm_kpis_use_class_arg_not_embedded_markup():
     assert ".kpi .v.warn{color:var(--warn)}" in html
 
 
+def test_no_kpi_value_embeds_raw_span_markup():
+    """Regression (llamacpp CPU-threads, vLLM Waiting/Swapped/Preemptions): a value passed
+    to kpi() must NOT embed `<span>` markup — kpi() escapeHtml's its value, so the tag would
+    render as literal text ('<span class="">…'). Colour/sub-label go through kpi()'s class /
+    sub params (which escape their content) instead. Scans every dashboard's kpi() calls."""
+    for fn in sorted((ROOT / "web").glob("*.html")):
+        src = fn.read_text(encoding="utf-8")
+        # drop the kpi() helper definition itself — it legitimately builds an escaped <span>
+        src2 = re.sub(r"function kpi\(.*?\n\}", "", src, flags=re.S)
+        for m in re.finditer(r"\bkpi\(", src2):
+            seg = src2[m.start(): m.start() + 400]
+            end = re.search(r"\+kpi\(|setHtml|\)\);", seg)
+            arg = seg[: end.start()] if end else seg[:200]
+            assert "<span" not in arg, \
+                f"{fn.name}: kpi() value embeds <span> (would render as literal text): {arg[:80]!r}"
+
+
 def test_vllm_every_graph_has_a_tooltip():
     """Every chart on the vLLM page must carry an info tooltip explaining its goal: each
     CHARTS entry has a `desc`, and the builder renders it as an `.info` element."""
@@ -812,10 +869,19 @@ def test_vllm_every_graph_has_a_tooltip():
     assert len(chart_ids) >= 10, f"expected the full vLLM chart set, found {chart_ids}"
     # one desc per chart config
     assert html.count("desc:") >= len(chart_ids), "every CHARTS entry needs a desc"
-    # the builder turns desc into an info tooltip element, and .info is styled
-    assert 'info.className="info"' in html and "info.title=cfg.desc" in html, \
-        "builder must render cfg.desc as an .info tooltip"
+    # the builder turns desc into an info element, and .info is styled
+    assert 'info.className="info"' in html, "builder must render cfg.desc as an .info element"
     assert ".info{" in html, "vLLM page must style .info"
+    # help opens on CLICK, not hover: no native title= tooltip on the icon, a click
+    # handler on the trigger, and a dedicated popover element that carries the desc
+    assert "info.title=cfg.desc" not in html, \
+        "help must be click-toggled, not a hover-only title= tooltip"
+    assert 'info.addEventListener("click"' in html, "info icon must toggle on click"
+    assert "info-pop" in html and "closeAllInfo" in html, \
+        "click help needs a popover element and an outside/Escape dismiss path"
+    assert "pop.textContent=cfg.desc" in html, "the popover must carry the graph's desc"
+    # accessible toggle state
+    assert 'aria-expanded' in html
 
 
 def test_backend_logos_are_published():
@@ -2095,3 +2161,96 @@ def test_vllm_empty_charts_auto_hide():
     html = (ROOT / "web" / "vllm.html").read_text(encoding="utf-8")
     assert re.search(r'pts\.some\(p=>p\[cfg\.key\]!=null\)\?"":"none"', html), \
         "empty vLLM chart tiles must auto-hide"
+
+
+def test_alerts_down_breach_shows_recheck_state():
+    """A `down:<backend>` breach is re-evaluated on every poll and clears itself once the
+    service returns — but with no sign of that it reads as a frozen error, and people
+    restart things that were already recovering. The row must show it is being re-checked,
+    driven by the page's OWN poll rather than a second timer that could disagree with it."""
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert "ALERT_POLL_MS" in html
+    assert "paintRecheck" in html
+    # the countdown is derived from the real poll, not an independent interval
+    assert re.search(r'setInterval\(tick,\s*ALERT_POLL_MS\)', html), \
+        "the poll and the countdown must share one interval constant"
+    assert re.search(r're-checking in', html)
+    assert re.search(r'last checked', html)
+    # only backend-down breaches get it: a threshold breach clears when the VALUE moves,
+    # so a retry countdown there would promise something that does not happen
+    assert re.search(r'\/\^down:\/\.test', html), \
+        "recheck indicator must be limited to down: breaches"
+    # the 1s ticker repaints text only — it must not issue requests
+    assert re.search(r'setInterval\(paintRecheck,\s*1000\)', html)
+    # timers still registered for cleanup (§12)
+    assert html.count("_timers.push") >= 2
+
+
+def test_alerts_recheck_only_on_down_breach_behavior():
+    """Behavioral: run the REAL active-breach row builder from alerts.html. A
+    `down:<backend>` key must emit the `.recheck` countdown element; a threshold
+    breach (which clears on a value change, not a retry) must NOT — otherwise the
+    UI promises a re-check that never happens. Skipped if node is absent."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    m = re.search(r'active\.map\(k=>\{([\s\S]*?)\}\)\.join\(""\)', html)
+    assert m, "active-breach row builder not found in alerts.html"
+    script = "function row(k){" + m.group(1) + "}\n" + """
+const escapeHtml = s => String(s);
+console.log(JSON.stringify({
+  down: row("down:vllm"),
+  thr:  row("cpu_pct 95%"),
+}));
+"""
+    out = subprocess.run([node, "-e", script], capture_output=True,
+                         text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    r = json.loads(out.stdout)
+    assert 'class="recheck"' in r["down"] and "re-checking" in r["down"], \
+        f"down: breach missing re-check indicator: {r['down']!r}"
+    assert "recheck" not in r["thr"], \
+        f"threshold breach must NOT get a re-check countdown: {r['thr']!r}"
+    # both must still escape the key (XSS — §12)
+    assert "down:vllm" in r["down"]
+
+
+def test_alerts_recheck_countdown_behavior():
+    """Behavioral: run the REAL paintRecheck. The countdown must derive from the
+    poll interval and the last-check timestamp, clamp at 0 (never negative), and
+    issue NO network request — it only repaints text. Skipped if node is absent."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    m = re.search(r"function paintRecheck\(\)\{[\s\S]*?\n\}", html)
+    assert m, "paintRecheck not found in alerts.html"
+    script = m.group(0) + """
+const ALERT_POLL_MS = 5000;
+let apiCalls = 0;
+function api(){ apiCalls++; return Promise.resolve(null); }   // must stay 0
+const els = [{textContent:""}, {textContent:""}];
+globalThis.document = { querySelectorAll: () => els };
+let _lastAlertCheck;
+function run(elapsed){ _lastAlertCheck = Date.now() - elapsed; paintRecheck(); return els[0].textContent; }
+const r0 = run(0);       // just checked  -> ~5s left
+const r3 = run(2000);    // 2s ago        -> ~3s left
+const rNeg = run(6000);  // 6s ago (past) -> clamp to 0, not -1
+// no .recheck elements at all -> must be a safe no-op, not a throw
+globalThis.document = { querySelectorAll: () => [] };
+let noElsThrew = false;
+try { run(0); } catch(e){ noElsThrew = true; }
+console.log(JSON.stringify({r0, r3, rNeg, apiCalls, noElsThrew}));
+"""
+    out = subprocess.run([node, "-e", script], capture_output=True,
+                         text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    r = json.loads(out.stdout)
+    assert re.search(r"re-checking in 5s\b", r["r0"]), r["r0"]
+    assert "last checked" in r["r0"]
+    assert re.search(r"re-checking in 3s\b", r["r3"]), r["r3"]
+    assert re.search(r"re-checking in 0s\b", r["rNeg"]), \
+        f"countdown must clamp at 0, never go negative: {r['rNeg']!r}"
+    assert r["apiCalls"] == 0, "paintRecheck must not issue any network request"
+    assert r["noElsThrew"] is False, "paintRecheck must no-op when no .recheck elements exist"

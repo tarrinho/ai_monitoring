@@ -40,7 +40,22 @@
   .kpi .v{font-size:22px;font-weight:600}
   .kpi .v.warn{color:var(--warn)} .kpi .v.bad{color:var(--bad)}
   .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
-  .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
+  /* click-to-toggle help: a native title= is hover-only and vanishes on touch /
+     on the move — the per-graph explanation is worth reading, so it stays open
+     until dismissed. */
+  .info{color:var(--muted);cursor:pointer;font-size:10px;margin-left:5px;
+    border:1px solid var(--line);border-radius:50%;width:15px;height:15px;
+    display:inline-flex;align-items:center;justify-content:center;line-height:1;
+    user-select:none;flex:0 0 auto;vertical-align:middle}
+  .info:hover,.info[aria-expanded="true"]{color:var(--fg);border-color:var(--muted)}
+  .mini h3 .nm{position:relative;display:inline-flex;align-items:center;min-width:0}
+  .info-pop{position:absolute;top:20px;left:0;z-index:30;display:none;
+    width:250px;max-width:72vw;padding:9px 11px;border-radius:8px;
+    background:var(--panel);border:1px solid var(--line);
+    box-shadow:0 6px 22px rgba(0,0,0,.4);color:var(--fg);font-size:11px;
+    font-weight:400;line-height:1.55;white-space:normal;text-transform:none;
+    text-align:left;letter-spacing:normal}
+  .info-pop.open{display:block}
   table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
   th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
   th{color:var(--muted);font-weight:500}
@@ -161,7 +176,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.7.0</div>
+      <div id="sidebar-brand-ver">v1.7.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -297,10 +312,27 @@ function mkChart(canvas, cfg){
   for(const cfg of CHARTS){
     const card=document.createElement("div");card.className="mini";card.id=cfg.id+"-card";
     const h=document.createElement("h3");
-    const nm=document.createElement("span");nm.textContent=cfg.label;
-    // per-graph info tooltip: what the graph is for + how to read it
-    if(cfg.desc){ const info=document.createElement("span"); info.className="info";
-      info.textContent="ⓘ"; info.title=cfg.desc; nm.append(" ",info); }
+    const nm=document.createElement("span");nm.className="nm";
+    const lbl=document.createElement("span");lbl.textContent=cfg.label;nm.append(lbl);
+    // per-graph explanation: what the graph is for + how to read it. Click to
+    // toggle (not hover) so it survives touch and reading, and is dismissed by a
+    // second click, an outside click, or Escape (wired once, below).
+    if(cfg.desc){
+      const info=document.createElement("button");info.type="button";
+      info.className="info";info.textContent="ⓘ";
+      info.setAttribute("aria-expanded","false");
+      info.setAttribute("aria-label","About “"+(cfg.label||cfg.id)+"”: click to toggle");
+      const pop=document.createElement("span");pop.className="info-pop";
+      pop.setAttribute("role","tooltip");pop.textContent=cfg.desc;
+      info.addEventListener("click",function(ev){
+        ev.stopPropagation();
+        const open=pop.classList.contains("open");
+        closeAllInfo();                       // one popover at a time
+        if(!open){ pop.classList.add("open"); info.setAttribute("aria-expanded","true"); }
+      });
+      pop.addEventListener("click",e=>e.stopPropagation());  // clicks inside stay open
+      nm.append(" ",info,pop);
+    }
     const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
     h.append(nm,cur);
     const wrap=document.createElement("div");wrap.className="chart-wrap";
@@ -309,6 +341,16 @@ function mkChart(canvas, cfg){
     _charts[cfg.id]=mkChart(cv,cfg);
   }
 })();
+// Close any open per-graph help popover and reset its trigger's aria state.
+function closeAllInfo(){
+  document.querySelectorAll(".info-pop.open").forEach(p=>p.classList.remove("open"));
+  document.querySelectorAll('.info[aria-expanded="true"]')
+    .forEach(b=>b.setAttribute("aria-expanded","false"));
+}
+// Dismiss on an outside click or Escape — standard popover behaviour. Listeners
+// are on document (not per-icon) so they cost nothing per graph.
+document.addEventListener("click",closeAllInfo);
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeAllInfo(); });
 function fmtT(t){ if(!t) return ""; return new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
 // axisT(pts): label granularity from the ACTUAL data span, not the window name.
 function axisT(pts){ const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean); const span=ts.length>1?Math.max(...ts)-Math.min(...ts):0; return function(p){ const t=(p&&typeof p==="object")?p.t:p; if(!t) return ""; const d=new Date(t*1000); return span>180*86400?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):span>2*86400?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }; }

@@ -139,7 +139,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.7.0</div>
+      <div id="sidebar-brand-ver">v1.7.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -232,7 +232,16 @@ function render(d){
   if(active.length){ ab.className="badge bad"; ab.textContent=active.length; }
   else { ab.className="badge ok"; ab.textContent="clear"; }
   setHtml(document.getElementById("active-body"),
-    active.length ? `<table>${active.map(k=>`<tr><td class="fire">⚠ ${escapeHtml(k)}</td></tr>`).join("")}</table>`
+    active.length ? `<table>${active.map(k=>{
+      // only backend-down breaches auto-resolve on re-check; a threshold breach
+      // (CPU/queue/...) clears when the VALUE changes, so a countdown there would
+      // imply a retry that is not happening.
+      const isDown=/^down:/.test(String(k));
+      return `<tr><td class="fire">⚠ ${escapeHtml(k)}`
+        +(isDown?`<div class="recheck" style="color:var(--muted);font-size:11px;`
+          +`font-weight:400;margin-top:2px">⟳ re-checking…</div>`:``)
+        +`</td></tr>`;
+    }).join("")}</table>`
                   : `<div class="unavail">no active breaches</div>`);
   // thresholds
   const t=d.thresholds||{};
@@ -254,9 +263,34 @@ function render(d){
       : `<div class="unavail">no alerts yet — thresholds not breached</div>`);
 }
 
+// A backend-down breach is re-evaluated on EVERY poll — the collector re-samples the
+// backend on the same cadence, so the breach clears by itself once the service is back.
+// Without surfacing that, a down row looks frozen and people go restart something that
+// was already recovering. The countdown is driven by THIS poll, not a second timer, so
+// what it shows is what actually happens.
+const ALERT_POLL_MS = 5000;
+let _lastAlertCheck = null;
+
 async function tick(){
   const d=await api("/api/alerts");
-  if(d){ render(d); document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString(); }
+  if(d){
+    _lastAlertCheck = Date.now();
+    render(d);
+    document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString();
+    paintRecheck();
+  }
+}
+
+// Live "next re-check in Ns". Pure DOM update on a 1s tick — no network — so the
+// countdown reads smoothly while the actual re-check stays on the poll interval.
+function paintRecheck(){
+  const els=document.querySelectorAll(".recheck");
+  if(!els.length || _lastAlertCheck==null) return;
+  const left=Math.max(0, Math.ceil((ALERT_POLL_MS-(Date.now()-_lastAlertCheck))/1000));
+  const seen=new Date(_lastAlertCheck).toLocaleTimeString();
+  els.forEach(function(el){
+    el.textContent="⟳ re-checking in "+left+"s · last checked "+seen;
+  });
 }
 
 document.getElementById("test-btn").addEventListener("click", async ()=>{
@@ -286,7 +320,8 @@ document.getElementById("test-btn").addEventListener("click", async ()=>{
 }catch(e){} })();
 
 tick();
-_timers.push(setInterval(tick, 5000));
+_timers.push(setInterval(tick, ALERT_POLL_MS));
+_timers.push(setInterval(paintRecheck, 1000));   // countdown only — no extra requests
 </script>
 </div>
 <script>

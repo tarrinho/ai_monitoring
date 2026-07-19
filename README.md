@@ -460,10 +460,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.7.0-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.7.1-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.7.0-armv7 ai-monitoring:1.7.0
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.7.1-armv7 ai-monitoring:1.7.1
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```

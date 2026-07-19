@@ -38,6 +38,7 @@
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px}
   .kpi{background:var(--panel2);border-radius:8px;padding:10px 12px}
   .kpi .v{font-size:22px;font-weight:600}
+  .kpi .v .sub{font-size:11px;font-weight:400;color:var(--muted)}
   .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
   table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
   th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
@@ -159,7 +160,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.7.0</div>
+      <div id="sidebar-brand-ver">v1.7.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -228,9 +229,10 @@ const _timers = [];
 window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
 
 let HOST_NCPU=0;
-function kpi(label,val){
-  return `<div class="kpi"><div class="v">${escapeHtml(val)}</div>`
-       + `<div class="l">${escapeHtml(label)}</div></div>`;
+function kpi(label,val,sub){
+  return `<div class="kpi"><div class="v">${escapeHtml(val)}`
+       + (sub?` <span class="sub">${escapeHtml(sub)}</span>`:"")
+       + `</div><div class="l">${escapeHtml(label)}</div></div>`;
 }
 function badge(el, up, txt){ el.className="badge "+(up?"ok":"bad"); el.textContent=up?(txt||"live"):"down"; }
 function baseName(p){ if(!p) return "—"; const s=String(p); const i=s.lastIndexOf("/"); return i>=0?s.slice(i+1):s; }
@@ -314,8 +316,8 @@ function renderKpis(lc){
     // idle cores are idle BY DESIGN (work offloaded to the GPU) or starved by a low
     // --threads. "gen / batch" = -t / -tb. "—" when the build's /props omits them.
     +kpi("CPU threads", (lc.n_threads!=null?lc.n_threads:"—")
-         +" / "+(lc.n_threads_batch!=null?lc.n_threads_batch:"—")
-         +(HOST_NCPU?` <span class="sub">of ${HOST_NCPU} cores</span>`:""))
+         +" / "+(lc.n_threads_batch!=null?lc.n_threads_batch:"—"),
+         HOST_NCPU?`of ${HOST_NCPU} cores`:"")
     +kpi("Status", lc.status||"—"));
   setHtml(document.getElementById("l-model"),
     `<table><tr><th>Model</th><th class="num">Context</th>`

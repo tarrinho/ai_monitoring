@@ -6,6 +6,46 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.1] — 2026-07-19
+
+Patch release: hides the monitor's own metrics key from the graphs, fixes a vLLM KPI
+rendering bug, and adds explanatory tooltips across the vLLM and LiteLLM dashboards.
+
+### Added
+- **`MONITOR_EXCLUDE_KEYS` — hide keys/users from every per-key & per-user graph.** The
+  monitor's own LiteLLM key polls `/spend` + `/global/activity`, so it shows up as a
+  "user" driving traffic in Top keys, Top users, Cost by user, model×user, and
+  keys-over-time. List its key **alias**, key hash, or resolved owner email/username
+  (comma-separated, case-insensitive) to drop it from **all** of those charts on every
+  page. Applied at every chokepoint — the collector's `top_keys` build, the model×user
+  fold, and the persisted `key_series`/delta reads — so both live and historical charts
+  hide it. The health-check pseudo-key is still always dropped. Prefer the alias/hash (it
+  is present on every chart's data). New tests `test_key_excluded_*`,
+  `test_fold_model_user_drops_excluded_key`, `test_key_series_read_hides_excluded_label`.
+- **Per-graph info tooltips on the vLLM page.** Every chart (Running, Waiting, KV cache,
+  TTFT, Per-token, End-to-end, Queue wait, Prefix-cache hit, Prompt tok/s, Generated
+  tok/s) now carries an `ⓘ` explaining what it measures and how to read it.
+- **Clarity tooltips on the LiteLLM "Top keys/users by requests" cards** — they use the
+  live `LITELLM_SPEND_WINDOW_MIN` spend snapshot (fixed rolling window), independent of
+  the page time-window selector, so the "last 15m" badge no longer surprises.
+
+### Fixed
+- **vLLM KPI values rendered raw HTML (`<span class="">0…`).** The Waiting / Swapped /
+  Preemptions KPIs embedded a `<span>` for colouring inside `kpi()`, whose `escapeHtml`
+  then displayed the tag as literal text. `kpi()` now takes a class argument (matching the
+  other pages) and the value is escaped normally; the warn colour is applied via a styled
+  `.kpi .v.warn` (which the vLLM page was also missing). Test
+  `test_vllm_kpis_use_class_arg_not_embedded_markup`.
+- **GPU/CPU → "CPU usage by app (stacked)" no longer exceeds 100%.** The stacked
+  per-app chart plotted top-style per-process `%CPU` (each value is relative to ONE
+  core, so N busy processes could sum to `cores × 100`), with no axis cap — the stack
+  blew past 100%. Each band is now the app's share of *total* capacity (raw `%CPU ÷
+  cores`) on a fixed 0–100 axis, matching the *CPU cores (stacked)* card. The divisor
+  is an authoritative `ncpu` returned by `/api/procseries?kind=cpu` (distinct cores in
+  the window, from the per-core samples), so it's independent of client load order; the
+  tooltip recovers the raw top-style load as `band × cores`. Regression tests
+  `test_db_ncpu_counts_logical_cores_in_window` + `test_procseries_cpu_exposes_ncpu_for_normalization`.
+
 ## [1.7.0] — 2026-07-19
 
 Minor release rolling up this line's work: a **vLLM backend** dashboard; a **Spend →
@@ -71,15 +111,6 @@ gate; **`MONITOR_CURRENCY`**; Settings shows only cards for present backends.
   live-only — so the metrics tiers aren't inflated for data nobody queries historically).
 
 ### Fixed
-- **GPU/CPU → "CPU usage by app (stacked)" no longer exceeds 100%.** The stacked
-  per-app chart plotted top-style per-process `%CPU` (each value is relative to ONE
-  core, so N busy processes could sum to `cores × 100`), with no axis cap — the stack
-  blew past 100%. Each band is now the app's share of *total* capacity (raw `%CPU ÷
-  cores`) on a fixed 0–100 axis, matching the *CPU cores (stacked)* card. The divisor
-  is an authoritative `ncpu` returned by `/api/procseries?kind=cpu` (distinct cores in
-  the window, from the per-core samples), so it's independent of client load order; the
-  tooltip recovers the raw top-style load as `band × cores`. Regression tests
-  `test_db_ncpu_counts_logical_cores_in_window` + `test_procseries_cpu_exposes_ncpu_for_normalization`.
 - **Stale image tags in deploy examples bumped to current.** `deploy/k8s/*.yaml`,
   `deploy/prometheus-example/` (compose default + README), and the README offline-install
   snippet still referenced old image tags (`:1.4.0` / `:1.0.0`); all now track the current

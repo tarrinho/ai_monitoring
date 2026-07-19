@@ -2379,6 +2379,10 @@ def bucket_model_user_series(rows: list, omap: dict, prices: dict, kind_ov: dict
         if rate <= 0:
             continue                          # unpriced → no cost line (same as sibling)
         user = _owner_of(r, omap)
+        # drop the operator-excluded key/user (e.g. the monitor's own key) — match on the
+        # key hash, alias, or the resolved owner so any of those in MONITOR_EXCLUDE_KEYS hits.
+        if config.key_excluded(r.get("key"), r.get("alias"), user):
+            continue
         s = series.setdefault((model, user),
                               {"model": model, "user": user,
                                "label": f"{model} · {user}", "costs": [0.0] * len(labels)})

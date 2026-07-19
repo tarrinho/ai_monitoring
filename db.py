@@ -448,10 +448,13 @@ def key_series(window: str, max_points: int = 300,
         table, tc = "key_series_1h", "bucket"
     try:
         with _connect() as conn:
-            top = [r[0] for r in conn.execute(
+            # over-fetch, then drop excluded labels (the monitor's own key etc.) so the
+            # historical per-key chart matches the live one, and still show a full top-N.
+            ranked = [r[0] for r in conn.execute(
                 f"SELECT label, SUM(reqs) s FROM {table} "
                 f"WHERE {tc} >= ? AND {tc} <= ? "
-                f"GROUP BY label ORDER BY s DESC LIMIT ?", (start, end, top_n))]
+                f"GROUP BY label ORDER BY s DESC LIMIT ?", (start, end, top_n * 3))]
+            top = [lab for lab in ranked if not config.key_excluded(lab)][:top_n]
             if not top:
                 return {"labels": [], "points": []}
             ph = ",".join("?" for _ in top)
@@ -501,7 +504,7 @@ def key_series_window_delta(window: str, top_n: int = 10,
                 (start, end)).fetchall()
         out = []
         for label, lastv, firstv in rows:
-            if lastv is None:
+            if lastv is None or config.key_excluded(label):
                 continue
             fv = firstv if firstv is not None else 0.0
             delta = (lastv - fv) if lastv >= fv else lastv     # reset-safe

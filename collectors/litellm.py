@@ -414,7 +414,9 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
             "alias": k.get("key_alias") or k.get("key_name") or "",
             "reqs": None, "tokens": None,
             "cost": round(float(k.get("total_spend") or 0), 4),
-        } for k in ks]
+        } for k in ks
+            if not config.key_excluded(k.get("api_key"),
+                                       k.get("key_alias") or k.get("key_name"))]
     _dbg(f"/spend lite: requests={out.get('requests_window')} "
          f"per_model={len(out.get('per_model', []))} top_keys={len(out.get('top_keys', []))} "
          f"errs=({e1},{e2},{e3})")
@@ -1517,6 +1519,8 @@ def _fold_model_user(logs: list) -> list[dict]:
         day = datetime.fromtimestamp(st, tz=timezone.utc).strftime("%Y-%m-%d")
         alias = str(row.get("key_alias") or row.get("api_key_alias")
                     or meta.get("user_api_key_alias") or "")
+        if config.key_excluded(kid, alias):     # monitor's own / operator-excluded key
+            continue
         e = mu.setdefault((day, model, kid), {"alias": alias, "cost": 0.0, "tokens": 0})
         e["cost"] += spend
         e["tokens"] += tok
@@ -1696,11 +1700,14 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
             res["recent_failures"] = failures[:10]
             # top-10 API keys by request count in the window
             res["spend_window_min"] = config.LITELLM_SPEND_WINDOW_MIN
+            # drop excluded keys/users (e.g. the monitor's own key) BEFORE the top-10
+            # slice, so the ranking isn't padded by a key the operator never sees.
+            _ranked = [k for k in sorted(per_key.values(), key=lambda x: -x["reqs"])
+                       if not config.key_excluded(k["key"], k["alias"])]
             res["top_keys"] = [{
                 "key": k["key"], "alias": k["alias"], "reqs": k["reqs"],
                 "tokens": k["tokens"], "cost": round(k["cost"], 4),
-            } for k in sorted(per_key.values(),
-                              key=lambda x: -x["reqs"])[:10]]
+            } for k in _ranked[:10]]
 
     return res, _kept, total
 

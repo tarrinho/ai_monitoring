@@ -54,7 +54,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: ai-monitoring
-          image: ghcr.io/tarrinho/ai_monitoring:1.7.0
+          image: ghcr.io/tarrinho/ai_monitoring:1.7.1
           ports:
             - { name: http, containerPort: 9925 }
           securityContext:                    # restricted Pod Security Standard

@@ -6878,6 +6878,55 @@ def test_fold_model_user_aggregates_and_drops_healthcheck():
     assert not any("health-check" in r["key"] for r in rows)
 
 
+def test_key_excluded_matches_hash_alias_or_user(monkeypatch):
+    """config.key_excluded hides the monitor's own key/user from every graph — matching a
+    key hash, key alias, or resolved owner (case-insensitive, exact on the whole value)."""
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", {"monitoring", "hz", "bot@demo.local"})
+    assert config.key_excluded("hz")                       # by key hash
+    assert config.key_excluded("x", "Monitoring")          # by alias, case-insensitive
+    assert config.key_excluded(None, None, "bot@demo.local")  # by resolved owner
+    assert not config.key_excluded("hA", "pedro", "ana@demo.local")
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", set())     # empty list → never excludes
+    assert not config.key_excluded("monitoring", "hz")
+
+
+def test_fold_model_user_drops_excluded_key(monkeypatch):
+    """_fold_model_user drops an operator-excluded key (by alias or hash), same as it drops
+    the health-check key — so the monitor's own traffic never enters the model×user rollup."""
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", {"monitor-key"})
+    now = time.time()
+    logs = [
+        {"startTime": now, "api_key": "hA", "key_alias": "pedro", "model": "gpt-5-mini",
+         "response_cost": 0.10, "total_tokens": 1000},
+        {"startTime": now, "api_key": "hZ", "key_alias": "monitor-key", "model": "gpt-5-mini",
+         "response_cost": 5.0, "total_tokens": 99999},
+    ]
+    rows = litellm._fold_model_user(logs)
+    assert any(r["alias"] == "pedro" for r in rows)
+    assert not any(r["alias"] == "monitor-key" for r in rows)   # excluded → gone
+
+
+def test_key_series_read_hides_excluded_label(tmp_path, monkeypatch):
+    """The persisted per-key over-time chart (key_series) drops an excluded label at READ
+    time, so historical rows for the monitor's own key vanish from the chart too — and a
+    full top-N is still returned (the excluded key doesn't eat a slot)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ks.db"))
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", {"monitor-key"})
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(30):
+        db.insert_key_series(now - 1800 + i * 60, [
+            {"key": "hA", "alias": "pedro", "reqs": 100 + i},
+            {"key": "hZ", "alias": "monitor-key", "reqs": 99999},   # would rank #1
+        ])
+    out = db.key_series("1h", top_n=10)
+    assert "pedro" in out["labels"]
+    assert "monitor-key" not in out["labels"]          # excluded even though it ranked top
+    dl = db.key_series_window_delta("1h", top_n=10)
+    assert "monitor-key" not in dl["labels"]
+
+
 def test_spend_model_user_upsert_is_idempotent(tmp_path, monkeypatch):
     """The sampler re-aggregates the whole day each tick and UPSERT-REPLACEs, so applying
     the same rows twice must NOT double-count (that's the no-high-water-mark guarantee)."""

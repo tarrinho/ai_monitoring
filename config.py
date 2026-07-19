@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.7.0"
+VERSION = "AI-Monitoring_1.7.1"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -153,6 +153,33 @@ INTERNAL_MODEL_FAMILIES = {
         "granite,phi-,phi3,phi4,yi-,llama",
     ) or "").split(",") if p.strip()
 }
+# Keys / users to HIDE from every per-key and per-user graph — Top keys, Top users,
+# Cost by user, model×user, keys-over-time — on every page. The monitor's own LiteLLM
+# key shows up as a "user" driving traffic (it polls /spend + /global/activity); list
+# its key alias, key hash, or resolved owner email/username here (comma-separated,
+# case-insensitive, exact match on the whole value) to drop it everywhere. The
+# health-check pseudo-key is always dropped regardless of this list. Prefer the key
+# ALIAS or hash — it is present on every chart's data and so filters all of them.
+EXCLUDE_KEYS = {
+    p.strip().lower() for p in (_str("MONITOR_EXCLUDE_KEYS", "") or "").split(",")
+    if p.strip()
+}
+
+
+def key_excluded(*identifiers: object) -> bool:
+    """True if ANY identifier (key hash, key alias, or resolved owner user/email) matches
+    the MONITOR_EXCLUDE_KEYS list — case-insensitive, exact match on the whole value. Used
+    to keep the monitor's own metrics-scraping key/user out of every per-key/per-user graph."""
+    if not EXCLUDE_KEYS:
+        return False
+    for v in identifiers:
+        if v is None:
+            continue
+        if str(v).strip().lower() in EXCLUDE_KEYS:
+            return True
+    return False
+
+
 SLO_LATENCY_MS      = _float("SLO_LATENCY_MS", 2000.0)  # SLO target; % under this
 # Verbose per-call logging for the LiteLLM collector (diagnose empty dashboards).
 LITELLM_DEBUG = (_str("LITELLM_DEBUG", "0") or "0").lower() in ("1", "true", "yes", "on")

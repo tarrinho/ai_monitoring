@@ -1,4 +1,4 @@
-<svg width="1280" height="700" viewBox="0 0 1280 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI-Monitoring architecture: decoupled collectors write to a cache, a 5s tick flattens a snapshot into SQLite, alerts and anomalies fire a webhook, and eight dashboards read the JSON API over SSE and polling.">
+<svg width="1280" height="700" viewBox="0 0 1280 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI-Monitoring architecture: decoupled collectors write to a cache, a 5s tick flattens a snapshot into SQLite, alerts and anomalies fire a webhook, and nine dashboards read the JSON API over SSE and polling.">
   <defs>
     <linearGradient id="abg" x1="0" y1="0" x2="0" y2="700" gradientUnits="userSpaceOnUse">
       <stop stop-color="#0d1117"/><stop offset="1" stop-color="#12161d"/>
@@ -51,12 +51,14 @@
   <rect class="box" x="40" y="364" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
   <text x="54" y="384" class="h">llama.cpp  <tspan class="s">/health · /slots</tspan></text>
   <rect class="box" x="40" y="398" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
-  <text x="54" y="418" class="h">containers  <tspan class="s">docker.sock (RO)</tspan></text>
-  <text x="40" y="446" class="xs">each returns {available,…} · never raises</text>
+  <text x="54" y="418" class="h">vllm  <tspan class="s">/metrics</tspan></text>
+  <rect class="box" x="40" y="432" width="250" height="30" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="54" y="452" class="h">containers  <tspan class="s">docker.sock (RO)</tspan></text>
+  <text x="40" y="480" class="xs">each returns {available,…} · never raises</text>
 
   <!-- _backend_latest cache -->
-  <rect class="box" x="306" y="262" width="40" height="166" rx="9" fill="#1c2230" stroke="#3d4657"/>
-  <text x="326" y="345" class="h" fill="#f0883e" transform="rotate(-90 326 345)">_backend_latest</text>
+  <rect class="box" x="306" y="262" width="40" height="200" rx="9" fill="#1c2230" stroke="#3d4657"/>
+  <text x="326" y="362" class="h" fill="#f0883e" transform="rotate(-90 326 362)">_backend_latest</text>
 
   <!-- ===================== PROCESS ===================== -->
   <rect class="box" x="392" y="150" width="252" height="150" rx="12" fill="#1c2230" stroke="#3d4657"/>
@@ -111,15 +113,16 @@
   <text x="1002" y="342" class="s">/api/alerts · /api/anomalies</text>
   <text x="1002" y="362" class="h" font-size="12.5px" fill="#7ee787">/api/stream · SSE push</text>
 
-  <rect class="box" x="984" y="394" width="256" height="176" rx="12" fill="#161b22" stroke="#30363d"/>
-  <text x="1002" y="420" class="h" fill="#bc8cff">8 dashboards  <tspan class="xs">(web/)</tspan></text>
+  <rect class="box" x="984" y="394" width="256" height="198" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="1002" y="420" class="h" fill="#bc8cff">9 dashboards  <tspan class="xs">(web/)</tspan></text>
   <text x="1002" y="444" class="s">Overview</text><text x="1130" y="444" class="s">llama.cpp</text>
   <text x="1002" y="466" class="s">LiteLLM</text><text x="1130" y="466" class="s">Alerts</text>
   <text x="1002" y="488" class="s">GPU</text><text x="1130" y="488" class="s">Spend &amp; Quota</text>
-  <text x="1002" y="510" class="s">Ollama</text><text x="1130" y="510" class="s">Settings</text>
-  <line x1="1002" y1="524" x2="1222" y2="524" stroke="#30363d"/>
-  <text x="1002" y="547" class="h" font-size="12.5px" fill="#7ee787">SSE push + 5s poll fallback</text>
-  <text x="1002" y="563" class="xs">day / night · windowed 15m…12mo · pan ◀ ▶</text>
+  <text x="1002" y="510" class="s">Ollama</text><text x="1130" y="510" class="s">vLLM</text>
+  <text x="1002" y="532" class="s">Settings</text>
+  <line x1="1002" y1="546" x2="1222" y2="546" stroke="#30363d"/>
+  <text x="1002" y="569" class="h" font-size="12.5px" fill="#7ee787">SSE push + 5s poll fallback</text>
+  <text x="1002" y="585" class="xs">day / night · windowed 15m…12mo · pan ◀ ▶</text>
 
   <!-- ===================== FLOW ARROWS ===================== -->
   <!-- fast collectors → loop (green, on tick) -->
@@ -130,7 +133,8 @@
   <path class="flow" d="M290 311 L304 320" marker-end="url(#arw)"/>
   <path class="flow" d="M290 345 L304 345" marker-end="url(#arw)"/>
   <path class="flow" d="M290 379 L304 372" marker-end="url(#arw)"/>
-  <path class="flow" d="M290 413 L304 392" marker-end="url(#arw)"/>
+  <path class="flow" d="M290 413 L304 400" marker-end="url(#arw)"/>
+  <path class="flow" d="M290 447 L304 424" marker-end="url(#arw)"/>
   <!-- cache → loop -->
   <path class="flow" d="M346 300 C368 290 372 250 390 244" marker-end="url(#arw)"/>
   <!-- loop → SQLite -->
