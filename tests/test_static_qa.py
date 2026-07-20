@@ -230,6 +230,37 @@ def test_litellm_per_model_table_follows_window():
     assert html.count("loadModels()") >= 3
 
 
+def test_litellm_per_model_shows_param_size():
+    """The Per-model card shows each model's parameter count, inferred from the model name
+    (LiteLLM does not report it). A `params` column + a `paramSize()` helper, and the header
+    documents that it is inferred. Runs the REAL helper via node to guard the regex against
+    false positives (version numbers like 3.5, 'mini', embeddings) and MoE/million forms."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "function paramSize(" in html, "paramSize helper missing"
+    assert ">params<" in html, "Per-model table missing a params column header"
+    assert "inferred from the model name" in html, "params column must note it is inferred"
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    m = re.search(r"function paramSize\(name\)\{[\s\S]*?\n\}", html)
+    assert m, "paramSize body not found"
+    cases = {
+        "qwen2.5-7b-instruct": "7B", "llama-3.3-70b": "70B", "mixtral-8x7b": "8×7B",
+        "gemma-3-270m": "270M", "llama-3.1-405b": "405B", "qwen-1.5-72b-chat": "72B",
+        "deepseek-r1-1.5b": "1.5B", "e5-mistral-7b": "7B",
+        # no size token / must NOT false-match a version or 'mini'
+        "phi-3.5": None, "gpt-5-mini": None, "gpt-4o-mini": None,
+        "claude-3-5-sonnet": None, "text-embedding-3-large": None,
+    }
+    script = m.group(0) + "\nconsole.log(JSON.stringify([" + \
+        ",".join(f"paramSize({n!r})" for n in cases) + "]));"
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout)
+    for (name, expect), val in zip(cases.items(), got):
+        assert val == expect, f"paramSize({name!r}) = {val!r}, expected {expect!r}"
+
+
 def test_litellm_has_window_delta_key_chart():
     # new "requests in window" (delta) bar chart alongside the over-time keys chart
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
@@ -390,7 +421,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.7.1"
+    assert config.VERSION == "AI-Monitoring_1.8.1"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -399,7 +430,7 @@ def test_all_version_surfaces_match_config_version():
     offline-install snippet must equal config.VERSION — these lagged in past releases
     (deploy/k8s + prometheus-example + README were the repeat offenders). Derives the
     version from config so it can't go stale itself."""
-    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.7.1"
+    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.1"
     other = re.compile(r"(?:ai[-_]monitoring|ai_monitoring):(\d+\.\d+\.\d+)")
 
     def stale_tags(text):
@@ -2325,3 +2356,68 @@ console.log(JSON.stringify({ start, openedA, oneAtATime, toggledOff, allClosed,
     assert r["stoppedA"] >= 1, "click handler must stopPropagation (else outside-click re-closes it)"
     assert r["desc"] == "queue depth explanation", "popover must carry the graph's desc"
     assert r["tag"] == "button", "the help trigger must be a real <button> (keyboard/focus)"
+
+
+def test_gpu_vram_missing_shows_explained_placeholder():
+    """When a GPU reports no VRAM (unified memory, or a metrics feed whose rows omit the
+    memory columns — observed live: mode=file, vram_total null), the page must not just
+    drop the two VRAM tiles, leaving a silent gap that reads as a bug. It must render a
+    '—' VRAM KPI and a note that says WHY, distinguishing the feed-gap case from the
+    unified-memory case."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert 'id="g-vram-note"' in html, "GPU page needs a VRAM-explanation note element"
+    assert 'kpi("VRAM", "—")' in html, "a '—' VRAM tile must replace the dropped pair"
+    # both causes are worded, and the feed-gap wording is gated on the file/url source
+    assert "not reported by this GPU feed" in html
+    assert "unified memory" in html
+    assert re.search(r'g\.mode==="file"\|\|g\.mode==="url"', html), \
+        "feed-gap wording must be chosen by the metrics source, not shown unconditionally"
+
+
+def test_spend_series_default_windows_are_aligned():
+    """A param-less call to the two stacked Spend charts must land on the SAME span —
+    model-series and model-user-series both default to 30d (the Spend page's own default
+    and only-offered daily window). 14d stays a valid explicit granularity but is no
+    longer a divergent default."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    def _default(handler):
+        m = re.search(r"async def " + handler + r"\b[\s\S]*?"
+                      r'window = request\.query\.get\("window", "([^"]+)"\)', src)
+        assert m, f"could not find window default for {handler}"
+        return m.group(1)
+
+    a = _default("spend_model_series_handler")
+    b = _default("spend_model_user_series_handler")
+    assert a == b == "30d", f"spend chart defaults diverge: model={a} model-user={b}"
+    # 14d must remain accepted where the daily rollup supports it (not silently removed)
+    assert '"14d", "30d", "12mo", "month"' in src, "14d must stay a valid explicit window"
+
+
+def test_llamacpp_chart_keys_are_persisted_columns():
+    """Every chart on the llama.cpp page reads points[key] from /api/series, and that key
+    is only populated if it is a real metric column (db._METRIC_COLS) fed by _metrics_row.
+    A chart whose key isn't a column would plot nothing forever. Guards the 3 added charts
+    (prompt tok/s, slots busy %, context %) and the originals."""
+    import app as appmod
+    import db as dbmod
+    html = (ROOT / "web" / "llamacpp.html").read_text(encoding="utf-8")
+    keys = set(re.findall(r'key:"([a-z0-9]+)"', html))
+    assert {"pptok", "busy", "ctxused"} <= keys, f"new llama.cpp charts missing: {keys}"
+    cols = set(dbmod._METRIC_COLS)
+    missing = keys - cols
+    assert not missing, f"chart keys with no metric column (plot nothing): {missing}"
+    # and _metrics_row must actually emit the new keys, or the columns stay null
+    snap = {"ts": 0, "collectors": {
+        "host": {"available": True, "cpu_pct": 1, "mem_pct": 1,
+                 "disk": {"pct": 1}, "load": [0, 0, 0]},
+        "gpu": {"available": False}, "ollama": {"available": False},
+        "litellm": {"available": False},
+        "llamacpp": {"available": True, "prompt_per_second": 700.0,
+                     "slots_busy_pct": 50.0, "ctx_used_pct": 25.0}}}
+    row = appmod._metrics_row(snap)
+    assert row["pptok"] == 700.0 and row["busy"] == 50.0 and row["ctxused"] == 25.0
+    # unavailable backend -> None, never a stale/fabricated value
+    snap["collectors"]["llamacpp"] = {"available": False}
+    row2 = appmod._metrics_row(snap)
+    assert row2["pptok"] is None and row2["busy"] is None and row2["ctxused"] is None

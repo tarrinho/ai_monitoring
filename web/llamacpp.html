@@ -160,13 +160,14 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.7.1</div>
+      <div id="sidebar-brand-ver">v1.8.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">🏠 Overview</a>
     <a href="/gpu">🖥️ GPU/CPU</a>
+    <a href="/network">🌐 Network</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
     <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
@@ -238,9 +239,12 @@ function badge(el, up, txt){ el.className="badge "+(up?"ok":"bad"); el.textConte
 function baseName(p){ if(!p) return "—"; const s=String(p); const i=s.lastIndexOf("/"); return i>=0?s.slice(i+1):s; }
 
 const CHARTS = [
-  {id:"c-tok",   key:"tok",     label:"Tokens/s",   color:"#7ee787"},
-  {id:"c-slots", key:"slots",   label:"Busy slots", color:"#79c0ff"},
-  {id:"c-kv",    key:"kvcache", label:"KV cache %", color:"#f778ba", max:100},
+  {id:"c-tok",   key:"tok",     label:"Tokens/s (gen)",  color:"#7ee787"},
+  {id:"c-pptok", key:"pptok",   label:"Prompt tok/s",    color:"#56d364"},
+  {id:"c-slots", key:"slots",   label:"Busy slots",      color:"#79c0ff"},
+  {id:"c-busy",  key:"busy",    label:"Slots busy %",    color:"#58a6ff", max:100},
+  {id:"c-kv",    key:"kvcache", label:"KV cache %",      color:"#f778ba", max:100},
+  {id:"c-ctx",   key:"ctxused", label:"Context used %",  color:"#d2a8ff", max:100},
 ];
 const _charts = {};
 function mkChart(canvas, cfg){

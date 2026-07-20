@@ -184,13 +184,14 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.7.1</div>
+      <div id="sidebar-brand-ver">v1.8.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">🏠 Overview</a>
     <a href="/gpu">🖥️ GPU/CPU</a>
+    <a href="/network">🌐 Network</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
     <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
@@ -487,6 +488,20 @@ function renderKpis(l){
   // the selected date range, incl. prior days) instead of this fixed snapshot.
 }
 
+// Model size (parameter count) INFERRED from the model name — LiteLLM does not report it.
+// Handles MoE ("8x7b" -> 8×7B), billions ("7b", "1.5b", "70b") and millions ("270m").
+// Returns null when the name carries no size token (closed models like gpt-5-mini).
+function paramSize(name){
+  if(!name) return null;
+  const s=String(name).toLowerCase();
+  let m=s.match(/\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*b\b/);   // mixture-of-experts, e.g. 8x7b
+  if(m) return m[1]+"×"+m[2]+"B";
+  m=s.match(/\b(\d+(?:\.\d+)?)\s*b\b/);                    // billions, e.g. 7b / 70b / 1.5b
+  if(m) return m[1]+"B";
+  m=s.match(/\b(\d+(?:\.\d+)?)\s*m\b/);                    // millions, e.g. 270m
+  if(m) return m[1]+"M";
+  return null;
+}
 // Per-model requests+tokens for the SELECTED window (follows 15m/1h/24h/30d/12mo).
 // Backed by /api/litellm/models -> LiteLLM /global/activity/model (day-granular,
 // cheap aggregate), so 24h shows yesterday+today and 30d/12mo show prior months.
@@ -506,9 +521,11 @@ async function loadModels(){
     const sb=servedBy(m.model);
     const svc=svcProc(sb);   // serving-process CPU%/RSS (from procs collector) — live
     const [kl,kc]=kind(m);
+    const ps=paramSize(m.model);
     return `<tr><td>${escapeHtml(m.model||"(unnamed)")}`
       +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")
       +` <span class="srv" style="color:${kc};border-color:${kc}">${kl}</span></td>`
+      +`<td class="num">${ps?escapeHtml(ps):'—'}</td>`
       +`<td class="num">${(m.reqs||0).toLocaleString()}</td>`
       +`<td class="num">${(m.tokens||0).toLocaleString()}</td>`
       +`<td class="num">${svc.cpu!=null?svc.cpu+'%':'—'}</td>`
@@ -533,7 +550,9 @@ async function loadModels(){
     +`over the selected window (${escapeHtml(d.start_date)} → today, day-granular); `
     +`svc CPU / RAM are the live serving-process cost. Latency / cost per model need `
     +`spend_mode=full (shown in the KPI tiles above).</div>`
-    +`<table><tr><th>Model</th><th class="num">reqs</th><th class="num">tokens</th>`
+    +`<table><tr><th>Model</th>`
+    +`<th class="num" title="Parameter count inferred from the model name (LiteLLM does not report it); — when the name has no size token">params</th>`
+    +`<th class="num">reqs</th><th class="num">tokens</th>`
     +`<th class="num">svc CPU</th><th class="num">svc RAM</th>`
     +`</tr>${rows}</table>`);
 }

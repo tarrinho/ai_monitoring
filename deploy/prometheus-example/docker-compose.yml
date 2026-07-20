@@ -14,7 +14,7 @@
 services:
   ai-monitoring:
     # defaults to the published image; override with AIMON_IMAGE to test a local build
-    image: ${AIMON_IMAGE:-ghcr.io/tarrinho/ai_monitoring:1.7.1}
+    image: ${AIMON_IMAGE:-ghcr.io/tarrinho/ai_monitoring:1.8.1}
     container_name: aimon-demo
     restart: unless-stopped
     environment:

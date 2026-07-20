@@ -20,7 +20,7 @@ import db
 import auth
 import alerts
 import anomaly
-from collectors import host, litellm, ollama, llamacpp, gpu, procs, vllm
+from collectors import host, litellm, ollama, llamacpp, gpu, procs, vllm, network
 
 
 # ------------------------------------------------------------- app endpoints --
@@ -2049,7 +2049,11 @@ async def test_llamacpp_reports_cpu_threads(monkeypatch):
     operator whether idle CPU cores are idle BY DESIGN (layers on the GPU) or starved by a
     low --threads. llama.cpp has moved these between the top level,
     default_generation_settings and params across builds, so all three are read."""
-    for shape in ("top", "gen", "params"):
+    # "gen_params" and "deep" reproduce the live gap: /props parsed fine (model/ctx/
+    # slots populated) yet the old fixed-path read returned None because this build
+    # nests the counts under default_generation_settings.params — and a future move
+    # would break it again, which the bounded deep walk (_deep_num) must absorb.
+    for shape in ("top", "gen", "params", "gen_params", "deep"):
         async def health(_):
             return web.json_response({"status": "ok"})
 
@@ -2060,8 +2064,12 @@ async def test_llamacpp_reports_cpu_threads(monkeypatch):
                 body.update(vals)
             elif _shape == "gen":
                 body["default_generation_settings"].update(vals)
-            else:
+            elif _shape == "params":
                 body["params"] = vals
+            elif _shape == "gen_params":
+                body["default_generation_settings"]["params"] = vals
+            else:   # deep: some unforeseen future nesting
+                body["cpu"] = {"runtime": vals}
             return web.json_response(body)
 
         async def slots(_):
@@ -2150,6 +2158,28 @@ def test_llamacpp_first_num_rejects_zero_and_junk():
     assert llamacpp._first_num("8") == 8                    # string digits are fine
 
 
+def test_llamacpp_deep_num_finds_relocated_field():
+    """Fallback for the live gap: /props is readable but the thread count sits at a
+    path the fixed list doesn't know. A bounded deep walk must find the first
+    positive value wherever this (or a future) build nests it, ignore zero/junk, and
+    return None when it is genuinely absent — without looping on cyclic-looking data
+    or scanning unbounded depth."""
+    assert llamacpp._deep_num({"n_threads": 16}, "n_threads") == 16
+    assert llamacpp._deep_num(
+        {"default_generation_settings": {"params": {"n_threads": 16}}}, "n_threads") == 16
+    assert llamacpp._deep_num({"a": [{"b": {"n_threads_batch": 32}}]}, "n_threads_batch") == 32
+    assert llamacpp._deep_num({"n_threads": 0}, "n_threads") is None      # 0 is 'absent'
+    assert llamacpp._deep_num({"model_path": "x", "n_ctx": 4096}, "n_threads") is None
+    assert llamacpp._deep_num("not-a-container", "n_threads") is None
+    # depth cap: a value buried past the cap is not found (kept cheap on huge blobs)
+    deep = cur = {}
+    for _ in range(8):
+        cur["x"] = {}
+        cur = cur["x"]
+    cur["n_threads"] = 16
+    assert llamacpp._deep_num(deep, "n_threads") is None
+
+
 async def test_llamacpp_nested_timings_parsed(monkeypatch):
     # newer llama.cpp nests generation timings under a "timings" object instead
     # of the slot top level — the collector must read both (else tok/s + KV%
@@ -2185,6 +2215,79 @@ async def test_llamacpp_nested_timings_parsed(monkeypatch):
             out = await llamacpp.sample(s)
         assert out["predicted_per_second"] == 55.0     # from timings.*
         assert out["kv_cache_pct"] == 30.0             # (0.4+0.2)/2 * 100
+    finally:
+        await srv.close()
+
+
+async def test_llamacpp_extra_series_prefill_busy_context(monkeypatch):
+    """The three added llama.cpp charts each need a source field. Prefill tok/s
+    (prompt_per_second, top-level OR nested in timings), slot-busy % (active/total),
+    and context-window fill % (used tokens / n_ctx, spelled n_past here) must all be
+    derived from /slots. A build that reports none of them must leave them None while
+    the backend stays available — an empty chart auto-hides, it is not an error."""
+    async def health(_):
+        return web.json_response({"status": "ok"})
+
+    async def props(_):
+        return web.json_response({"total_slots": 4,
+                                  "default_generation_settings": {"n_ctx": 1000}})
+
+    async def slots(_):
+        return web.json_response([
+            {"is_processing": True, "n_ctx": 1000, "n_past": 250,
+             "prompt_per_second": 800.0,
+             "timings": {"predicted_per_second": 40.0}},
+            {"is_processing": True, "n_ctx": 1000, "n_past": 750,
+             "timings": {"prompt_per_second": 600.0}},   # prefill nested in timings
+            {"is_processing": False},
+            {"is_processing": False},
+        ])
+
+    app = web.Application()
+    for path, hdl in (("/health", health), ("/props", props), ("/slots", slots)):
+        app.router.add_get(path, hdl)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LLAMACPP_BASE_URL",
+                            str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LLAMACPP_API_KEY", None)
+        async with aiohttp.ClientSession() as s:
+            out = await llamacpp.sample(s)
+        assert out["prompt_per_second"] == 700.0        # (800 + 600) / 2
+        assert out["slots_busy_pct"] == 50.0            # 2 active / 4 total
+        assert out["ctx_used_pct"] == 50.0             # (250/1000 + 750/1000)/2 * 100
+    finally:
+        await srv.close()
+
+
+async def test_llamacpp_extra_series_absent_stay_none(monkeypatch):
+    """A minimal /slots (no prefill / no n_past) must not fabricate values: prefill and
+    context stay None so their charts hide, busy% is still computable from counts."""
+    async def health(_):
+        return web.json_response({"status": "ok"})
+
+    async def props(_):
+        return web.json_response({"total_slots": 2})
+
+    async def slots(_):
+        return web.json_response([{"is_processing": False}, {"is_processing": False}])
+
+    app = web.Application()
+    for path, hdl in (("/health", health), ("/props", props), ("/slots", slots)):
+        app.router.add_get(path, hdl)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LLAMACPP_BASE_URL",
+                            str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LLAMACPP_API_KEY", None)
+        async with aiohttp.ClientSession() as s:
+            out = await llamacpp.sample(s)
+        assert out["available"] is True
+        assert out["prompt_per_second"] is None
+        assert out["ctx_used_pct"] is None
+        assert out["slots_busy_pct"] == 0.0
     finally:
         await srv.close()
 
@@ -2455,7 +2558,10 @@ async def test_nav_endpoint_shape():
     c = await _client()
     try:
         d = await (await c.get("/api/nav")).json()
-        assert set(d) == {"litellm", "spend", "ollama", "llamacpp", "vllm", "gpu", "admin"}
+        assert set(d) == {"litellm", "spend", "ollama", "llamacpp", "vllm", "gpu",
+                          "network", "admin"}
+        # host network page is a local /proc read → always shown, like GPU/CPU
+        assert d["network"] is True
         assert all(isinstance(v, bool) for v in d.values())
         # GPU/CPU page hosts universal CPU views → the link is always shown, even with no
         # GPU configured (as here); only the on-page GPU cards degrade to "No GPU detected".
@@ -7537,3 +7643,117 @@ async def test_vllm_awaiting_traffic_distinguished_from_broken(monkeypatch):
         assert out["awaiting_traffic"] is False and out["prompt_tokens"] == 500
     finally:
         await srv2.close()
+
+
+# ------------------------------------------------------------- network collector
+def test_network_collector_rates_filter_and_totals(monkeypatch):
+    """The Ethernet dashboard needs down/up RATES differentiated from the cumulative
+    /proc/net/dev byte counters, virtual/overlay interfaces skipped by default, a
+    'primary' NIC pick, and lifetime totals. First sample has no rate (no baseline);
+    the second yields bytes/sec; a counter RESET (cur < prev) drops back to None
+    rather than rendering a bogus negative spike."""
+    # reset module delta state so the test is order-independent
+    network._prev = {"ts": None, "ifaces": {}}
+    t = {"v": 1000.0}
+    monkeypatch.setattr(network.time, "time", lambda: t["v"])
+
+    dev1 = {
+        "lo":     {"rx_bytes": 5, "rx_packets": 0, "rx_errs": 0, "rx_drop": 0,
+                   "tx_bytes": 5, "tx_packets": 0, "tx_errs": 0, "tx_drop": 0},
+        "veth0":  {"rx_bytes": 9, "rx_packets": 0, "rx_errs": 0, "rx_drop": 0,
+                   "tx_bytes": 9, "tx_packets": 0, "tx_errs": 0, "tx_drop": 0},
+        "eth0":   {"rx_bytes": 1000, "rx_packets": 10, "rx_errs": 1, "rx_drop": 2,
+                   "tx_bytes": 500, "tx_packets": 5, "tx_errs": 0, "tx_drop": 0},
+    }
+    monkeypatch.setattr(network, "_read_net_dev", lambda: dev1)
+    monkeypatch.setattr(config, "NETWORK_IFACES", None)
+    s1 = network.sample()
+    assert s1["available"] is True
+    names = [i["name"] for i in s1["interfaces"]]
+    assert names == ["eth0"], f"virtual/loopback not filtered: {names}"
+    assert s1["primary"] == "eth0"
+    assert s1["rx_rate_total"] is None and s1["tx_rate_total"] is None  # first sample
+
+    # +10s, eth0 +2000 rx / +1000 tx  -> 200 / 100 bytes/sec
+    t["v"] = 1010.0
+    dev2 = {k: dict(v) for k, v in dev1.items()}
+    dev2["eth0"]["rx_bytes"] = 3000
+    dev2["eth0"]["tx_bytes"] = 1500
+    monkeypatch.setattr(network, "_read_net_dev", lambda: dev2)
+    s2 = network.sample()
+    assert s2["rx_rate_total"] == 200.0 and s2["tx_rate_total"] == 100.0
+    eth = s2["interfaces"][0]
+    assert eth["rx_rate"] == 200.0 and eth["tx_rate"] == 100.0
+    assert eth["rx_errs"] == 1 and eth["rx_drop"] == 2
+    assert s2["rx_bytes_total"] == 3000 and s2["tx_bytes_total"] == 1500
+
+    # counter reset (reboot): cur < prev -> rate None, not a huge negative
+    t["v"] = 1020.0
+    dev3 = {k: dict(v) for k, v in dev2.items()}
+    dev3["eth0"]["rx_bytes"] = 10
+    dev3["eth0"]["tx_bytes"] = 4
+    monkeypatch.setattr(network, "_read_net_dev", lambda: dev3)
+    s3 = network.sample()
+    assert s3["interfaces"][0]["rx_rate"] is None
+
+
+def test_network_iface_whitelist_overrides_autoselect(monkeypatch):
+    """NETWORK_IFACES pins an exact set — including one that autoselect would skip."""
+    network._prev = {"ts": None, "ifaces": {}}
+    dev = {"eth0": {"rx_bytes": 1, "rx_packets": 0, "rx_errs": 0, "rx_drop": 0,
+                    "tx_bytes": 1, "tx_packets": 0, "tx_errs": 0, "tx_drop": 0},
+           "tailscale0": {"rx_bytes": 7, "rx_packets": 0, "rx_errs": 0, "rx_drop": 0,
+                          "tx_bytes": 7, "tx_packets": 0, "tx_errs": 0, "tx_drop": 0}}
+    monkeypatch.setattr(network, "_read_net_dev", lambda: dev)
+    monkeypatch.setattr(config, "NETWORK_IFACES", "tailscale0")
+    s = network.sample()
+    assert [i["name"] for i in s["interfaces"]] == ["tailscale0"]
+
+
+def test_network_unavailable_when_proc_missing(monkeypatch):
+    monkeypatch.setattr(network, "_read_net_dev", lambda: {})
+    s = network.sample()
+    assert s["available"] is False and "error" in s
+
+
+def test_network_series_columns_and_row():
+    """net_down/net_up must be persisted metric columns fed by _metrics_row, or the
+    Download/Upload charts plot nothing."""
+    assert "net_down" in db._METRIC_COLS and "net_up" in db._METRIC_COLS
+    snap = {"ts": 0, "collectors": {
+        "host": {"available": True, "cpu_pct": 1, "mem_pct": 1,
+                 "disk": {"pct": 1}, "load": [0, 0, 0]},
+        "gpu": {"available": False}, "ollama": {"available": False},
+        "litellm": {"available": False},
+        "network": {"available": True, "rx_rate_total": 1234.0, "tx_rate_total": 56.0}}}
+    row = appmod._metrics_row(snap)
+    assert row["net_down"] == 1234.0 and row["net_up"] == 56.0
+    snap["collectors"]["network"] = {"available": False}
+    assert appmod._metrics_row(snap)["net_down"] is None
+
+
+async def test_network_page_served_and_gated(monkeypatch):
+    """/network is a first-class page: served in open mode, gated to /login when a
+    token is set, and it carries the Download/Upload chart keys that map to the
+    net_down/net_up columns."""
+    monkeypatch.setattr(appmod, "_latest", {"ts": 0, "collectors": {}})
+    c = await _client()
+    try:
+        r = await c.get("/network")
+        assert r.status == 200
+        html = await r.text()
+        assert "Network" in html and "chart-grid" in html
+        assert 'id="l-kpis"' in html and 'id="l-ifaces"' in html
+        assert 'key:"net_down"' in html and 'key:"net_up"' in html
+        assert 'href="/network"' in html
+    finally:
+        await c.close()
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok-net-1")
+    c2 = await _client()
+    try:
+        r2 = await c2.get("/network", allow_redirects=False)
+        assert r2.status == 302 and "/login" in r2.headers.get("Location", "")
+        r = await c2.get("/network?token=tok-net-1", allow_redirects=False)
+        assert r.status == 302
+    finally:
+        await c2.close()

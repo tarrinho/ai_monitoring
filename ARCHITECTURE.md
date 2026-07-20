@@ -20,9 +20,9 @@ server** that serves dashboards + a JSON API reading from that same store.
              └──────┬─────────────────────────────┘                    │
                     │                                                    │
                     ▼                        SQLite (/data) ◄────────────┘
-        collectors/ (host, procs, gpu,     metrics(+_1m,_1h) key_series(+rollups)
-        litellm, ollama, llamacpp,         proc_series(+rollups) events anomalies
-        containers)                        alert_log samples
+        collectors/ (host, procs, network, metrics(+_1m,_1h) key_series(+rollups)
+        gpu, litellm, ollama, llamacpp,    proc_series(+rollups) events anomalies
+        vllm, containers)                  alert_log samples
 ```
 
 ## Sampling loop (`app.py:_sampling_loop`)
@@ -30,8 +30,8 @@ server** that serves dashboards + a JSON API reading from that same store.
 Each tick (`MONITOR_SAMPLE_INTERVAL`, default 5s):
 
 1. **Collect (decoupled — the anti-freeze guarantee)** — the tick only `await`s
-   the two cheap, always-fast collectors: `host` and `procs` (sync `/proc` reads
-   via `asyncio.to_thread`). Every heavier backend — `gpu` (subprocess
+   the cheap, always-fast local collectors: `host`, `procs` and `network` (sync
+   `/proc` reads via `asyncio.to_thread`). Every heavier backend — `gpu` (subprocess
    `nvidia-smi`), `litellm`, `ollama`, `llamacpp`, `containers` (HTTP / socket) —
    runs in its **own `_backend_loop`** on its own cadence, each call HARD-bounded
    by `asyncio.wait_for`, writing its latest result into `_backend_latest`. The
@@ -109,6 +109,10 @@ Each exposes `sample()` returning `{available, …}` and degrades to
   can be diffed). Feeds the GPU/CPU dashboard's per-core grid.
 - `procs` — per-PID `/proc/*/stat` + `statm`, aggregated by executable → top-N
   by CPU% (delta) and RSS. `pid: host` to see host processes.
+- `network` — `/proc/net/dev` per-interface byte counters, differentiated into
+  down/up **rates** (bytes/sec) with cumulative totals; loopback/veth/bridge/overlay
+  interfaces are skipped by default, `NETWORK_IFACES` pins an explicit set. Feeds the
+  Network dashboard. A cheap local read, sampled inline on the tick like `host`/`procs`.
 - `gpu` — `nvidia-smi`/`rocm-smi` locally, **or remote** via SSH (`GPU_SSH`) or
   an HTTP agent (`GPU_METRICS_URL`); util/VRAM/power/temp/throttle.
 - `vllm` — `/health` + `/v1/models` (status, loaded model) and vLLM's own `/metrics`

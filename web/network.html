@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI-Monitoring · Ollama</title>
+<title>AI-Monitoring · Network</title>
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
@@ -38,6 +38,7 @@
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px}
   .kpi{background:var(--panel2);border-radius:8px;padding:10px 12px}
   .kpi .v{font-size:22px;font-weight:600}
+  .kpi .v .sub{font-size:11px;font-weight:400;color:var(--muted)}
   .kpi .l{font-size:11px;color:var(--muted);text-transform:uppercase}
   table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
   th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
@@ -56,6 +57,7 @@
   .unavail{color:var(--muted);font-style:italic;padding:6px 0}
   a{color:var(--accent)}
   .pill{font-size:10px;padding:1px 6px;border-radius:10px;background:var(--panel);color:var(--muted)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
 
   /* ── lateral collapsible sidebar (AntiBot GW pattern) ── */
   #sidebar{width:164px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
@@ -178,8 +180,8 @@
 <button id="sidebar-reopen" title="Show menu" aria-label="Show menu">☰</button>
 <div id="main-area">
 <header>
-  <h1>Ollama</h1>
-  <span class="badge" id="o-ver"></span>
+  <h1>🌐 Network</h1>
+  <span class="badge" id="l-status"></span>
   <div class="windows" id="windows" role="group" aria-label="time window and range">
     <button id="nav-left" title="shift earlier" aria-label="shift window earlier">◀</button>
     <button data-w="15m" aria-pressed="false">15m</button>
@@ -199,22 +201,17 @@
 </header>
 <main>
   <section class="card span-2" id="card-kpi">
-    <h2>Live <span class="badge" id="o-badge"></span></h2>
-    <div class="kpis" id="o-kpis"></div>
+    <h2>Live <span class="badge" id="l-badge"></span></h2>
+    <div class="kpis" id="l-kpis"></div>
   </section>
 
-  <section class="card span-2" id="card-running">
-    <h2>Active running models</h2>
-    <div id="o-running"><div class="unavail">no data</div></div>
-  </section>
-
-  <section class="card" id="card-modelevents" style="grid-column:1/-1">
-    <h2>Model activity <span class="badge" style="background:var(--panel2)">load / unload</span></h2>
-    <div id="o-modelevents"><div class="unavail">no model events yet</div></div>
+  <section class="card span-2" id="card-ifaces">
+    <h2>Interfaces</h2>
+    <div id="l-ifaces"><div class="unavail">no data</div></div>
   </section>
 
   <section class="card" id="card-charts" style="grid-column:1/-1">
-    <h2>Ollama over time — <span id="win-label">24h</span>
+    <h2>Network over time — <span id="win-label">24h</span>
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>
     <div class="chart-grid" id="chart-grid"></div>
@@ -232,49 +229,46 @@ function setHtml(el, html){ el.innerHTML = DOMPurify.sanitize(html); }
 const _timers = [];
 window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
 
-function bytes(n){
-  if(!n) return "0 B";
-  const u=["B","KB","MB","GB","TB"]; let i=0; n=Number(n);
-  while(n>=1024&&i<u.length-1){n/=1024;i++;}
-  return n.toFixed(i?1:0)+" "+u[i];
-}
-function kpi(label,val){
-  return `<div class="kpi"><div class="v">${escapeHtml(val)}</div>`
-       + `<div class="l">${escapeHtml(label)}</div></div>`;
+function kpi(label,val,sub){
+  return `<div class="kpi"><div class="v">${escapeHtml(val)}`
+       + (sub?` <span class="sub">${escapeHtml(sub)}</span>`:"")
+       + `</div><div class="l">${escapeHtml(label)}</div></div>`;
 }
 function badge(el, up, txt){ el.className="badge "+(up?"ok":"bad"); el.textContent=up?(txt||"live"):"down"; }
-function expiresIn(iso){
-  if(!iso) return "—";
-  const t=new Date(iso).getTime(); if(isNaN(t)) return "—";
-  const s=Math.round((t-Date.now())/1000);
-  if(s<=0) return "now";
-  if(s<60) return s+"s"; if(s<3600) return Math.round(s/60)+"m"; return Math.round(s/3600)+"h";
-}
 
 const CHARTS = [
-  {id:"c-run",  key:"orun",  label:"Running models", color:"#7ee787"},
-  {id:"c-ram",  key:"oram",  label:"Model RAM",      color:"#f0883e", bytes:true},
-  {id:"c-vram", key:"ovram", label:"Model VRAM",     color:"#f778ba", bytes:true},
+  {id:"c-down", key:"net_down", label:"Download", color:"#7ee787", rate:true},
+  {id:"c-up",   key:"net_up",   label:"Upload",   color:"#58a6ff", rate:true},
 ];
+// bytes → human size; rate=true appends "/s". Binary (1024) units, like every
+// other size on the dashboard.
+function humanBytes(b, rate){
+  if(b==null) return "—";
+  let n=Number(b); if(!isFinite(n)) return "—";
+  const u=["B","KB","MB","GB","TB","PB"]; let i=0;
+  while(n>=1024 && i<u.length-1){ n/=1024; i++; }
+  return (n<10?n.toFixed(2):n<100?n.toFixed(1):Math.round(n))+" "+u[i]+(rate?"/s":"");
+}
 const _charts = {};
 function mkChart(canvas, cfg){
-  const yTick = cfg.bytes
-    ? {color:cssv("--muted"),font:{size:9},callback:v=>bytes(v)}
-    : {color:cssv("--muted"),font:{size:9}};
   return new Chart(canvas, {
     type:"line",
     data:{labels:[],datasets:[{label:cfg.label,data:[],borderColor:cfg.color,
       backgroundColor:cfg.color+"22",borderWidth:1.5,pointRadius:0,tension:.25,fill:true,spanGaps:true}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
-      interaction:{intersect:false,mode:"index"},plugins:{legend:{display:false}},
+      interaction:{intersect:false,mode:"index"},
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){
+        const v=ctx.parsed.y; return cfg.rate?humanBytes(v,true):v;}}}},
       scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:6,font:{size:9}},grid:{color:"#30363d33"}},
-              y:{ticks:yTick,grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
+              y:{ticks:{color:cssv("--muted"),font:{size:9},
+                   callback:function(v){return cfg.rate?humanBytes(v,true):v;}},
+                 grid:{color:"#30363d33"},beginAtZero:true,max:cfg.max}}}
   });
 }
 (function build(){
   const grid=document.getElementById("chart-grid");
   for(const cfg of CHARTS){
-    const card=document.createElement("div");card.className="mini";
+    const card=document.createElement("div");card.className="mini";card.id=cfg.id+"-card";
     const h=document.createElement("h3");
     const nm=document.createElement("span");nm.textContent=cfg.label;
     const cur=document.createElement("span");cur.className="cur";cur.id=cfg.id+"-cur";cur.textContent="—";
@@ -285,11 +279,10 @@ function mkChart(canvas, cfg){
     _charts[cfg.id]=mkChart(cv,cfg);
   }
 })();
-function fmtT(t){ return t?new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""; }
-// axisT(pts): chart-axis label granularity from the ACTUAL data span, not the
-// window name, so a 12mo view with only days of history shows distinct labels.
+function fmtT(t){ if(!t) return ""; return new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+// axisT(pts): label granularity from the ACTUAL data span, not the window name.
 function axisT(pts){ const ts=(pts||[]).map(p=>p&&p.t).filter(Boolean); const span=ts.length>1?Math.max(...ts)-Math.min(...ts):0; return function(p){ const t=(p&&typeof p==="object")?p.t:p; if(!t) return ""; const d=new Date(t*1000); return span>180*86400?(d.toLocaleDateString([],{month:"short"})+" '"+String(d.getFullYear()).slice(-2)):span>2*86400?d.toLocaleDateString([],{month:"short",day:"numeric"}):d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }; }
-function fmtCur(cfg,v){ return v==null?"—":(cfg.bytes?bytes(v):(Math.round(v*100)/100)); }
+function fmtCur(v){ return v==null?"—":(Math.round(v*100)/100); }
 function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!=null) return pts[i][key]; } return null; }
 
 const AUTH = new URLSearchParams(location.search).get("token");
@@ -309,38 +302,48 @@ async function api(path){
   }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
 }
 
-function renderKpis(o){
-  const b=document.getElementById("o-badge");
-  document.getElementById("o-ver").textContent = (o&&o.version)?("v"+o.version):"";
-  if(!o || o.available===false){
+function renderNet(net){
+  const b=document.getElementById("l-badge");
+  const st=document.getElementById("l-status");
+  if(!net || net.available===false){
     badge(b,false);
-    setHtml(document.getElementById("o-kpis"),
-      `<div class="unavail">${escapeHtml((o&&o.error)||"unconfigured")}</div>`);
-    setHtml(document.getElementById("o-running"),
-      `<div class="unavail">Set OLLAMA_BASE_URL (e.g. http://host:11434) to see running models.</div>`);
+    st.textContent="";
+    setHtml(document.getElementById("l-kpis"),
+      `<div class="unavail">${escapeHtml((net&&net.error)||"no network data")}</div>`);
+    setHtml(document.getElementById("l-ifaces"),
+      `<div class="unavail">Host network counters unavailable (/proc/net/dev not readable).</div>`);
     return;
   }
   badge(b,true,"live");
-  setHtml(document.getElementById("o-kpis"),
-    kpi("Running", o.models_running)
-    +kpi("Installed", o.models_installed)
-    +kpi("Model RAM", bytes(o.ram_used))
-    +kpi("Model VRAM", bytes(o.vram_used))
-    +kpi("On GPU", (o.gpu_pct!=null?o.gpu_pct:0)+"%")
-    +kpi("Version", o.version||"—"));
-  if(o.models&&o.models.length){
-    let rows=o.models.map(m=>`<tr><td>${escapeHtml(m.name)}</td>`
-      +`<td>${escapeHtml(m.params||"—")} <span class="pill">${escapeHtml(m.quant||"")}</span></td>`
-      +`<td class="num">${bytes(m.size)}</td>`
-      +`<td class="num">${bytes(m.size_vram)}</td>`
-      +`<td class="num">${m.gpu_pct!=null?m.gpu_pct+"%":"—"}</td>`
-      +`<td class="num">${escapeHtml(expiresIn(m.expires_at))}</td></tr>`).join("");
-    setHtml(document.getElementById("o-running"),
-      `<table><tr><th>Model</th><th>params</th><th class="num">size</th>`
-      +`<th class="num">VRAM</th><th class="num">on GPU</th>`
-      +`<th class="num">unloads in</th></tr>${rows}</table>`);
-  } else setHtml(document.getElementById("o-running"),
-      `<div class="unavail">no models currently loaded</div>`);
+  const ifs=net.interfaces||[];
+  st.className="badge ok"; st.textContent=(net.primary||(ifs.length+" iface"))+"";
+  // Down/Up are the current RATES (null on the first tick / after a counter reset);
+  // Total down/up are the cumulative bytes since the counters last reset (boot).
+  setHtml(document.getElementById("l-kpis"),
+    kpi("Download", humanBytes(net.rx_rate_total, true))
+    +kpi("Upload", humanBytes(net.tx_rate_total, true))
+    +kpi("Total down", humanBytes(net.rx_bytes_total))
+    +kpi("Total up", humanBytes(net.tx_bytes_total))
+    +kpi("Primary", net.primary||"—", ifs.length?`${ifs.length} iface`+(ifs.length>1?"s":""):"")
+    +kpi("Interfaces", ifs.length));
+  if(!ifs.length){
+    setHtml(document.getElementById("l-ifaces"),
+      `<div class="unavail">no physical interfaces selected (set NETWORK_IFACES to pin one).</div>`);
+    return;
+  }
+  setHtml(document.getElementById("l-ifaces"),
+    `<table><tr><th>Interface</th><th class="num">↓ speed</th><th class="num">↑ speed</th>`
+    +`<th class="num">total ↓</th><th class="num">total ↑</th>`
+    +`<th class="num">errs</th><th class="num">drops</th></tr>`
+    +ifs.map(i=>`<tr><td class="mono">${escapeHtml(i.name)}`
+      +(i.name===net.primary?` <span class="pill">primary</span>`:``)+`</td>`
+      +`<td class="num">${humanBytes(i.rx_rate, true)}</td>`
+      +`<td class="num">${humanBytes(i.tx_rate, true)}</td>`
+      +`<td class="num">${humanBytes(i.rx_bytes)}</td>`
+      +`<td class="num">${humanBytes(i.tx_bytes)}</td>`
+      +`<td class="num">${(i.rx_errs||0)+(i.tx_errs||0)}</td>`
+      +`<td class="num">${(i.rx_drop||0)+(i.tx_drop||0)}</td></tr>`).join("")
+    +`</table>`);
 }
 
 async function loadSeries(){
@@ -353,7 +356,10 @@ async function loadSeries(){
     ch.data.datasets[0].data=pts.map(p=>(p[cfg.key]==null?null:p[cfg.key]));
     ch.update("none");
     const cur=document.getElementById(cfg.id+"-cur");
-    if(cur) cur.textContent=fmtCur(cfg,lastNonNull(pts,cfg.key));
+    if(cur){ const lv=lastNonNull(pts,cfg.key);
+      cur.textContent=cfg.rate?humanBytes(lv,true):fmtCur(lv); }
+    const card=document.getElementById(cfg.id+"-card");
+    if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
 function rangedReload(){ loadSeries(); }
@@ -402,32 +408,14 @@ document.getElementById("export-btn").addEventListener("click",()=>{
     +(AUTH?("&token="+encodeURIComponent(AUTH)):""),"_blank");
 });
 
-async function loadModelEvents(){
-  const d=await api("/api/events?kind=model&limit=30");
-  const evs=(d&&d.events)||[];
-  const el=document.getElementById("o-modelevents");
-  if(!el) return;
-  if(!evs.length){ setHtml(el,`<div class="unavail">no model events yet</div>`); return; }
-  const rows=evs.map(e=>{
-    const load=e.up;
-    const glyph=`<span style="color:${load?'var(--ok)':'var(--bad)'}">${load?'▲':'▼'}</span>`;
-    const model=escapeHtml((e.detail||"").replace(/^(un)?loaded\s+/,""));
-    return `<tr><td>${glyph} ${escapeHtml(e.backend)}</td>`
-      +`<td>${load?'loaded':'unloaded'}</td><td>${model}</td>`
-      +`<td class="num" style="color:var(--muted)">${escapeHtml(fmtT(e.ts))}</td></tr>`;
-  }).join("");
-  setHtml(el,`<table><tr><th>Backend</th><th>Event</th><th>Model</th>`
-    +`<th class="num">time</th></tr>${rows}</table>`);
-}
 async function tick(){
   const d=await api("/api/data?history=1");
   if(d){
     const c=(d.latest||{}).collectors||{};
-    renderKpis(c.ollama);
+    renderNet(c.network);
     const t=(d.latest||{}).ts?new Date(d.latest.ts*1000).toLocaleTimeString():"—";
     document.getElementById("updated").textContent="updated "+t;
   }
-  await loadModelEvents();
   await loadSeries();
 }
 updateRangeUI();

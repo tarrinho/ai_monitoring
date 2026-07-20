@@ -235,6 +235,10 @@ SPEND_MU_RETENTION_DAYS = 366
 # Columns charted over time (order must match _METRIC_COLS in queries).
 _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
                 "wait", "disk", "load1", "tok", "power", "gtemp", "slots",
+                # llama.cpp extra series: prefill tok/s, slot-busy %, context fill %
+                "pptok", "busy", "ctxused",
+                # host network down/up rates (bytes/sec)
+                "net_down", "net_up",
                 # Tier A + efficiency
                 "reqrate", "tok_in", "tok_out", "errrate", "vram_pct",
                 "costrate", "kvcache", "tokwatt", "backlog",

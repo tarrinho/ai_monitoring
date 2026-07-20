@@ -6,6 +6,62 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-07-20
+
+### Added
+- **Network (Ethernet) dashboard** — a new `/network` page showing host network I/O:
+  live **download / upload speed**, **total downloaded / uploaded**, and a per-interface
+  table (speed, lifetime totals, errors, drops) with the busiest NIC marked *primary*.
+  New `collectors/network.py` reads `/proc/net/dev` (a cheap local read, sampled inline
+  on the main tick like host/procs) and differentiates the cumulative byte counters into
+  down/up **rates**; virtual/loopback/overlay-VPN interfaces are skipped by default, and
+  `NETWORK_IFACES` pins an explicit set. Rates are persisted as metric columns
+  `net_down`/`net_up` (charted with empty-tile auto-hide) and served via `/api/series`.
+  Always shown in the sidebar (host-level, like GPU/CPU). New tests
+  `test_network_*`.
+
+## [1.8.0] — 2026-07-20
+
+Feature release: more llama.cpp charts, a live re-check indicator on backend-down
+alerts, click-to-open help on the vLLM page, and fixes for the llama.cpp thread
+readout, GPU VRAM display, and Spend chart window defaults.
+
+### Added
+- **Three new llama.cpp charts** — **Prompt tok/s** (prefill throughput, distinct from
+  decode), **Slots busy %** (concurrency saturation over time), and **Context used %**
+  (context-window fill). New collector fields `prompt_per_second` / `slots_busy_pct` /
+  `ctx_used_pct` read from `/slots` (top-level or nested in `timings`; context fill from
+  `n_past`/`n_ctx_used`/`cache_tokens` where the build reports it), persisted as metric
+  columns `pptok` / `busy` / `ctxused` (auto-migrated onto raw + `_1m`/`_1h` rollups) and
+  charted with empty-tile auto-hide. New tests `test_llamacpp_extra_series_*`,
+  `test_llamacpp_chart_keys_are_persisted_columns`.
+- **Live re-check indicator on backend-down alerts.** A `down:<backend>` breach on the
+  Alerts page now shows "⟳ re-checking in Ns · last checked HH:MM:SS", driven by the
+  page's existing poll (no extra requests) so an operator can see the breach is being
+  re-evaluated and will clear itself once the service returns. Threshold breaches (which
+  clear on a value change, not a retry) deliberately get no countdown. New tests
+  `test_alerts_down_breach_shows_recheck_state`, `test_alerts_recheck_*`.
+
+### Changed
+- **vLLM per-graph help is now click-to-toggle, not hover.** The `ⓘ` opens a popover that
+  stays put until dismissed (second click / outside click / Escape) — hover tooltips
+  vanish on touch and on the move. Accessible `<button>` trigger with `aria-expanded`.
+- **README** now shows each backend's logo next to its first mention.
+- **Spend charts default to the same window.** `/api/spend/model-user-series` now defaults
+  to `30d` (matching `/api/spend/model-series` and the Spend page's own default) so a
+  param-less call no longer lands the two stacked charts on different spans; `14d` stays a
+  valid explicit granularity.
+
+### Fixed
+- **llama.cpp CPU-thread readout stayed "—" even though `/props` was reachable.** The
+  thread counts moved to a nesting the fixed path list didn't cover; a bounded deep walk
+  (`_deep_num`) now finds `n_threads` / `n_threads_batch` wherever the build places them.
+  New test `test_llamacpp_deep_num_finds_relocated_field`.
+- **GPU page silently dropped both VRAM tiles when VRAM was unavailable.** It now renders a
+  `—` VRAM tile plus a note explaining the cause (metrics feed omits the memory columns,
+  vs unified-memory GPUs that have no separate VRAM). New test
+  `test_gpu_vram_missing_shows_explained_placeholder`.
+
 ## [1.7.1] — 2026-07-19
 
 Patch release: hides the monitor's own metrics key from the graphs, fixes a vLLM KPI

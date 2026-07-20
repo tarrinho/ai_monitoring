@@ -195,13 +195,14 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.7.1</div>
+      <div id="sidebar-brand-ver">v1.8.1</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
   <nav id="sidebar-nav" aria-label="Main navigation">
     <a href="/">🏠 Overview</a>
     <a href="/gpu">🖥️ GPU/CPU</a>
+    <a href="/network">🌐 Network</a>
     <a href="/litellm">🔀 LiteLLM</a>
     <a href="/spend" style="padding-left:26px">💰 Spend &amp; Quota</a>
     <a href="/ollama" class="navlogo nl-ollama" style="padding-left:26px">Ollama</a>
@@ -236,6 +237,7 @@ function updateSeries(chart,labels,next){
   <section class="card span-2" id="card-kpi">
     <h2>Live <span class="badge" id="g-badge"></span></h2>
     <div class="kpis" id="g-kpis"></div>
+    <div class="hint" id="g-vram-note" style="margin-top:6px;display:none"></div>
   </section>
 
   <section class="card span-2" id="card-list">
@@ -518,11 +520,24 @@ function renderKpis(g){
   }
   badge(b,true,(g.mode||"")+" "+(g.vendor||""));
   const thr=g.throttled?"bad":"";
+  // VRAM only meaningful on discrete GPUs. When it is absent we still show a "—"
+  // KPI plus a note saying WHY, rather than silently dropping the tiles — a blank
+  // where two numbers used to be reads as a bug. Two legitimate causes: a
+  // unified-memory GPU (e.g. GB10) that has no separate VRAM, or a metrics feed
+  // (GPU_METRICS_FILE / URL) whose rows omit the memory columns.
+  const vramKnown = g.vram_total!=null;
+  const note=document.getElementById("g-vram-note");
+  if(vramKnown){ note.style.display="none"; note.textContent=""; }
+  else {
+    note.textContent = (g.mode==="file"||g.mode==="url")
+      ? "VRAM not reported by this GPU feed — the metrics source omits memory.used / memory.total columns."
+      : "VRAM not reported by this GPU (unified memory has no separate VRAM pool).";
+    note.style.display="";
+  }
   setHtml(document.getElementById("g-kpis"),
     kpi("GPU util", g.util+"%")
-    // VRAM only meaningful on discrete GPUs; unified-memory (e.g. GB10) reports N/A
-    +(g.vram_total!=null?kpi("VRAM used", bytes(g.vram_used))
-        +kpi("VRAM total", bytes(g.vram_total)):"")
+    +(vramKnown?kpi("VRAM used", bytes(g.vram_used))
+        +kpi("VRAM total", bytes(g.vram_total)):kpi("VRAM", "—"))
     +kpi("Power", g.power!=null?g.power+" W":"—")
     +kpi("Temp", g.temp_max!=null?g.temp_max+"°":"—")
     +kpi("Throttled", g.throttled?"YES":"no", thr)

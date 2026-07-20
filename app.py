@@ -30,7 +30,8 @@ import auth
 import alerts
 import anomaly
 import metrics_prom
-from collectors import host, litellm, ollama, llamacpp, vllm, gpu, procs, containers
+from collectors import (host, litellm, ollama, llamacpp, vllm, gpu, procs,
+                        containers, network)
 
 _notifier = alerts.Notifier()
 # last-known up/down state per backend, for transition (event) detection
@@ -101,13 +102,14 @@ async def _sample_once(session: aiohttp.ClientSession) -> dict:
     # ONLY host + procs are sampled inline — both are pure /proc reads that never
     # block on a subprocess or the network. GPU (subprocess) and the HTTP backends
     # run in their own bounded loops, so nothing here can wedge the main sampler.
-    h, pr = await asyncio.gather(
+    h, pr, net = await asyncio.gather(
         asyncio.to_thread(host.sample, "/"),
         asyncio.to_thread(procs.sample, 10),
+        asyncio.to_thread(network.sample),
     )
     return {
         "ts": time.time(),
-        "collectors": {"host": h, "procs": pr,
+        "collectors": {"host": h, "procs": pr, "network": net,
                        "gpu": _backend_latest["gpu"],
                        "litellm": _backend_latest["litellm"],
                        "ollama": _backend_latest["ollama"],
@@ -127,6 +129,7 @@ def _metrics_row(snap: dict) -> dict:
     h, g = c.get("host", {}), c.get("gpu", {})
     ol, ll, lc = c.get("ollama", {}), c.get("litellm", {}), c.get("llamacpp", {})
     vl = c.get("vllm", {})
+    net = c.get("network", {})
     host_ok = h.get("available")
     gpu_ok = g.get("available")
     vram_used = g.get("vram_used") if gpu_ok else (
@@ -145,6 +148,13 @@ def _metrics_row(snap: dict) -> dict:
         "power": g.get("power") if gpu_ok else None,
         "gtemp": g.get("temp_max") if gpu_ok else None,
         "slots": lc.get("slots_active") if lc.get("available") else None,
+        # llama.cpp extra series: prefill tok/s, slot-busy %, context-window fill %
+        "pptok": lc.get("prompt_per_second") if lc.get("available") else None,
+        "busy": lc.get("slots_busy_pct") if lc.get("available") else None,
+        "ctxused": lc.get("ctx_used_pct") if lc.get("available") else None,
+        # host network down/up rates (bytes/sec) for the Ethernet dashboard
+        "net_down": net.get("rx_rate_total") if net.get("available") else None,
+        "net_up": net.get("tx_rate_total") if net.get("available") else None,
         # Tier A + efficiency (derived / rate metrics)
         "reqrate": ll.get("req_rate") if ll.get("available") else None,
         "tok_in": ll.get("tok_in_rate") if ll.get("available") else None,
@@ -597,8 +607,8 @@ def _is_master_token_auth(request: web.Request) -> bool:
 
 
 # HTML pages that require auth (static assets + /healthz + /login stay open).
-_PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/vllm", "/alerts",
-          "/admin/users", "/account", "/settings")
+_PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/vllm",
+          "/network", "/alerts", "/admin/users", "/account", "/settings")
 # Reachable without a session: the login page/handlers and public assets.
 _OPEN = ("/healthz", "/login", "/logout", "/metrics")
 # Admin-only surfaces (role must be 'admin' — NOT a specific username — or the
@@ -924,6 +934,10 @@ async def llamacpp_page_handler(request: web.Request) -> web.Response:
 
 async def vllm_page_handler(request: web.Request) -> web.Response:
     return _page(request, _WEB / "vllm.html", "/vllm")
+
+
+async def network_page_handler(request: web.Request) -> web.Response:
+    return _page(request, _WEB / "network.html", "/network")
 
 
 async def alerts_page_handler(request: web.Request) -> web.Response:
@@ -1529,6 +1543,7 @@ async def nav_handler(request: web.Request) -> web.Response:
         "llamacpp": _configured("llamacpp", bool(config.LLAMACPP_BASE_URL)),
         "vllm": _configured("vllm", bool(config.VLLM_BASE_URL)),
         "gpu": True,   # GPU/CPU page: CPU views are universal → always shown (GPU degrades)
+        "network": True,   # host network: local /proc read, always available
         # Settings link: real admin only — the shared URL token is NOT admin here.
         "admin": (role == "admin" and not _is_master_token_auth(request))
                  or not _auth_enabled(),
@@ -2807,9 +2822,13 @@ async def spend_model_user_series_handler(request: web.Request) -> web.Response:
     result is TTL-cached (see _MU_SERIES_CACHE) so the 5s poll doesn't rescan every time."""
     if not _litellm_configured():
         raise web.HTTPNotFound()
-    window = request.query.get("window", "14d")
+    # Default 30d to match /api/spend/model-series and the Spend page's own default
+    # window (its selector offers 30d / 12mo / month) — a param-less call must not
+    # land these two stacked charts on different spans. 14d stays a VALID explicit
+    # granularity (daily, distinct from 30d) for any caller that asks for it.
+    window = request.query.get("window", "30d")
     if window not in ("14d", "30d", "12mo", "month"):
-        window = "14d"
+        window = "30d"
     now = time.time()
     hit = _MU_SERIES_CACHE.get(window)
     if hit and now - hit[0] < _MU_SERIES_TTL:
@@ -3087,6 +3106,7 @@ def build_app() -> web.Application:
     app.router.add_get("/ollama", ollama_page_handler)
     app.router.add_get("/llamacpp", llamacpp_page_handler)
     app.router.add_get("/vllm", vllm_page_handler)
+    app.router.add_get("/network", network_page_handler)
     app.router.add_get("/alerts", alerts_page_handler)
     # multi-user login + admin user management
     app.router.add_get("/login", login_page_handler)

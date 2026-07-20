@@ -78,9 +78,9 @@ returns 404).
   `/spend/logs` + `/health/*`, llama.cpp `/slots`, vLLM `/metrics`, `nvidia-smi`
   (local or over SSH), and the Docker socket (read-only) for container health. aiohttp + a
   couple pure-python libs; nothing else.
-- **Nine dashboards** — Overview, LiteLLM, GPU, Ollama, llama.cpp, vLLM,
-  Alerts, Spend & Quota, Settings. Collapsible sidebar, day/night, time-window + pan,
-  CSV export.
+- **Ten dashboards** — Overview, LiteLLM, GPU, Ollama, llama.cpp, vLLM,
+  Network, Alerts, Spend & Quota, Settings. Collapsible sidebar, day/night,
+  time-window + pan, CSV export.
 - **Retention up to years** — raw 24h, 1-minute + 1-hour rollups (configurable,
   default 1 year) so charts stay fast and the DB stays bounded.
 - **Alerting + anomaly detection** — thresholds, per-key spike/budget detection,
@@ -134,6 +134,7 @@ attaches a cosign-signed image manifest (`*.txt` + `*.txt.bundle`).
 | `/ollama` | running/installed models, RAM/VRAM, %-on-GPU, per-model params/quant/unload-countdown, over-time charts |
 | `/llamacpp` | tokens/s, active/total slots, busy %, KV-cache %, context size, status, loaded-model card, over-time charts |
 | `/vllm` | **running / waiting** requests (queue depth), **GPU KV-cache %**, **TTFT** + per-token latency, prompt/generation token counters and **preemptions** (>0 = vLLM evicting under memory pressure). Read from vLLM's own `/metrics`; with `VLLM_METRICS_ENABLED=0` the page still shows status + loaded model and says why the counters are absent |
+| `/network` | host **download / upload speed** + **total downloaded / uploaded**, per-interface table (speed, lifetime totals, errors, drops) with the busiest NIC marked *primary*. Reads `/proc/net/dev`; `NETWORK_IFACES` pins which interface(s) to show (default: physical NICs, skipping loopback / veth / bridges / overlay VPNs) |
 | `/alerts` | configured channel, thresholds, active breaches, **"Send test alert"**, fired-alert history |
 | `/settings` (admin) | Operator tuning applied **live** (no restart): alerts, sampling, retention, LiteLLM/circuit-breaker knobs — drag-to-arrange cards, layout saved in the DB. A **Teams** board — one line per user (**email · team · per-user budget · keys**), ranked by usage, click a name for **ID · username · email · team · keys**; reassign a key's **team** or **user** as a local override (existing users only; LiteLLM untouched). A **Model costs** board — mark each model **real** (external paid) or **estimated** (self-hosted), driving the Spend cost split |
 
@@ -460,10 +461,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.7.1-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.8.1-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.7.1-armv7 ai-monitoring:1.7.1
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.1-armv7 ai-monitoring:1.8.1
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```
@@ -591,7 +592,7 @@ pip install -r requirements-dev.txt && pytest
 ## Development
 
 This project was built with AI assistance (Claude Code). All code is human-reviewed and
-gated by an extensive CI pipeline that runs on every push: 500+ tests, ruff / semgrep /
+gated by an extensive CI pipeline that runs on every push: 600+ tests, ruff / semgrep /
 bandit static analysis, gitleaks + trufflehog secret scanning, Trivy CVE scans
 (filesystem + image), and cosign image signing.
 

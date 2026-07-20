@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.7.1"
+VERSION = "AI-Monitoring_1.8.1"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -248,6 +248,11 @@ LLAMACPP_API_KEY  = _str("LLAMACPP_API_KEY")            # optional Bearer
 # own state, exactly like llama.cpp serving /slots. Set VLLM_METRICS_ENABLED=0 to
 # stay strictly on the JSON endpoints (up/down + model list only).
 VLLM_BASE_URL     = _str("VLLM_BASE_URL")               # e.g. http://host:8000
+
+# --- host network (Ethernet dashboard) ---------------------------------------
+# Comma-separated interface whitelist (e.g. "eth0,eth1"); empty = auto-select
+# physical NICs and skip loopback/virtual/container devices.
+NETWORK_IFACES = _str("NETWORK_IFACES")
 VLLM_API_KEY      = _str("VLLM_API_KEY")                # optional Bearer
 VLLM_METRICS_ENABLED = (_str("VLLM_METRICS_ENABLED", "1") or "1").lower() in (
     "1", "true", "yes", "on")
