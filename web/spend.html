@@ -260,7 +260,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.1</div>
+      <div id="sidebar-brand-ver">v1.8.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -326,7 +326,7 @@ function updateSeries(chart,labels,next){
         <button data-by="key">by key</button>
         <button data-by="team">by team</button>
       </span></h2>
-    <div class="hint" style="margin-top:2px">cumulative spend to date (LiteLLM per-key totals) — real cash, all-time · <b>click a user to see the keys they used</b></div>
+    <div class="hint" style="margin-top:2px">real-cash spend in the selected time window · <b>click a user to see the keys they used</b></div>
     <div class="chart-wrap"><canvas id="cost-chart" role="img" aria-label="Cost by user"></canvas></div>
     <div id="cost-detail"></div>
   </section>
@@ -398,7 +398,20 @@ const scls=p=>p>=90?"bad":p>=70?"warn":"ok";
 const SLBL={bad:"Critical",warn:"Watch",ok:"On track",none:"No budget"};
 
 // ── spend over time (30d daily / 12mo monthly) + spending per year ──
-let SPWIN="30d";
+// Per-page time window: remember the user's choice for THIS page (path-keyed) so a
+// refresh keeps it, and each page keeps its OWN window (not shared site-wide). Falls
+// back to the page default when nothing is saved or the saved value isn't a valid button.
+function _winKey(){ return "aimon-win:"+location.pathname; }
+function _winSave(w){ try{ localStorage.setItem(_winKey(), w); }catch(e){} }
+function _winRestore(sel, def, labelId){
+  var w=null; try{ w=localStorage.getItem(_winKey()); }catch(e){}
+  if(!(w && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
+  document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
+    var on=x.dataset.w===w; x.classList.toggle("active",on); x.setAttribute("aria-pressed", on?"true":"false"); });
+  if(labelId){ var l=document.getElementById(labelId); if(l) l.textContent=w; }
+  return w;
+}
+let SPWIN=_winRestore("#sp-windows", "30d", null);
 function cssv(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n; }
 function axisSp(t,gran){
   const d=new Date(t*1000);
@@ -541,6 +554,14 @@ function renderYearCost(d, realCol, estCol){
 // Cost by key/team — cumulative $ spend (LiteLLM per-key totals). Horizontal bars so
 // long key names stay readable; real cash, all-time (not a time series).
 let COSTBY="user", _lastKeys=[], _costRows=[], _keysPage=0, _costOpen=null;
+let SPWINCOST=null;   // {alias: windowed spend} — makes Cost-by-user/key/team follow SPWIN
+// spend for the SELECTED window (falls back to LiteLLM all-time until the map loads)
+function winSpent(k){ return SPWINCOST?(SPWINCOST[k.key]||0):(k.spent||0); }
+async function loadKeyCost(){
+  const d=await api("/api/spend/keycost?window="+SPWIN);
+  SPWINCOST=(d&&d.cost)||{};
+  renderCostChart(_lastKeys);
+}
 const KEYS_PER_PAGE=20;
 const costChart=new Chart(document.getElementById("cost-chart"),{
   type:"bar",
@@ -560,26 +581,29 @@ function showCostKeys(row){
   if(!row||!row.keys||COSTBY==="key"){ _costOpen=null; setHtml(el,""); return; }
   _costOpen=row.name;   // remember the open selection so a poll can restore it
   const kind = COSTBY==="user" ? "user" : "team";
-  const rows=row.keys.slice().filter(k=>(k.spent||0)>0).sort((a,b)=>(b.spent||0)-(a.spent||0))
+  const rows=row.keys.slice().filter(k=>winSpent(k)>0).sort((a,b)=>winSpent(b)-winSpent(a))
     .map(k=>`<div class="crow"><span class="ck"><b>${escapeHtml(k.key)}</b>`
       +(kind==="user"&&k.team?`<span class="srv">${escapeHtml(k.team)}</span>`:"")
       +(kind==="team"&&k.email?`<span class="srv">${escapeHtml(k.email)}</span>`:"")
-      +`</span><span class="cv">${money(k.spent||0)}</span></div>`).join("");
+      +`</span><span class="cv">${money(winSpent(k))}</span></div>`).join("");
   setHtml(el,`<div class="cdet"><div class="ch">Keys used by <b>${escapeHtml(row.name)}</b> `
     +`(${row.keys.length}) · ${money(row.spent)}</div>${rows}</div>`);
 }
 function renderCostChart(keys){
+  // Spend for the SELECTED window (winSpent, keyed by alias) so this chart follows the
+  // page time-window like the time-series charts.
+  const spentOf=winSpent;
   let rows;
   if(COSTBY==="team"){
     const t={};
-    keys.forEach(k=>{ const n=k.team||"—"; (t[n]=t[n]||{spent:0,keys:[]}); t[n].spent+=(k.spent||0); t[n].keys.push(k); });
+    keys.forEach(k=>{ const n=k.team||"—"; (t[n]=t[n]||{spent:0,keys:[]}); t[n].spent+=spentOf(k); t[n].keys.push(k); });
     rows=Object.entries(t).map(([name,v])=>({name,spent:v.spent,keys:v.keys}));
   } else if(COSTBY==="user"){
     const u={};
-    keys.forEach(k=>{ const n=k.email||"Unassigned"; (u[n]=u[n]||{spent:0,keys:[]}); u[n].spent+=(k.spent||0); u[n].keys.push(k); });
+    keys.forEach(k=>{ const n=k.email||"Unassigned"; (u[n]=u[n]||{spent:0,keys:[]}); u[n].spent+=spentOf(k); u[n].keys.push(k); });
     rows=Object.entries(u).map(([name,v])=>({name,spent:v.spent,keys:v.keys}));
   } else {
-    rows=keys.map(k=>({name:k.key,spent:k.spent||0,keys:[k]}));
+    rows=keys.map(k=>({name:k.key,spent:spentOf(k),keys:[k]}));
   }
   // show EVERY user/key/team with spend — no fixed top-N cap (regression: used to
   // slice to 12 and hide the rest). Rank by spend, biggest first.
@@ -784,8 +808,8 @@ async function loadSpendSeries(){
 document.querySelectorAll("#sp-windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#sp-windows button").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
-    b.classList.add("active"); b.setAttribute("aria-pressed","true"); SPWIN=b.dataset.w;
-    loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries();   // one window, all charts
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); SPWIN=b.dataset.w; _winSave(SPWIN);
+    loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost();   // one window, all charts
   });
 });
 
@@ -1009,7 +1033,7 @@ async function tick(){
   renderKeys(d.keys);
   _lastKeys=d.keys||[];
   renderCostChart(_lastKeys);
-  loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries();
+  loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost();
 }
 tick();
 _timers.push(setInterval(tick, 5000));

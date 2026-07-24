@@ -44,14 +44,41 @@ def _iface_filter() -> set[str] | None:
     return names or None
 
 
+# Which /proc/net/dev the last successful read came from — surfaced to the dashboard
+# so it can label whether the figures are the HOST's or just this container's.
+_source: dict[str, str | None] = {"path": None, "scope": None}
+
+
+def _net_dev_candidates() -> list[tuple[str, str]]:
+    """Ordered (path, scope) candidates for the interface counters.
+
+    `/proc/net` is a symlink to `/proc/self/net`, so it is per-network-namespace:
+    read inside a bridge-networked container it shows only the container's own
+    eth0 (Docker traffic), never the host NICs. PID 1 (the host's init) lives in
+    the host ROOT netns — reachable at `/proc/1/net/dev` when the container shares
+    the host PID namespace (`pid: host`, already set for the procs collector) or on
+    bare metal — so we prefer it, then fall back to our own netns."""
+    override = (config.NET_DEV_PATH or "").strip()
+    if override:
+        return [(override, "host")]
+    return [(f"{_PROC}/1/net/dev", "host"), (f"{_PROC}/net/dev", "container")]
+
+
 def _read_net_dev() -> dict[str, dict[str, int]]:
-    """Parse /proc/net/dev into {iface: {rx_bytes, rx_packets, rx_errs, rx_drop,
-    tx_bytes, tx_packets, tx_errs, tx_drop}}. Returns {} on any error."""
+    """Parse the host's /proc/net/dev into {iface: {rx_bytes, rx_packets, rx_errs,
+    rx_drop, tx_bytes, tx_packets, tx_errs, tx_drop}}. Tries the host-netns path
+    (PID 1) first, then the container's own. Returns {} when none is readable."""
     out: dict[str, dict[str, int]] = {}
-    try:
-        with open(f"{_PROC}/net/dev") as f:
-            lines = f.readlines()
-    except Exception:
+    lines: list[str] = []
+    for path, scope in _net_dev_candidates():
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+            _source["path"], _source["scope"] = path, scope
+            break
+        except Exception:
+            continue
+    if not lines:
         return {}
     # first two lines are headers; each data line is "  name: rx... tx..."
     for ln in lines[2:]:
@@ -141,6 +168,9 @@ def sample() -> dict:
         "available": True,
         "interfaces": ifaces,
         "primary": primary,
+        # "host" = counters are the real host NICs (PID 1 netns / bare metal);
+        # "container" = only this container's netns was readable (add `pid: host`).
+        "scope": _source["scope"],
         "rx_rate_total": round(rx_rate_total, 1) if have_rate else None,
         "tx_rate_total": round(tx_rate_total, 1) if have_rate else None,
         "rx_bytes_total": rx_bytes_total,

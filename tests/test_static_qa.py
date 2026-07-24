@@ -261,6 +261,61 @@ def test_litellm_per_model_shows_param_size():
         assert val == expect, f"paramSize({name!r}) = {val!r}, expected {expect!r}"
 
 
+def test_network_total_follows_time_window():
+    """The network 'Total down/up' KPIs must reflect bytes moved DURING the selected window
+    (integrated from the rate series), not the cumulative-since-boot counter. Guards the
+    wiring (windowBytes + _winDown/_winUp fed into the KPIs with an 'in <WIN>' sub) and runs
+    the real integrator via node (constant rate over a window = rate × duration)."""
+    net = ROOT / "web" / "network.html"
+    if not net.exists():
+        pytest.skip("network dashboard not present")
+    html = net.read_text(encoding="utf-8")
+    assert "function windowBytes(" in html, "windowBytes integrator missing"
+    # the totals are fed from the windowed values, not net.rx_bytes_total (boot counter)
+    assert 'kpi("Total down", _winDown' in html and 'kpi("Total up", _winUp' in html, \
+        "Total down/up must use the windowed values"
+    assert 'humanBytes(net.rx_bytes_total)' not in html, \
+        "Total KPIs must no longer use the cumulative-since-boot counter"
+    assert '"in "+WIN' in html, "windowed totals should note the active window"
+    assert '_winDown=windowBytes(pts,"net_down")' in html and '_winUp=windowBytes(pts,"net_up")' in html
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    m = re.search(r"function windowBytes\(pts,key\)\{[\s\S]*?\n\}", html)
+    assert m, "windowBytes body not found"
+    script = m.group(0) + """
+const P=[]; for(let t=0;t<=3600;t+=60) P.push({t, r:1000});   // 1000 B/s across 1h
+const ramp=[{t:0,r:0},{t:100,r:100}];                          // trapezoid 0..100 over 100s
+console.log(JSON.stringify([
+  windowBytes(P,"r"),                    // 3,600,000
+  windowBytes(ramp,"r"),                 // 5,000
+  windowBytes([{t:0,r:null},{t:60,r:null}],"r"),   // null
+  windowBytes([],"r")                    // null
+]));"""
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == [3600000, 5000, None, None]
+
+
+def test_network_scope_badge_shows_host_vs_container():
+    """The network Live card must surface whether the figures are the HOST's NICs or only
+    this container's netns — a `l-scope` badge fed from the collector's `net.scope`, with the
+    'container' case telling the operator to set `pid: host`. Prevents Docker-bridge traffic
+    from being silently mistaken for the host's network (the reported confusion)."""
+    net = ROOT / "web" / "network.html"
+    if not net.exists():
+        pytest.skip("network dashboard not present")
+    html = net.read_text(encoding="utf-8")
+    assert 'id="l-scope"' in html, "network Live card missing the scope badge element"
+    assert 'net.scope==="container"' in html and 'net.scope==="host"' in html, \
+        "scope badge must handle both host and container states"
+    assert "pid: host" in html, "container-scope state must tell the operator to set pid: host"
+    # the collector actually emits the scope this UI consumes
+    coll = (ROOT / "collectors" / "network.py").read_text(encoding="utf-8")
+    assert '"scope"' in coll and '"host"' in coll and '"container"' in coll, \
+        "network collector must emit a host/container scope for the badge"
+
+
 def test_litellm_has_window_delta_key_chart():
     # new "requests in window" (delta) bar chart alongside the over-time keys chart
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
@@ -268,6 +323,56 @@ def test_litellm_has_window_delta_key_chart():
     assert "/api/keydelta" in html and "loadKeyDelta" in html and "keyDeltaChart" in html
     # it is a timeline (line chart plotting per-interval points), not a bar
     assert 'type:"line"' in html and "d.points" in html
+
+
+def test_spend_all_charts_follow_time_window():
+    """Every chart on the Spend page must follow the page time-window (SPWIN): the four
+    time-series charts already did, and Cost-by-user/key/team now does too via a windowed
+    per-key cost map (winSpent / /api/spend/keycost) reloaded on window change — so it no
+    longer shows LiteLLM's all-time per-key total regardless of the selector."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    # the windowed cost source + helper
+    assert "/api/spend/keycost?window=" in html and "function winSpent(" in html
+    # cost-by chart uses the windowed spend, and re-fetches when the window changes
+    assert "const spentOf=winSpent" in html
+    m = re.search(r'#sp-windows button\[data-w\]"\)\.forEach.*?loadKeyCost\(\)', html, re.S)
+    assert m, "window change must reload the windowed cost-by chart (loadKeyCost)"
+    # each time-series chart still follows SPWIN
+    for fn in ("loadSpendSeries", "loadModelCostSeries", "loadModelUserCostSeries"):
+        assert f"{fn}()" in html
+        assert re.search(rf"{fn}.*?window=\"?\+?SPWIN", html, re.S), f"{fn} must use SPWIN"
+
+
+def test_litellm_concurrency_backlog_by_key_stacked_and_labeled_estimated():
+    """The two new stacked charts (Concurrent work / Backlog by key) exist, read the
+    attribution endpoint, follow the window, and are HONESTLY labeled as estimated — because
+    LiteLLM gives no per-key breakdown for these aggregates (the split is inferred)."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    for cid in ("card-conc-by-key", "card-backlog-by-key",
+                "conc-by-key-chart", "backlog-by-key-chart"):
+        assert cid in html, f"missing {cid}"
+    assert "/api/litellm/concurrency-by-key" in html
+    assert "loadConcByKey" in html and "loadBacklogByKey" in html
+    # both reload on window change / tick (search for them in rangedReload)
+    assert re.search(r"function rangedReload\(\)\{[^}]*loadConcByKey\(\)[^}]*loadBacklogByKey\(\)", html)
+    # stacked area (bands sum to the total) and the "estimated" honesty must be present
+    assert "stacked:true" in html
+    assert "Estimated attribution" in html and "no per-key breakdown" in html
+
+
+def test_litellm_keytime_is_cumulative_requests_not_rolling():
+    """'Top 10 API keys over time' plots CUMULATIVE requests (all-time, only rises) from the
+    daily rollup — NOT the rolling 15-min request count that decays to 0 when a key goes
+    quiet (the reported "why did the number drop" confusion). Guards the rewire so it can't
+    regress to the falling rolling-window series."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "/api/keyrequests" in html, "keytime chart must read the cumulative-requests endpoint"
+    assert "cumulative requests" in html and "all time" in html, "header/labels must say all-time cumulative"
+    # loadKeyTime must no longer pull the rolling per-window key request series
+    m = re.search(r"async function loadKeyTime\(\)\{.*?\n\}", html, re.S)
+    assert m, "loadKeyTime not found"
+    assert "/api/keyseries" not in m.group(0), "keytime must not use the rolling keyseries"
+    assert "rolling window" not in m.group(0), "the falling rolling-window note must be gone"
 
 
 def test_litellm_has_per_user_usage_charts():
@@ -296,7 +401,7 @@ def test_windowed_pages_have_live_button():
         assert 'id="nav-live"' in html, name
         # click handler snaps to live; disabled state tracks TIMEEND
         assert 'getElementById("nav-live").addEventListener' in html, name
-        assert "TIMEEND=null; updateRangeUI()" in html, name
+        assert "TIMEEND=null; _winSave(WIN, null); updateRangeUI()" in html, name
         assert '_liveBtn.disabled=!TIMEEND' in html, name
 
 
@@ -421,7 +526,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.1"
+    assert config.VERSION == "AI-Monitoring_1.8.5"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -430,7 +535,7 @@ def test_all_version_surfaces_match_config_version():
     offline-install snippet must equal config.VERSION — these lagged in past releases
     (deploy/k8s + prometheus-example + README were the repeat offenders). Derives the
     version from config so it can't go stale itself."""
-    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.1"
+    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.5"
     other = re.compile(r"(?:ai[-_]monitoring|ai_monitoring):(\d+\.\d+\.\d+)")
 
     def stale_tags(text):
@@ -684,9 +789,9 @@ def test_litellm_page_exists_and_secure():
     # per-model resource cost columns sourced from the procs collector
     assert "svcProc" in html and "svc CPU" in html and "svc RAM" in html
     assert 'type:"bar"' in html
-    # top-10 keys OVER TIME — multi-line, one color per key
+    # top-10 keys OVER TIME — multi-line, one color per key; cumulative all-time spend
     assert 'id="keytime-chart"' in html and "loadKeyTime" in html
-    assert "/api/keyseries" in html and "KEY_COLORS" in html
+    assert "/api/keyrequests" in html and "KEY_COLORS" in html
     # per-key anomaly panel
     assert 'id="card-anomalies"' in html and "loadAnomalies" in html
     assert "/api/anomalies" in html
@@ -1604,14 +1709,75 @@ def test_metrics_over_time_is_full_width():
 
 
 def test_llm_pages_default_to_24h_window():
-    """regression: LiteLLM/Ollama/llama.cpp open on a 24h window by default."""
+    """regression: LiteLLM/Ollama/llama.cpp open on a 24h window by default (the fallback
+    when nothing is saved), and the static markup's active button is 24h. The live window is
+    now restored per-page from localStorage (see test_window_selection_persists_per_page)."""
     for name in _LLM_PAGES:
         html = _page(name)
-        assert 'let WIN = "24h";' in html, f"{name}: default WIN must be 24h"
+        assert '_winRestore("#windows", "24h"' in html, f"{name}: default WIN fallback must be 24h"
         assert 'data-w="24h" class="active"' in html, \
-            f"{name}: the 24h button must be the active one"
+            f"{name}: the 24h button must be the static-default active one"
         assert '<button data-w="1h" class="active">' not in html, \
             f"{name}: the 1h button must no longer be active"
+
+
+def test_window_selection_persists_per_page():
+    """The time-window selection must stick PER PAGE across refresh: restored from a
+    path-keyed localStorage entry on load, saved on change. Guards the wiring on every
+    windowed page (WIN pages via #windows, spend via #sp-windows)."""
+    for name in ("index", "gpu", "ollama", "llamacpp", "litellm", "vllm", "network"):
+        html = _page(name)
+        assert 'localStorage.setItem(_winKey()' in html and '_winKey()' in html, \
+            f"{name}: window not persisted to localStorage"
+        assert '"aimon-win:"+location.pathname' in html, f"{name}: window key must be per-page (path)"
+        assert '_winRestore("#windows"' in html, f"{name}: window not restored on load"
+        assert "WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null)" in html, \
+            f"{name}: window change must reset the pan cursor and be saved as a live named window"
+    sp = _page("spend")
+    assert '_winRestore("#sp-windows"' in sp and "SPWIN=b.dataset.w; _winSave(SPWIN)" in sp, \
+        "spend page window must persist per page too"
+
+
+_WIN_PAGES = ["index", "gpu", "ollama", "llamacpp", "litellm", "vllm", "network"]
+
+
+def test_drag_to_zoom_wired_on_every_win_page():
+    """Kibana-style drag-to-zoom: dragging across any chart sets a custom time window.
+    Each WIN page must carry the delegated pointer-drag handler, the selection overlay,
+    and encode the range through the existing window+end plumbing (WIN='custom:<secs>')."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert "drag-to-zoom: drag across ANY chart" in html, f"{name}: drag handler missing"
+        assert "addEventListener(\"pointerdown\"" in html, f"{name}: no pointerdown listener"
+        assert "addEventListener(\"pointerup\"" in html, f"{name}: no pointerup listener"
+        assert 'WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND)' in html, \
+            f"{name}: drag must set a custom window + absolute end and persist it"
+        assert 'ov.className="drag-sel"' in html, f"{name}: selection overlay not created"
+        assert ".drag-sel{" in html and ".chart-wrap{position:relative}" in html, \
+            f"{name}: drag overlay CSS missing"
+
+
+def test_custom_window_flows_through_api_and_wsecs_on_every_win_page():
+    """A custom range must reach the server: wsecs() resolves 'custom:<secs>' to its
+    seconds, and api() appends the absolute end for every windowed endpoint (not a
+    hard-coded endpoint list) so the server derives start=end-secs."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert 'w.indexOf("custom:")===0' in html, f"{name}: wsecs does not parse custom windows"
+        assert 'if(TIMEEND && path.indexOf("window=")>=0)' in html, \
+            f"{name}: api() must append end for any windowed endpoint"
+
+
+def test_custom_window_persistence_is_restored_on_refresh():
+    """The saved entry is {w,end}; on load a custom range restores both the window token
+    AND its absolute end (TIMEEND) so the zoom survives a refresh, per page."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert 'JSON.stringify({w:w, end:(end||null)})' in html, \
+            f"{name}: window state must be persisted as {{w,end}}"
+        assert 'function _winCustom(w)' in html, f"{name}: _winCustom helper missing"
+        assert 'TIMEEND=(s&&s.end)||null;' in html, \
+            f"{name}: custom range must restore its absolute end on load"
 
 
 def test_gpu_name_in_header_via_textcontent():
@@ -1780,9 +1946,10 @@ def test_gpu_per_core_charts_honour_the_window():
     # window switch AND pan both refresh the per-core data
     assert re.search(r'loadSeries\(\);\s*loadAppCpu\(\);\s*loadPerCpu\(\);', html), \
         "window/pan handlers must reload the per-core series"
-    # pan offset (`end=`) is forwarded for cpuseries like the other series endpoints
-    assert re.search(r'series\|keyseries\|procseries\|cpuseries', html), \
-        "api() must attach the pan `end=` param to /api/cpuseries"
+    # pan offset (`end=`) is forwarded for cpuseries like every windowed endpoint
+    assert '/api/cpuseries?window=' in html, "per-core must request the windowed cpuseries endpoint"
+    assert 'if(TIMEEND && path.indexOf("window=")>=0)' in html, \
+        "api() must attach the pan `end=` param to every windowed endpoint (incl. /api/cpuseries)"
 
 
 def test_gpu_per_core_cpu_grid():
@@ -2083,19 +2250,18 @@ def test_prometheus_example_stack_shipped():
 
 
 def test_keytime_card_states_its_window_semantics():
-    """"Top 10 API keys over time" plots a ROLLING window count (LITELLM_SPEND_WINDOW_MIN),
-    not a running total, so a line legitimately FALLS when a key goes quiet. Without that
-    stated the chart reads as broken data — the sibling delta card already says it is
-    cumulative, so one card explaining itself and the other not is the actual trap."""
+    """"Top 10 API keys over time" plots CUMULATIVE spend per key, ALL-TIME — a running total
+    that only rises (never the old rolling-window count that fell when a key went quiet, which
+    read as broken data). The card's sub-note must state the all-time running-total semantics
+    and point at the sibling 'requests in window' card for the per-window view."""
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
     assert 'id="keytime-sub"' in html
-    assert "rolling window, not a running" in html
-    assert "goes quiet" in html
-    # the window length comes from the collector, not a hard-coded 15
-    assert "_spendWinMin" in html
-    assert re.search(r'spend_window_min', html)
-    # lite mode reports no per-key requests → cumulative spend, which only rises
-    assert "only rises" in html
+    assert "running total" in html and "all time" in html
+    # the old rolling-window framing must be gone from the keytime sub-note
+    m = re.search(r'ksub\.textContent\s*=.*?;', html, re.S)
+    assert m and "rolling window" not in m.group(0), "keytime sub-note must not describe a rolling window"
+    assert "only\n" in m.group(0) or "only rises" in m.group(0).replace('"\n    +"', ""), \
+        "keytime sub-note must state the line only rises"
 
 
 def test_test_db_path_is_per_process():
@@ -2421,3 +2587,97 @@ def test_llamacpp_chart_keys_are_persisted_columns():
     snap["collectors"]["llamacpp"] = {"available": False}
     row2 = appmod._metrics_row(snap)
     assert row2["pptok"] is None and row2["busy"] is None and row2["ctxused"] is None
+
+
+def test_litellm_page_init_executes_without_js_error():
+    """Regression for the '_keytimeMetric before initialization' TDZ crash: the
+    keyTimeChart's axis callback reads a `let` that was declared AFTER the chart, so
+    Chart.js invoking the callback during construction threw an uncaught ReferenceError
+    that halted the whole script — empty charts AND a dead time-window selector. The
+    static `new Function()` syntax check can't catch it (it compiles, never runs), so
+    execute the page's inline JS with a Chart stub that INVOKES the scale/tooltip
+    callbacks at construction (like Chart.js does). Skipped if node is absent."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    scripts = [m.group(1) for m in re.finditer(r"<script>([\s\S]*?)</script>", html)]
+    combined = "\n".join(scripts)
+    harness = r"""
+    process.on('unhandledRejection', () => {});
+    global.window = global;
+    global.CUR = "$";                       // server injects window.CUR before </head>
+    global.addEventListener = () => {}; global.removeEventListener = () => {};
+    const el = new Proxy(function(){}, { apply: () => el, get(t,p){
+      if (typeof p === "symbol") return t[p];
+      if (["style","dataset","classList"].includes(p)) return t[p] || (t[p] = {add(){},remove(){},toggle(){},contains(){return false}});
+      if (["getContext","querySelector","createElement","closest"].includes(p)) return () => el;
+      if (p === "querySelectorAll") return () => [];
+      if (p === "getAttribute") return () => null;
+      if (typeof t[p] === "function") return t[p];
+      if (p in t) return t[p];
+      return () => {};
+    }, set(t,p,v){ t[p]=v; return true; }});
+    global.document = { getElementById: () => el, querySelector: () => el,
+      querySelectorAll: () => [], createElement: () => el, addEventListener: () => {},
+      body: el, documentElement: el, head: el, cookie: "", title: "" };
+    global.location = { search: "?token=x", pathname: "/litellm", href: "", hostname: "x" };
+    global.localStorage = { getItem: () => null, setItem: () => {} };
+    global.matchMedia = () => ({ matches:false, addEventListener(){} });
+    global.setInterval = () => 0; global.clearInterval = () => {}; global.setTimeout = () => 0;
+    global.fetch = () => Promise.resolve({ ok:true, status:200, json:()=>Promise.resolve({}), text:()=>Promise.resolve("") });
+    global.getComputedStyle = () => ({ getPropertyValue: () => "" });
+    // Chart stub that RUNS the callbacks at construction, reproducing the TDZ crash.
+    global.Chart = function(_c, cfg){
+      try {
+        const o = (cfg && cfg.options) || {};
+        const sc = o.scales || {};
+        for (const k in sc){ const cb = sc[k] && sc[k].ticks && sc[k].ticks.callback; if (cb) cb(0,0,[]); }
+        const tt = o.plugins && o.plugins.tooltip && o.plugins.tooltip.callbacks;
+        if (tt && tt.label) tt.label({ parsed:{x:0,y:0}, dataset:{label:""}, raw:0 });
+      } catch(e){ throw e; }
+      const data = (cfg && cfg.data) || { labels:[], datasets:[] };
+      (data.datasets || []).forEach(ds => { if (!ds.data) ds.data = []; });
+      return { data, update(){}, destroy(){}, options:(cfg && cfg.options) || {} };
+    };
+    global.Chart.defaults = {};
+    global.DOMPurify = { sanitize: s => s };
+    """
+    script = harness + "\ntry {\n" + combined + \
+        '\n} catch (e) { console.error("PAGE_INIT_THREW: " + e.message); process.exit(3); }\n'
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, \
+        f"litellm.html init threw a JS error at load:\n{out.stderr.strip()}"
+    # and the specific ordering that caused it stays correct
+    decl = html.index("let _keytimeMetric")
+    use = html.index('new Chart(document.getElementById("keytime-chart")')
+    assert decl < use, "_keytimeMetric must be declared BEFORE keyTimeChart (TDZ guard)"
+
+
+def test_litellm_request_delta_charts_hide_when_no_request_data():
+    """The 'Top keys/users — requests in window' charts plot per-key REQUEST counts,
+    which lite/off spend mode doesn't have (only per-key spend) — so they came back
+    all-zero and rendered as flat-empty. They must auto-hide their card when there's no
+    non-zero request data, like the empty mini-charts do, instead of showing flat-zero
+    lines. Guards the fix for the two persistently-empty /litellm graphs in lite mode."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    for card, chart in (("card-keydelta", "keyDeltaChart"),
+                        ("card-userdelta", "userDeltaChart")):
+        assert f'getElementById("{card}")' in html, f"{card} hide-toggle missing"
+    # the toggle is driven by whether any datapoint is non-null AND non-zero
+    assert re.search(r"labels\.some\(lab=>pts\.some\(p=>p\[lab\]!=null && p\[lab\]!==0\)\)",
+                     html), "delta charts must hide on all-zero/null request data"
+    assert re.search(r'card-keydelta"\)?;?\s*\n?\s*if\(_kdCard\)\s*_kdCard\.style\.display', html)
+
+
+def test_services_toggle_tunables_and_bool_ui():
+    """Settings → Services exposes a per-backend monitor on/off for litellm/ollama/
+    llamacpp/vllm as bool tunables, and the Settings page renders bool as an On/Off
+    control (it previously only rendered number/choice, so bool tunables were invisible)."""
+    import config
+    for name in ("LITELLM_ENABLED", "OLLAMA_ENABLED", "LLAMACPP_ENABLED", "VLLM_ENABLED"):
+        assert name in config.TUNABLES, f"{name} tunable missing"
+        assert config.TUNABLES[name]["t"] == "bool" and config.TUNABLES[name]["group"] == "Services"
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    assert 's.type==="bool"' in html, "settings page must render bool tunables"
+    assert re.search(r'\["1","On"\]', html) and re.search(r'\["0","Off"\]', html)

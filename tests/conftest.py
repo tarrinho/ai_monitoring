@@ -60,6 +60,11 @@ def _reset_auth_state():
             # one-time backfill marker) like the other shared tables.
             conn.execute("DELETE FROM spend_model_user_daily")
             conn.execute("DELETE FROM settings WHERE key = 'spend_mu_backfill'")
+            # Same for the per-day usage/cost history: the spend-series write-through
+            # persists each call's live days, and db.spend_daily_range is merged into the
+            # Spend "cost over time" series, so rows a prior test upserts would otherwise
+            # inflate another test's lifetime/window real_cost totals.
+            conn.execute("DELETE FROM spend_daily")
     except Exception:
         pass
     _app._users_seen["checked"] = 0.0

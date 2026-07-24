@@ -113,6 +113,9 @@ function updateSeries(chart,labels,next){
     body:not(.sb-collapsed) #sidebar{transform:none}
     #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
   }
+  .chart-wrap{position:relative}
+  .drag-sel{position:absolute;background:rgba(88,166,255,.18);border:1px solid var(--accent);
+    pointer-events:none;z-index:6;border-radius:2px}
 </style>
 <script>
 /* day/night — applied on every page; choice shared via localStorage */
@@ -184,7 +187,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.1</div>
+      <div id="sidebar-brand-ver">v1.8.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -291,6 +294,18 @@ function updateSeries(chart,labels,next){
     <div class="chart-wrap" style="height:260px"><canvas id="userdelta-chart" role="img" aria-label="Cumulative requests by user"></canvas></div>
   </section>
 
+  <section class="card span-2" id="card-conc-by-key">
+    <h2>Concurrent LLM work — by key <span id="conc-by-key-basis" class="badge"></span>
+      <span class="info" title="Estimated attribution. LiteLLM reports ONE total for concurrent work (in-flight requests + llama.cpp active slots) with no per-key breakdown, so each point's total is split across the top keys by their share of recent activity (requests in full spend mode, spend in off/lite). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top key.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:220px"><canvas id="conc-by-key-chart" role="img" aria-label="Concurrent LLM work attributed by key (estimated)"></canvas></div>
+  </section>
+
+  <section class="card span-2" id="card-backlog-by-key">
+    <h2>LLM Backlog — by key <span id="backlog-by-key-basis" class="badge"></span>
+      <span class="info" title="Estimated attribution. LiteLLM's /health/backlog reports ONE total in-flight-request count with no per-key breakdown, so each point's total is split across the top keys by their share of recent activity (requests in full spend mode, spend in off/lite). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top key.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:220px"><canvas id="backlog-by-key-chart" role="img" aria-label="LLM backlog attributed by key (estimated)"></canvas></div>
+  </section>
+
   <section class="card span-2" id="card-corr">
     <h2>Concurrency vs p95 latency — <span id="corr-win">24h</span></h2>
     <div class="chart-wrap" style="height:170px"><canvas id="corr-chart" role="img" aria-label="Request rate versus latency"></canvas></div>
@@ -388,6 +403,7 @@ const CHARTS = [
   {id:"c-req",  key:"reqrate",  label:"Requests/s",      color:"#a5d6ff"},
   {id:"c-tin",  key:"tok_in",   label:"Prompt tok/s",    color:"#39c5cf"},
   {id:"c-tout", key:"tok_out",  label:"Completion tok/s",color:"#26a641"},
+  {id:"c-ttot", key:"toktot",   label:"Tokens/s",        color:"#2dd4bf"},
   {id:"c-err",  key:"errrate",  label:"Error rate %",    color:"#f85149", unit:"%", max:100},
   {id:"c-cost", key:"costrate", label:"Cost/h",           color:"#e3b341", unit:" "+CUR},
   {id:"c-bklog",key:"backlog",  label:"LLM Backlog Reqs",color:"#ff9bce"},
@@ -433,10 +449,35 @@ function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
-function wsecs(w){return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
-let WIN = "24h";
+function wsecs(w){ if(typeof w==="string"&&w.indexOf("custom:")===0){var cs=parseInt(w.slice(7),10); if(cs>0) return cs;} return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
+// Per-page time window: remember the user's choice for THIS page (path-keyed) so a
+// refresh keeps it, and each page keeps its OWN window (not shared site-wide). Falls
+// back to the page default when nothing is saved or the saved value isn't a valid button.
+function _winKey(){ return "aimon-win:"+location.pathname; }
+function _winCustom(w){ return typeof w==="string" && w.indexOf("custom:")===0 && parseInt(w.slice(7),10)>0; }
+// Persist {w,end}: a named window (end=null -> live) OR a drag-selected custom range
+// ("custom:<secs>" + absolute end t2). Restored on refresh so each page keeps its OWN
+// window/zoom until a NEW one is chosen (window button, Live, or a fresh drag).
+function _winSave(w, end){ try{ localStorage.setItem(_winKey(), JSON.stringify({w:w, end:(end||null)})); }catch(e){} }
+function _winRestore(sel, def, labelId){
+  var s=null; try{ s=JSON.parse(localStorage.getItem(_winKey())||"null"); }catch(e){}
+  var w=s&&s.w;
+  if(_winCustom(w)){
+    TIMEEND=(s&&s.end)||null;                 // absolute custom range persists across refresh
+    document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
+      x.classList.remove("active"); x.setAttribute("aria-pressed","false"); });
+    if(labelId){ var lc=document.getElementById(labelId); if(lc) lc.textContent="custom"; }
+    return w;
+  }
+  if(!(w && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
+  document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
+    var on=x.dataset.w===w; x.classList.toggle("active",on); x.setAttribute("aria-pressed", on?"true":"false"); });
+  if(labelId){ var l=document.getElementById(labelId); if(l) l.textContent=w; }
+  return w;
+}
+let WIN = _winRestore("#windows", "24h", "win-label");
 async function api(path){
-  if(TIMEEND && /\/api\/(series|keyseries|keydelta|procseries)/.test(path))
+  if(TIMEEND && path.indexOf("window=")>=0)
     path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
   try{
     const sep=path.includes("?")?"&":"?";
@@ -662,6 +703,13 @@ function renderUserKeys(l){
   userKeysChart.update("none");
 }
 
+// "reqs" (full mode) or "spend" (off/lite: no per-key requests). MUST be declared
+// BEFORE keyTimeChart below: Chart.js invokes the axis `callback` during construction,
+// and it reads _keytimeMetric — a `let` declared later would throw a temporal-dead-zone
+// "Cannot access '_keytimeMetric' before initialization", halting the whole script
+// (empty charts + dead window buttons). loadKeyTime() reassigns it per poll.
+let _keytimeMetric = "reqs";
+
 // Top-10 keys OVER TIME — one colored line per key.
 const KEY_COLORS = ["#58a6ff","#3fb950","#f778ba","#e3b341","#bc8cff",
                     "#ff7b72","#39c5cf","#f0883e","#7ee787","#db61a2"];
@@ -670,9 +718,12 @@ const keyTimeChart = new Chart(document.getElementById("keytime-chart"), {
   data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
+      // adaptive: integer requests, or currency spend (off/lite fallback)
+      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "+(_keytimeMetric==="spend"
+        ?CUR+Number(c.parsed.y).toFixed(2):Number(c.parsed.y).toLocaleString()+" reqs")}}},
     scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
-            y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
+            y:{ticks:{color:cssv("--muted"),font:{size:9},callback:v=>_keytimeMetric==="spend"?CUR+v:v},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
 function keyDisp(label){
   const s=String(label||"?");
@@ -694,6 +745,13 @@ async function loadKeyDelta(){
   const w=document.getElementById("keydelta-win"); if(w) w.textContent=WIN;
   if(!d) return;
   const pts=d.points||[]; const labels=d.labels||[];
+  // Per-key REQUEST counts need full spend mode; lite/off track per-key SPEND only, so
+  // these deltas come back all-zero. Hide the card (like the empty grid charts) instead
+  // of drawing 10 flat-zero lines — cumulative per-key spend is on the chart above.
+  const _kdAny = labels.some(lab=>pts.some(p=>p[lab]!=null && p[lab]!==0));
+  const _kdCard=document.getElementById("card-keydelta");
+  if(_kdCard) _kdCard.style.display=_kdAny?"":"none";
+  if(!_kdAny) return;
   updateSeries(keyDeltaChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
     _k:lab, label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
@@ -717,6 +775,12 @@ async function loadUserDelta(){
   const w=document.getElementById("userdelta-win"); if(w) w.textContent=WIN;
   if(!d) return;
   const pts=d.points||[]; const labels=d.labels||[];
+  // Same as loadKeyDelta: per-user request counts are unavailable in lite/off mode →
+  // hide the card rather than show flat-zero lines.
+  const _udAny = labels.some(lab=>pts.some(p=>p[lab]!=null && p[lab]!==0));
+  const _udCard=document.getElementById("card-userdelta");
+  if(_udCard) _udCard.style.display=_udAny?"":"none";
+  if(!_udAny) return;
   const byUser={};                                   // username -> [key alias labels]
   labels.forEach(lab=>{ const u=userOf(lab); (byUser[u]=byUser[u]||[]).push(lab); });
   const last = pts.length ? pts[pts.length-1] : {};
@@ -729,6 +793,48 @@ async function loadUserDelta(){
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
     backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
     borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
+}
+
+// Estimated per-key attribution of the proxy-wide concurrency / backlog aggregates.
+// Stacked area: bands sum to the real measured total; the split is by each key's recent
+// activity share (server-side). Card auto-hides when there's no aggregate data.
+function mkStackByKey(cid){
+  return new Chart(document.getElementById(cid), {
+    type:"line", data:{labels:[],datasets:[]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{intersect:false,mode:"index"},
+      plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+      scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{display:false}},
+              y:{stacked:true,beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9}},
+                 grid:{color:"#30363d33"}}}}
+  });
+}
+const concByKeyChart=mkStackByKey("conc-by-key-chart");
+const backlogByKeyChart=mkStackByKey("backlog-by-key-chart");
+function renderStackByKey(d, chart, cardId, basisId){
+  if(!d) return;
+  const series=d.series||[];
+  const any=series.some(s=>(s.data||[]).some(v=>v!=null && v!==0));
+  const card=document.getElementById(cardId);
+  if(card) card.style.display=any?"":"none";
+  const b=document.getElementById(basisId);
+  if(b) b.textContent=any?("estimated · by "+(d.weight_basis||"activity")+" share"):"";
+  if(!any) return;
+  const pts=(d.labels||[]).map(t=>({t}));
+  updateSeries(chart, pts.map(axisT(pts)), series.map((s,i)=>{
+    const col=s.label==="Other"?"#6e7681":KEY_COLORS[i%KEY_COLORS.length];
+    return {_k:s.label, label:keyDisp(s.label), data:s.data||[],
+      borderColor:col, backgroundColor:col+"88",
+      borderWidth:1, pointRadius:0, tension:.25, fill:true};
+  }));
+}
+async function loadConcByKey(){
+  const d=await api("/api/litellm/concurrency-by-key?metric=conc&window="+WIN);
+  renderStackByKey(d, concByKeyChart, "card-conc-by-key", "conc-by-key-basis");
+}
+async function loadBacklogByKey(){
+  const d=await api("/api/litellm/concurrency-by-key?metric=backlog&window="+WIN);
+  renderStackByKey(d, backlogByKeyChart, "card-backlog-by-key", "backlog-by-key-basis");
 }
 async function loadAnomalies(){
   const d=await api("/api/anomalies");
@@ -864,20 +970,23 @@ async function loadCorr(){
 }
 
 async function loadKeyTime(){
-  const d=await api("/api/keyseries?window="+WIN);
-  document.getElementById("keytime-win").textContent=WIN;
-  // lite mode ranks keys by spend (no per-key request counts) → label accordingly
+  // CUMULATIVE per key, ALL-TIME (persisted) — a running total that only ever rises,
+  // independent of the page's short window selector. Requests when the proxy exposes
+  // per-key request counts (full spend mode); otherwise cumulative SPEND (off/lite modes
+  // only expose per-key spend). The "requests in window" chart below is the per-window view.
+  const d=await api("/api/keyrequests");
+  _keytimeMetric=(d&&d.metric==="spend")?"spend":"reqs";
+  const spend=_keytimeMetric==="spend";
   const km=document.getElementById("keytime-metric");
-  if(km) km.textContent = _spendMode==="lite" ? "by spend" : "by requests";
-  // A falling line here is normal in full mode and alarming-looking without this note:
-  // each point is a ROLLING window count, not a running total, so it decays toward 0
-  // when a key goes quiet. In lite mode the value is cumulative spend and only rises.
+  if(km) km.textContent=spend?"cumulative spend":"cumulative requests";
+  const kw=document.getElementById("keytime-win");
+  if(kw) kw.textContent="all time";
   const ksub=document.getElementById("keytime-sub");
-  if(ksub) ksub.textContent = _spendMode==="lite"
-    ? "cumulative spend to date per key — only rises (lite mode reports no per-key request counts)"
-    : "requests in the trailing "+(_spendWinMin||15)+" min (rolling window, not a running "
-      +"total) — a line falls when that key goes quiet, and reaches 0 after "
-      +(_spendWinMin||15)+" min of no traffic";
+  if(ksub) ksub.textContent=spend
+    ? "running total of each key's spend to date (all time) — only rises (per-key request "
+      +"counts need full spend mode; showing spend)"
+    : "running total of each key's requests to date (all time) — only rises; for activity "
+      +"in the selected window see 'requests in window' below";
   if(!d){ return; }
   const pts=d.points||[]; const labels=d.labels||[];
   updateSeries(keyTimeChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
@@ -917,7 +1026,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadCorr(); loadImpact(); loadModels(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -939,6 +1048,41 @@ function updateRangeUI(){
   const m=Math.round((now-TIMEEND)/60);
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
+// ---- drag-to-zoom: drag across ANY chart to set a custom time window (Kibana-style) ----
+(function(){
+  var dg=null;
+  function chartOf(cv){ return (window.Chart && Chart.getChart) ? Chart.getChart(cv) : null; }
+  function place(x){
+    if(!dg) return; var a=dg.ch.chartArea, r=dg.cv.getBoundingClientRect();
+    var lo=Math.max(a.left, Math.min(dg.x0,x)-r.left), hi=Math.min(a.right, Math.max(dg.x0,x)-r.left);
+    dg.ov.style.left=lo+"px"; dg.ov.style.width=Math.max(0,hi-lo)+"px";
+    dg.ov.style.top=a.top+"px"; dg.ov.style.height=(a.bottom-a.top)+"px";
+  }
+  document.addEventListener("pointerdown",function(e){
+    if(e.button) return;
+    var wrap=e.target.closest && e.target.closest(".chart-wrap"); if(!wrap) return;
+    var cv=wrap.querySelector("canvas"); if(!cv) return;
+    var ch=chartOf(cv); if(!ch||!ch.chartArea) return;
+    var ov=document.createElement("div"); ov.className="drag-sel"; wrap.appendChild(ov);
+    dg={wrap:wrap,cv:cv,ch:ch,x0:e.clientX,ov:ov}; place(e.clientX); e.preventDefault();
+  });
+  document.addEventListener("pointermove",function(e){ if(dg) place(e.clientX); });
+  document.addEventListener("pointerup",function(e){
+    if(!dg) return; var d=dg; dg=null; if(d.ov.parentNode) d.ov.parentNode.removeChild(d.ov);
+    if(Math.abs(e.clientX-d.x0)<5) return;                 // a click, not a drag
+    var a=d.ch.chartArea, r=d.cv.getBoundingClientRect(), w=a.right-a.left; if(w<=0) return;
+    var f1=(Math.min(d.x0,e.clientX)-r.left-a.left)/w, f2=(Math.max(d.x0,e.clientX)-r.left-a.left)/w;
+    f1=Math.max(0,Math.min(1,f1)); f2=Math.max(0,Math.min(1,f2));
+    var end=TIMEEND||Date.now()/1000, s=end-wsecs(WIN), span=end-s;
+    var t1=s+f1*span, t2=s+f2*span;
+    if(t2-t1<30) return;                                   // ignore < 30s selections
+    WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND);
+    document.querySelectorAll("#windows button[data-w]").forEach(function(x){x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    document.querySelectorAll('#win-label,[id$="-win"]').forEach(function(el){ el.textContent="custom"; });
+    if(typeof updateRangeUI==="function") updateRangeUI();
+    rangedReload();
+  });
+})();
 document.getElementById("nav-left").addEventListener("click",()=>{
   const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(WIN);
   updateRangeUI(); rangedReload();
@@ -949,14 +1093,14 @@ document.getElementById("nav-right").addEventListener("click",()=>{
   updateRangeUI(); rangedReload();
 });
 document.getElementById("nav-live").addEventListener("click",()=>{
-  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
+  if(!TIMEEND) return; TIMEEND=null; _winSave(WIN, null); updateRangeUI(); rangedReload();
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
-    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI();
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); updateRangeUI();
     document.getElementById("win-label").textContent=WIN;
-    loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadCorr(); loadImpact(); loadModels();
+    loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -985,6 +1129,8 @@ async function tick(){
   await loadKeyTime();
   await loadKeyDelta();
   await loadUserDelta();
+  await loadConcByKey();
+  await loadBacklogByKey();
   await loadCorr();
   await loadImpact();
   await loadAnomalies();

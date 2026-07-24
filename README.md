@@ -59,7 +59,11 @@ It reads LiteLLM's own accounting and lays it out top-to-bottom:
 - **Usage over time** — requests + tokens as **30-day daily** / **12-month monthly**
   bars, each with **per-year** totals, so growth is visible at a glance. (LiteLLM's
   free tier reports usage, not daily `$`, so the timeline is usage — the `$` split
-  comes from the cost chart below.)
+  comes from the cost chart below.) LiteLLM's free-tier `/global/activity` only serves
+  the **last 7 days**, so AI-Monitoring persists each day locally (`spend_daily`,
+  captured hourly by the sampler regardless of whether anyone opens the page) and
+  serves **stored history ∪ the live window** — the timeline keeps growing past the
+  7-day cap.
 - **Cost over time** — daily tokens × your per-model price, drawn as **real
   (external)** vs **estimated (self-hosted)** series, per-day accurate (an external
   model's cost lands only on days it actually ran), plus a **current-year cost card**.
@@ -134,7 +138,7 @@ attaches a cosign-signed image manifest (`*.txt` + `*.txt.bundle`).
 | `/ollama` | running/installed models, RAM/VRAM, %-on-GPU, per-model params/quant/unload-countdown, over-time charts |
 | `/llamacpp` | tokens/s, active/total slots, busy %, KV-cache %, context size, status, loaded-model card, over-time charts |
 | `/vllm` | **running / waiting** requests (queue depth), **GPU KV-cache %**, **TTFT** + per-token latency, prompt/generation token counters and **preemptions** (>0 = vLLM evicting under memory pressure). Read from vLLM's own `/metrics`; with `VLLM_METRICS_ENABLED=0` the page still shows status + loaded model and says why the counters are absent |
-| `/network` | host **download / upload speed** + **total downloaded / uploaded**, per-interface table (speed, lifetime totals, errors, drops) with the busiest NIC marked *primary*. Reads `/proc/net/dev`; `NETWORK_IFACES` pins which interface(s) to show (default: physical NICs, skipping loopback / veth / bridges / overlay VPNs) |
+| `/network` | host **download / upload speed** + **total downloaded / uploaded** (over the selected time window), per-interface table (speed, lifetime totals, errors, drops) with the busiest NIC marked *primary*. Reads the **host** netns via PID 1 (`/proc/1/net/dev`) — works when the container shares the host PID namespace (`pid: host`, the compose default) or on bare metal; without it the page falls back to the container's own netns and flags the scope as *container* (set `pid: host` to see the host's NICs, or `MONITOR_NET_DEV` to point at a bind-mounted host proc). `NETWORK_IFACES` pins which interface(s) to show (default: physical NICs, skipping loopback / veth / bridges / overlay VPNs) |
 | `/alerts` | configured channel, thresholds, active breaches, **"Send test alert"**, fired-alert history |
 | `/settings` (admin) | Operator tuning applied **live** (no restart): alerts, sampling, retention, LiteLLM/circuit-breaker knobs — drag-to-arrange cards, layout saved in the DB. A **Teams** board — one line per user (**email · team · per-user budget · keys**), ranked by usage, click a name for **ID · username · email · team · keys**; reassign a key's **team** or **user** as a local override (existing users only; LiteLLM untouched). A **Model costs** board — mark each model **real** (external paid) or **estimated** (self-hosted), driving the Spend cost split |
 
@@ -461,10 +465,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.8.1-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.8.5-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.1-armv7 ai-monitoring:1.8.1
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.5-armv7 ai-monitoring:1.8.5
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```

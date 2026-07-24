@@ -51,6 +51,7 @@ _INDEX = _WEB / "index.html"
 _SESSION: web.AppKey = web.AppKey("session", aiohttp.ClientSession)
 _SAMPLER: web.AppKey = web.AppKey("sampler", asyncio.Task)
 _MU_BACKFILL: web.AppKey = web.AppKey("mu_backfill", asyncio.Task)
+_SPEND_CAP: web.AppKey = web.AppKey("spend_cap", asyncio.Task)
 _BACKENDS: web.AppKey = web.AppKey("backends", list)
 
 # In-memory ring of recent merged snapshots (newest last).
@@ -159,6 +160,9 @@ def _metrics_row(snap: dict) -> dict:
         "reqrate": ll.get("req_rate") if ll.get("available") else None,
         "tok_in": ll.get("tok_in_rate") if ll.get("available") else None,
         "tok_out": ll.get("tok_out_rate") if ll.get("available") else None,
+        # total tokens/s — works in lite mode too (full = prompt+completion). Lite has
+        # no prompt/completion split, so tok_in/tok_out stay None there but this fills.
+        "toktot": ll.get("tok_total_rate") if ll.get("available") else None,
         "errrate": ll.get("error_pct") if ll.get("available") else None,
         "costrate": ll.get("cost_rate_hr") if ll.get("available") else None,
         "kvcache": lc.get("kv_cache_pct") if lc.get("available") else None,
@@ -376,6 +380,7 @@ async def _sampling_loop(app: web.Application) -> None:
                 db.prune_metrics()
                 db.prune_key_series()
                 db.prune_spend_model_user()
+                db.prune_spend_daily()
                 db.audit_prune(snap["ts"] - config.AUDIT_RETENTION_DAYS * 86400)
                 last_prune = snap["ts"]
         except asyncio.CancelledError:
@@ -1401,8 +1406,7 @@ async def data_handler(request: web.Request) -> web.Response:
 
 async def series_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "1h")
-    if window not in db.VALID_WINDOWS:
-        window = "1h"
+    window = db.norm_window(window, "1h")
     try:
         pts = int(request.query.get("points", "300"))
     except ValueError:
@@ -1431,8 +1435,7 @@ async def procseries_handler(request: web.Request) -> web.Response:
     if kind not in ("cpu", "ram"):
         kind = "cpu"
     window = request.query.get("window", "1h")
-    if window not in db.VALID_WINDOWS:
-        window = "1h"
+    window = db.norm_window(window, "1h")
     end = _q_end(request)
     resp = {"kind": kind, "window": window,
             **db.proc_series(kind, window, end=end)}
@@ -1447,16 +1450,14 @@ async def cpuseries_handler(request: web.Request) -> web.Response:
     """Per-core CPU% over the selected window (GPU/CPU page's per-core grid). Honours
     the same `window` + `end` (pan) params as the other series endpoints."""
     window = request.query.get("window", "1h")
-    if window not in db.VALID_WINDOWS:
-        window = "1h"
+    window = db.norm_window(window, "1h")
     return web.json_response({"window": window,
                               **db.cpu_core_series(window, end=_q_end(request))})
 
 
 async def keyseries_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "1h")
-    if window not in db.VALID_WINDOWS:
-        window = "1h"
+    window = db.norm_window(window, "1h")
     try:
         pts = int(request.query.get("points", "200"))
     except ValueError:
@@ -1466,14 +1467,57 @@ async def keyseries_handler(request: web.Request) -> web.Response:
     return web.json_response({"window": window, **data})
 
 
+async def keyrequests_handler(request: web.Request) -> web.Response:
+    """CUMULATIVE requests per key over time (the 'Top 10 API keys over time' chart). Reads
+    the local per-(day,model,key) rollup — no /spend/logs pull — so each line is an
+    ever-rising running total, all-time (up to the rollup's 1-year retention), independent
+    of the page's short time-window selector. `metric=cost` returns cumulative spend instead."""
+    top_n = 10
+    try:
+        top_n = max(1, min(int(request.query.get("top", "10")), 20))
+    except ValueError:
+        top_n = 10
+    metric = "cost" if request.query.get("metric") == "cost" else "reqs"
+    end = _q_end(request)
+    data = db.key_cumulative(metric=metric, top_n=top_n, end=end)
+    if metric == "reqs" and not data.get("points"):
+        # off/lite spend mode has NO per-key request counts (only /spend/logs does). Fall
+        # back to the per-key cumulative SPEND recorded in key_series — there top_keys stores
+        # LiteLLM's cumulative total_spend, so the line still only rises — rather than blank.
+        ks = db.key_series("12mo", 400, top_n=top_n, end=end)
+        if ks.get("points"):
+            data = {"labels": ks.get("labels", []), "points": ks["points"], "metric": "spend"}
+    return web.json_response(data)
+
+
+async def concurrency_by_key_handler(request: web.Request) -> web.Response:
+    """Estimated per-key attribution of a proxy-wide aggregate over time (LiteLLM page's
+    'Concurrent work by key' + 'Backlog by key' stacked charts). metric='conc' (default) or
+    'backlog'. The bands sum to the real measured aggregate; the split is by each key's
+    key_series activity share. `weight_basis` says whether that share is requests (full spend
+    mode) or spend (off/lite) so the UI can label it honestly."""
+    metric = "backlog" if request.query.get("metric") == "backlog" else "conc"
+    window = request.query.get("window", "1h")
+    window = db.norm_window(window, "1h")
+    # weight basis: full mode records per-key REQUESTS (already a recent-activity level);
+    # lite/off records per-key CUMULATIVE spend, so the split must weight by the per-bucket
+    # spend DELTA (recent activity) — else a key that only spent in the PAST gets a band for
+    # current work it isn't doing. Determine the basis from the live top-key shape.
+    tk = (_backend_latest.get("litellm", {}) or {}).get("top_keys") or []
+    basis = "requests" if any(k.get("reqs") is not None for k in tk) else "spend"
+    data = db.concurrency_by_key(window, metric, end=_q_end(request),
+                                 cumulative=(basis == "spend"))
+    data["weight_basis"] = basis
+    return web.json_response({"window": window, **data})
+
+
 async def keydelta_handler(request: web.Request) -> web.Response:
     """Timeline of CUMULATIVE requests during the window per top key — each point is
     the running total of requests made since the window start, so the line climbs to
     the key's window total and an idle key is a flat 0 line. Top-N ranked by total
     net requests over the window."""
     window = request.query.get("window", "1h")
-    if window not in db.VALID_WINDOWS:
-        window = "1h"
+    window = db.norm_window(window, "1h")
     try:
         pts = int(request.query.get("points", "200"))
     except ValueError:
@@ -1486,6 +1530,11 @@ async def keydelta_handler(request: web.Request) -> web.Response:
 def _configured(name: str, env_ok: bool) -> bool:
     """A dashboard link is shown when its backend is configured. Prefer the
     latest live sample (handles local GPU auto-detect); fall back to env."""
+    # A backend switched OFF in Settings → Services is treated as not-configured
+    # everywhere (nav link hidden, page gate, alerts) — immediately, without waiting
+    # for the next sample. gpu has no toggle → getattr default True.
+    if not getattr(config, f"{name.upper()}_ENABLED", True):
+        return False
     c = _latest.get("collectors", {}).get(name, {})
     if c:
         return not (c.get("available") is False and c.get("error") == "unconfigured")
@@ -1496,8 +1545,9 @@ def _litellm_configured() -> bool:
     """Spend & Quota is entirely LiteLLM-derived — with no LiteLLM configured the
     link is hidden and the page 404s. Keyed on the env URL (not the live sample):
     "configured" is a deployment fact, so a configured-but-momentarily-down LiteLLM
-    still keeps its Spend link, and the gate is deterministic."""
-    return bool(config.LITELLM_BASE_URL)
+    still keeps its Spend link, and the gate is deterministic. Off in Settings →
+    Services also hides it."""
+    return bool(config.LITELLM_BASE_URL) and config.LITELLM_ENABLED
 
 
 # Sidebar link name per backend path — used to strip an unconfigured backend's link
@@ -1556,8 +1606,7 @@ async def litellm_models_handler(request: web.Request) -> web.Response:
     15m/1h/24h/30d/12mo — including prior days — instead of only the collector's
     fixed rolling window (which is today-only / last-15-min)."""
     window = request.query.get("window", "24h")
-    if window not in db.VALID_WINDOWS:
-        window = "24h"
+    window = db.norm_window(window, "24h")
     now = time.time()
     # /global/activity/model is day-granular: open at the day the window starts,
     # close tomorrow so today is fully covered. A rolling 24h thus spans yesterday
@@ -2671,6 +2720,51 @@ def window_and_years(daily_full: list, window: str, now: float) -> dict:
     return out
 
 
+def _spend_daily_records(daily_live: list | None, daily_cost: dict | None,
+                         daily_tok: dict | None) -> list[dict]:
+    """Per-day rows to persist into db.spend_daily — one per LIVE date, carrying the
+    fully-computed usage + cost + token split. Older days already live in the store, so
+    only the live window is (re)written (idempotent REPLACE keeps today fresh)."""
+    recs = []
+    for r in (daily_live or []):
+        d = str(r.get("date") or "")[:10]
+        if not d:
+            continue
+        c = (daily_cost or {}).get(d) or {}
+        tk = (daily_tok or {}).get(d) or {}
+        recs.append({
+            "date": d, "requests": r.get("requests") or 0,
+            "tokens": r.get("tokens") or 0, "spend": r.get("spend") or 0.0,
+            "real_cost": c.get("real") or 0.0, "est_cost": c.get("est") or 0.0,
+            "tokens_ext": tk.get("ext") or 0.0, "tokens_int": tk.get("int") or 0.0})
+    return recs
+
+
+async def _capture_spend_daily(session: aiohttp.ClientSession, now: float) -> None:
+    """Persist the recent spend window into db.spend_daily on a background cadence, so the
+    Spend timeline keeps every day even if NOBODY opens /spend within LiteLLM's 7-day
+    window (the page write-through only fires when viewed). Cheap lite endpoints; the
+    caller bounds it with wait_for. No-op when LiteLLM is unconfigured."""
+    if not (config.LITELLM_BASE_URL and config.LITELLM_MASTER_KEY):
+        return
+    days = min(config.SPEND_ACTIVITY_DAYS, 14)     # only the live window needs capturing
+    start = time.strftime("%Y-%m-%d", time.gmtime(now - days * 86400))
+    end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+    daily = await litellm.spend_activity(session, start, end)
+    if not daily:
+        return
+    overrides = db.model_kind_overrides()
+    daily_cost = daily_tok = None
+    try:
+        prices = await litellm.model_prices(session)
+        _apply_cost_overrides(prices)
+        daily_cost = await litellm.per_model_daily_cost(session, start, end, prices, overrides)
+        daily_tok = await litellm.per_model_daily_tokens(session, start, end, overrides)
+    except Exception as e:      # cost is best-effort; still persist usage
+        print(f"[spend] capture cost estimate: {type(e).__name__}: {e}", file=sys.stderr)
+    db.spend_daily_upsert(_spend_daily_records(daily, daily_cost, daily_tok), now)
+
+
 async def spend_series_handler(request: web.Request) -> web.Response:
     """Spend over time: daily buckets for 30d, monthly for 12mo, plus per-year
     year-to-date totals. Backed by LiteLLM /global/activity."""
@@ -2689,7 +2783,20 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                           time.gmtime(now - config.SPEND_ACTIVITY_DAYS * 86400))
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
     try:
-        daily = await litellm.spend_activity(request.app[_SESSION], start, end)
+        daily_live = await litellm.spend_activity(request.app[_SESSION], start, end)
+        # Merge LiteLLM's live window (only the LAST 7 DAYS on the free tier) with our own
+        # persisted per-day history (db.spend_daily), so the chart shows far more than
+        # LiteLLM's 7-day cap. Live rows WIN on any overlapping date (freshest); stored rows
+        # fill everything older. See the write-through at the end of the cost block.
+        stored = db.spend_daily_range(start, end)
+        _live_dates = {r["date"] for r in (daily_live or [])}
+        _usage = {r["date"]: {"date": r["date"], "spend": r.get("spend") or 0.0,
+                              "requests": r.get("requests") or 0,
+                              "tokens": r.get("tokens") or 0}
+                  for r in stored}
+        for r in (daily_live or []):
+            _usage[r["date"]] = r
+        daily = sorted(_usage.values(), key=lambda r: r["date"])
         if not daily:
             return web.json_response({"window": window, "available": False,
                                       "points": [], "years": []})
@@ -2709,7 +2816,12 @@ async def spend_series_handler(request: web.Request) -> web.Response:
             # ACCURATE path: per-day per-model tokens → each day's cost from its own model
             # mix, so an external model's cost lands only on the days it actually ran.
             daily_cost = await litellm.per_model_daily_cost(
-                request.app[_SESSION], start, end, prices, overrides)
+                request.app[_SESSION], start, end, prices, overrides) or {}
+            # Overlay persisted cost for the OLDER (non-live) days LiteLLM no longer returns.
+            for r in stored:
+                if r["date"] not in _live_dates and r["date"] not in daily_cost:
+                    daily_cost[r["date"]] = {"real": r.get("real_cost") or 0.0,
+                                             "est": r.get("est_cost") or 0.0}
             if daily_cost:
                 apply_daily_cost(out, daily_cost)
                 out["cost_basis"] = "per-day"
@@ -2738,9 +2850,19 @@ async def spend_series_handler(request: web.Request) -> web.Response:
             out["cost_models"] = cost_model_split(per_model or [])
             # per-day EXTERNAL vs INTERNAL token split, so the usage bar can 2-colour it
             daily_tok = await litellm.per_model_daily_tokens(
-                request.app[_SESSION], start, end, overrides)
+                request.app[_SESSION], start, end, overrides) or {}
+            for r in stored:
+                if r["date"] not in _live_dates and r["date"] not in daily_tok:
+                    daily_tok[r["date"]] = {"ext": r.get("tokens_ext") or 0.0,
+                                            "int": r.get("tokens_int") or 0.0}
             if daily_tok:
                 apply_daily_tokens(out, daily_tok)
+            # Write-through: persist the LIVE window's fully-computed per-day values so they
+            # outlast LiteLLM's 7-day cap and are read back (merged) on later calls. Only
+            # the live dates — older days already came from the store. Idempotent REPLACE.
+            # The background sampler (_capture_spend_daily) does the same on an hourly
+            # cadence so capture never depends on the page being open.
+            db.spend_daily_upsert(_spend_daily_records(daily_live, daily_cost, daily_tok), now)
         except Exception as ce:     # cost is best-effort; usage chart must still render
             print(f"[warn] spend/series cost estimate: {type(ce).__name__}: {ce}",
                   file=sys.stderr)
@@ -2763,6 +2885,21 @@ async def spend_series_handler(request: web.Request) -> web.Response:
         print(f"[error] /api/spend/series {type(e).__name__}: {e}", file=sys.stderr)
         return web.json_response({"window": window, "available": False,
                                   "points": [], "years": [], "error": type(e).__name__})
+
+
+async def spend_keycost_handler(request: web.Request) -> web.Response:
+    """Total spend per key WITHIN the selected window (alias → cost), from the local rollup.
+    Lets the 'Cost by user/key/team' chart follow the page time-window instead of showing
+    LiteLLM's all-time per-key total. LiteLLM-gated like the rest of Spend; no /spend/logs pull."""
+    if not _litellm_configured():
+        raise web.HTTPNotFound()
+    window = request.query.get("window", "30d")
+    if window not in ("30d", "12mo", "month"):
+        window = "30d"
+    end = _q_end(request) or time.time()
+    secs = (end - db.month_start(end)) if window == "month" else db.window_secs(window)
+    days = int(secs // 86400) + 1
+    return web.json_response({"window": window, "cost": db.key_cost_window(days, end=end)})
 
 
 async def spend_model_series_handler(request: web.Request) -> web.Response:
@@ -2884,8 +3021,7 @@ async def anomalies_handler(request: web.Request) -> web.Response:
 
 async def uptime_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "24h")
-    if window not in db.VALID_WINDOWS:
-        window = "24h"
+    window = db.norm_window(window, "24h")
     return web.json_response({
         "window": window,
         "uptime": db.uptime(window),
@@ -2935,8 +3071,7 @@ async def events_handler(request: web.Request) -> web.Response:
 async def export_handler(request: web.Request) -> web.Response:
     """Export a window's series as CSV or JSON for offline analysis."""
     window = request.query.get("window", "24h")
-    if window not in db.VALID_WINDOWS:
-        window = "24h"
+    window = db.norm_window(window, "24h")
     fmt = request.query.get("format", "csv").lower()
     pts = db.series(window, 1000)
     cols = ["t"] + db._METRIC_COLS
@@ -3024,6 +3159,26 @@ async def metrics_handler(request: web.Request) -> web.Response:
 
 
 # --------------------------------------------------------------- lifecycle ----
+async def _spend_capture_loop(app: web.Application) -> None:
+    """Persist the day's spend into db.spend_daily hourly, in its OWN task — decoupled
+    from the main sampling loop so its (bounded) LiteLLM calls can never stall the tick
+    (§6). Captures shortly after startup, then every hour; each run is wait_for-bounded
+    and best-effort. This is why the Spend timeline outlives LiteLLM's 7-day window even
+    when nobody opens /spend."""
+    session: aiohttp.ClientSession = app[_SESSION]
+    await asyncio.sleep(20)                     # let the dashboard + first samples settle
+    while True:
+        try:
+            await asyncio.wait_for(_capture_spend_daily(session, time.time()), 30)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            print("[spend] daily capture exceeded 30s — skipped this hour", file=sys.stderr)
+        except Exception as e:
+            print(f"[spend] daily capture: {type(e).__name__}: {e}", file=sys.stderr)
+        await asyncio.sleep(3600)
+
+
 async def _spend_mu_backfill_once(session: aiohttp.ClientSession) -> None:
     """Seed the per-(model,user) spend rollup with the last N days, ONCE (guarded by a
     settings marker so later restarts never re-pull). Runs in the background after a short
@@ -3037,6 +3192,15 @@ async def _spend_mu_backfill_once(session: aiohttp.ClientSession) -> None:
             return                                          # already seeded
         if not (config.LITELLM_BASE_URL and config.LITELLM_MASTER_KEY):
             return                                          # retry on a later boot
+        # The backfill is a multi-day /spend/logs pull — the SAME heavy call the operator
+        # disables for freeze-safety. Only run it in FULL spend mode; in off/lite skip it
+        # (do NOT mark done, so a later switch to full still backfills). This keeps a
+        # spend-off box from re-freezing its proxy just to seed history.
+        if litellm._spend_mode() != "full":
+            print("[startup] spend model×user backfill skipped — spend mode is not 'full' "
+                  "(/spend/logs disabled); rollup grows forward from live samples",
+                  file=sys.stderr)
+            return
         await asyncio.sleep(15)                             # let the dashboard start first
         rows = await litellm.model_user_backfill(session, config.SPEND_MU_BACKFILL_DAYS)
         now = time.time()
@@ -3075,10 +3239,12 @@ async def _on_startup(app: web.Application) -> None:
     ]
     app[_SAMPLER] = asyncio.create_task(_sampling_loop(app))
     app[_MU_BACKFILL] = asyncio.create_task(_spend_mu_backfill_once(session))
+    app[_SPEND_CAP] = asyncio.create_task(_spend_capture_loop(app))
 
 
 async def _on_cleanup(app: web.Application) -> None:
-    tasks = [app.get(_SAMPLER), app.get(_MU_BACKFILL), *(app.get(_BACKENDS) or [])]
+    tasks = [app.get(_SAMPLER), app.get(_MU_BACKFILL), app.get(_SPEND_CAP),
+             *(app.get(_BACKENDS) or [])]
     for task in tasks:
         if task:
             task.cancel()
@@ -3145,6 +3311,8 @@ def build_app() -> web.Application:
     app.router.add_get("/api/events", events_handler)
     app.router.add_get("/api/stream", stream_handler)
     app.router.add_get("/api/keyseries", keyseries_handler)
+    app.router.add_get("/api/keyrequests", keyrequests_handler)
+    app.router.add_get("/api/litellm/concurrency-by-key", concurrency_by_key_handler)
     app.router.add_get("/api/keydelta", keydelta_handler)
     app.router.add_get("/api/procseries", procseries_handler)
     app.router.add_get("/api/cpuseries", cpuseries_handler)
@@ -3154,6 +3322,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/budgets", budgets_handler)
     app.router.add_get("/api/spend/series", spend_series_handler)
     app.router.add_get("/api/spend/model-series", spend_model_series_handler)
+    app.router.add_get("/api/spend/keycost", spend_keycost_handler)
     app.router.add_get("/api/spend/model-user-series", spend_model_user_series_handler)
     app.router.add_get("/api/alerts", alerts_handler)
     app.router.add_post("/api/alerts/test", alerts_test_handler)

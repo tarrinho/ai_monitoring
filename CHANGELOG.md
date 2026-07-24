@@ -6,6 +6,63 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Drag-to-zoom on every chart (Kibana-style).** Drag horizontally across any chart on the overview / GPU / Ollama / llama.cpp / LiteLLM / vLLM / network pages to set the time window to the selected span. The drag fraction of the current view is mapped to `[t1,t2]` and encoded through the existing window+pan plumbing as `WIN="custom:<secs>"` + `TIMEEND=t2`; the server resolves the custom token in `db.window_secs`/`db.norm_window` (clamped to `[60s, 366d]`) so `start = end − secs` flows through the tiered tables unchanged. A hand-rolled pointer-drag overlay (no new deps) draws the selection band; `<5px` = a click (ignored), `<30s` spans are ignored. New tests `test_drag_to_zoom_wired_on_every_win_page`, `test_custom_window_flows_through_api_and_wsecs_on_every_win_page`, `test_custom_window_secs_parsed_and_clamped`, `test_norm_window_accepts_custom_or_falls_back`.
+- **Per-page time-window persistence now covers custom ranges.** Each page already restored its own named window across refresh (path-keyed `localStorage`); the stored value is now `{w,end}` so a drag-selected custom range restores BOTH the window token and its absolute end (`TIMEEND`) — the zoom survives a reload until a new window is chosen (a window button, **Live**, or a fresh drag). New test `test_custom_window_persistence_is_restored_on_refresh`.
+
+### Fixed
+- **Backlog counted the monitor's own probe → "Concurrent LLM work / Backlog — by key" flooded "Other".** LiteLLM counts the request making the `/health/backlog` call (our own probe) as in-flight, so an idle proxy reported a constant backlog of 1. That baseline sits in EVERY bucket, so on the many buckets with no real request it had no key to attribute to and piled into "Other" (observed live: backlog `{1,2}` across all 60 buckets, real requests in only 5). `_fetch_backlog` now subtracts that self-probe (`in_flight − 1`, floored) so backlog/conc read 0 when idle and the by-key bands attribute to the actually-active keys; `MONITOR_LITELLM_BACKLOG_PROBE_SELFCOUNT=0` disables it for a build that already excludes the measuring request. New test `test_backlog_subtracts_own_probe`.
+- **"Concurrent LLM work — by key" / "LLM Backlog — by key" showed bands with no traffic.** Two causes: (1) in lite/off mode `key_series` holds each key's CUMULATIVE lifetime spend, and the split weighted the instantaneous total by that lifetime value, so a key that only spent in the PAST got a band — now weighted by the per-bucket spend DELTA (recent activity) via a `cumulative` flag on `db.concurrency_by_key`; (2) even so, an idle window still painted an "Other" band from the baseline aggregate (LiteLLM reports a constant backlog of 1 — it counts the monitor's own `/health/backlog` probe as in-flight), so in lite/off mode a window with NO per-key activity now returns empty and the by-key chart hides. Full mode is unchanged (per-key requests are already recent activity; unattributed total still preserved in "Other"). New tests `test_concurrency_by_key_ignores_idle_keys_in_lite_mode`, `test_concurrency_by_key_hides_when_no_activity_despite_baseline_backlog`.
+
+## [1.8.5] — 2026-07-23
+
+### Added
+- **Per-backend monitoring toggles (Settings → Services).** Turn LiteLLM / Ollama / llama.cpp / vLLM monitoring **off** from the dashboard without unsetting its URL. A disabled backend is not polled, is hidden from the sidebar menu + the Spend gate, and fires **no down-alert** (its collector returns the `unconfigured` sentinel, which the alert + nav paths already treat as not-configured). Runtime-tunable + persisted (`*_ENABLED` bool tunables; env `MONITOR_<BACKEND>_ENABLED` sets the boot default); the Settings page now renders bool tunables as an On/Off control. New tests `test_service_toggle_*`, `test_services_toggle_tunables_and_bool_ui`.
+
+## [1.8.4] — 2026-07-23
+
+### Fixed
+- **Sampling-loop lag from the hourly spend capture (§6 observer-effect).** `_capture_spend_daily` ran INLINE in the main sampling loop with a 30s bound, so on a busy proxy its sequential LiteLLM calls stalled the tick — snapshot age was observed spiking to ~60s before recovering. Moved it to its own decoupled background task (`_spend_capture_loop`, hourly, `wait_for`-bounded, cancelled on cleanup) so it can never wedge sampling. New test `test_spend_capture_decoupled_from_sampling_loop`.
+- **Two `/litellm` charts stayed empty in lite spend mode: "Top 10 API keys/users — requests in window".** They plot per-key/user REQUEST counts, which lite/off mode does not have (LiteLLM `/global/spend/keys` reports per-key *spend*, not requests), so the series came back all-zero and drew flat-empty lines. They now auto-hide their card when there is no non-zero request data — matching the mini-charts' empty-hide — so lite instances no longer show two dead graphs (per-key cumulative *spend* is still charted above). New test `test_litellm_request_delta_charts_hide_when_no_request_data`.
+
+## [1.8.3] — 2026-07-23
+
+### Fixed
+- **`/litellm` page was fully broken in the browser (empty charts + dead time-window
+  selector).** `keyTimeChart`'s axis callback reads `_keytimeMetric`, but that `let`
+  was declared *after* the chart was constructed — Chart.js invokes the callback during
+  construction, hitting a temporal-dead-zone `ReferenceError: Cannot access
+  '_keytimeMetric' before initialization`. It threw uncaught and halted the rest of the
+  page script, so no charts finished building and the window-button listeners never
+  wired. Moved the declaration before the chart. The static syntax gate missed it
+  (`new Function()` compiles without executing); new regression test
+  `test_litellm_page_init_executes_without_js_error` runs the page's inline JS with a
+  Chart stub that invokes the callbacks at construction (as the browser does).
+
+- **LiteLLM throughput charts were blank in `lite` spend mode.** The `/litellm`
+  Requests/s + token-rate charts read `/api/series`, but lite mode only fetched the
+  day's running totals and never derived per-second rates (they came only from full
+  mode's `/spend/logs`). Lite now differentiates `/global/activity`'s running totals
+  into **`req_rate`** and a new **total `tok_total_rate`** across polls (reset-safe at
+  UTC midnight), so the **Requests/s** chart fills and a new **Tokens/s** chart
+  populates in both modes. Prompt/completion split, latency percentiles, TTFT, error %,
+  and cost/h remain full-mode only (they need per-request data lite doesn't have). New
+  metric column `toktot`; new tests `test_litellm_lite_derives_throughput_rates`,
+  `test_toktot_series_column_and_row`.
+## [1.8.2] — 2026-07-22
+
+### Added
+- **Spend history now outlasts LiteLLM's 7-day window.** LiteLLM's free-tier
+  `/global/activity` only returns the last 7 days, so the Spend page's usage/cost
+  timeline was capped at a week. A new `spend_daily` SQLite table captures each day and
+  the series is served as **stored history ∪ the live 7-day window** — so history
+  accumulates well past the cap. Capture is **continuous and UI-independent**: the
+  background sampler persists the day hourly (`_capture_spend_daily`) so nothing is lost
+  even if nobody opens `/spend`, and the page also write-throughs whatever it fetches.
+  Retention `SPEND_DAILY_RETENTION_DAYS` (~5y). New tests `test_spend_daily_*`,
+  `test_spend_series_merges_stored_history_beyond_live_window`,
+  `test_capture_spend_daily_*`.
+
 ## [1.8.1] — 2026-07-20
 
 ### Added

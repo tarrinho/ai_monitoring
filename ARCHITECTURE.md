@@ -60,6 +60,7 @@ Each tick (`MONITOR_SAMPLE_INTERVAL`, default 5s):
 | `key_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/keyseries` |
 | `proc_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/procseries` |
 | `samples` | every tick | `MONITOR_DB_RETENTION_HOURS` | boot warm-load |
+| `spend_daily` | sampler hourly (`_capture_spend_daily`) + `/api/spend/series` write-through | `SPEND_DAILY_RETENTION_DAYS` (~5y) | `/api/spend/series` (merged with LiteLLM's live 7-day window) |
 | `events` (`kind` state/model) | on transition / model swap | `ROLLUP_HOUR_DAYS` | `/api/uptime` (state) · `/api/events` (model) |
 | `anomalies` / `alert_log` | on fire | `ROLLUP_HOUR_DAYS` | `/api/anomalies` / `/api/alerts` |
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.1"
+VERSION = "AI-Monitoring_1.8.5"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -118,6 +118,11 @@ MONITOR_DEBUG = (_str("MONITOR_DEBUG", "0") or "0").lower() in ("1", "true", "ye
 LITELLM_BASE_URL   = _str("LITELLM_BASE_URL")           # e.g. http://host:4000
 LITELLM_MASTER_KEY = _str("LITELLM_MASTER_KEY")         # Bearer for /spend,/health
 LITELLM_SPEND_WINDOW_MIN = _int("LITELLM_SPEND_WINDOW_MIN", 15)  # latency window
+# LiteLLM's /health/backlog counts the request making the call (the monitor's own probe)
+# as in-flight, so an idle proxy reports a constant 1. Subtract that self-count so backlog
+# reads 0 when idle (and the by-key attribution stops flooding "Other"). Set 0 only for a
+# LiteLLM build that excludes the measuring request from its own in-flight count.
+LITELLM_BACKLOG_PROBE_SELFCOUNT = (_str("MONITOR_LITELLM_BACKLOG_PROBE_SELFCOUNT", "1") or "1").lower() in ("1", "true", "yes", "on")
 # Optional per-key monthly budgets as JSON {"key-alias": 2000, ...} — drives the
 # Spend & Quota panel until real max_budget is read from LiteLLM /key/info.
 KEY_BUDGETS_JSON   = _str("MONITOR_KEY_BUDGETS", "")
@@ -249,10 +254,33 @@ LLAMACPP_API_KEY  = _str("LLAMACPP_API_KEY")            # optional Bearer
 # stay strictly on the JSON endpoints (up/down + model list only).
 VLLM_BASE_URL     = _str("VLLM_BASE_URL")               # e.g. http://host:8000
 
+# --- per-backend monitoring toggles (Settings → Services) --------------------
+# Turn a configured backend OFF from the dashboard without unsetting its URL: a
+# disabled backend is not polled, is hidden from the sidebar + Spend gate, and never
+# fires a down-alert (its collector reports the "unconfigured" sentinel). Runtime-
+# tunable (persisted); env sets the boot default. Default ON.
+def _envbool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+LITELLM_ENABLED  = _envbool("MONITOR_LITELLM_ENABLED", True)
+OLLAMA_ENABLED   = _envbool("MONITOR_OLLAMA_ENABLED", True)
+LLAMACPP_ENABLED = _envbool("MONITOR_LLAMACPP_ENABLED", True)
+VLLM_ENABLED     = _envbool("MONITOR_VLLM_ENABLED", True)
+
 # --- host network (Ethernet dashboard) ---------------------------------------
 # Comma-separated interface whitelist (e.g. "eth0,eth1"); empty = auto-select
 # physical NICs and skip loopback/virtual/container devices.
 NETWORK_IFACES = _str("NETWORK_IFACES")
+# /proc/net is per-network-namespace, so inside a container it shows only the
+# container's own interfaces (Docker bridge / eth0), NOT the host's NICs. To
+# monitor the HOST, the collector reads PID 1's netns (`/proc/1/net/dev`) — the
+# host's init, visible when the compose sets `pid: host` (already the default,
+# used by the procs collector) or on bare metal — and falls back to its own netns.
+# Override the exact path here only for unusual setups (e.g. a bind-mounted host
+# proc: MONITOR_NET_DEV=/host/proc/1/net/dev).
+NET_DEV_PATH = _str("MONITOR_NET_DEV", "")
 VLLM_API_KEY      = _str("VLLM_API_KEY")                # optional Bearer
 VLLM_METRICS_ENABLED = (_str("VLLM_METRICS_ENABLED", "1") or "1").lower() in (
     "1", "true", "yes", "on")
@@ -386,6 +414,11 @@ def validate(user_count: int = 0) -> list[str]:
 # tunable(name), never the bare module constant, so a UI change applies without a
 # restart. Keys are the config attribute name; `def` is the env-derived default.
 TUNABLES: dict[str, dict] = {
+    # ── Services: turn a backend's monitoring off (hidden from menu + alerts) ──
+    "LITELLM_ENABLED":  {"t": "bool", "def": LITELLM_ENABLED,  "group": "Services", "label": "Monitor LiteLLM",  "help": "Off = not polled, hidden from menu + Spend, no down-alert"},
+    "OLLAMA_ENABLED":   {"t": "bool", "def": OLLAMA_ENABLED,   "group": "Services", "label": "Monitor Ollama",   "help": "Off = not polled, hidden from menu, no down-alert"},
+    "LLAMACPP_ENABLED": {"t": "bool", "def": LLAMACPP_ENABLED, "group": "Services", "label": "Monitor llama.cpp", "help": "Off = not polled, hidden from menu, no down-alert"},
+    "VLLM_ENABLED":     {"t": "bool", "def": VLLM_ENABLED,     "group": "Services", "label": "Monitor vLLM",     "help": "Off = not polled, hidden from menu, no down-alert"},
     # ── Phase 1: alert thresholds (0 = off) ──
     "ALERT_CPU_PCT":  {"t": "float", "def": ALERT_CPU_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "CPU % ≥", "help": "Fire when host CPU ≥ this (0 = off)"},
     "ALERT_MEM_PCT":  {"t": "float", "def": ALERT_MEM_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "Memory % ≥", "help": "Host RAM used ≥ this"},

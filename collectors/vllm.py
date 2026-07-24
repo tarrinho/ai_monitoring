@@ -108,6 +108,8 @@ def _pick(m: dict, *names: str) -> float | None:
 
 
 async def sample(session: aiohttp.ClientSession) -> dict:
+    if not config.VLLM_ENABLED:
+        return unconfigured()          # monitoring turned off in Settings → Services
     base = (config.VLLM_BASE_URL or "").rstrip("/")
     if not base:
         return unconfigured()

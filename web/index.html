@@ -156,6 +156,9 @@ function updateSeries(chart,labels,next){
     body:not(.sb-collapsed) #sidebar{transform:none}
     #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
   }
+  .chart-wrap{position:relative}
+  .drag-sel{position:absolute;background:rgba(88,166,255,.18);border:1px solid var(--accent);
+    pointer-events:none;z-index:6;border-radius:2px}
 </style>
 <script>
 /* day/night — applied on every page; choice shared via localStorage */
@@ -227,7 +230,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.1</div>
+      <div id="sidebar-brand-ver">v1.8.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -871,11 +874,36 @@ function renderLlamacpp(c){
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
-function wsecs(w){return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
-let WIN = "1h";
+function wsecs(w){ if(typeof w==="string"&&w.indexOf("custom:")===0){var cs=parseInt(w.slice(7),10); if(cs>0) return cs;} return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
+// Per-page time window: remember the user's choice for THIS page (path-keyed) so a
+// refresh keeps it, and each page keeps its OWN window (not shared site-wide). Falls
+// back to the page default when nothing is saved or the saved value isn't a valid button.
+function _winKey(){ return "aimon-win:"+location.pathname; }
+function _winCustom(w){ return typeof w==="string" && w.indexOf("custom:")===0 && parseInt(w.slice(7),10)>0; }
+// Persist {w,end}: a named window (end=null -> live) OR a drag-selected custom range
+// ("custom:<secs>" + absolute end t2). Restored on refresh so each page keeps its OWN
+// window/zoom until a NEW one is chosen (window button, Live, or a fresh drag).
+function _winSave(w, end){ try{ localStorage.setItem(_winKey(), JSON.stringify({w:w, end:(end||null)})); }catch(e){} }
+function _winRestore(sel, def, labelId){
+  var s=null; try{ s=JSON.parse(localStorage.getItem(_winKey())||"null"); }catch(e){}
+  var w=s&&s.w;
+  if(_winCustom(w)){
+    TIMEEND=(s&&s.end)||null;                 // absolute custom range persists across refresh
+    document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
+      x.classList.remove("active"); x.setAttribute("aria-pressed","false"); });
+    if(labelId){ var lc=document.getElementById(labelId); if(lc) lc.textContent="custom"; }
+    return w;
+  }
+  if(!(w && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
+  document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
+    var on=x.dataset.w===w; x.classList.toggle("active",on); x.setAttribute("aria-pressed", on?"true":"false"); });
+  if(labelId){ var l=document.getElementById(labelId); if(l) l.textContent=w; }
+  return w;
+}
+let WIN = _winRestore("#windows", "1h", "win-label");
 
 async function api(path){
-  if(TIMEEND && /\/api\/(series|keyseries|procseries)/.test(path))
+  if(TIMEEND && path.indexOf("window=")>=0)
     path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
   try{
     const sep = path.includes("?") ? "&" : "?";
@@ -985,6 +1013,41 @@ function updateRangeUI(){
   const m=Math.round((now-TIMEEND)/60);
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
+// ---- drag-to-zoom: drag across ANY chart to set a custom time window (Kibana-style) ----
+(function(){
+  var dg=null;
+  function chartOf(cv){ return (window.Chart && Chart.getChart) ? Chart.getChart(cv) : null; }
+  function place(x){
+    if(!dg) return; var a=dg.ch.chartArea, r=dg.cv.getBoundingClientRect();
+    var lo=Math.max(a.left, Math.min(dg.x0,x)-r.left), hi=Math.min(a.right, Math.max(dg.x0,x)-r.left);
+    dg.ov.style.left=lo+"px"; dg.ov.style.width=Math.max(0,hi-lo)+"px";
+    dg.ov.style.top=a.top+"px"; dg.ov.style.height=(a.bottom-a.top)+"px";
+  }
+  document.addEventListener("pointerdown",function(e){
+    if(e.button) return;
+    var wrap=e.target.closest && e.target.closest(".chart-wrap"); if(!wrap) return;
+    var cv=wrap.querySelector("canvas"); if(!cv) return;
+    var ch=chartOf(cv); if(!ch||!ch.chartArea) return;
+    var ov=document.createElement("div"); ov.className="drag-sel"; wrap.appendChild(ov);
+    dg={wrap:wrap,cv:cv,ch:ch,x0:e.clientX,ov:ov}; place(e.clientX); e.preventDefault();
+  });
+  document.addEventListener("pointermove",function(e){ if(dg) place(e.clientX); });
+  document.addEventListener("pointerup",function(e){
+    if(!dg) return; var d=dg; dg=null; if(d.ov.parentNode) d.ov.parentNode.removeChild(d.ov);
+    if(Math.abs(e.clientX-d.x0)<5) return;                 // a click, not a drag
+    var a=d.ch.chartArea, r=d.cv.getBoundingClientRect(), w=a.right-a.left; if(w<=0) return;
+    var f1=(Math.min(d.x0,e.clientX)-r.left-a.left)/w, f2=(Math.max(d.x0,e.clientX)-r.left-a.left)/w;
+    f1=Math.max(0,Math.min(1,f1)); f2=Math.max(0,Math.min(1,f2));
+    var end=TIMEEND||Date.now()/1000, s=end-wsecs(WIN), span=end-s;
+    var t1=s+f1*span, t2=s+f2*span;
+    if(t2-t1<30) return;                                   // ignore < 30s selections
+    WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND);
+    document.querySelectorAll("#windows button[data-w]").forEach(function(x){x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    document.querySelectorAll('#win-label,[id$="-win"]').forEach(function(el){ el.textContent="custom"; });
+    if(typeof updateRangeUI==="function") updateRangeUI();
+    rangedReload();
+  });
+})();
 document.getElementById("nav-left").addEventListener("click",()=>{
   const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(WIN);
   updateRangeUI(); rangedReload();
@@ -995,12 +1058,12 @@ document.getElementById("nav-right").addEventListener("click",()=>{
   updateRangeUI(); rangedReload();
 });
 document.getElementById("nav-live").addEventListener("click",()=>{
-  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
+  if(!TIMEEND) return; TIMEEND=null; _winSave(WIN, null); updateRangeUI(); rangedReload();
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
-    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; updateRangeUI(); setWinLabels();
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); updateRangeUI(); setWinLabels();
     loadSeries(); loadUptime(); loadProcEvo();
   });
 });

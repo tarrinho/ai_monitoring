@@ -5,6 +5,7 @@
 # simplest and keeps the schema stable as panels evolve. Old rows pruned by age.
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sqlite3
@@ -223,14 +224,36 @@ CREATE TABLE IF NOT EXISTS spend_model_user_daily (
     alias   TEXT,
     cost    REAL NOT NULL,
     tokens  REAL NOT NULL,
+    reqs    REAL NOT NULL DEFAULT 0,   -- request count per (day,model,key)
     updated REAL,
     PRIMARY KEY(day, model, key)
 );
 CREATE INDEX IF NOT EXISTS idx_smud_day ON spend_model_user_daily(day);
+
+-- Per-DAY usage + cost totals for the Spend page's "usage/cost over time" chart.
+-- LiteLLM's free-tier /global/activity only returns the LAST 7 DAYS, so the chart is
+-- otherwise capped at a week. This table captures each day as it is seen (write-through
+-- from the spend-series build) and is read back MERGED with the live 7-day window, so
+-- history accumulates well past LiteLLM's cap. One row per calendar day (idempotent
+-- UPSERT-REPLACE — the source always reports the whole day). Pruned to SPEND_DAILY_RETENTION_DAYS.
+CREATE TABLE IF NOT EXISTS spend_daily (
+    date        TEXT PRIMARY KEY,   -- YYYY-MM-DD (UTC)
+    requests    REAL,
+    tokens      REAL,
+    spend       REAL,               -- LiteLLM's actual cash for the day (0 on free tier)
+    tokens_ext  REAL,               -- external-model tokens (2-colour usage bar)
+    tokens_int  REAL,               -- self-hosted tokens
+    real_cost   REAL,               -- external paid $ (estimated from tokens×price)
+    est_cost    REAL,               -- self-hosted estimated $
+    updated     REAL
+);
 """
 
 # Retention for the per-(day,model,key) spend rollup — 1 year of daily buckets.
 SPEND_MU_RETENTION_DAYS = 366
+# Retention for the per-day usage/cost history (Spend "over time"). Long by design —
+# the whole point is to outlast LiteLLM's 7-day window; default ~5 years.
+SPEND_DAILY_RETENTION_DAYS = 1826
 
 # Columns charted over time (order must match _METRIC_COLS in queries).
 _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
@@ -240,7 +263,7 @@ _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
                 # host network down/up rates (bytes/sec)
                 "net_down", "net_up",
                 # Tier A + efficiency
-                "reqrate", "tok_in", "tok_out", "errrate", "vram_pct",
+                "reqrate", "tok_in", "tok_out", "toktot", "errrate", "vram_pct",
                 "costrate", "kvcache", "tokwatt", "backlog",
                 "ttft", "cachehit",
                 # latency percentiles (#2)
@@ -271,14 +294,45 @@ def month_start(ref: float | None = None) -> float:
                   + lt.tm_min * 60 + lt.tm_sec)
 
 
+# Bounds for a drag-selected custom window (chart drag-to-zoom). Min 60s so a bucket
+# grid is meaningful; max = 1 year (matches the rollup retention).
+CUSTOM_WIN_MIN = 60
+CUSTOM_WIN_MAX = 366 * 86400
+
+
+def _custom_secs(window: str) -> int | None:
+    """If `window` is a drag-selected 'custom:<secs>' token, return the clamped seconds;
+    else None. Lets an arbitrary time range flow through the same named-window plumbing."""
+    if not isinstance(window, str) or not window.startswith("custom:"):
+        return None
+    try:
+        return max(CUSTOM_WIN_MIN, min(CUSTOM_WIN_MAX, int(float(window[7:]))))
+    except (TypeError, ValueError):
+        return None
+
+
 def window_secs(window: str, ref: float | None = None) -> float:
     """Seconds spanned by a window. Fixed durations come from WINDOWS; the special
     'month' window is MONTH-TO-DATE (from the 1st of the current UTC month), so its
-    length grows through the month — used to reconcile against a provider's monthly bill."""
+    length grows through the month — used to reconcile against a provider's monthly bill.
+    A 'custom:<secs>' token (chart drag-to-zoom) spans that many seconds, clamped."""
+    cs = _custom_secs(window)
+    if cs is not None:
+        return float(cs)
     if window == "month":
         ref = time.time() if ref is None else ref
         return max(60.0, ref - month_start(ref))
     return float(WINDOWS.get(window, WINDOWS["1h"]))
+
+
+def norm_window(window: str, default: str = "1h") -> str:
+    """Validate an incoming window: a named window, or a clamped 'custom:<secs>' token.
+    Anything else falls back to `default`. Used by every windowed API handler so drag-zoom
+    ranges pass through while junk is rejected."""
+    cs = _custom_secs(window)
+    if cs is not None:
+        return "custom:%d" % cs
+    return window if window in VALID_WINDOWS else default
 
 
 # Every window the API/series layer accepts (WINDOWS + the dynamic 'month').
@@ -322,6 +376,17 @@ def init() -> None:
                         pass
         # events.kind: split up/down transitions ('state') from model load/unload
         # ('model') so the model timeline never pollutes the uptime calc.
+        # spend_model_user_daily.reqs: per-key request count (drives the cumulative
+        # "Top 10 API keys over time" chart). Existing rows keep reqs=0; the column
+        # populates from live full-mode folds going forward. Do NOT clear the
+        # spend_mu_backfill marker here — that would re-run the 14-day /spend/logs
+        # backfill on upgrade, which is the heavy pull a spend-off box disabled on
+        # purpose (freeze safety). Not worth re-freezing the proxy to fill 14 days.
+        if "reqs" not in {r[1] for r in conn.execute("PRAGMA table_info(spend_model_user_daily)")}:
+            try:
+                conn.execute("ALTER TABLE spend_model_user_daily ADD COLUMN reqs REAL NOT NULL DEFAULT 0")
+            except Exception:
+                pass
         if "kind" not in {r[1] for r in conn.execute("PRAGMA table_info(events)")}:
             try:
                 conn.execute("ALTER TABLE events ADD COLUMN kind TEXT DEFAULT 'state'")
@@ -629,6 +694,120 @@ def key_rate_baselines(recent_s: float = 300.0,
         return out
     except Exception:
         return {}
+
+
+def concurrency_by_key(window: str, metric: str, max_points: int = 200,
+                       top_n: int = 8, end: float | None = None,
+                       cumulative: bool = False) -> dict[str, Any]:
+    """ESTIMATED per-key attribution of a proxy-wide aggregate over time.
+
+    `metric` is 'conc' (concurrent LLM work) or 'backlog' (in-flight requests). LiteLLM
+    reports ONE total for these with no per-key breakdown, so each time bucket's total is
+    SPLIT across the top-N keys by their share of key_series activity in that bucket
+    (requests in full spend mode; in off/lite key_series holds CUMULATIVE spend, so with
+    `cumulative=True` the caller has us weight by the per-bucket spend DELTA = recent
+    activity, NOT the lifetime total — else idle-but-once-active keys get phantom bands).
+    The stacked bands therefore sum to the
+    real measured aggregate; only the split is inferred. Activity we can't attribute to a
+    top-N key (or any key) goes to 'Other', so the total height always equals the aggregate.
+
+    key_series + the metrics series bucket on the SAME grid (CAST((t-start)/bsize)), so the
+    two reads align by bucket index. Returns {labels, metric, series:[{label,data}]}."""
+    if metric not in ("conc", "backlog"):
+        return {"labels": [], "metric": metric, "series": []}
+    secs = window_secs(window)
+    end = end or time.time()
+    start = end - secs
+    bsize = max(1.0, secs / max_points)
+    if secs <= WINDOWS["1h"]:
+        mtab, ktab, tc = "metrics", "key_series", "ts"
+    elif secs <= WINDOWS["24h"]:
+        mtab, ktab, tc = "metrics_1m", "key_series_1m", "bucket"
+    else:
+        mtab, ktab, tc = "metrics_1h", "key_series_1h", "bucket"
+    try:
+        with _connect() as conn:
+            agg = conn.execute(
+                f"SELECT CAST(({tc}-?)/? AS INT) bkt, AVG({tc}), AVG({metric}) "
+                f"FROM {mtab} WHERE {tc}>=? AND {tc}<=? GROUP BY bkt ORDER BY bkt",
+                (start, bsize, start, end)).fetchall()
+            krows = conn.execute(
+                f"SELECT CAST(({tc}-?)/? AS INT) bkt, label, AVG(reqs) "
+                f"FROM {ktab} WHERE {tc}>=? AND {tc}<=? GROUP BY bkt, label",
+                (start, bsize, start, end)).fetchall()
+        aggv: dict[int, float] = {}
+        ts: dict[int, float] = {}
+        for bkt, t, v in agg:
+            if v is None:
+                continue
+            aggv[bkt] = float(v)
+            ts[bkt] = t
+        if not aggv:
+            return {"labels": [], "metric": metric, "series": []}
+        weights: dict[int, dict[str, float]] = {}
+        for bkt, label, val in krows:
+            weights.setdefault(bkt, {})[label] = float(val or 0)
+        if cumulative:
+            # key_series stored a CUMULATIVE per-key value (lite/off = lifetime spend).
+            # Weighting instantaneous concurrency by a lifetime total attributes work to
+            # keys that only spent in the PAST — so convert each key's series to per-bucket
+            # DELTAS (spend DURING the bucket = recent activity). Idle keys → 0 → no band.
+            labels = {lab for bw in weights.values() for lab in bw}
+            for lab in labels:
+                prev = None
+                for bkt in sorted(weights):
+                    if lab not in weights[bkt]:
+                        continue
+                    cur = weights[bkt][lab]
+                    weights[bkt][lab] = max(0.0, cur - prev) if prev is not None else 0.0
+                    prev = cur                       # baseline against the raw cumulative
+        totals: dict[str, float] = {}
+        for bw in weights.values():
+            for label, f in bw.items():
+                totals[label] = totals.get(label, 0.0) + f
+        # Lite/off only: no per-key SPEND activity across the whole window (an idle hour)
+        # → return empty so the by-key chart HIDES, rather than painting an "Other" band
+        # from a baseline aggregate that isn't real per-key work (e.g. a constant backlog
+        # of 1 from LiteLLM counting the monitor's own /health/backlog probe as in-flight).
+        # Full mode keeps the "unattributed → Other preserves the total" behaviour.
+        if cumulative and not any(v > 0 for v in totals.values()):
+            return {"labels": [], "metric": metric, "series": []}
+        # Drop excluded labels (MONITOR_EXCLUDE_KEYS — the monitor's own key etc.) from
+        # TOP-N candidacy, same as key_series()/key_series_window_delta() already do.
+        # This function was missing that filter: a key added to MONITOR_EXCLUDE_KEYS
+        # (or the monitor's own self/probe traffic recorded before the config existed)
+        # still had rows in key_series from BEFORE it was excluded, and — unlike every
+        # other by-key chart — kept surfacing here as its own named band instead of
+        # being hidden. Its weight stays in `weights`/`tot` below (so the proportional
+        # split for the real, non-excluded keys is unaffected); only dropping it from
+        # `top` means its share now correctly flows into 'Other' like any other
+        # unattributed activity, instead of leaking through as a labelled key.
+        top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
+               if not config.key_excluded(lab)][:top_n]
+        buckets = sorted(aggv)
+        data: dict[str, list] = {lab: [] for lab in top}
+        other: list = []
+        for b in buckets:
+            a = aggv[b]
+            bw = weights.get(b, {})
+            tot = sum(bw.values())
+            if tot <= 0:                          # aggregate present but nothing to attribute
+                for lab in top:
+                    data[lab].append(0.0)
+                other.append(round(a, 3))         # keep the real total as unattributed
+                continue
+            assigned = 0.0
+            for lab in top:
+                band = round(a * (bw.get(lab, 0.0) / tot), 3)
+                data[lab].append(band)
+                assigned += band
+            other.append(round(max(0.0, a - assigned), 3))
+        series = [{"label": lab, "data": data[lab]} for lab in top]
+        if any(o > 0 for o in other):
+            series.append({"label": "Other", "data": other})
+        return {"labels": [ts[b] for b in buckets], "metric": metric, "series": series}
+    except Exception:
+        return {"labels": [], "metric": metric, "series": []}
 
 
 def insert_proc_series(ts: float, kind: str, items: list[dict],
@@ -1188,16 +1367,16 @@ def spend_model_user_upsert(rows: list[dict[str, Any]], now: float) -> None:
     try:
         payload = [(str(r["day"])[:10], str(r["model"])[:200], str(r["key"])[:200],
                     str(r.get("alias") or "")[:120], float(r.get("cost") or 0),
-                    float(r.get("tokens") or 0), now) for r in rows]
+                    float(r.get("tokens") or 0), float(r.get("reqs") or 0), now) for r in rows]
     except (KeyError, TypeError, ValueError):
         return
     try:
         with _connect() as conn:
             conn.executemany(
-                "INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,updated) "
-                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(day,model,key) DO UPDATE SET "
+                "INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs,updated) "
+                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(day,model,key) DO UPDATE SET "
                 "alias=excluded.alias, cost=excluded.cost, tokens=excluded.tokens, "
-                "updated=excluded.updated", payload)
+                "reqs=excluded.reqs, updated=excluded.updated", payload)
     except Exception:
         pass
 
@@ -1218,6 +1397,79 @@ def spend_model_user_rows(days_back: int, end: float | None = None) -> list[dict
         return []
 
 
+def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
+                   end: float | None = None) -> dict[str, Any]:
+    """CUMULATIVE per-key metric over time, from the persisted per-(day,model,key) rollup.
+
+    `metric` is "reqs" (request count, the default — drives 'Top 10 API keys over time')
+    or "cost". Each point is a key's running total up to that day, so every line only ever
+    RISES (never the rolling-window decay of the live request-rate view). Keys are labelled
+    by alias (falling back to the key hash) and ranked by their total over the span; the
+    top-N are returned. Day-granular; reads the local rollup only (no /spend/logs pull).
+
+    Returns {"labels": [...top-N...], "metric": <metric>, "points": [{t, <label>: cum, ...}]}
+    with `t` the UTC epoch of each day. Empty on error / unknown metric / no data."""
+    col = {"reqs": "reqs", "cost": "cost"}.get(metric)
+    if col is None:
+        return {"labels": [], "metric": metric, "points": []}
+    ndp = 0 if col == "reqs" else 4          # requests are whole numbers; cost keeps cents
+    end = end or time.time()
+    start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                f"SELECT day, COALESCE(NULLIF(alias,''), key) AS label, SUM({col}) v "
+                "FROM spend_model_user_daily WHERE day >= ? "
+                "GROUP BY day, label ORDER BY day", (start_day,)).fetchall()
+        if not rows:
+            return {"labels": [], "metric": metric, "points": []}
+        # rank keys by total over the span; keep the top-N
+        totals: dict[str, float] = {}
+        days: list[str] = []
+        by_day: dict[str, dict[str, float]] = {}
+        for day, label, val in rows:
+            totals[label] = totals.get(label, 0.0) + float(val or 0)
+            d = by_day.setdefault(day, {})
+            d[label] = d.get(label, 0.0) + float(val or 0)
+            if day not in days:
+                days.append(day)
+        top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])[:top_n]]
+        if not top:
+            return {"labels": [], "metric": metric, "points": []}
+        # accumulate each top key's daily value into a running total across the days
+        cum: dict[str, float] = {lab: 0.0 for lab in top}
+        pts: list[dict[str, Any]] = []
+        for day in days:
+            t = float(calendar.timegm(time.strptime(day, "%Y-%m-%d")))
+            d = by_day.get(day, {})
+            for lab in top:
+                cum[lab] += float(d.get(lab, 0.0))
+            pt: dict[str, Any] = {"t": t}
+            for lab in top:
+                pt[lab] = round(cum[lab], ndp)
+            pts.append(pt)
+        return {"labels": top, "metric": metric, "points": pts}
+    except Exception:
+        return {"labels": [], "metric": metric, "points": []}
+
+
+def key_cost_window(days_back: int, end: float | None = None) -> dict[str, float]:
+    """Total spend per key WITHIN the window (last `days_back` days), from the persisted
+    per-(day,model,key) rollup. Keyed by alias (falling back to the key hash) to match the
+    /api/budgets key rows. Powers the windowed 'Cost by user/key/team' chart so it follows
+    the page time-window instead of showing LiteLLM's all-time per-key total. Empty on error."""
+    end = end or time.time()
+    start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(NULLIF(alias,''), key) AS label, SUM(cost) c "
+                "FROM spend_model_user_daily WHERE day >= ? GROUP BY label", (start_day,)).fetchall()
+        return {r[0]: round(float(r[1] or 0), 4) for r in rows}
+    except Exception:
+        return {}
+
+
 def prune_spend_model_user() -> int:
     """Drop rollup rows older than the 1-year retention. Returns rows removed."""
     cutoff = time.strftime(
@@ -1226,6 +1478,69 @@ def prune_spend_model_user() -> int:
         with _connect() as conn:
             cur = conn.execute(
                 "DELETE FROM spend_model_user_daily WHERE day < ?", (cutoff,))
+            return cur.rowcount or 0
+    except Exception:
+        return 0
+
+
+# ── per-DAY usage+cost history (Spend "over time" chart, past LiteLLM's 7-day cap) ──
+_SPEND_DAILY_COLS = ("requests", "tokens", "spend", "tokens_ext", "tokens_int",
+                     "real_cost", "est_cost")
+
+
+def spend_daily_upsert(rows: list[dict[str, Any]], now: float) -> None:
+    """REPLACE per-day usage+cost totals. Idempotent: the source always reports the
+    whole day, so overwriting a date can't double-count. Each row needs `date`
+    (YYYY-MM-DD) plus any of _SPEND_DAILY_COLS (missing → 0.0). No-op on empty/error
+    — this is best-effort history capture, never allowed to break the page."""
+    if not rows:
+        return
+    payload = []
+    for r in rows:
+        d = str((r or {}).get("date") or "")[:10]
+        if not d:
+            continue
+        payload.append((d, *[float(r.get(c) or 0) for c in _SPEND_DAILY_COLS], now))
+    if not payload:
+        return
+    cols = ",".join(_SPEND_DAILY_COLS)
+    setter = ", ".join(f"{c}=excluded.{c}" for c in _SPEND_DAILY_COLS)
+    try:
+        with _connect() as conn:
+            conn.executemany(
+                f"INSERT INTO spend_daily(date,{cols},updated) "
+                f"VALUES (?,{','.join('?' for _ in _SPEND_DAILY_COLS)},?) "
+                f"ON CONFLICT(date) DO UPDATE SET {setter}, updated=excluded.updated",
+                payload)
+    except Exception:
+        pass
+
+
+def spend_daily_range(start: str, end: str) -> list[dict[str, Any]]:
+    """Stored per-day rows with start <= date <= end (YYYY-MM-DD), sorted by date.
+    Empty on error — the caller falls back to the live 7-day window."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                f"SELECT date,{','.join(_SPEND_DAILY_COLS)} FROM spend_daily "
+                "WHERE date >= ? AND date <= ? ORDER BY date", (start[:10], end[:10]))
+            out = []
+            for row in cur.fetchall():
+                rec = {"date": row[0]}
+                rec.update({c: row[i + 1] for i, c in enumerate(_SPEND_DAILY_COLS)})
+                out.append(rec)
+            return out
+    except Exception:
+        return []
+
+
+def prune_spend_daily() -> int:
+    """Drop day rows older than the retention horizon. Returns rows removed."""
+    cutoff = time.strftime(
+        "%Y-%m-%d", time.gmtime(time.time() - SPEND_DAILY_RETENTION_DAYS * 86400))
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM spend_daily WHERE date < ?", (cutoff,))
             return cur.rowcount or 0
     except Exception:
         return 0

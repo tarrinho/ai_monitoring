@@ -429,6 +429,7 @@ async def test_litellm_heavy_calls_are_throttled(monkeypatch):
     try:
         monkeypatch.setattr(config, "LITELLM_BASE_URL",
                             str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
         monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
         monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)  # never re-fetch
         async with aiohttp.ClientSession() as s:
@@ -995,6 +996,7 @@ async def test_litellm_spend_can_be_disabled(monkeypatch):
     try:
         monkeypatch.setattr(config, "LITELLM_BASE_URL",
                             str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
         monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
         monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)
         monkeypatch.setattr(config, "LITELLM_SPEND_ENABLED", False)
@@ -1005,6 +1007,157 @@ async def test_litellm_spend_can_be_disabled(monkeypatch):
         assert out["available"] is True and out["backlog"] == 1
     finally:
         await srv.close()
+
+
+async def test_litellm_off_mode_still_lists_keys_cheaply(monkeypatch):
+    """Regression (live box: per-key charts empty): with SPEND_ENABLED=0 the HEAVY
+    /spend/logs pull is off, but the per-key list must STILL populate from the cheap
+    /global/spend/keys aggregate — so Top keys/users/over-time aren't blank on a
+    freeze-safe (spend-off) config. /spend/logs must NOT be hit."""
+    hits = {"logs": 0, "keys": 0}
+
+    async def _logs(_r): hits["logs"] += 1; return web.json_response([])
+    async def _keys(_r):
+        hits["keys"] += 1
+        return web.json_response([
+            {"api_key": "hA", "key_alias": "alice", "total_spend": 5.0},
+            {"api_key": "hB", "key_alias": "bob", "total_spend": 2.0}])
+    async def _live(_r): return web.json_response({"status": "healthy"})
+    async def _models(_r): return web.json_response({"data": []})
+    async def _bk(_r): return web.json_response({"in_flight_requests": 0})
+
+    app = web.Application()
+    for p, fn in (("/health/liveliness", _live), ("/v1/models", _models),
+                  ("/health/backlog", _bk), ("/spend/logs", _logs),
+                  ("/global/spend/keys", _keys)):
+        app.router.add_get(p, fn)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LITELLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
+        monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)
+        monkeypatch.setattr(config, "LITELLM_SPEND_ENABLED", False)   # → mode 'off'
+        async with aiohttp.ClientSession() as s:
+            out = await litellm.sample(s)
+        assert hits["logs"] == 0, "heavy /spend/logs must NOT run in off mode"
+        assert hits["keys"] == 1, "cheap /global/spend/keys must still run to list keys"
+        tk = out.get("top_keys") or []
+        assert {k["alias"] for k in tk} == {"alice", "bob"}, "per-key list must populate in off mode"
+        assert all(k["reqs"] is None for k in tk)   # off/lite exposes spend, not requests
+    finally:
+        await srv.close()
+
+
+def test_keyrequests_falls_back_to_spend_when_no_request_data(tmp_path, monkeypatch):
+    """/api/keyrequests plots cumulative REQUESTS from the rollup; when that's empty
+    (off/lite mode has no per-key request counts) it falls back to per-key cumulative
+    SPEND from key_series (metric='spend') so the chart is never blank."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kr.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    # no rollup rows (reqs) — but key_series has cumulative-spend snapshots (off/lite).
+    # Span >1h so the 12mo fallback (which reads the 1h tier) has data after rollup().
+    for i in range(80):
+        db.insert_key_series(now - 80 * 90 + i * 90,
+                             [{"key": "hA", "alias": "alice", "cost": 1.0 + i}])
+    db.rollup()                       # populate key_series_1h (runs every 60s in prod)
+    import asyncio
+
+    class _Req:
+        def __init__(self, q): self.query = q
+    import app as _app
+    monkeypatch.setattr(_app, "_q_end", lambda r: now)
+    r = asyncio.run(_app.keyrequests_handler(_Req({})))
+    import json as _json
+    d = _json.loads(r.body.decode())
+    assert d["metric"] == "spend", "must fall back to spend when no request data"
+    assert "alice" in d["labels"] and d["points"], "fallback series must not be empty"
+
+
+def test_concurrency_by_key_attribution_sums_to_aggregate(tmp_path, monkeypatch):
+    """The 'Concurrent work / Backlog by key' stacked charts estimate per-key attribution:
+    each bucket's bands must SUM to the real measured aggregate (conc/backlog), split by each
+    key's key_series activity share. Guards the invariant that the stack height == the true
+    total (only the split is inferred)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk.db"))
+    db.init()
+    now = 9_000_000.0
+    for i in range(10):
+        t = now - 600 + i * 60
+        with db._connect() as c:
+            c.execute("INSERT INTO metrics(ts,conc,backlog) VALUES (?,?,?)", (t, 10.0, 4.0))
+        db.insert_key_series(t, [{"key": "hA", "alias": "alice", "reqs": 6},
+                                 {"key": "hB", "alias": "bob", "reqs": 2}])
+    out = db.concurrency_by_key("1h", "conc", end=now)
+    assert {s["label"] for s in out["series"]} == {"alice", "bob"}
+    last = {s["label"]: s["data"][-1] for s in out["series"]}
+    assert last == {"alice": 7.5, "bob": 2.5}                 # 6/8 and 2/8 of conc=10
+    assert round(sum(last.values()), 2) == 10.0               # bands sum to the real aggregate
+    bk = {s["label"]: s["data"][-1] for s in db.concurrency_by_key("1h", "backlog", end=now)["series"]}
+    assert round(sum(bk.values()), 2) == 4.0                  # sums to backlog=4
+    assert db.concurrency_by_key("1h", "bogus", end=now)["series"] == []
+
+
+def test_concurrency_by_key_unattributed_goes_to_other(tmp_path, monkeypatch):
+    """When there's an aggregate but no per-key activity to attribute it to, the whole total
+    goes to 'Other' — the stack height must still equal the real aggregate (never dropped)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk2.db"))
+    db.init()
+    now = 9_000_000.0
+    for i in range(5):                       # metrics only, no key_series activity
+        with db._connect() as c:
+            c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 300 + i * 60, 7.0))
+    out = db.concurrency_by_key("1h", "conc", end=now)
+    assert [s["label"] for s in out["series"]] == ["Other"]
+    assert out["series"][0]["data"][-1] == 7.0               # unattributed total preserved
+
+
+@pytest.mark.asyncio
+async def test_concurrency_by_key_endpoint_labels_basis():
+    c = await _client()
+    try:
+        r = await c.get("/api/litellm/concurrency-by-key?metric=backlog&window=1h")
+        assert r.status == 200
+        d = await r.json()
+        assert d["metric"] == "backlog" and "series" in d and "labels" in d
+        assert d["weight_basis"] in ("requests", "spend")   # auto-labeled for honesty
+        # unknown metric coerces to the default 'conc'
+        assert (await (await c.get("/api/litellm/concurrency-by-key?metric=x")).json())["metric"] == "conc"
+    finally:
+        await c.close()
+
+
+async def test_spend_backfill_skipped_when_spend_not_full(tmp_path, monkeypatch):
+    """The one-time spend backfill is a multi-day /spend/logs pull — it MUST be skipped in
+    off/lite spend mode (freeze safety) and must NOT mark itself done, so a later switch to
+    full still backfills. Regression: an upgrade must never re-trigger the heavy pull on a
+    box that disabled spend on purpose."""
+    import app as _app
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "bf.db"))
+    db.init()
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    monkeypatch.setattr(config, "SPEND_MU_BACKFILL_DAYS", 14)
+    called = {"n": 0}
+
+    async def _spy(session, days):
+        called["n"] += 1
+        return []
+    monkeypatch.setattr(litellm, "model_user_backfill", _spy)
+
+    # off mode → skip the heavy pull, do NOT mark done
+    monkeypatch.setattr(config, "LITELLM_SPEND_ENABLED", False)     # → mode 'off'
+    await _app._spend_mu_backfill_once(None)
+    assert called["n"] == 0, "backfill must NOT pull /spend/logs in off mode"
+    assert not db.settings_all().get("spend_mu_backfill"), "must not mark done when skipped"
+
+    # lite mode → still skip
+    monkeypatch.setattr(config, "LITELLM_SPEND_ENABLED", True)
+    monkeypatch.setattr(config, "LITELLM_SPEND_MODE", "lite")
+    await _app._spend_mu_backfill_once(None)
+    assert called["n"] == 0, "backfill must NOT run in lite mode"
 
 
 async def test_litellm_spend_row_cap(monkeypatch):
@@ -1993,6 +2146,7 @@ async def test_litellm_backlog(monkeypatch):
     try:
         base = str(srv.make_url("")).rstrip("/")
         monkeypatch.setattr(config, "LITELLM_BASE_URL", base)
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)  # test raw parse
         monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
         async with aiohttp.ClientSession() as s:
             out = await litellm.sample(s)
@@ -3728,6 +3882,67 @@ async def test_keyseries_endpoint():
         assert "labels" in d and "points" in d
         # bad window falls back
         assert (await (await c.get("/api/keyseries?window=x")).json())["window"] == "1h"
+    finally:
+        await c.close()
+
+
+def test_key_cumulative_is_monotonic(tmp_path, monkeypatch):
+    """The 'Top 10 API keys over time' chart plots CUMULATIVE requests per key from the daily
+    rollup, so every line must only ever rise (never the rolling-window decay of the live
+    request-rate view). Ranked by total requests; an idle day holds the running total flat.
+    (metric='cost' folds the same way for the spend variant.)"""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ks.db"))
+    db.init()
+    import calendar as _cal
+    rows = [
+        {"day": "2026-07-01", "model": "m", "key": "hA", "alias": "alice", "cost": 1.0, "tokens": 1, "reqs": 3},
+        {"day": "2026-07-02", "model": "m", "key": "hA", "alias": "alice", "cost": 2.0, "tokens": 1, "reqs": 5},
+        {"day": "2026-07-03", "model": "m", "key": "hA", "alias": "alice", "cost": 0.5, "tokens": 1, "reqs": 0},
+        {"day": "2026-07-01", "model": "m", "key": "hB", "alias": "bob", "cost": 5.0, "tokens": 1, "reqs": 100},
+    ]
+    db.spend_model_user_upsert(rows, time.time())
+    end = _cal.timegm(time.strptime("2026-07-04", "%Y-%m-%d"))
+    out = db.key_cumulative(metric="reqs", days_back=3650, top_n=10, end=end)
+    assert out["metric"] == "reqs"
+    assert out["labels"] == ["bob", "alice"]          # ranked by total requests (100 > 8)
+    pts = out["points"]
+    assert [int(p["alice"]) for p in pts] == [3, 8, 8]      # rises, then flat (idle day)
+    assert [int(p["bob"]) for p in pts] == [100, 100, 100]  # flat after day 1, never falls
+    # monotonic non-decreasing for EVERY key across the whole series
+    for lab in out["labels"]:
+        seq = [p[lab] for p in pts]
+        assert all(b >= a for a, b in zip(seq, seq[1:])), f"{lab} request line decreased"
+    # the cost variant still works off the same rollup
+    assert db.key_cumulative(metric="cost", end=end)["metric"] == "cost"
+    assert db.key_cumulative(metric="bogus", end=end)["labels"] == []   # unknown metric → empty
+
+
+async def test_spend_keycost_endpoint_windowed(tmp_path, monkeypatch):
+    """/api/spend/keycost returns per-key spend WITHIN the window (alias→cost) so the
+    Cost-by-user/key/team chart follows the page selector. db.key_cost_window excludes
+    rows outside the window."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kc.db"))
+    db.init()
+    import calendar as _cal
+    now = _cal.timegm(time.strptime("2026-07-22", "%Y-%m-%d"))
+    db.spend_model_user_upsert([
+        {"day": "2026-07-21", "model": "m", "key": "hA", "alias": "alice", "cost": 3.0, "tokens": 1, "reqs": 1},
+        {"day": "2026-06-01", "model": "m", "key": "hA", "alias": "alice", "cost": 9.0, "tokens": 1, "reqs": 1},
+        {"day": "2026-07-20", "model": "m", "key": "hB", "alias": "bob", "cost": 1.0, "tokens": 1, "reqs": 1},
+    ], time.time())
+    assert db.key_cost_window(7, end=now) == {"alice": 3.0, "bob": 1.0}   # June row excluded
+    assert db.key_cost_window(60, end=now)["alice"] == 12.0               # both rows in window
+
+
+async def test_keyrequests_endpoint_shape():
+    c = await _client()
+    try:
+        r = await c.get("/api/keyrequests")
+        assert r.status == 200
+        d = await r.json()
+        assert "labels" in d and "points" in d and d.get("metric") == "reqs"
+        # opt-in cost variant
+        assert (await (await c.get("/api/keyrequests?metric=cost")).json()).get("metric") == "cost"
     finally:
         await c.close()
 
@@ -7033,6 +7248,40 @@ def test_key_series_read_hides_excluded_label(tmp_path, monkeypatch):
     assert "monitor-key" not in dl["labels"]
 
 
+def test_concurrency_by_key_hides_excluded_label(tmp_path, monkeypatch):
+    """Regression — 'Concurrent LLM work / Backlog — by key' was the one by-key chart
+    that never called config.key_excluded(): key_series()/key_series_window_delta()
+    already drop an operator-excluded label (e.g. the monitor's own probe/self-traffic
+    key) at READ time so it can't leak through even from rows recorded before it was
+    excluded, but concurrency_by_key() had no such filter — an excluded key with
+    disproportionate activity (like a constant self-probe baseline) still surfaced as
+    its own named band instead of folding into 'Other'. Its weight must still count
+    toward the split denominator (so real keys' shares aren't inflated) — only its
+    OWN labelled band must disappear, with that share landing in 'Other'."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk3.db"))
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", {"monitor-key"})
+    db.init()
+    now = 9_000_000.0
+    for i in range(10):
+        t = now - 600 + i * 60
+        with db._connect() as c:
+            c.execute("INSERT INTO metrics(ts,conc,backlog) VALUES (?,?,?)", (t, 10.0, 4.0))
+        db.insert_key_series(t, [
+            {"key": "hA", "alias": "alice", "reqs": 3},
+            {"key": "hZ", "alias": "monitor-key", "reqs": 9999},   # would rank #1
+        ])
+    out = db.concurrency_by_key("1h", "conc", end=now)
+    labels = {s["label"] for s in out["series"]}
+    assert "monitor-key" not in labels                 # never its own band
+    assert "alice" in labels and "Other" in labels
+    last = {s["label"]: s["data"][-1] for s in out["series"]}
+    assert round(sum(last.values()), 2) == 10.0        # bands still sum to the real total
+    # alice's tiny real share (3 reqs) vs monitor-key's excluded 9999 must NOT inflate
+    # alice's band to the whole aggregate — the excluded weight still counts in the
+    # split denominator, so alice gets only her true (small) proportional share.
+    assert last["alice"] < 1.0
+
+
 def test_spend_model_user_upsert_is_idempotent(tmp_path, monkeypatch):
     """The sampler re-aggregates the whole day each tick and UPSERT-REPLACEs, so applying
     the same rows twice must NOT double-count (that's the no-high-water-mark guarantee)."""
@@ -7716,6 +7965,38 @@ def test_network_unavailable_when_proc_missing(monkeypatch):
     assert s["available"] is False and "error" in s
 
 
+def test_network_prefers_host_netns_pid1(monkeypatch):
+    """To monitor the HOST from inside a container, the collector reads PID 1's netns
+    (/proc/1/net/dev) first — that is the host root netns under `pid: host` / bare metal —
+    then falls back to its own netns. An explicit MONITOR_NET_DEV overrides both."""
+    monkeypatch.setattr(config, "NET_DEV_PATH", "")
+    cands = network._net_dev_candidates()
+    assert cands[0] == ("/proc/1/net/dev", "host"), "must try the host (PID 1) netns first"
+    assert ("/proc/net/dev", "container") in cands, "must fall back to the container netns"
+    monkeypatch.setattr(config, "NET_DEV_PATH", "/host/proc/1/net/dev")
+    assert network._net_dev_candidates() == [("/host/proc/1/net/dev", "host")]
+
+
+def test_network_read_sets_scope_and_falls_back(monkeypatch, tmp_path):
+    """_read_net_dev records which source it read (host vs container) so the dashboard can
+    label it, and skips an unreadable candidate to try the next."""
+    host = tmp_path / "hostnet"
+    host.write_text(
+        "Inter-|   Receive                    |  Transmit\n"
+        " face |bytes packets errs drop fifo frame compressed multicast|"
+        "bytes packets errs drop fifo colls carrier compressed\n"
+        "  eth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n")
+    # first candidate unreadable, second (our stand-in "host") readable → scope carried
+    monkeypatch.setattr(network, "_net_dev_candidates",
+                        lambda: [("/nonexistent/x/net/dev", "host"), (str(host), "container")])
+    network._prev = {"ts": None, "ifaces": {}}
+    dev = network._read_net_dev()
+    assert "eth0" in dev and dev["eth0"]["rx_bytes"] == 100
+    assert network._source["scope"] == "container"
+    s = network.sample()
+    assert s["available"] is True and s["scope"] == "container"
+
+
 def test_network_series_columns_and_row():
     """net_down/net_up must be persisted metric columns fed by _metrics_row, or the
     Download/Upload charts plot nothing."""
@@ -7757,3 +8038,346 @@ async def test_network_page_served_and_gated(monkeypatch):
         assert r.status == 302
     finally:
         await c2.close()
+
+
+# ───────────────── Spend history persistence (past LiteLLM's 7-day cap) ─────────
+def test_spend_daily_upsert_range_prune_idempotent():
+    """db.spend_daily is the store that lets the Spend chart outlast LiteLLM's 7-day
+    /global/activity window. UPSERT must REPLACE a day (source reports the whole day —
+    never additive), range must filter by date, prune must drop past the horizon."""
+    db.init()
+    with db._connect() as conn:
+        conn.execute("DELETE FROM spend_daily")
+    db.spend_daily_upsert([
+        {"date": "2026-05-10", "requests": 100, "tokens": 1_000_000, "real_cost": 1.5,
+         "est_cost": 0.5, "tokens_ext": 600_000, "tokens_int": 400_000},
+        {"date": "2026-05-11", "requests": 120, "tokens": 1_200_000},
+    ], 1.0)
+    # re-report the same day with new totals → REPLACE, not add
+    db.spend_daily_upsert([{"date": "2026-05-10", "requests": 175, "tokens": 1_750_000}], 2.0)
+    rows = db.spend_daily_range("2026-05-01", "2026-05-31")
+    assert len(rows) == 2
+    r0 = next(r for r in rows if r["date"] == "2026-05-10")
+    assert r0["requests"] == 175 and r0["tokens"] == 1_750_000, "upsert must overwrite"
+    assert db.spend_daily_range("2026-05-11", "2026-05-11") == \
+        [r for r in rows if r["date"] == "2026-05-11"]
+    # a blank date is skipped, never crashes
+    db.spend_daily_upsert([{"date": "", "requests": 9}], 3.0)
+    assert len(db.spend_daily_range("2026-05-01", "2026-05-31")) == 2
+
+
+async def test_spend_series_merges_stored_history_beyond_live_window(monkeypatch):
+    """The core fix: LiteLLM only returns the last few days live, but the chart must show
+    the full stored history. Seed spend_daily with a day 20 days back, have LiteLLM return
+    ONLY today — the 30d series must include BOTH, and today's live values must be written
+    through to the store."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-hist-123456")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    now = time.time()
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    old = time.strftime("%Y-%m-%d", time.gmtime(now - 20 * 86400))
+
+    db.init()
+    with db._connect() as conn:
+        conn.execute("DELETE FROM spend_daily")
+    # stored history LiteLLM no longer returns (20 days ago)
+    db.spend_daily_upsert([{"date": old, "requests": 500, "tokens": 9_000_000,
+                            "real_cost": 4.0, "est_cost": 1.0,
+                            "tokens_ext": 5_000_000, "tokens_int": 4_000_000}], now)
+
+    async def _daily(session, s, e):          # LiteLLM live window: ONLY today
+        return [{"date": today, "requests": 30, "tokens": 300_000, "spend": 0.0}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001}
+
+    async def _permodel(session, s, e, ov=None):
+        return [{"model": "gpt-4o", "tokens": 300_000, "reqs": 30,
+                 "internal": False, "cost_kind": "real"}]
+
+    async def _daily_cost(session, s, e, prices, ov=None):
+        return {today: {"real": 0.30, "est": 0.0}}
+
+    async def _daily_tok(session, s, e, ov=None):
+        return {today: {"ext": 300_000, "int": 0}}
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _permodel)
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _daily_cost)
+    monkeypatch.setattr(litellm, "per_model_daily_tokens", _daily_tok)
+
+    hdr = {"Authorization": "Bearer sp-hist-123456"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
+        assert d["available"] is True
+        dates = {time.strftime("%Y-%m-%d", time.gmtime(p["t"])) for p in d["points"]}
+        assert old in dates, f"stored history missing from chart: {sorted(dates)}"
+        assert today in dates
+        # the old day's tokens (stored) are present — proof the merge fed the buckets
+        oldpt = next(p for p in d["points"]
+                     if time.strftime("%Y-%m-%d", time.gmtime(p["t"])) == old)
+        assert oldpt["tokens"] == 9_000_000
+        # write-through: today's live values were persisted for next time
+        stored_today = [r for r in db.spend_daily_range(today, today)]
+        assert stored_today and stored_today[0]["requests"] == 30
+    finally:
+        await c.close()
+        with db._connect() as conn:
+            conn.execute("DELETE FROM spend_daily")
+
+
+async def test_capture_spend_daily_persists_without_page_view(monkeypatch):
+    """'Store everything from now on': the background sampler must capture the day into
+    db.spend_daily on its own cadence — NOT only when someone opens /spend. Drive the
+    capture helper directly with mocked LiteLLM and assert the rows land in the store."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    db.init()
+    with db._connect() as conn:
+        conn.execute("DELETE FROM spend_daily")
+
+    async def _daily(session, s, e):
+        return [{"date": "2026-07-02", "requests": 42, "tokens": 2_000_000, "spend": 0.0},
+                {"date": "2026-07-03", "requests": 55, "tokens": 3_000_000, "spend": 0.0}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001}
+
+    async def _dc(session, s, e, prices, ov=None):
+        return {"2026-07-02": {"real": 0.20, "est": 0.0}}
+
+    async def _dt(session, s, e, ov=None):
+        return {"2026-07-02": {"ext": 2_000_000, "int": 0}}
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _dc)
+    monkeypatch.setattr(litellm, "per_model_daily_tokens", _dt)
+
+    await appmod._capture_spend_daily(None, time.time())
+    rows = {r["date"]: r for r in db.spend_daily_range("2026-07-01", "2026-07-31")}
+    assert set(rows) == {"2026-07-02", "2026-07-03"}, "background capture must store every live day"
+    assert rows["2026-07-02"]["requests"] == 42 and rows["2026-07-02"]["real_cost"] == 0.20
+    assert rows["2026-07-03"]["tokens"] == 3_000_000       # persisted even with no cost row
+    with db._connect() as conn:
+        conn.execute("DELETE FROM spend_daily")
+
+
+async def test_capture_spend_daily_noop_without_litellm(monkeypatch):
+    """No LiteLLM configured → capture is a clean no-op (no crash, nothing written)."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "")
+    await appmod._capture_spend_daily(None, time.time())   # must not raise
+
+
+async def test_litellm_lite_derives_throughput_rates(monkeypatch):
+    """Lite mode has no per-request rows, but /global/activity gives the day's running
+    totals — so req/s and total tok/s are derived as the delta between polls (the fix for
+    the empty /litellm throughput charts in lite mode). First poll has no baseline → no
+    rate; a UTC-midnight reset (totals roll back) suppresses the rate, not a huge spike.
+    Prompt/completion split + latency stay unavailable in lite (no per-request data)."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://x")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk")
+    litellm._prev_lite = {"ts": None, "requests": None, "tokens": None}
+    act = {"v": {"sum_api_requests": 1000, "sum_total_tokens": 50000}}
+
+    async def _fj(session, url, headers=None, timeout_s=None):
+        if "/global/activity/model" in url:
+            return ([], None)
+        if "/global/activity" in url:
+            return (act["v"], None)
+        return ([], None)                       # /global/spend/keys
+    monkeypatch.setattr(litellm, "fetch_json", _fj)
+
+    o1 = await litellm._lite_spend(None, "http://x", {}, 1000.0)   # first: no baseline
+    assert "req_rate" not in o1 and "tok_total_rate" not in o1
+    assert o1["requests_window"] == 1000 and o1["tokens_today"] == 50000
+
+    act["v"] = {"sum_api_requests": 1600, "sum_total_tokens": 80000}  # +600 req / +30k tok in 60s
+    o2 = await litellm._lite_spend(None, "http://x", {}, 1060.0)
+    assert o2["req_rate"] == 10.0              # 600 / 60
+    assert o2["tok_total_rate"] == 500.0       # 30000 / 60
+    assert o2.get("tok_in_rate") is None and o2.get("wait_avg_ms") is None  # no split/latency
+
+    act["v"] = {"sum_api_requests": 5, "sum_total_tokens": 100}     # midnight reset
+    o3 = await litellm._lite_spend(None, "http://x", {}, 1120.0)
+    assert "req_rate" not in o3 and "tok_total_rate" not in o3      # cur<prev → suppressed
+
+
+def test_toktot_series_column_and_row():
+    """The total-tokens/s series must be a persisted metric column fed by _metrics_row,
+    or the new /litellm 'Tokens/s' chart plots nothing."""
+    import app as appmod, db as dbmod
+    assert "toktot" in dbmod._METRIC_COLS
+    snap = {"ts": 0, "collectors": {
+        "host": {"available": True, "cpu_pct": 1, "mem_pct": 1, "disk": {"pct": 1}, "load": [0, 0, 0]},
+        "gpu": {"available": False}, "ollama": {"available": False},
+        "litellm": {"available": True, "tok_total_rate": 42.5}}}
+    assert appmod._metrics_row(snap)["toktot"] == 42.5
+    snap["collectors"]["litellm"] = {"available": False}
+    assert appmod._metrics_row(snap)["toktot"] is None
+
+
+def test_spend_capture_decoupled_from_sampling_loop():
+    """§6 observer-effect: the hourly spend_daily capture must NOT run inline in the main
+    sampling loop (its bounded LiteLLM calls stalled the tick — snapshot age spiked to
+    ~60s on a busy proxy). It runs in its own task (_spend_capture_loop), registered at
+    startup and cancelled on cleanup, so it can never wedge sampling."""
+    import inspect
+    import app as a
+    samp = inspect.getsource(a._sampling_loop)
+    assert "_capture_spend_daily" not in samp, "capture must not be inline in _sampling_loop"
+    loop = inspect.getsource(a._spend_capture_loop)
+    assert "_capture_spend_daily" in loop and "3600" in loop, "capture loop must run it hourly"
+    assert "wait_for" in loop, "each capture must stay bounded"
+    startup = inspect.getsource(a._on_startup)
+    cleanup = inspect.getsource(a._on_cleanup)
+    assert "_spend_capture_loop" in startup and "_SPEND_CAP" in startup
+    assert "_SPEND_CAP" in cleanup, "capture task must be cancelled on cleanup"
+
+
+async def test_service_toggle_disables_backend_everywhere(monkeypatch):
+    """Settings → Services can turn a backend OFF. When off: its collector reports the
+    'unconfigured' sentinel (so it is not polled and, per alerts.py, fires NO down-alert),
+    and _configured() hides it (nav link + page gate). Covers litellm/ollama/llamacpp/vllm."""
+    import app as a
+    from collectors import ollama, llamacpp, vllm, litellm as llm
+    cases = [("OLLAMA_ENABLED", ollama, "ollama"),
+             ("LLAMACPP_ENABLED", llamacpp, "llamacpp"),
+             ("VLLM_ENABLED", vllm, "vllm"),
+             ("LITELLM_ENABLED", llm, "litellm")]
+    for flag, mod, name in cases:
+        monkeypatch.setattr(config, flag, False)
+        r = await mod.sample(None)                       # gate returns before any I/O
+        assert r == {"available": False, "error": "unconfigured"}, f"{name} not gated"
+        monkeypatch.setattr(a, "_latest", {"ts": 0, "collectors": {name: r}})
+        assert a._configured(name, True) is False, f"{name} still shown in nav when off"
+        monkeypatch.setattr(config, flag, True)          # re-enable → flag no longer gates
+        monkeypatch.setattr(a, "_latest", {"ts": 0, "collectors": {}})   # no sample yet
+        assert a._configured(name, True) is True         # falls back to env_ok, not gated
+
+
+async def test_service_toggle_off_fires_no_down_alert(monkeypatch):
+    """The whole point for the operator: a disabled backend must not show in alarms.
+    A backend reporting 'unconfigured' (what the toggle produces) yields no down: breach."""
+    import alerts
+    snap = {"collectors": {
+        "ollama": {"available": False, "error": "unconfigured"},        # toggled OFF
+        "llamacpp": {"available": False, "error": "conn refused"},      # genuinely down
+    }}
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    keys = [k for k, _ in alerts.evaluate(snap)]
+    assert "down:ollama" not in keys, "disabled backend must not alarm"
+    assert "down:llamacpp" in keys, "a genuinely-down backend still alarms"
+
+
+async def test_litellm_disabled_hides_spend(monkeypatch):
+    """LITELLM_ENABLED off hides the Spend surface even with a URL configured."""
+    import app as a
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_ENABLED", False)
+    assert a._litellm_configured() is False
+    monkeypatch.setattr(config, "LITELLM_ENABLED", True)
+    assert a._litellm_configured() is True
+
+
+def test_concurrency_by_key_ignores_idle_keys_in_lite_mode():
+    """The 'Concurrent LLM work — by key' chart showed bands for keys that aren't being
+    used: in lite mode key_series holds CUMULATIVE per-key spend, and the old split
+    weighted the instantaneous concurrency by that lifetime total, so a key that only
+    spent in the PAST got a phantom band. With cumulative=True the weight is the per-bucket
+    spend DELTA (recent activity), so an idle-but-once-active key gets ZERO."""
+    import time
+    import db as dbmod
+    dbmod.init()
+    now = time.time()
+    with dbmod._connect() as c:
+        c.execute("DELETE FROM metrics")
+        c.execute("DELETE FROM key_series")
+        for i, t in enumerate([now - 90, now - 65, now - 40, now - 15]):
+            c.execute("INSERT INTO metrics(ts,conc) VALUES(?,?)", (t, 2.0))
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "idle", 100.0))
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "active", float(i + 1)))
+    try:
+        # buggy path: lifetime total → idle key soaks up the concurrency
+        old = {s["label"]: sum(s["data"])
+               for s in dbmod.concurrency_by_key("1h", "conc", end=now)["series"]}
+        assert old.get("idle", 0) > old.get("active", 0), "precondition: old logic favours idle key"
+        # fixed path: per-bucket delta → idle key contributes nothing
+        fix = {s["label"]: sum(s["data"])
+               for s in dbmod.concurrency_by_key("1h", "conc", end=now, cumulative=True)["series"]}
+        assert fix.get("idle", 0) == 0.0, f"idle key must get no band, got {fix.get('idle')}"
+        assert fix.get("active", 0) > 0, "actively-spending key should be attributed the work"
+    finally:
+        with dbmod._connect() as c:
+            c.execute("DELETE FROM metrics")
+            c.execute("DELETE FROM key_series")
+
+
+def test_concurrency_by_key_hides_when_no_activity_despite_baseline_backlog():
+    """The live symptom: an idle hour (zero requests) still showed bands because the
+    backlog aggregate sits at a constant 1 (LiteLLM counting the monitor's own probe).
+    With no per-key activity to attribute, the by-key result must be EMPTY (so the chart
+    auto-hides) rather than dumping that baseline into 'Other'."""
+    import time
+    import db as dbmod
+    dbmod.init()
+    now = time.time()
+    with dbmod._connect() as c:
+        c.execute("DELETE FROM metrics")
+        c.execute("DELETE FROM key_series")
+        for t in (now - 90, now - 65, now - 40, now - 15):
+            c.execute("INSERT INTO metrics(ts,conc,backlog) VALUES(?,?,?)", (t, 1.0, 1.0))
+            # keys with lifetime spend but NO change across the window = idle
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "rodolfo", 9.2))
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "leonor", 8.8))
+    try:
+        for metric in ("conc", "backlog"):
+            out = dbmod.concurrency_by_key(metric=metric, window="1h", cumulative=True, end=now)
+            assert out["series"] == [], f"{metric}: idle window must yield empty (hidden) chart"
+    finally:
+        with dbmod._connect() as c:
+            c.execute("DELETE FROM metrics")
+            c.execute("DELETE FROM key_series")
+
+
+async def test_backlog_subtracts_own_probe(monkeypatch):
+    """LiteLLM counts the monitor's own /health/backlog request as in-flight, so an idle
+    proxy reports a constant 1 — which floods the by-key attribution's 'Other' band every
+    idle bucket. _fetch_backlog subtracts that self-probe so idle reads 0 and real backlog
+    is preserved; the toggle disables it for a build that doesn't self-count."""
+    from collectors import litellm as L
+
+    async def _fj(n):
+        async def f(session, url, headers=None, timeout_s=None):
+            return ({"in_flight_requests": n}, None)
+        return f
+    monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", True)
+    monkeypatch.setattr(L, "fetch_json", await _fj(1))
+    assert await L._fetch_backlog(None, "x", {}) == 0        # idle: just the probe → 0
+    monkeypatch.setattr(L, "fetch_json", await _fj(3))
+    assert await L._fetch_backlog(None, "x", {}) == 2        # 3 in-flight − our probe = 2
+    monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
+    assert await L._fetch_backlog(None, "x", {}) == 3        # toggle off → raw count
+
+
+def test_custom_window_secs_parsed_and_clamped():
+    """Drag-to-zoom encodes a range as WIN='custom:<secs>'. window_secs must return those
+    seconds, clamped to [CUSTOM_WIN_MIN, CUSTOM_WIN_MAX] so a bogus/huge drag can't blow up
+    the query, and named windows still resolve normally."""
+    assert db.window_secs("custom:3600") == 3600.0
+    assert db.window_secs("custom:5") == float(db.CUSTOM_WIN_MIN)          # sub-minimum → floor
+    assert db.window_secs("custom:99999999999") == float(db.CUSTOM_WIN_MAX)  # over-max → ceiling
+    assert db.window_secs("custom:abc") == db.window_secs("1h")            # unparseable → named path
+    assert db.window_secs("1h") == 3600.0                                  # named still works
+
+
+def test_norm_window_accepts_custom_or_falls_back():
+    """norm_window is the endpoint gate: it must pass a valid custom token through, canonicalise
+    it (clamped int), keep named windows, and reject junk to the page default."""
+    assert db.norm_window("custom:3600", "1h") == "custom:3600"
+    assert db.norm_window("custom:5", "1h") == "custom:%d" % db.CUSTOM_WIN_MIN
+    assert db.norm_window("24h", "1h") == "24h"
+    assert db.norm_window("bogus", "1h") == "1h"
+    assert db.norm_window("custom:", "24h") == "24h"

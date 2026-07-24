@@ -245,7 +245,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.1</div>
+      <div id="sidebar-brand-ver">v1.8.5</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -461,7 +461,15 @@
       dot.title="modified from default"; lbl.appendChild(dot); }
     row.appendChild(lbl);
     var field;
-    if(s.type==="choice"){
+    if(s.type==="bool"){
+      // On/Off select — value "1"/"0" matches the tunable's bool coercion, so it reuses
+      // the same save path (reads field.value) as the numeric/choice inputs.
+      field=document.createElement("select");
+      var on=(s.value===true||String(s.value).toLowerCase()==="true"||String(s.value)==="1");
+      [["1","On"],["0","Off"]].forEach(function(c){var o=document.createElement("option");
+        o.value=c[0];o.textContent=c[1];
+        if((c[0]==="1")===on)o.selected=true;field.appendChild(o);});
+    }else if(s.type==="choice"){
       field=document.createElement("select");
       (s.choices||[]).forEach(function(c){var o=document.createElement("option");o.value=c;o.textContent=c;
         if(String(c)===String(s.value))o.selected=true;field.appendChild(o);});

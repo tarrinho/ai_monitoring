@@ -36,7 +36,7 @@ curl -s 'localhost:9090/api/v1/query?query=aimon_up' | jq '.data.result'
 ## Use a locally-built image instead of ghcr
 
 ```bash
-AIMON_IMAGE=ai-monitoring:1.8.1-arm64 docker compose up -d
+AIMON_IMAGE=ai-monitoring:1.8.5-arm64 docker compose up -d
 ```
 
 ## Stop

@@ -61,6 +61,8 @@ def _headers() -> dict[str, str] | None:
 
 
 async def sample(session: aiohttp.ClientSession) -> dict:
+    if not config.LLAMACPP_ENABLED:
+        return unconfigured()          # monitoring turned off in Settings → Services
     base = config.LLAMACPP_BASE_URL
     if not base:
         return unconfigured()

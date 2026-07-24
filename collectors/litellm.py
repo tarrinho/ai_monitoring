@@ -146,7 +146,15 @@ async def _fetch_backlog(session: aiohttp.ClientSession, base: str,
     data, err = await fetch_json(session, f"{base}/health/backlog", headers=headers)
     if err is not None:
         return None
-    return _extract_backlog(data)
+    n = _extract_backlog(data)
+    # LiteLLM counts the request MAKING the call (our own /health/backlog probe) as
+    # in-flight, so an idle proxy reports a constant 1 — which then floods the by-key
+    # attribution's "Other" band on every idle bucket. Subtract that self-probe so
+    # backlog reads 0 when truly idle. Disable for a build that excludes the measuring
+    # request (MONITOR_LITELLM_BACKLOG_PROBE_SELFCOUNT=0).
+    if n is not None and config.LITELLM_BACKLOG_PROBE_SELFCOUNT:
+        n = max(0, n - 1)
+    return n
 
 
 def _short_key(kid) -> str:
@@ -196,6 +204,8 @@ def _cache_is_hit(val) -> bool:
 
 
 async def sample(session: aiohttp.ClientSession) -> dict:
+    if not config.LITELLM_ENABLED:
+        return unconfigured()          # monitoring turned off in Settings → Services
     base = config.LITELLM_BASE_URL
     if not base:
         return unconfigured()
@@ -375,6 +385,43 @@ def _spend_mode() -> str:
     return m if m in ("full", "lite", "off") else "full"
 
 
+async def _fetch_top_keys(session: aiohttp.ClientSession, base: str,
+                          h: dict) -> tuple[list[dict], str | None]:
+    """Per-key CUMULATIVE spend from `/global/spend/keys` — a CHEAP server-side aggregate
+    (~200 ms, ~0 CPU), NOT the heavy `/spend/logs` blob that causes the freeze. Returns
+    (top_keys, err). Used by lite mode AND the 'off'/load-shed paths so the per-key charts
+    (Top keys/users/over-time) stay populated even when the heavy pull is disabled. Honours
+    MONITOR_EXCLUDE_KEYS. reqs/tokens are None here (only /spend/logs has per-key requests)."""
+    ks, err = await fetch_json(session, f"{base}/global/spend/keys?limit=100",
+                               headers=h, timeout_s=config.HTTP_TIMEOUT)
+    keys: list[dict] = []
+    if err is None and isinstance(ks, list):
+        keys = [{
+            "key": k.get("api_key", "?"),
+            "alias": k.get("key_alias") or k.get("key_name") or "",
+            "reqs": None, "tokens": None,
+            "cost": round(float(k.get("total_spend") or 0), 4),
+        } for k in ks
+            if not config.key_excluded(k.get("api_key"),
+                                       k.get("key_alias") or k.get("key_name"))]
+    return keys, err
+
+
+# Previous lite-mode daily totals, for differentiating them into per-second RATES.
+# Module-level like host._prev_cpu / vllm._prev_tokens: one proxy per monitor instance.
+_prev_lite: dict = {"ts": None, "requests": None, "tokens": None}
+
+
+def _lite_rate(cur, prev, dt: float):
+    """Per-second rate from two cumulative day-total readings, or None on the first
+    sample and across the UTC-midnight reset (cur < prev — the day-total rolls back to
+    ~0). A negative delta would render as a huge bogus spike, so a one-sample gap is
+    preferred (same guard as vllm._token_rates)."""
+    if cur is None or prev is None or dt <= 0 or cur < prev:
+        return None
+    return round((cur - prev) / dt, 3)
+
+
 async def _lite_spend(session: aiohttp.ClientSession, base: str,
                       h: dict, now: float) -> dict:
     """CPU-free spend via LiteLLM's SERVER-SIDE aggregate endpoints — no raw
@@ -392,6 +439,21 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
     if e1 is None and isinstance(act, dict):
         out["requests_window"] = int(act.get("sum_api_requests") or 0)
         out["tokens_today"] = int(act.get("sum_total_tokens") or 0)
+        # Throughput over-time charts in lite mode: /global/activity gives only the
+        # day's RUNNING TOTALS (no per-request rows), so differentiate them into
+        # per-second rates across successive polls. Requests/s and total Tokens/s are
+        # honest here; prompt/completion SPLIT and latency are NOT available in lite
+        # (no per-request data) and stay None. cost/s needs per-day $ (Enterprise) too.
+        prev = _prev_lite
+        dt = (now - prev["ts"]) if prev["ts"] is not None else 0.0
+        rq, tk = out["requests_window"], out["tokens_today"]
+        rr = _lite_rate(rq, prev["requests"], dt)
+        tr = _lite_rate(tk, prev["tokens"], dt)
+        if rr is not None:
+            out["req_rate"] = rr
+        if tr is not None:
+            out["tok_total_rate"] = tr
+        prev["ts"], prev["requests"], prev["tokens"] = now, rq, tk
     # per-model requests + tokens
     pm, e2 = await fetch_json(
         session, f"{base}/global/activity/model?start_date={today}&end_date={tmr}",
@@ -406,17 +468,7 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
         } for m in pm][:20]
     # keys by spend (pre-aggregated). limit=100 (not 10) so the Spend "Cost by key" chart
     # sees EVERY key on the fallback path, not just the top 10.
-    ks, e3 = await fetch_json(session, f"{base}/global/spend/keys?limit=100",
-                              headers=h, timeout_s=t)
-    if e3 is None and isinstance(ks, list):
-        out["top_keys"] = [{
-            "key": k.get("api_key", "?"),
-            "alias": k.get("key_alias") or k.get("key_name") or "",
-            "reqs": None, "tokens": None,
-            "cost": round(float(k.get("total_spend") or 0), 4),
-        } for k in ks
-            if not config.key_excluded(k.get("api_key"),
-                                       k.get("key_alias") or k.get("key_name"))]
+    out["top_keys"], e3 = await _fetch_top_keys(session, base, h)
     _dbg(f"/spend lite: requests={out.get('requests_window')} "
          f"per_model={len(out.get('per_model', []))} top_keys={len(out.get('top_keys', []))} "
          f"errs=({e1},{e2},{e3})")
@@ -1455,11 +1507,21 @@ async def _heavy_sample(session: aiohttp.ClientSession, base: str,
 
     async def _do_spend() -> None:
         mode = _spend_mode()
-        if mode == "off":
-            _dbg("/spend skipped (mode=off) -> latency/cost/keys off")
-            return
         if _cb_open("spend", now):
             _dbg("/spend skipped — circuit breaker OPEN (repeated failures)")
+            return
+        if mode == "off":
+            # 'off' disables the HEAVY /spend/logs pull (the freeze source) — but the
+            # per-key spend LIST comes from /global/spend/keys, a cheap aggregate that
+            # never caused the freeze. Still fetch it so Top-keys/users/over-time stay
+            # populated at ~0 CPU. No latency/cost-per-request (those need the raw logs).
+            try:
+                hv["top_keys"], ke = await _fetch_top_keys(session, base, h)
+                _cb_record("spend", ke is None, now)
+                _dbg(f"/spend off: cheap keys-only -> top_keys={len(hv['top_keys'])} err={ke}")
+            except Exception as e:
+                _cb_record("spend", False, now)
+                _dbg(f"/spend off keys-only error: {type(e).__name__}")
             return
         if mode == "lite":
             # tiny aggregate GETs — no big pull, no deserialize spike, no CPU freeze
@@ -1521,13 +1583,15 @@ def _fold_model_user(logs: list) -> list[dict]:
                     or meta.get("user_api_key_alias") or "")
         if config.key_excluded(kid, alias):     # monitor's own / operator-excluded key
             continue
-        e = mu.setdefault((day, model, kid), {"alias": alias, "cost": 0.0, "tokens": 0})
+        e = mu.setdefault((day, model, kid),
+                          {"alias": alias, "cost": 0.0, "tokens": 0, "reqs": 0})
         e["cost"] += spend
         e["tokens"] += tok
+        e["reqs"] += 1                          # each log row is one request
         if alias and not e["alias"]:
             e["alias"] = alias
     return [{"day": d, "model": m, "key": k, "alias": v["alias"],
-             "cost": round(v["cost"], 6), "tokens": v["tokens"]}
+             "cost": round(v["cost"], 6), "tokens": v["tokens"], "reqs": v["reqs"]}
             for (d, m, k), v in mu.items()]
 
 
@@ -1671,6 +1735,7 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
             res["req_rate"] = round(n / win_s, 3)
             res["tok_in_rate"] = round(prompt_total / win_s, 2)
             res["tok_out_rate"] = round(completion_total / win_s, 2)
+            res["tok_total_rate"] = round((prompt_total + completion_total) / win_s, 2)
             res["cost_rate_hr"] = round(cost_total / (win_s / 3600), 4)
             res["error_pct"] = round(errors / n * 100, 1)
             # TTFT + cache economics (JSON-derived, no prometheus)

@@ -19,6 +19,8 @@ def _gpu_pct(size: int, vram: int) -> float:
 
 
 async def sample(session: aiohttp.ClientSession) -> dict:
+    if not config.OLLAMA_ENABLED:
+        return unconfigured()          # monitoring turned off in Settings → Services
     base = config.OLLAMA_BASE_URL
     if not base:
         return unconfigured()
