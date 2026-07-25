@@ -352,6 +352,12 @@ async def _sampling_loop(app: web.Application) -> None:
                 db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])
                 if _mu_rows:
                     db.spend_model_user_upsert(_mu_rows, snap["ts"])
+                # /key/list-confirmed labels (collectors.litellm._heavy_sample), for the
+                # by-key charts to fold a real-but-INVALID auth attempt (garbage bearer
+                # token) into 'Other' instead of it claiming its own band — see
+                # db.known_keys_set()/config.key_known(). Only present on a HEAVY tick.
+                if _ll.get("known_keys"):
+                    db.known_keys_upsert(_ll["known_keys"], snap["ts"])
             _pr = snap["collectors"].get("procs", {})
             if _pr.get("available"):
                 db.insert_proc_series(snap["ts"], "cpu", _pr.get("top_cpu") or [], "cpu")
@@ -1399,7 +1405,7 @@ async def data_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "version": config.VERSION,
         "now": time.time(),
-        "latest": _latest,
+        "latest": _snapshot_for_display(_latest),
         "history": hist,
     })
 
@@ -1415,7 +1421,7 @@ async def series_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "window": window,
         "windows": list(db.WINDOWS.keys()),
-        "points": db.series(window, pts, end=_q_end(request)),
+        "points": await asyncio.to_thread(db.series, window, pts, end=_q_end(request)),
     })
 
 
@@ -1442,7 +1448,7 @@ async def procseries_handler(request: web.Request) -> web.Response:
     # ncpu lets the client normalize top-style per-process %CPU (relative to ONE
     # core) into a share of total capacity so the stacked per-app chart tops at 100%.
     if kind == "cpu":
-        resp["ncpu"] = db.ncpu(window, end=end)
+        resp["ncpu"] = await asyncio.to_thread(db.ncpu, window, end=end)
     return web.json_response(resp)
 
 
@@ -1463,7 +1469,7 @@ async def keyseries_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 200
     pts = max(30, min(pts, 1000))
-    data = db.key_series(window, pts, end=_q_end(request))
+    data = await asyncio.to_thread(db.key_series, window, pts, end=_q_end(request))
     return web.json_response({"window": window, **data})
 
 
@@ -1479,12 +1485,19 @@ async def keyrequests_handler(request: web.Request) -> web.Response:
         top_n = 10
     metric = "cost" if request.query.get("metric") == "cost" else "reqs"
     end = _q_end(request)
-    data = db.key_cumulative(metric=metric, top_n=top_n, end=end)
+    data = await asyncio.to_thread(db.key_cumulative, metric=metric, top_n=top_n, end=end)
     if metric == "reqs" and not data.get("points"):
         # off/lite spend mode has NO per-key request counts (only /spend/logs does). Fall
-        # back to the per-key cumulative SPEND recorded in key_series — there top_keys stores
-        # LiteLLM's cumulative total_spend, so the line still only rises — rather than blank.
-        ks = db.key_series("12mo", 400, top_n=top_n, end=end)
+        # back to the per-key cumulative SPEND recorded in key_series — top_keys stores
+        # LiteLLM's per-key total_spend there.
+        #
+        # Use key_delta_series, NOT key_series: the raw counter is NOT monotonic. LiteLLM's
+        # total_spend re-bases (a key re-issued, a budget period rolling, a replica with a
+        # different view — observed live dropping 697 → 11), so plotting it raw made this
+        # "only rises" chart FALL. key_delta_series sums the per-bucket POSITIVE steps
+        # (reset-safe: a backwards step contributes 0), giving a genuinely monotonic
+        # running total of spend accumulated to date — which is what the chart promises.
+        ks = await asyncio.to_thread(db.key_delta_series, "12mo", 400, top_n=top_n, end=end)
         if ks.get("points"):
             data = {"labels": ks.get("labels", []), "points": ks["points"], "metric": "spend"}
     return web.json_response(data)
@@ -1505,8 +1518,8 @@ async def concurrency_by_key_handler(request: web.Request) -> web.Response:
     # current work it isn't doing. Determine the basis from the live top-key shape.
     tk = (_backend_latest.get("litellm", {}) or {}).get("top_keys") or []
     basis = "requests" if any(k.get("reqs") is not None for k in tk) else "spend"
-    data = db.concurrency_by_key(window, metric, end=_q_end(request),
-                                 cumulative=(basis == "spend"))
+    data = await asyncio.to_thread(db.concurrency_by_key, window, metric,
+                                   end=_q_end(request), cumulative=(basis == "spend"))
     data["weight_basis"] = basis
     return web.json_response({"window": window, **data})
 
@@ -1523,8 +1536,73 @@ async def keydelta_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 200
     pts = max(30, min(pts, 1000))
-    data = db.key_delta_series(window, pts, end=_q_end(request))
+    data = await asyncio.to_thread(db.key_delta_series, window, pts, end=_q_end(request))
     return web.json_response({"window": window, **data})
+
+
+def _visible_top_keys(rows: list) -> list:
+    """The per-key rows allowed to appear as their OWN entry on a chart.
+
+    Applies the SAME two gates the stored-series read paths use (db.key_series,
+    db.key_series_window_delta, db.concurrency_by_key):
+      * `config.key_known()` — folds garbage labels (an unexpanded '${ENV_VAR}' bearer
+        token, a made-up/revoked hash) that LiteLLM's own /key/list has never confirmed;
+      * `db.hidden_unassigned()` — the "Unassigned" group when it is hidden in Settings.
+    plus `config.key_excluded()`, which `_fetch_top_keys` already honours.
+
+    This exists because `top_keys` reaches the dashboard on a SECOND path: straight off
+    the live collector snapshot, never touching the DB — so the stored-series gates could
+    not see it, and an owner-less/garbage key still drew its own bar on the top-key
+    charts, the Overview KPIs and the Spend page. The collector cannot apply these gates
+    itself (collectors never import db, by design), so the filter belongs here, at the
+    serving boundary, where every consumer of that one list picks it up at once.
+
+    NOT applied to what is STORED (history must stay complete — the read paths filter at
+    query time) nor to the admin keys board, where an unassigned key must remain visible
+    precisely so an admin can assign it."""
+    if not rows:
+        return rows
+    try:
+        known = db.known_keys_set()
+        hidden = db.hidden_unassigned()
+    except Exception:
+        return rows
+    out = []
+    for k in rows:
+        if not isinstance(k, dict):
+            continue
+        label = k.get("alias") or k.get("key") or "?"
+        if config.key_excluded(k.get("key"), k.get("alias")):
+            continue
+        if not config.key_known(label, known) or label in hidden:
+            continue
+        out.append(k)
+    return out
+
+
+def _snapshot_for_display(snap: dict) -> dict:
+    """`snap` with its LiteLLM per-key list reduced to the chart-visible keys.
+
+    Returns a shallow COPY — never mutates the live `_latest`, which is also what gets
+    persisted to key_series (history must keep every key). The pre-filter aggregate is
+    carried as `cost_all_keys` so a hidden key still counts toward the Overview's spend
+    total: hiding removes a key's own bar, it never rewrites a measured total."""
+    try:
+        cols = snap.get("collectors") or {}
+        ll = cols.get("litellm")
+        if not isinstance(ll, dict) or not ll.get("top_keys"):
+            return snap
+        vis = _visible_top_keys(ll["top_keys"])
+        if len(vis) == len(ll["top_keys"]):
+            return snap
+        ll2 = dict(ll)
+        ll2["top_keys"] = vis
+        ll2["cost_all_keys"] = round(
+            sum(float(k.get("cost") or 0) for k in ll["top_keys"]), 4)
+        ll2["keys_total"] = len(ll["top_keys"])
+        return {**snap, "collectors": {**cols, "litellm": ll2}}
+    except Exception:
+        return snap
 
 
 def _configured(name: str, env_ok: bool) -> bool:
@@ -1780,6 +1858,28 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
     return keys
 
 
+async def _store_owners_from_live(live: dict | None) -> None:
+    """Single source of truth for key ownership. Whenever a handler resolves owners LIVE from
+    LiteLLM's /key/list (the Settings board, the budgets panel), write the {alias: owner}
+    through to `known_keys` — the SAME store the by-key graph read-paths use
+    (`db.unassigned_labels`). Previously the board re-resolved live on every view while the
+    graphs used only the sampler's stored copy, so the two could diverge: a key shown under a
+    named user on the board yet "unassigned" in the charts (observed live: 61/61 owners empty
+    in the store while 21 resolved on the board). Writing through keeps them consistent.
+
+    Safe by construction: `known_keys_upsert` only ever FILLS an empty owner, never blanks a
+    known one, and we skip the write entirely when nothing resolved — so this can only improve
+    the store. Off-loaded like every other DB write on a request path (§6)."""
+    if not live:
+        return
+    owners = {a: str((info or {}).get("user") or "") for a, info in live.items()}
+    if any(owners.values()):          # only touch the store when we actually resolved someone
+        try:
+            await asyncio.to_thread(db.known_keys_upsert, owners, time.time())
+        except Exception:
+            pass
+
+
 def _resolve_budget_map(keys: list) -> dict:
     """Effective monthly budget per key: an explicit per-key budget (UI override or
     MONITOR_KEY_BUDGETS) wins; otherwise the key inherits its TEAM's budget. LiteLLM's
@@ -1807,8 +1907,10 @@ async def budgets_handler(request: web.Request) -> web.Response:
     lt = time.gmtime(now)
     mlen = calendar.monthrange(lt.tm_year, lt.tm_mon)[1]
     live = await litellm.key_budgets(request.app[_SESSION])
+    await _store_owners_from_live(live)          # keep known_keys.owner in sync with the board
     snap = _backend_latest.get("litellm", {})
-    keys = merge_key_budgets(live, snap.get("top_keys") or [], _key_budget_map())
+    keys = merge_key_budgets(live, _visible_top_keys(snap.get("top_keys") or []),
+                             _key_budget_map())
     _apply_team_overrides(keys)          # admin-assigned team wins over LiteLLM's
     rows = litellm.budget_rows(keys, _resolve_budget_map(keys), lt.tm_mday, mlen)
     # per-key `spend` is LIFETIME, so the monthly figures come from the daily series
@@ -1904,6 +2006,7 @@ async def _detect_teams(session, force: bool) -> tuple[dict, str]:
     hit_litellm = force or not _TEAMS_DETECT_CACHE
     if hit_litellm:
         live = await litellm.key_budgets(session)
+        await _store_owners_from_live(live)      # keep known_keys.owner in sync with the board
         for alias, info in (live or {}).items():
             _merge_team(alias, str(info.get("team", "") or ""), str(info.get("user", "") or ""),
                         float(info.get("budget", 0) or 0), float(info.get("spend", 0) or 0),
@@ -2788,7 +2891,7 @@ async def spend_series_handler(request: web.Request) -> web.Response:
         # persisted per-day history (db.spend_daily), so the chart shows far more than
         # LiteLLM's 7-day cap. Live rows WIN on any overlapping date (freshest); stored rows
         # fill everything older. See the write-through at the end of the cost block.
-        stored = db.spend_daily_range(start, end)
+        stored = await asyncio.to_thread(db.spend_daily_range, start, end)
         _live_dates = {r["date"] for r in (daily_live or [])}
         _usage = {r["date"]: {"date": r["date"], "spend": r.get("spend") or 0.0,
                               "requests": r.get("requests") or 0,
@@ -2899,7 +3002,8 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
     end = _q_end(request) or time.time()
     secs = (end - db.month_start(end)) if window == "month" else db.window_secs(window)
     days = int(secs // 86400) + 1
-    return web.json_response({"window": window, "cost": db.key_cost_window(days, end=end)})
+    return web.json_response({"window": window,
+        "cost": await asyncio.to_thread(db.key_cost_window, days, end=end)})
 
 
 async def spend_model_series_handler(request: web.Request) -> web.Response:
@@ -2972,7 +3076,7 @@ async def spend_model_user_series_handler(request: web.Request) -> web.Response:
         return web.json_response(hit[1])
     days = (int((now - db.month_start(now)) / 86400) + 1 if window == "month"
             else 366 if window == "12mo" else (30 if window == "30d" else 14))
-    rows = db.spend_model_user_rows(days, now)
+    rows = await asyncio.to_thread(db.spend_model_user_rows, days, now)
     if not rows:
         payload = {"window": window, "available": False, "labels": [], "series": []}
     else:
@@ -3024,7 +3128,7 @@ async def uptime_handler(request: web.Request) -> web.Response:
     window = db.norm_window(window, "24h")
     return web.json_response({
         "window": window,
-        "uptime": db.uptime(window),
+        "uptime": await asyncio.to_thread(db.uptime, window),
         "events": db.recent_events(30, kind="state"),
     })
 
@@ -3042,8 +3146,9 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
     await resp.prepare(request)
     try:
         while True:
-            data = json.dumps({"ts": _latest.get("ts"),
-                               "collectors": _latest.get("collectors", {})})
+            _disp = _snapshot_for_display(_latest)
+            data = json.dumps({"ts": _disp.get("ts"),
+                               "collectors": _disp.get("collectors", {})})
             await resp.write(b"data: " + data.encode() + b"\n\n")
             await asyncio.sleep(config.SAMPLE_INTERVAL)
     except (ConnectionResetError, asyncio.CancelledError):
@@ -3073,7 +3178,9 @@ async def export_handler(request: web.Request) -> web.Response:
     window = request.query.get("window", "24h")
     window = db.norm_window(window, "24h")
     fmt = request.query.get("format", "csv").lower()
-    pts = db.series(window, 1000)
+    # honour the pan/zoom cursor: without it a zoomed or panned view silently exported a
+    # same-duration window ending NOW, i.e. not the range the user was looking at
+    pts = await asyncio.to_thread(db.series, window, 1000, end=_q_end(request))
     cols = ["t"] + db._METRIC_COLS
     if fmt == "json":
         return web.json_response({"window": window, "points": pts})

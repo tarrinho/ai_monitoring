@@ -5,13 +5,15 @@
 # simplest and keeps the schema stable as panels evolve. Old rows pruned by age.
 from __future__ import annotations
 
+import bisect
 import calendar
 import json
+import math
 import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 import config
 
@@ -60,6 +62,23 @@ CREATE TABLE IF NOT EXISTS key_series_1m (bucket REAL, label TEXT, reqs REAL,
     PRIMARY KEY(bucket,label));
 CREATE TABLE IF NOT EXISTS key_series_1h (bucket REAL, label TEXT, reqs REAL,
     PRIMARY KEY(bucket,label));
+
+-- Labels (key alias, or hash when no alias resolves) LiteLLM's OWN /key/list has ever
+-- confirmed as a currently-registered key. Written by the sampler each time
+-- collectors.litellm.key_budgets() succeeds (piggy-backs on the existing
+-- LITELLM_HEAVY_INTERVAL cadence — see collectors/litellm._heavy_sample), so the
+-- per-key charts can tell a REAL key from a client sending garbage (an unexpanded
+-- '${LITELLM_API_KEY}' env-var string, a made-up/revoked hash) without this sync,
+-- SQLite-only module ever calling out to LiteLLM itself. Rows are NEVER deleted —
+-- a key that was valid and later rotated/deleted must keep showing in HISTORY
+-- (only its candidacy for a *new* top-N band is gated by current validity, at the
+-- read functions that check this table: key_series(), key_series_window_delta(),
+-- concurrency_by_key()).
+CREATE TABLE IF NOT EXISTS known_keys (
+    label      TEXT PRIMARY KEY,
+    first_seen REAL,
+    last_seen  REAL
+);
 
 -- Per-app CPU%/RAM over time (top-N apps as separate colored lines).
 -- kind = 'cpu' | 'ram'. Pruned at raw retention.
@@ -306,8 +325,10 @@ def _custom_secs(window: str) -> int | None:
     if not isinstance(window, str) or not window.startswith("custom:"):
         return None
     try:
+        # OverflowError: int(float("inf")) / int(float("1e400")) — a crafted 'custom:inf'
+        # would otherwise raise uncaught here and 500 the request (window is caller-supplied).
         return max(CUSTOM_WIN_MIN, min(CUSTOM_WIN_MAX, int(float(window[7:]))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -390,6 +411,15 @@ def init() -> None:
         if "kind" not in {r[1] for r in conn.execute("PRAGMA table_info(events)")}:
             try:
                 conn.execute("ALTER TABLE events ADD COLUMN kind TEXT DEFAULT 'state'")
+            except Exception:
+                pass
+        # Owner (LiteLLM user-id) per known key, so the read paths can tell an
+        # UNASSIGNED key (no owner anywhere) from an owned one without re-querying
+        # LiteLLM. Empty string = LiteLLM reports no user for this key. Existing rows
+        # backfill to '' and are corrected on the next /key/list poll.
+        if "owner" not in {r[1] for r in conn.execute("PRAGMA table_info(known_keys)")}:
+            try:
+                conn.execute("ALTER TABLE known_keys ADD COLUMN owner TEXT DEFAULT ''")
             except Exception:
                 pass
         # per-user alert webhook (1.2.2): each user can set their own webhook URL.
@@ -497,6 +527,100 @@ def insert_key_series(ts: float, top_keys: list[dict[str, Any]]) -> None:
         pass
 
 
+def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float) -> None:
+    """Record `labels` (aliases, or hashes for alias-less keys) as CONFIRMED-valid by
+    LiteLLM's own /key/list as of `ts`. Called by the sampler whenever
+    collectors.litellm.key_budgets() succeeds. Rows accumulate forever (no delete) —
+    see the known_keys table comment for why a rotated/deleted key must keep its
+    history.
+
+    Accepts either a plain sequence of labels or a {label: owner} mapping. The owner is
+    LiteLLM's user-id for the key ('' when it reports none) and is what
+    unassigned_labels() keys off — passing a sequence records an empty owner, which is
+    indistinguishable from 'LiteLLM says nobody owns it', so prefer the mapping."""
+    if not labels:
+        return
+    owners = labels if isinstance(labels, dict) else {}
+    rows = [(str(lab)[:80], ts, ts, str(owners.get(lab, "") or "")[:120])
+            for lab in labels if lab]
+    if not rows:
+        return
+    try:
+        with _connect() as conn:
+            conn.executemany(
+                "INSERT INTO known_keys(label, first_seen, last_seen, owner) "
+                "VALUES (?,?,?,?) "
+                "ON CONFLICT(label) DO UPDATE SET last_seen=excluded.last_seen, "
+                # only overwrite a known owner with another KNOWN owner — a transient
+                # /key/list response that lost the user must not blank an existing one
+                "owner=CASE WHEN excluded.owner<>'' THEN excluded.owner "
+                "           ELSE known_keys.owner END", rows)
+    except Exception:
+        pass
+
+
+def hidden_unassigned() -> set[str]:
+    """Labels the per-key charts must drop because the "Unassigned" group is hidden
+    (Settings → Keys → Hide unassigned keys). Empty — a pure no-op — while the toggle
+    is off, so the default costs nothing and changes nothing. Read through
+    `config.HIDE_UNASSIGNED_KEYS` at CALL time, not import time, because the tunable is
+    live-editable and `config._apply()` rebinds the module constant."""
+    if not getattr(config, "HIDE_UNASSIGNED_KEYS", False):
+        return set()
+    return unassigned_labels()
+
+
+def unassigned_labels() -> set[str]:
+    """Labels LiteLLM reports NO owner for and that carry no admin user override — the
+    keys the Settings board groups under "Unassigned". Mirrors that grouping exactly
+    (settings.html: `k.user_grp || k.user || "__unassigned__"`), so hiding the group in
+    Settings hides the same set of keys the board shows under it.
+
+    CRITICAL guard: "owner is empty" means UNASSIGNED only once owner resolution has
+    actually run. If NOT ONE row in known_keys carries a non-empty owner, owner data was
+    never populated (an image predating owner emission, or no /key/list poll has resolved
+    a user yet) — and "empty owner" is then indistinguishable from "owner not known". In
+    that state EVERY key looks unassigned, so returning them would blank every band on a
+    populated deployment (observed live: 61/61 keys owner-empty → the whole chart hidden).
+    Treat it as a no-op until at least one owner is known — only then is empty-owner a
+    trustworthy signal that LiteLLM genuinely names no owner."""
+    try:
+        ovr = key_user_overrides()
+        with _connect() as conn:
+            rows = conn.execute("SELECT label, owner FROM known_keys").fetchall()
+        if not any((o or "") for _, o in rows):
+            return set()                     # owner never resolved → hide is a no-op
+        return {lab for lab, o in rows if not (o or "") and not ovr.get(lab)}
+    except Exception:
+        return set()
+
+
+def _label_hidden(label: str, known: set[str], hidden: set[str]) -> bool:
+    """Whether a per-key `label` must be dropped from a NAMED band — folded into 'Other' on
+    the aggregate/cost charts, simply omitted from a top-N ranking. True for an operator
+    -excluded key (`MONITOR_EXCLUDE_KEYS`), a label LiteLLM's /key/list never confirmed (an
+    unexpanded `${...}` bearer, a garbage/revoked hash — but only once a known-keys baseline
+    exists, so cold start stays permissive), or a hidden 'Unassigned' key. THE one predicate
+    every per-key chart applies, so a new chart can't silently skip a class — the two
+    spend_model_user_daily-backed charts (`key_cumulative`, `key_cost_window`) did exactly
+    that and surfaced excluded/garbage/ownerless keys the sibling charts already dropped."""
+    return (config.key_excluded(label)
+            or not config.key_known(label, known)
+            or label in hidden)
+
+
+def known_keys_set() -> set[str]:
+    """All labels LiteLLM's /key/list has EVER confirmed valid (empty until the first
+    successful key_budgets() poll — callers must treat 'empty' as 'no baseline yet',
+    NOT as 'nothing is valid', or every by-key chart would blank out before the first
+    poll completes)."""
+    try:
+        with _connect() as conn:
+            return {r[0] for r in conn.execute("SELECT label FROM known_keys")}
+    except Exception:
+        return set()
+
+
 def key_series(window: str, max_points: int = 300,
                top_n: int = 10, end: float | None = None) -> dict[str, Any]:
     """Multi-series per-key request counts for the top-N keys in the window.
@@ -516,14 +640,20 @@ def key_series(window: str, max_points: int = 300,
     else:
         table, tc = "key_series_1h", "bucket"
     try:
+        known = known_keys_set()
+        hidden = hidden_unassigned()
         with _connect() as conn:
-            # over-fetch, then drop excluded labels (the monitor's own key etc.) so the
-            # historical per-key chart matches the live one, and still show a full top-N.
+            # over-fetch, then drop excluded labels (the monitor's own key etc.) AND labels
+            # LiteLLM's own /key/list has never confirmed as a real key (an unexpanded
+            # '${ENV_VAR}' string, a made-up/revoked hash — a real but INVALID auth attempt)
+            # so the historical per-key chart matches the live one, and still show a full top-N.
             ranked = [r[0] for r in conn.execute(
                 f"SELECT label, SUM(reqs) s FROM {table} "
                 f"WHERE {tc} >= ? AND {tc} <= ? "
                 f"GROUP BY label ORDER BY s DESC LIMIT ?", (start, end, top_n * 3))]
-            top = [lab for lab in ranked if not config.key_excluded(lab)][:top_n]
+            top = [lab for lab in ranked
+                   if not config.key_excluded(lab) and config.key_known(lab, known)
+                   and lab not in hidden][:top_n]
             if not top:
                 return {"labels": [], "points": []}
             ph = ",".join("?" for _ in top)
@@ -544,13 +674,70 @@ def key_series(window: str, max_points: int = 300,
         return {"labels": [], "points": []}
 
 
+def _prewindow_baseline(conn: Any, table: str, tc: str, start: float,
+                        bsize: float = 0.0,
+                        labels: list[str] | None = None) -> dict[str, float]:
+    """Last per-key CUMULATIVE value observed strictly BEFORE `start`.
+
+    Every per-key chart derives activity from the STEP between consecutive samples of a
+    cumulative counter. Seeding that step from the first sample INSIDE the window makes
+    that sample contribute 0, which silently deletes the leading-edge activity — and when
+    a window is narrow enough to hold only ONE per-key sample (zooming in on a spike),
+    it deletes ALL of it: every key weighs 0 and the entire aggregate falls into "Other".
+    Reading the previous sample gives the first in-window bucket a real step, so the same
+    spike attributes identically at any zoom level.
+
+    Bounded lookback: per-key samples land at most one collector interval apart, so a few
+    buckets back (at least 1h) finds the predecessor without scanning the whole history.
+    No predecessor (key first seen inside the window, or older than the lookback) → the
+    label is absent and the caller keeps the old first-sample-is-baseline behaviour."""
+    lb = start - max(4.0 * bsize, 3600.0)
+    try:
+        q = f"SELECT label, {tc}, reqs FROM {table} WHERE {tc} < ? AND {tc} >= ?"
+        params: list[Any] = [start, lb]
+        if labels:
+            q += " AND label IN (%s)" % ",".join("?" for _ in labels)
+            params += list(labels)
+        q += f" ORDER BY label, {tc}"
+        out: dict[str, float] = {}
+        for label, _t, v in conn.execute(q, params):
+            if v is not None:
+                out[label] = float(v)          # ascending ts → last write = latest before start
+        return out
+    except Exception:
+        return {}
+
+
+def _pos_step(cur: float, prev: float | None) -> float:
+    """Reset-safe positive step of a cumulative counter: the increase since the previous
+    reading. Returns 0 on the FIRST reading (prev is None) or when the counter moved
+    BACKWARDS — a re-based key / rolled budget / a replica with a different view. Crediting a
+    backwards move would manufacture activity, and 0 is the only honest answer across a
+    baseline change; the climb after it is picked up by the next positive step.
+
+    THE single definition of the delta semantics every per-key chart shares
+    (`key_series_window_delta`, `key_delta_series`, `concurrency_by_key`). It lived inline in
+    all three, and getting it wrong in lockstep is exactly what silently broke zoom
+    attribution — one place now, so the three cannot drift apart again."""
+    return max(0.0, cur - prev) if prev is not None else 0.0
+
+
 def key_series_window_delta(window: str, top_n: int = 10,
                             end: float | None = None) -> dict[str, Any]:
-    """Top-N keys by NET requests made DURING the window: value at the end minus
-    value at the start (per key). A key whose count is unchanged over the window
-    (e.g. 1000 → 1000) yields 0 — this shows *activity in the window*, not the
-    running total the over-time chart plots. Reset-safe: if the counter dropped
-    (daily reset), the end value is used instead of a negative delta.
+    """Top-N keys by NET requests made DURING the window — the SUM OF POSITIVE STEPS
+    across every sample in the window, per key. A key whose count is unchanged
+    (e.g. 1000 → 1000) yields 0: this shows *activity in the window*, not the running
+    total the over-time chart plots.
+
+    Summing steps rather than last-minus-first is what makes this reset-safe HONESTLY.
+    Comparing only the endpoints cannot distinguish "counter reset to 0, then 50 real
+    requests" from "baseline re-based to 50 with no traffic at all" — both read
+    900 → 50 — and the old fallback (credit the end value) guessed the first. Live,
+    that guess invented a band: a key sat flat at 2.72, re-based to 0.86, then sat flat
+    again, and was charged 0.86 of activity on an idle proxy. Walking the samples tells
+    the two apart: a genuine reset shows a climb AFTER the drop and still scores it,
+    while a plateau-drop-plateau scores 0. Matches key_delta_series exactly, so a key
+    can never rank here and draw flat there.
 
     Returns {"labels": [...], "deltas": [...]} aligned by index (bar chart)."""
     secs = window_secs(window)
@@ -563,22 +750,32 @@ def key_series_window_delta(window: str, top_n: int = 10,
     else:
         table, tc = "key_series_1h", "bucket"
     try:
+        known = known_keys_set()
+        hidden = hidden_unassigned()
         with _connect() as conn:
             rows = conn.execute(
-                f"SELECT b.label, "
-                f"  (SELECT reqs FROM {table} WHERE label=b.label AND {tc}=b.mx) AS lastv, "
-                f"  (SELECT reqs FROM {table} WHERE label=b.label AND {tc}=b.mn) AS firstv "
-                f"FROM (SELECT label, MIN({tc}) mn, MAX({tc}) mx FROM {table} "
-                f"      WHERE {tc} >= ? AND {tc} <= ? GROUP BY label) b",
+                f"SELECT label, {tc}, reqs FROM {table} "
+                f"WHERE {tc} >= ? AND {tc} <= ? ORDER BY label, {tc}",
                 (start, end)).fetchall()
-        out = []
-        for label, lastv, firstv in rows:
-            if lastv is None or config.key_excluded(label):
+            # baseline from the sample BEFORE the window, so activity at the leading edge
+            # (and a window holding a single sample) is not lost — see _prewindow_baseline
+            base = _prewindow_baseline(conn, table, tc, start)
+        # sum the positive steps per label; a backwards step contributes 0 (baseline
+        # change — unknowable), and the climb after it is picked up normally
+        totals: dict[str, float] = {}
+        prev: dict[str, float] = dict(base)
+        for label, _ts, v in rows:
+            if v is None:
                 continue
-            fv = firstv if firstv is not None else 0.0
-            delta = (lastv - fv) if lastv >= fv else lastv     # reset-safe
+            totals[label] = totals.get(label, 0.0) + _pos_step(v, prev.get(label))
+            prev[label] = v
+        out = []
+        for label, delta in totals.items():
+            if (config.key_excluded(label) or not config.key_known(label, known)
+                    or label in hidden):
+                continue
             out.append({"label": label, "delta": max(0.0, round(delta, 2))})
-        out.sort(key=lambda x: x["delta"], reverse=True)
+        out.sort(key=lambda x: cast(float, x["delta"]), reverse=True)
         out = out[:top_n]
         return {"labels": [o["label"] for o in out],
                 "deltas": [o["delta"] for o in out]}
@@ -618,23 +815,20 @@ def key_delta_series(window: str, max_points: int = 300, top_n: int = 10,
                 f"WHERE {tc} >= ? AND {tc} <= ? AND label IN ({ph}) "
                 f"GROUP BY bkt, label ORDER BY bkt",
                 (start, bsize, start, end, *ranked)).fetchall()
+            base = _prewindow_baseline(conn, table, tc, start, bsize, ranked)
         # absolute per-bucket value per label -> per-bucket step -> running total
         buckets: dict[int, dict] = {}
         for bkt, avg_ts, label, avg_reqs in rows:
             b = buckets.setdefault(bkt, {"t": avg_ts, "_abs": {}})
             b["_abs"][label] = avg_reqs
-        prev: dict[str, float] = {}
+        prev: dict[str, float] = dict(base)
         cum: dict[str, float] = {}
         points = []
         for k in sorted(buckets):
             b = buckets[k]
             pt = {"t": b["t"]}
             for label, v in b["_abs"].items():
-                if label in prev:
-                    step = v - prev[label]
-                    step = step if step >= 0 else v      # reset-safe
-                else:
-                    step = 0.0                            # first observed bucket
+                step = _pos_step(v, prev.get(label))     # reset-safe; 0 on first/backwards
                 cum[label] = cum.get(label, 0.0) + step
                 pt[label] = round(cum[label], 2)         # cumulative since window start
                 prev[label] = v
@@ -711,6 +905,14 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
     real measured aggregate; only the split is inferred. Activity we can't attribute to a
     top-N key (or any key) goes to 'Other', so the total height always equals the aggregate.
 
+    The aggregate and key_series are polled on independent cadences (SAMPLE_INTERVAL vs
+    LITELLM_HEAVY_INTERVAL), so a bucket can have an aggregate value with no key_series row
+    of its own — most often a single isolated request, whose backlog blip and matching
+    spend-delta sample rarely land in the same bucket. Such a bucket borrows the nearest
+    bucket's key-mix within one heavy-poll interval (`max_gap`, below) instead of dumping
+    straight to 'Other'; beyond that distance the mix is stale enough that 'Other' is still
+    the honest answer.
+
     key_series + the metrics series bucket on the SAME grid (CAST((t-start)/bsize)), so the
     two reads align by bucket index. Returns {labels, metric, series:[{label,data}]}."""
     if metric not in ("conc", "backlog"):
@@ -735,6 +937,7 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
                 f"SELECT CAST(({tc}-?)/? AS INT) bkt, label, AVG(reqs) "
                 f"FROM {ktab} WHERE {tc}>=? AND {tc}<=? GROUP BY bkt, label",
                 (start, bsize, start, end)).fetchall()
+            kbase = _prewindow_baseline(conn, ktab, tc, start, bsize)
         aggv: dict[int, float] = {}
         ts: dict[int, float] = {}
         for bkt, t, v in agg:
@@ -754,12 +957,16 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
             # DELTAS (spend DURING the bucket = recent activity). Idle keys → 0 → no band.
             labels = {lab for bw in weights.values() for lab in bw}
             for lab in labels:
-                prev = None
+                # Seed from the sample BEFORE the window (else the first in-window sample
+                # is its own baseline and scores 0 — which is why zooming into a single
+                # spike used to attribute the whole aggregate to "Other": the zoomed
+                # window held only that one per-key sample). See _prewindow_baseline.
+                prev = kbase.get(lab)
                 for bkt in sorted(weights):
                     if lab not in weights[bkt]:
                         continue
                     cur = weights[bkt][lab]
-                    weights[bkt][lab] = max(0.0, cur - prev) if prev is not None else 0.0
+                    weights[bkt][lab] = _pos_step(cur, prev)   # reset-safe; shared kernel
                     prev = cur                       # baseline against the raw cumulative
         totals: dict[str, float] = {}
         for bw in weights.values():
@@ -782,8 +989,28 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
         # split for the real, non-excluded keys is unaffected); only dropping it from
         # `top` means its share now correctly flows into 'Other' like any other
         # unattributed activity, instead of leaking through as a labelled key.
+        #
+        # ALSO drop labels LiteLLM's own /key/list has never confirmed as a real key
+        # (config.key_known() against db.known_keys_set()) — some clients hit the
+        # gateway with a real but INVALID bearer token (an unexpanded '${ENV_VAR}'
+        # string, a made-up/revoked hash) and key_series faithfully records whatever
+        # string was presented. That activity is genuine backlog/concurrency load —
+        # its weight stays in the split denominator below — but it must fold into
+        # 'Other' rather than get its own named band, same as an excluded key.
+        known = known_keys_set()
+        hidden = hidden_unassigned()
         top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
-               if not config.key_excluded(lab)][:top_n]
+               if not config.key_excluded(lab) and config.key_known(lab, known)
+               and lab not in hidden][:top_n]
+        # The aggregate (fast, ~SAMPLE_INTERVAL) and per-key spend (slow,
+        # ~LITELLM_HEAVY_INTERVAL) are polled independently, so a short, isolated
+        # request's backlog blip and its matching key_series sample rarely land in
+        # the SAME bucket — without bridging, every isolated request washes into
+        # "Other" even though the key that made it is known. Borrow the nearest
+        # bucket's key-mix within one heavy-poll interval; beyond that the mix is
+        # stale enough that "Other" is still the honest answer.
+        nonempty_bkts = sorted(b for b, bw in weights.items() if sum(bw.values()) > 0)
+        max_gap = max(1, math.ceil(config.LITELLM_HEAVY_INTERVAL / bsize)) + 1
         buckets = sorted(aggv)
         data: dict[str, list] = {lab: [] for lab in top}
         other: list = []
@@ -791,6 +1018,23 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
             a = aggv[b]
             bw = weights.get(b, {})
             tot = sum(bw.values())
+            if tot <= 0 and nonempty_bkts:
+                i = bisect.bisect_left(nonempty_bkts, b)
+                cands = [c for c in (nonempty_bkts[i - 1] if i > 0 else None,
+                                      nonempty_bkts[i] if i < len(nonempty_bkts) else None)
+                         if c is not None]
+                if cands:
+                    mind = min(abs(c - b) for c in cands)
+                    # On a tie (a gap bucket sits exactly between two donors), blend both
+                    # instead of arbitrarily favouring one side — neither is more likely to
+                    # represent the isolated request than the other.
+                    nearest = [c for c in cands if abs(c - b) == mind]
+                    if mind <= max_gap:
+                        bw = {}
+                        for c in nearest:
+                            for lab, v in weights[c].items():
+                                bw[lab] = bw.get(lab, 0.0) + v
+                        tot = sum(bw.values())
             if tot <= 0:                          # aggregate present but nothing to attribute
                 for lab in top:
                     data[lab].append(0.0)
@@ -1433,7 +1677,13 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
             d[label] = d.get(label, 0.0) + float(val or 0)
             if day not in days:
                 days.append(day)
-        top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])[:top_n]]
+        # drop excluded / unconfirmed / hidden-unassigned labels from top-N candidacy, same
+        # as the sibling over-time chart (key_series) — this rollup-backed chart used to skip
+        # the filter and surface them as their own lines.
+        known = known_keys_set()
+        hidden = hidden_unassigned()
+        top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
+               if not _label_hidden(lab, known, hidden)][:top_n]
         if not top:
             return {"labels": [], "metric": metric, "points": []}
         # accumulate each top key's daily value into a running total across the days
@@ -1465,7 +1715,23 @@ def key_cost_window(days_back: int, end: float | None = None) -> dict[str, float
             rows = conn.execute(
                 "SELECT COALESCE(NULLIF(alias,''), key) AS label, SUM(cost) c "
                 "FROM spend_model_user_daily WHERE day >= ? GROUP BY label", (start_day,)).fetchall()
-        return {r[0]: round(float(r[1] or 0), 4) for r in rows}
+        # Fold excluded / unconfirmed / hidden-unassigned keys into "Other" rather than showing
+        # them as named bands (this rollup-backed chart used to skip the filter entirely). Cost
+        # is FOLDED, not dropped, so the window's total spend is preserved — a hidden key's
+        # money stays visible in aggregate, it just loses its own labelled band.
+        known = known_keys_set()
+        hidden = hidden_unassigned()
+        out: dict[str, float] = {}
+        other = 0.0
+        for label, c in rows:
+            cost = float(c or 0)
+            if _label_hidden(str(label), known, hidden):
+                other += cost
+            else:
+                out[str(label)] = out.get(str(label), 0.0) + cost
+        if other > 0:
+            out["Other"] = out.get("Other", 0.0) + other
+        return {k: round(v, 4) for k, v in out.items()}
     except Exception:
         return {}
 

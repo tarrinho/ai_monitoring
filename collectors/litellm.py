@@ -385,13 +385,30 @@ def _spend_mode() -> str:
     return m if m in ("full", "lite", "off") else "full"
 
 
+def _is_health_check_key(*identifiers: object) -> bool:
+    """True if any identifier looks like LiteLLM's internal health-check pseudo-key
+    (e.g. 'litellm-internal-health-check'). Those rows are LiteLLM probing its own
+    deployments — not user traffic — so they are dropped from every per-key surface.
+    Single source of truth for the lite (/global/spend/keys) and full (/spend/logs)
+    paths, which previously each carried their own copy of this test."""
+    for v in identifiers:
+        if v is None:
+            continue
+        if "health-check" in str(v).lower():
+            return True
+    return False
+
+
 async def _fetch_top_keys(session: aiohttp.ClientSession, base: str,
                           h: dict) -> tuple[list[dict], str | None]:
     """Per-key CUMULATIVE spend from `/global/spend/keys` — a CHEAP server-side aggregate
     (~200 ms, ~0 CPU), NOT the heavy `/spend/logs` blob that causes the freeze. Returns
     (top_keys, err). Used by lite mode AND the 'off'/load-shed paths so the per-key charts
     (Top keys/users/over-time) stay populated even when the heavy pull is disabled. Honours
-    MONITOR_EXCLUDE_KEYS. reqs/tokens are None here (only /spend/logs has per-key requests)."""
+    MONITOR_EXCLUDE_KEYS and drops LiteLLM's internal health-check pseudo-key (same rule the
+    full-mode /spend/logs parse applies) — it is LiteLLM probing its own deployments, not
+    real usage, and it would otherwise occupy a slot in every per-key ranking.
+    reqs/tokens are None here (only /spend/logs has per-key requests)."""
     ks, err = await fetch_json(session, f"{base}/global/spend/keys?limit=100",
                                headers=h, timeout_s=config.HTTP_TIMEOUT)
     keys: list[dict] = []
@@ -402,8 +419,10 @@ async def _fetch_top_keys(session: aiohttp.ClientSession, base: str,
             "reqs": None, "tokens": None,
             "cost": round(float(k.get("total_spend") or 0), 4),
         } for k in ks
-            if not config.key_excluded(k.get("api_key"),
-                                       k.get("key_alias") or k.get("key_name"))]
+            if not _is_health_check_key(k.get("api_key"),
+                                        k.get("key_alias") or k.get("key_name"))
+            and not config.key_excluded(k.get("api_key"),
+                                        k.get("key_alias") or k.get("key_name"))]
     return keys, err
 
 
@@ -438,6 +457,12 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
         headers=h, timeout_s=t)
     if e1 is None and isinstance(act, dict):
         out["requests_window"] = int(act.get("sum_api_requests") or 0)
+        # /global/activity is queried today->tomorrow, so sum_api_requests is the
+        # DAY-TO-DATE total (resets at UTC midnight), NOT a rolling window like the
+        # full-mode figure. Declare the basis so the dashboard labels it honestly —
+        # rendering a day counter under a "last 15m" badge made an idle proxy look
+        # permanently busy (the number just sits at the day's total).
+        out["requests_basis"] = "today_utc"
         out["tokens_today"] = int(act.get("sum_total_tokens") or 0)
         # Throughput over-time charts in lite mode: /global/activity gives only the
         # day's RUNNING TOTALS (no per-request rows), so differentiate them into
@@ -610,6 +635,7 @@ async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str
     model's per-day cost so the UI can chart cost-per-model over time. Returns
     {"models": [{"model", "kind", "total", "daily": {date: $}} …] sorted by total desc,
     "dates": [sorted union of dates]}, or None when there's no per-model daily data."""
+    global _MODEL_SERIES_CACHE
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
         return None
@@ -619,7 +645,9 @@ async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str
         f"{base}/global/activity/model?start_date={start_date}&end_date={end_date}",
         headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
     if err is not None or not isinstance(pm, list):
-        return None
+        # transient failure (timeout / circuit-breaker / bad shape) → serve last-good so
+        # the chart persists across the blip instead of vanishing until the next poll
+        return dict(_MODEL_SERIES_CACHE) if _MODEL_SERIES_CACHE else None
     models: list = []
     dates: set[str] = set()
     unpriced: set[str] = set()
@@ -675,16 +703,21 @@ async def per_model_daily_series(session: aiohttp.ClientSession, start_date: str
                            "total": round(sum(dmap.values()), 2),
                            "daily": {d: round(v, 4) for d, v in dmap.items()}})
     if not saw:
-        return None
+        # endpoint answered but priced nothing this poll (momentary empty / mid-reload) →
+        # keep the last-good series so the card doesn't blink off; None only before the
+        # first-ever success (genuinely no data yet), where hiding is correct
+        return dict(_MODEL_SERIES_CACHE) if _MODEL_SERIES_CACHE else None
     models.sort(key=lambda x: -x["total"])
     basis = ("actual" if n_actual and not n_est
              else "estimated" if n_est and not n_actual
              else "mixed" if n_actual and n_est else "none")
-    return {"models": models, "dates": sorted(dates), "cost_basis": basis,
-            # models that cost real money but could not be valued — the chart total is
-            # short by whatever they spent, and the UI must say so rather than imply
-            # the breakdown is complete
-            "unpriced": sorted(unpriced)}
+    out = {"models": models, "dates": sorted(dates), "cost_basis": basis,
+           # models that cost real money but could not be valued — the chart total is
+           # short by whatever they spent, and the UI must say so rather than imply
+           # the breakdown is complete
+           "unpriced": sorted(unpriced)}
+    _MODEL_SERIES_CACHE = out          # cache this good series as last-good
+    return out
 
 
 async def model_prices(session: aiohttp.ClientSession) -> dict:
@@ -1069,6 +1102,11 @@ _TEAM_DIR_CACHE: tuple[dict, dict, dict] = ({}, {}, {})
 _PRICES_CACHE: dict = {}  # last good /model/info {model: $/token} — prices are stable
                           # config, so reuse them when the endpoint blips empty (else
                           # cost=0 → the Spend "Cost over time" card flickers off)
+# Last good per-model daily series (the Spend "Cost per model over time" chart). The
+# chart hides on an empty payload, so a single transient /global/activity/model failure
+# (timeout, circuit-breaker cooldown, mid-reload) made the WHOLE card blink off between
+# polls. Reuse the last-good series across a blip — same rule as _PRICES_CACHE above.
+_MODEL_SERIES_CACHE: dict | None = None
 
 
 async def _paginate(session: aiohttp.ClientSession, url: str, root_keys: tuple,
@@ -1553,6 +1591,26 @@ async def _heavy_sample(session: aiohttp.ClientSession, base: str,
             _dbg("kept-rows=0 -> no rows in window (no traffic / key perms / date).")
 
     await _do_spend()
+    # /key/list is LiteLLM's OWN record of which labels are real, currently (or
+    # formerly) registered keys — piggy-backed on this same HEAVY cadence (it's a
+    # management-API call, no cheaper than /spend/logs) so the per-key charts can
+    # tell a real key from a client sending garbage (an unexpanded '${ENV_VAR}'
+    # string as its bearer token, a made-up/revoked hash) and fold that into
+    # 'Other' instead of it claiming its own named band. Best-effort: key_budgets()
+    # already falls back to its own last-good cache (or None on a cold start with
+    # no cache yet) on a transient /key/list error, so this never regresses a chart
+    # over a blip — it only ever grows the known-keys set (db.known_keys_upsert
+    # never deletes, so a later-rotated key still shows in HISTORY).
+    try:
+        kb = await key_budgets(session)
+        if kb:
+            # {alias: owner-user-id}, not just the alias list — the owner is what tells an
+            # UNASSIGNED key (LiteLLM reports no user) from an owned one, and it is already
+            # resolved here, so persisting it costs nothing and saves the read paths from
+            # re-querying LiteLLM. '' means "LiteLLM names no owner for this key".
+            hv["known_keys"] = {a: str(v.get("user") or "") for a, v in kb.items()}
+    except Exception as e:
+        _dbg(f"/key/list known-keys refresh error: {type(e).__name__}")
     return hv
 
 
@@ -1572,7 +1630,7 @@ def _fold_model_user(logs: list) -> list[dict]:
         meta = row.get("metadata")
         meta = meta if isinstance(meta, dict) else {}
         kid = str(row.get("api_key") or meta.get("user_api_key") or "?")
-        if not kid or kid == "?" or "health-check" in kid.lower():
+        if not kid or kid == "?" or _is_health_check_key(kid):
             continue
         model = str(row.get("model") or row.get("model_name") or "?")
         spend = float(row.get("response_cost",
@@ -1704,7 +1762,7 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
             # Skip LiteLLM's internal health-check pseudo-key — it's the monitor's
             # own /health probes, not real usage, and would dominate the chart.
             kid = (row.get("api_key") or meta.get("user_api_key") or "?")
-            if kid and "health-check" not in str(kid).lower():
+            if kid and not _is_health_check_key(kid):
                 alias = (row.get("key_alias") or row.get("api_key_alias")
                          or meta.get("user_api_key_alias") or "")
                 k = per_key.setdefault(kid, {"key": kid, "alias": alias,
@@ -1718,6 +1776,9 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
             n = len(waits)
             win_s = max(1.0, config.LITELLM_SPEND_WINDOW_MIN * 60)
             res["requests_window"] = n
+            # full mode really is a rolling LITELLM_SPEND_WINDOW_MIN window (counted
+            # from per-request rows), unlike lite's day-to-date total.
+            res["requests_basis"] = "window"
             res["wait_avg_ms"] = round(sum(waits) / n, 1)
             res["wait_max_ms"] = round(max(waits), 1)
             # latency percentiles (#2) — avg hides the tail; p95/p99 = real UX

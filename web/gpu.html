@@ -125,6 +125,10 @@ function updateSeries(chart,labels,next){
     #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
   }
   .chart-wrap{position:relative}
+  /* a restored drag-selection is a FROZEN historical window — mark it so it never reads
+     as "the dashboard stopped updating" */
+  .custom-win{color:var(--accent);font-weight:600}
+  .custom-win::after{content:" (not live)";font-weight:400;opacity:.75}
   .drag-sel{position:absolute;background:rgba(88,166,255,.18);border:1px solid var(--accent);
     pointer-events:none;z-index:6;border-radius:2px}
 </style>
@@ -198,7 +202,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.5</div>
+      <div id="sidebar-brand-ver">v1.8.6</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -399,7 +403,7 @@ function renderPerCpuGrid(){
   const labels=_percpuPts.map(axisT(_percpuPts));
   for(let i=0;i<_percpuCharts.length;i++){
     const key=String(ids[i]), cc=_percpuCharts[i];
-    cc.chart.data.labels=labels;
+    cc.chart.data.labels=labels; stampTs(cc.chart, _percpuPts);
     cc.chart.data.datasets[0].data=_percpuPts.map(p=>(p[key]==null?null:p[key]));
     cc.chart.update("none");                                    // in place — no rebuild
     const v=lastNonNull(_percpuPts,key);
@@ -442,11 +446,15 @@ function renderCpuCoresStack(){
     // Each core's SHARE of total capacity = core% ÷ N, so the N bands sum to the overall
     // CPU % (0–100). 0 (not null) for an absent sample: on a STACKED area a null span-gaps
     // into a phantom diagonal band (same reason the per-app CPU stack fills with 0).
+    // A plain fill-to-origin would stack translucent layers on top of each other so each
+    // band blends with the ones below it — fill to the PREVIOUS dataset instead (same fix
+    // as the per-app CPU stack).
     ds.push({_k:"core"+ids[i], label:"core "+ids[i],
       data:_percpuPts.map(function(p){ var v=p[String(ids[i])]; return (v==null?0:v)/n; }),
       borderColor:col, backgroundColor:col+"cc", borderWidth:.7, pointRadius:0,
-      tension:.2, fill:true});
+      tension:.2, fill:i?"-1":"origin"});
   }
+  stampTs(cpuCoresChart, _percpuPts);
   updateSeries(cpuCoresChart, labels, ds);
 }
 
@@ -469,7 +477,7 @@ const appCpuChart=new Chart(document.getElementById("appcpu-chart"),{
 });
 let _appCpuN=1;   // logical-core count for this window — divisor that keeps the stack ≤100%
 async function loadAppCpu(){
-  document.getElementById("appcpu-win").textContent=WIN;
+  document.getElementById("appcpu-win").textContent=wlabel(WIN);
   const d=await api("/api/procseries?kind=cpu&window="+WIN);
   if(!d) return;
   const pts=d.points||[], apps=d.apps||[];
@@ -478,7 +486,7 @@ async function loadAppCpu(){
   // back to the per-core card's count, else 1) so the stacked bands share one 0–100 axis.
   _appCpuN=(d.ncpu&&d.ncpu>0)?d.ncpu:(_cpuCoreN>1?_cpuCoreN:1);
   const n=_appCpuN;
-  updateSeries(appCpuChart, pts.map(axisT(pts)), apps.map((a,i)=>({_k:a, label:a,
+  stampTs(appCpuChart, pts); updateSeries(appCpuChart, pts.map(axisT(pts)), apps.map((a,i)=>({_k:a, label:a,
     // an app with no sample in a bucket (process absent / not in top-N then) is 0,
     // NOT null: on a STACKED area a null gets span-gapped into a straight diagonal
     // across the gap, producing the huge phantom bands. A flat 0 draws correctly.
@@ -501,7 +509,8 @@ function wsecs(w){ if(typeof w==="string"&&w.indexOf("custom:")===0){var cs=pars
 // refresh keeps it, and each page keeps its OWN window (not shared site-wide). Falls
 // back to the page default when nothing is saved or the saved value isn't a valid button.
 function _winKey(){ return "aimon-win:"+location.pathname; }
-function _winCustom(w){ return typeof w==="string" && w.indexOf("custom:")===0 && parseInt(w.slice(7),10)>0; }
+function _winCustom(w){ // STRICT "custom:<digits>" only. A loose check let a poisoned localStorage value like "custom:3600&x=1" pass, then flow unencoded into the export URL + api() query string (param injection). Anchored regex closes that.
+  return typeof w==="string" && /^custom:[0-9]+$/.test(w) && parseInt(w.slice(7),10)>0; }
 // Persist {w,end}: a named window (end=null -> live) OR a drag-selected custom range
 // ("custom:<secs>" + absolute end t2). Restored on refresh so each page keeps its OWN
 // window/zoom until a NEW one is chosen (window button, Live, or a fresh drag).
@@ -510,13 +519,15 @@ function _winRestore(sel, def, labelId){
   var s=null; try{ s=JSON.parse(localStorage.getItem(_winKey())||"null"); }catch(e){}
   var w=s&&s.w;
   if(_winCustom(w)){
-    TIMEEND=(s&&s.end)||null;                 // absolute custom range persists across refresh
+    TIMEEND=Number(s&&s.end)||null;           // absolute custom range persists across refresh
+    setTimeout(function(){ _winMark(true); },0);   // mark it: a frozen window isn't a dead dashboard
     document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
       x.classList.remove("active"); x.setAttribute("aria-pressed","false"); });
     if(labelId){ var lc=document.getElementById(labelId); if(lc) lc.textContent="custom"; }
     return w;
   }
-  if(!(w && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
+  // Only a safe-charset token may reach the querySelector interpolation below: a malformed restored value would otherwise throw a SyntaxError and crash page init (named windows are alphanumeric: 1h/24h/30d/12mo/month).
+  if(!(w && /^[a-z0-9]+$/i.test(w) && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
   document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
     var on=x.dataset.w===w; x.classList.toggle("active",on); x.setAttribute("aria-pressed", on?"true":"false"); });
   if(labelId){ var l=document.getElementById(labelId); if(l) l.textContent=w; }
@@ -590,7 +601,7 @@ async function loadSeries(){
   const pts=d.points||[]; const labels=pts.map(axisT(pts));
   for(const cfg of CHARTS){
     const ch=_charts[cfg.id];
-    ch.data.labels=labels;
+    ch.data.labels=labels; stampTs(ch, pts);
     ch.data.datasets[0].data=pts.map(p=>(p[cfg.key]==null?null:p[cfg.key]));
     ch.update("none");
     const cur=document.getElementById(cfg.id+"-cur");
@@ -621,41 +632,86 @@ function updateRangeUI(){
   const m=Math.round((now-TIMEEND)/60);
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
+// wlabel(): a custom window's raw token ("custom:900") must never reach the UI — every
+// window badge renders it through here (bug-registry class #3/#4: raw markup/tokens shown
+// to the user).
+function wlabel(w){ return (typeof w==="string" && w.indexOf("custom:")===0) ? "custom" : w; }
+// stampTs(): remember the ACTUAL timestamp of each plotted point on the chart. The server
+// omits empty buckets (GROUP BY yields only buckets holding rows), so points are NOT evenly
+// spread across the window whenever the monitor restarted or a backend was down — mapping a
+// drag by pixel fraction alone would then select the wrong time range.
+function stampTs(ch, pts){ try{ if(ch) ch.$ts=(pts||[]).map(function(p){ return p && p.t; }); }catch(e){} }
 // ---- drag-to-zoom: drag across ANY chart to set a custom time window (Kibana-style) ----
 (function(){
   var dg=null;
   function chartOf(cv){ return (window.Chart && Chart.getChart) ? Chart.getChart(cv) : null; }
   function place(x){
-    if(!dg) return; var a=dg.ch.chartArea, r=dg.cv.getBoundingClientRect();
+    if(!dg||!dg.ov) return; var a=dg.ch.chartArea, r=dg.cv.getBoundingClientRect();
     var lo=Math.max(a.left, Math.min(dg.x0,x)-r.left), hi=Math.min(a.right, Math.max(dg.x0,x)-r.left);
     dg.ov.style.left=lo+"px"; dg.ov.style.width=Math.max(0,hi-lo)+"px";
     dg.ov.style.top=a.top+"px"; dg.ov.style.height=(a.bottom-a.top)+"px";
   }
+  function abort(){ if(dg&&dg.ov&&dg.ov.parentNode) dg.ov.parentNode.removeChild(dg.ov); dg=null; }
   document.addEventListener("pointerdown",function(e){
     if(e.button) return;
     var wrap=e.target.closest && e.target.closest(".chart-wrap"); if(!wrap) return;
     var cv=wrap.querySelector("canvas"); if(!cv) return;
     var ch=chartOf(cv); if(!ch||!ch.chartArea) return;
-    var ov=document.createElement("div"); ov.className="drag-sel"; wrap.appendChild(ov);
-    dg={wrap:wrap,cv:cv,ch:ch,x0:e.clientX,ov:ov}; place(e.clientX); e.preventDefault();
+    // Time-series charts only. A by-key BAR chart's x-axis is key names, not time — a drag
+    // there would map pixels onto a time range that means nothing. $ts is set by stampTs(),
+    // so only charts plotted against real timestamps are draggable.
+    if(!ch.$ts || ch.$ts.length<2) return;
+    // Start ONLY inside the plot area: Chart.js paints the legend on the same canvas, so
+    // grabbing the whole wrap would swallow the click that toggles a series on/off.
+    var a=ch.chartArea, r=cv.getBoundingClientRect(), x=e.clientX-r.left, y=e.clientY-r.top;
+    if(x<a.left||x>a.right||y<a.top||y>a.bottom) return;
+    dg={wrap:wrap,cv:cv,ch:ch,x0:e.clientX,ov:null,moved:false};
   });
-  document.addEventListener("pointermove",function(e){ if(dg) place(e.clientX); });
+  document.addEventListener("pointermove",function(e){
+    if(!dg) return;
+    if(!dg.moved){
+      if(Math.abs(e.clientX-dg.x0)<5) return;      // still a click, not a drag
+      dg.moved=true;
+      dg.ov=document.createElement("div"); dg.ov.className="drag-sel"; dg.wrap.appendChild(dg.ov);
+    }
+    e.preventDefault();                            // suppress text selection ONLY while dragging
+    place(e.clientX);
+  });
+  document.addEventListener("pointercancel",abort);   // pointer lost (gesture/scroll/OS) → clean up
+  window.addEventListener("blur",abort);              // released outside the window → no stuck overlay
   document.addEventListener("pointerup",function(e){
-    if(!dg) return; var d=dg; dg=null; if(d.ov.parentNode) d.ov.parentNode.removeChild(d.ov);
-    if(Math.abs(e.clientX-d.x0)<5) return;                 // a click, not a drag
+    if(!dg) return; var d=dg; abort();
+    if(!d.moved) return;                           // a click: let the chart handle it
     var a=d.ch.chartArea, r=d.cv.getBoundingClientRect(), w=a.right-a.left; if(w<=0) return;
-    var f1=(Math.min(d.x0,e.clientX)-r.left-a.left)/w, f2=(Math.max(d.x0,e.clientX)-r.left-a.left)/w;
-    f1=Math.max(0,Math.min(1,f1)); f2=Math.max(0,Math.min(1,f2));
-    var end=TIMEEND||Date.now()/1000, s=end-wsecs(WIN), span=end-s;
-    var t1=s+f1*span, t2=s+f2*span;
-    if(t2-t1<30) return;                                   // ignore < 30s selections
+    var px1=Math.min(d.x0,e.clientX)-r.left, px2=Math.max(d.x0,e.clientX)-r.left;
+    var t1=null, t2=null, ts=d.ch.$ts, xs=d.ch.scales&&d.ch.scales.x;
+    if(ts&&ts.length>1&&xs&&xs.getValueForPixel){
+      // exact: pixel -> point index -> that point's real timestamp (handles data gaps)
+      var i1=Math.round(xs.getValueForPixel(px1)), i2=Math.round(xs.getValueForPixel(px2));
+      i1=Math.max(0,Math.min(ts.length-1,i1)); i2=Math.max(0,Math.min(ts.length-1,i2));
+      if(isFinite(ts[i1])&&isFinite(ts[i2])){ t1=ts[i1]; t2=ts[i2]; }
+    }
+    if(t1===null){                                 // fallback: fraction of the requested window
+      var f1=Math.max(0,Math.min(1,(px1-a.left)/w)), f2=Math.max(0,Math.min(1,(px2-a.left)/w));
+      var end=TIMEEND||Date.now()/1000, s=end-wsecs(WIN), span=end-s;
+      t1=s+f1*span; t2=s+f2*span;
+    }
+    if(!(t2-t1>=30)) return;                       // ignore < 30s selections
     WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND);
     document.querySelectorAll("#windows button[data-w]").forEach(function(x){x.classList.remove("active");x.setAttribute("aria-pressed","false");});
     document.querySelectorAll('#win-label,[id$="-win"]').forEach(function(el){ el.textContent="custom"; });
+    _winMark(true);
     if(typeof updateRangeUI==="function") updateRangeUI();
     rangedReload();
   });
 })();
+// _winMark(): make a restored custom range unmistakable — a frozen historical window that
+// survives a refresh otherwise reads as "the dashboard stopped updating".
+function _winMark(on){
+  var l=document.getElementById("win-label"); if(!l) return;
+  l.classList.toggle("custom-win", !!on);
+  l.title = on ? "Custom range from a chart selection — click Live to resume live data" : "";
+}
 document.getElementById("nav-left").addEventListener("click",()=>{
   const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(WIN);
   updateRangeUI(); rangedReload();
@@ -666,17 +722,18 @@ document.getElementById("nav-right").addEventListener("click",()=>{
   updateRangeUI(); rangedReload();
 });
 document.getElementById("nav-live").addEventListener("click",()=>{
-  if(!TIMEEND) return; TIMEEND=null; _winSave(WIN, null); updateRangeUI(); rangedReload();
+  if(!TIMEEND) return; TIMEEND=null; _winMark(false); _winSave(WIN, null); updateRangeUI(); rangedReload();
 });
 document.querySelectorAll("#windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
-    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); updateRangeUI();
-    document.getElementById("win-label").textContent=WIN; loadSeries(); loadAppCpu(); loadPerCpu();
+    b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); _winMark(false); var _wl=document.getElementById("win-label"); if(_wl)_wl.textContent=wlabel(WIN); updateRangeUI();
+    document.getElementById("win-label").textContent=wlabel(WIN); loadSeries(); loadAppCpu(); loadPerCpu();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
   window.open("/api/export?window="+WIN+"&format=csv"
+    + (TIMEEND?("&end="+Math.round(TIMEEND)):"")
     +(AUTH?("&token="+encodeURIComponent(AUTH)):""),"_blank");
 });
 

@@ -120,13 +120,39 @@
   .srow.tteam .lbl,.srow.tmodel .lbl{flex:1 1 90px}
   .srow .tin{width:104px;flex:0 0 auto} .srow .bin{width:56px;flex:0 0 auto}
   .srow .min{width:auto;max-width:130px;flex:0 0 auto}
-  /* model-costs: narrow the name + kind select to make room for the 3 per-type rate cells */
-  .srow.tmodel .lbl{flex:0 1 116px;max-width:116px}
-  .srow.tmodel select.min{max-width:92px}
-  .srow.tmodel .mcosts{display:flex;gap:11px;align-items:center;flex:1 1 auto;min-width:0}
-  .srow.tmodel .mc{display:flex;flex-direction:column;line-height:1.12;min-width:0}
-  .srow.tmodel .mck{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
-  .srow.tmodel .mcv{font-size:12px;font-variant-numeric:tabular-nums;color:var(--fg);white-space:nowrap}
+  /* model-costs: an ALIGNED grid — in/out/cache line up in their own right-aligned columns
+     under a single header, and the override input has its own column. (Was a ragged flex
+     row where each 2-line label-over-value cell floated and the override drifted, so nothing
+     lined up row-to-row.) The header (.mhdr) and every row MUST share this exact template —
+     test_model_costs_header_and_rows_share_one_grid pins the two strings equal. */
+  /* every column except the flexible name is a FIXED width, and that includes the actions
+     column — an `auto` actions track would be 0-wide in the header (empty) but ~64px in a
+     row, so the `1fr` name column would absorb different slack and the numeric columns would
+     not line up between header and rows. A fixed 64px keeps both grids identical. */
+  .srow.tmodel,.mhdr{grid-template-columns:minmax(80px,1fr) 92px 58px 58px 58px 72px 64px;
+    column-gap:9px}
+  .srow.tmodel{display:grid;align-items:center}
+  .mhdr{display:grid;font-size:9px;text-transform:uppercase;letter-spacing:.04em;
+    color:var(--muted);padding:1px 0 5px;border-bottom:1px solid var(--line)}
+  .mhdr .r{text-align:right}
+  .srow.tmodel .lbl{flex:none;max-width:none}                 /* the grid owns the widths now */
+  .srow.tmodel select.min{max-width:none;width:100%}
+  .srow.tmodel .mcv{font-size:12px;font-variant-numeric:tabular-nums;color:var(--fg);
+    text-align:right;white-space:nowrap}
+  .srow.tmodel .mcv.dash{color:var(--muted)}
+  .srow.tmodel input.mcost{width:100%!important;text-align:right}
+  .srow.tmodel .macts{display:flex;gap:3px;justify-content:flex-end}
+  .srow.tmodel .lbl.kname{cursor:pointer}
+  .srow.tmodel .lbl.kname:hover{color:var(--accent);border-bottom-color:var(--accent)}
+  /* click-a-model-name info popover (full name · provider · params · kind · usage · rates) */
+  .mpop{position:fixed;z-index:80;min-width:236px;max-width:340px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+    box-shadow:0 10px 30px rgba(0,0,0,.5)}
+  .mpop h4{margin:0 0 8px;font-size:12.5px;line-height:1.3;word-break:break-all;color:var(--fg)}
+  .mpop dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0}
+  .mpop dt{color:var(--muted);font-size:11px;white-space:nowrap}
+  .mpop dd{margin:0;font-size:12px;text-align:right;font-variant-numeric:tabular-nums;
+    word-break:break-word}
   .srow .ksync{margin-left:0;font-size:13px}
   /* Teams — ONE line per user: email · team · budget · actions · keys(scroll) */
   .ublock{border-top:1px solid var(--line)} .ublock:first-child{border-top:0}
@@ -145,6 +171,19 @@
   .teamcell{min-width:0} .teamcell .tsel,.teamcell .newin{width:100%;padding:4px 6px;font-size:12px}
   .urow .bin{width:66px;text-align:right}
   .ubtns{display:flex;gap:3px;align-items:center}
+  /* Unassigned's show/hide switch. Sits in the actions cell next to the icon buttons, so
+     it must size to its own text (a bare .ib is an icon-sized box and a grid child would
+     stretch to the column). Hidden = muted/struck, Shown = normal — the label states the
+     CURRENT state, not the action. */
+  .uvis-grp{display:inline-flex;flex:0 0 auto;margin-right:4px;border:1px solid var(--line);
+    border-radius:5px;overflow:hidden}
+  .uvis{background:var(--panel2);color:var(--muted);padding:2px 9px;font-size:11px;
+    line-height:1.5;cursor:pointer;font-weight:600;white-space:nowrap;border:0;
+    border-left:1px solid var(--line)}
+  .uvis:first-child{border-left:0}
+  .uvis:hover{color:var(--fg)}
+  .uvis.on{background:var(--accent);color:#fff}          /* the active side */
+  .uvis:disabled{opacity:.55;cursor:default}
   /* all of a user's keys on the SAME line, horizontally scrolling (chips; details in tooltip) */
   .kstrip{display:flex;gap:6px;min-width:0;overflow-x:auto;white-space:nowrap;
     padding-bottom:1px;overscroll-behavior:contain}
@@ -245,7 +284,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.5</div>
+      <div id="sidebar-brand-ver">v1.8.6</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -429,6 +468,10 @@
   function render(list){
     // drop config groups whose backend isn't present (e.g. the GPU group on a GPU-less box)
     list=(list||[]).filter(function(s){ var b=GROUP_BACKEND[s.group]; return !b || _present[b]!==false; });
+    // some tunables are served for their value but rendered by a bespoke control, not as a
+    // card (e.g. HIDE_UNASSIGNED_KEYS → the Show/Hide button on the Unassigned row). Drop
+    // them so an empty "Keys" card doesn't duplicate that control.
+    list=list.filter(function(s){ return s.card!==false; });
     var groups={},order=[];
     list.forEach(function(s){ if(!groups[s.group]){groups[s.group]=[];order.push(s.group);} groups[s.group].push(s); });
     var b=board(); initBoard();
@@ -502,10 +545,20 @@
     row.appendChild(save); row.appendChild(reset);
     return row;
   }
+  // Live value of the HIDE_UNASSIGNED_KEYS tunable, mirrored here so the Unassigned
+  // group's show/hide button can render the right state without a second round-trip.
+  var _hideUnassigned=false;
   function load(){
     fetch("/api/admin/settings").then(function(r){return r.ok?r.json():null;}).then(function(d){
       if(!d){document.getElementById("board").textContent="Settings are admin-only.";return;}
-      render(d.settings||[]);
+      var list=d.settings||[];
+      list.forEach(function(s){
+        if(s.name==="HIDE_UNASSIGNED_KEYS"){
+          _hideUnassigned=(s.value===true||String(s.value).toLowerCase()==="true"
+                           ||String(s.value)==="1");
+        }
+      });
+      render(list);
     }).catch(function(){});
   }
   // ── Teams board ── ONE line per user: email · team · budget · actions · all that user's
@@ -523,6 +576,53 @@
          || (g.keys[0] && g.keys[0].key) || "Unnamed user");
     uname.title="Click for details (ID · username · email · team · keys)";
     row.appendChild(uname);
+    // The Unassigned group is the one "user" that isn't a user — it's every key LiteLLM
+    // reports no owner for. Give it a show/hide switch: hidden, none of its keys claim a
+    // band on ANY per-key/per-user graph (enforced server-side in the same read paths
+    // that honour MONITOR_EXCLUDE_KEYS, so it holds for every chart, not just this page).
+    // Their usage still counts toward the measured totals and folds into "Other".
+    //
+    // BUILT here but appended into the ACTIONS cell further down, never straight onto the
+    // row: .urow is a fixed 5-column grid (uid | team | budget | actions | keys) and a 6th
+    // direct child silently takes the 150px team column, shoving every later cell one slot
+    // right and wrapping the key strip onto its own line.
+    var vis=null;
+    if(unassigned){
+      // A segmented Show | Hide control: the active side is highlighted, so the CURRENT
+      // state is visible at a glance and each click is an explicit choice (not a blind
+      // toggle). Both write the same HIDE_UNASSIGNED_KEYS the graphs read.
+      vis=document.createElement("span"); vis.className="uvis-grp";
+      var bShow=document.createElement("button"); bShow.type="button"; bShow.className="uvis";
+      bShow.textContent="Show";
+      var bHide=document.createElement("button"); bHide.type="button"; bHide.className="uvis";
+      bHide.textContent="Hide";
+      var paint=function(){
+        bShow.classList.toggle("on", !_hideUnassigned);
+        bHide.classList.toggle("on", _hideUnassigned);
+        bShow.setAttribute("aria-pressed", (!_hideUnassigned) ? "true" : "false");
+        bHide.setAttribute("aria-pressed", _hideUnassigned ? "true" : "false");
+        bShow.title = _hideUnassigned ? "Show unassigned keys in every graph"
+                                      : "Unassigned keys are shown in graphs";
+        bHide.title = _hideUnassigned ? "Unassigned keys are hidden from graphs"
+                                      : "Hide unassigned keys from every graph";
+      };
+      paint();
+      var apply=function(hide){
+        if(hide===_hideUnassigned) return;              // already in that state
+        bShow.disabled=bHide.disabled=true;
+        post({HIDE_UNASSIGNED_KEYS: hide?"1":"0"}).then(function(r){
+          bShow.disabled=bHide.disabled=false;
+          if(!r.ok){flash("bad","could not change unassigned visibility");return;}
+          _hideUnassigned=hide; paint();
+          flash("ok", hide?"unassigned keys hidden from graphs"
+                          :"unassigned keys shown in graphs");
+        }).catch(function(){bShow.disabled=bHide.disabled=false;
+                             flash("bad","could not change unassigned visibility");});
+      };
+      bShow.addEventListener("click",function(){apply(false);});
+      bHide.addEventListener("click",function(){apply(true);});
+      vis.appendChild(bShow); vis.appendChild(bHide);
+    }
     // 2) TEAM — pick an existing (identified) team or add a new one (same cell)
     var teamcell=document.createElement("div"); teamcell.className="teamcell";
     var tsel=document.createElement("select"); tsel.className="tsel";
@@ -576,6 +676,9 @@
       }).then(function(){ sync.disabled=false; sync.classList.remove("spin"); say("re-detected",true); setTimeout(loadTeams,700);
       }).catch(function(){sync.disabled=false;sync.classList.remove("spin");say("sync failed",false);});
     });
+    // Unassigned's visibility switch rides in the actions cell (auto-width) so the row
+    // keeps exactly 5 grid children and the key strip stays on the same line.
+    if(vis) btns.appendChild(vis);
     btns.appendChild(sync); btns.appendChild(save); btns.appendChild(reset); row.appendChild(btns);
     // 5) KEYS — all on the SAME line, horizontally scrolling (chips; details in tooltip)
     var strip=document.createElement("div"); strip.className="kstrip";
@@ -814,6 +917,66 @@
 
   // ── Model cost classification (real vs estimated) ──
   function kindLabel(k){ return k==="reference"?"estimated":(k==="real"?"real":k||"—"); }
+  // parameter count parsed from the model name (same rules as the /litellm per-model card):
+  // MoE "8x7b", plain billions "70b/1.5b", millions "270m"; plus the "…30B-A3B…" total+active
+  // form vLLM/Qwen use (total params · active experts).
+  function paramSize(name){
+    if(!name) return null;
+    var s=String(name).toLowerCase(), m;
+    m=s.match(/\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*b\b/); if(m) return m[1]+"×"+m[2]+"B";
+    m=s.match(/\b(\d+(?:\.\d+)?)\s*b\b/); if(m) return m[1]+"B";
+    m=s.match(/\b(\d+(?:\.\d+)?)\s*m\b/); if(m) return m[1]+"M";
+    return null;
+  }
+  function modelParams(name){
+    var s=String(name||"").toLowerCase();
+    var moe=s.match(/\b(\d+(?:\.\d+)?)\s*b\b[^]*?\ba(\d+(?:\.\d+)?)\s*b\b/);  // total … active
+    if(moe) return moe[1]+"B total · "+moe[2]+"B active";
+    return paramSize(name)||"—";
+  }
+  // Click-a-model-name → a small info popover (full name, provider, params, kind, usage,
+  // rates). position:fixed + body-append so the card's overflow:auto can't clip it; closes
+  // on an outside click or Escape. All content via textContent (no HTML sink).
+  var _mpop=null;
+  function closeMPop(){
+    if(_mpop&&_mpop.parentNode) _mpop.parentNode.removeChild(_mpop); _mpop=null;
+    document.removeEventListener("click",_mpopOut,true);
+    document.removeEventListener("keydown",_mpopKey);
+    window.removeEventListener("resize",closeMPop);
+  }
+  function _mpopOut(e){ if(_mpop&&!_mpop.contains(e.target)) closeMPop(); }
+  function _mpopKey(e){ if(e.key==="Escape") closeMPop(); }
+  function openModelInfo(m, anchor){
+    closeMPop();
+    var rate=function(v){ return v==null?"—":CUR+(+v).toLocaleString(undefined,{maximumFractionDigits:4})+" /1M"; };
+    var slash=m.model.indexOf("/");
+    var provider=slash>0?m.model.slice(0,slash):"—";
+    var shortName=slash>0?m.model.slice(slash+1):m.model;
+    var ut=m.tokens||0;
+    var uStr=ut>=1e6?(ut/1e6).toFixed(ut>=1e7?0:1)+"M":ut>=1e3?(ut/1e3).toFixed(0)+"k":String(ut);
+    var eff=(m.eff_cost_1m!=null?m.eff_cost_1m:m.cost_1m);
+    var p=document.createElement("div"); p.className="mpop"; p.setAttribute("role","dialog");
+    var h=document.createElement("h4"); h.textContent=m.model; p.appendChild(h);
+    var dl=document.createElement("dl");
+    [["Provider",provider],["Name",shortName],["Parameters",modelParams(m.model)],
+     ["Kind",kindLabel(m.kind)+(m.default_kind&&m.default_kind!==m.kind?(" (auto: "+kindLabel(m.default_kind)+")"):"")],
+     ["30d usage",uStr+" tokens"],["LiteLLM price",m.priced?"yes":"no"],
+     ["Input",rate(m.in_1m)],["Output",rate(m.out_1m)],["Cache read",rate(m.cache_1m)],
+     ["Effective",rate(eff)+(m.cost_overridden?" (pinned)":"")]
+    ].forEach(function(r){
+      var dt=document.createElement("dt"); dt.textContent=r[0];
+      var dd=document.createElement("dd"); dd.textContent=r[1];
+      dl.appendChild(dt); dl.appendChild(dd);
+    });
+    p.appendChild(dl); document.body.appendChild(p);
+    var rc=anchor.getBoundingClientRect(), pw=p.offsetWidth, ph=p.offsetHeight;
+    var left=Math.min(rc.left, window.innerWidth-pw-8);
+    var top=(rc.bottom+6+ph>window.innerHeight-8)?(rc.top-ph-6):(rc.bottom+6);
+    p.style.left=Math.max(8,left)+"px"; p.style.top=Math.max(8,top)+"px";
+    _mpop=p;
+    setTimeout(function(){ document.addEventListener("click",_mpopOut,true);
+      document.addEventListener("keydown",_mpopKey); window.addEventListener("resize",closeMPop); },0);
+  }
   function postModel(params){
     return fetch("/api/admin/model-kinds",{method:"POST",
       headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
@@ -827,8 +990,13 @@
     var ut=m.tokens||0;
     var uStr=ut>=1e6?(ut/1e6).toFixed(ut>=1e7?0:1)+"M":ut>=1e3?(ut/1e3).toFixed(0)+"k":String(ut);
     var tip=m.model+"\n30d usage: "+uStr+" tokens\nauto: "+kindLabel(m.default_kind)+(m.priced?" · LiteLLM priced":" · no LiteLLM price");
-    var lbl=document.createElement("span"); lbl.className="lbl kname"; lbl.textContent=m.model; lbl.title=tip;
+    var lbl=document.createElement("span"); lbl.className="lbl kname"; lbl.textContent=m.model;
+    lbl.title=tip+"\n(click for details)";
+    lbl.setAttribute("role","button"); lbl.setAttribute("tabindex","0");
     if(m.overridden) lbl.classList.add("mod");
+    lbl.addEventListener("click",function(e){ e.stopPropagation(); openModelInfo(m,lbl); });
+    lbl.addEventListener("keydown",function(e){
+      if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openModelInfo(m,lbl); } });
     row.appendChild(lbl);
     var sel=document.createElement("select"); sel.className="min"; sel.title=tip;
     [["real","Real (paid)"],["reference","Estimated"]].forEach(function(o){
@@ -838,19 +1006,15 @@
     // Cost per model — USD per 1M tokens. Shows the effective rate (LiteLLM/env) as a hint;
     // type a value + Save to PIN it when LiteLLM's price is wrong. Blank = fall back.
     // Three LiteLLM per-type rates (currency per 1M tokens): input / output / cache-read.
-    // Read-only breakdown that REPLACES the single summed blend (which read double).
-    var costs=document.createElement("div"); costs.className="mcosts";
-    costs.title="LiteLLM price per 1M tokens — input / output / cache-read";
-    function mcell(k,v){
-      var c=document.createElement("span"); c.className="mc";
-      var kk=document.createElement("span"); kk.className="mck"; kk.textContent=k;
-      var vv=document.createElement("span"); vv.className="mcv";
+    // Each is its OWN right-aligned grid cell so the columns line up down the card; the
+    // header (.mhdr, built in loadModels) labels them once — no per-cell label to jumble
+    // the row. Read-only breakdown that REPLACES the single summed blend (which read double).
+    function mcell(v){
+      var vv=document.createElement("span"); vv.className="mcv"+(v==null?" dash":"");
+      vv.title="LiteLLM price per 1M tokens";
       vv.textContent=(v==null?"—":CUR+(+v).toLocaleString(undefined,{maximumFractionDigits:4}));
-      c.appendChild(kk); c.appendChild(vv); return c;
+      return vv;
     }
-    costs.appendChild(mcell("in",m.in_1m));
-    costs.appendChild(mcell("out",m.out_1m));
-    costs.appendChild(mcell("cch",m.cache_1m));
     var cost=document.createElement("input"); cost.type="number"; cost.className="min mcost";
     cost.step="any"; cost.min="0"; cost.style.width="62px";
     cost.title="Cost override — "+CUR+" per 1M tokens. Pins this model's blended cost when "
@@ -878,8 +1042,13 @@
         say("reset",true); setTimeout(loadModels,900);
       }).catch(function(){say("reset failed",false);});
     });
-    row.appendChild(sel); row.appendChild(costs); row.appendChild(cost);
-    row.appendChild(save); row.appendChild(reset);
+    // grid children, in column order: name · kind · in · out · cache · override · actions
+    row.appendChild(sel);
+    row.appendChild(mcell(m.in_1m)); row.appendChild(mcell(m.out_1m)); row.appendChild(mcell(m.cache_1m));
+    row.appendChild(cost);
+    var acts=document.createElement("div"); acts.className="macts";
+    acts.appendChild(save); acts.appendChild(reset);
+    row.appendChild(acts);
     return row;
   }
   function loadModels(){
@@ -895,6 +1064,15 @@
       var hd=document.createElement("div"); hd.className="tsumhd";
       hd.textContent=ms.length+" model"+(ms.length>1?"s":"")+" · "+nReal+" real, "+(ms.length-nReal)+" estimated";
       el.appendChild(hd);
+      // column header — labels the in/out/cache/override columns ONCE so the rows stay clean
+      var mh=document.createElement("div"); mh.className="mhdr";
+      [["Model",""],["Kind",""]].forEach(function(p){
+        var s=document.createElement("span"); s.textContent=p[0]; mh.appendChild(s); });
+      [["in","input"],["out","output"],["cch","cache-read"],["override","pin a blended rate"]].forEach(function(p){
+        var s=document.createElement("span"); s.className="r"; s.textContent=p[0];
+        s.title=p[1]+" — "+CUR+" per 1M tokens"; mh.appendChild(s); });
+      mh.appendChild(document.createElement("span"));      // actions column (no header)
+      el.appendChild(mh);
       ms.forEach(function(m){ el.appendChild(modelRow(m)); });
     }).catch(function(){});
   }

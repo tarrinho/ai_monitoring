@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.5"
+VERSION = "AI-Monitoring_1.8.6"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -169,6 +169,15 @@ EXCLUDE_KEYS = {
     p.strip().lower() for p in (_str("MONITOR_EXCLUDE_KEYS", "") or "").split(",")
     if p.strip()
 }
+# Hide the "Unassigned" group — every key LiteLLM reports no owner for, and that has no
+# admin user override — from every per-key/per-user graph. Same set the Settings board
+# groups under "Unassigned", toggled by the show/hide button on that group. OFF by
+# default (unassigned keys are shown), so this changes nothing until it is turned on.
+# Their usage still counts toward the proxy-wide totals and folds into "Other", exactly
+# like an EXCLUDE_KEYS entry — hiding removes a key's own named band, it does not
+# rewrite the measured aggregate.
+HIDE_UNASSIGNED_KEYS = (_str("MONITOR_HIDE_UNASSIGNED_KEYS", "0") or "0").lower() in (
+    "1", "true", "yes", "on")
 
 
 def key_excluded(*identifiers: object) -> bool:
@@ -183,6 +192,23 @@ def key_excluded(*identifiers: object) -> bool:
         if str(v).strip().lower() in EXCLUDE_KEYS:
             return True
     return False
+
+
+def key_known(label: object, known_keys: set) -> bool:
+    """True if `label` should be allowed to claim its OWN named band on a per-key chart:
+    either it's in `known_keys` (a label LiteLLM's own /key/list has confirmed as a
+    real, currently-or-formerly-registered key — see db.known_keys_set()), or we have NO
+    baseline yet (`known_keys` empty — nothing has been confirmed valid OR invalid yet,
+    e.g. right after a fresh start before the first /key/list poll completes). The empty
+    case must be permissive: treating 'no data yet' as 'nothing is valid' would blank out
+    every by-key chart until the first poll, which is worse than the bug being fixed.
+    Used to fold garbage labels (an unexpanded '${ENV_VAR}' string, a made-up/revoked
+    hash — a real but INVALID auth attempt, not a registered key) into 'Other' instead of
+    letting them claim their own band, the same way key_excluded() folds operator-excluded
+    keys."""
+    if not known_keys:
+        return True
+    return str(label) in known_keys
 
 
 SLO_LATENCY_MS      = _float("SLO_LATENCY_MS", 2000.0)  # SLO target; % under this
@@ -419,6 +445,14 @@ TUNABLES: dict[str, dict] = {
     "OLLAMA_ENABLED":   {"t": "bool", "def": OLLAMA_ENABLED,   "group": "Services", "label": "Monitor Ollama",   "help": "Off = not polled, hidden from menu, no down-alert"},
     "LLAMACPP_ENABLED": {"t": "bool", "def": LLAMACPP_ENABLED, "group": "Services", "label": "Monitor llama.cpp", "help": "Off = not polled, hidden from menu, no down-alert"},
     "VLLM_ENABLED":     {"t": "bool", "def": VLLM_ENABLED,     "group": "Services", "label": "Monitor vLLM",     "help": "Off = not polled, hidden from menu, no down-alert"},
+    "HIDE_UNASSIGNED_KEYS": {"t": "bool", "def": HIDE_UNASSIGNED_KEYS, "group": "Keys",
+                             "label": "Hide unassigned keys",
+                             # card=False: the value is still served (env default, persistence,
+                             # and the button's live state all read it), but it is NOT drawn as
+                             # its own settings card — the Show/Hide button on the "Unassigned"
+                             # row is its only UI, so the two don't duplicate each other.
+                             "card": False,
+                             "help": "On = keys LiteLLM reports no owner for are dropped from every per-key/per-user graph (they still count toward totals, folded into 'Other')"},
     # ── Phase 1: alert thresholds (0 = off) ──
     "ALERT_CPU_PCT":  {"t": "float", "def": ALERT_CPU_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "CPU % ≥", "help": "Fire when host CPU ≥ this (0 = off)"},
     "ALERT_MEM_PCT":  {"t": "float", "def": ALERT_MEM_PCT,  "min": 0, "max": 100, "group": "Alerts", "label": "Memory % ≥", "help": "Host RAM used ≥ this"},
@@ -540,5 +574,8 @@ def tunables_view() -> list[dict]:
             "choices": spec.get("choices"),
             "value": tunable(name), "default": spec["def"],
             "overridden": name in _overrides,
+            # False = value is served but the page must NOT render it as its own card
+            # (it has a bespoke control elsewhere). Defaults True for every normal tunable.
+            "card": spec.get("card", True),
         })
     return out

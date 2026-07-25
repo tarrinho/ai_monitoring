@@ -357,6 +357,16 @@ def test_litellm_concurrency_backlog_by_key_stacked_and_labeled_estimated():
     assert re.search(r"function rangedReload\(\)\{[^}]*loadConcByKey\(\)[^}]*loadBacklogByKey\(\)", html)
     # stacked area (bands sum to the total) and the "estimated" honesty must be present
     assert "stacked:true" in html
+    # Same fill-to-origin defect as bug-registry class #1 (gpu.html's per-app CPU stack):
+    # fill:true fills every dataset to the zero axis, so translucent bands stack on top of
+    # each other and blend together instead of reading as a clean stack. Scoped to
+    # renderStackByKey so this can't hide behind an unrelated chart's correct occurrence.
+    m = re.search(r"function renderStackByKey\(.*?\n\}", html, re.S)
+    assert m, "renderStackByKey not found"
+    assert re.search(r'fill:\s*i\s*\?\s*["\']-1["\']\s*:\s*["\']origin["\']', m.group(0)), \
+        "by-key stacked charts must fill to previous dataset, not to zero"
+    assert "fill:true" not in m.group(0), \
+        "by-key stacked charts regressed to filling every band to the zero axis"
     assert "Estimated attribution" in html and "no per-key breakdown" in html
 
 
@@ -384,13 +394,30 @@ def test_litellm_has_per_user_usage_charts():
     assert 'id="card-userkeys"' in html and 'id="user-keys-chart"' in html
     assert 'id="card-userdelta"' in html and 'id="userdelta-chart"' in html
     assert "Top 10 API users by requests" in html
-    assert "Top 10 API users — requests in window" in html
+    # the delta card's metric word is now a span filled by labelDeltaCard() — it reads
+    # "requests" in full mode and "spend" in lite (where per-key request counts don't
+    # exist), so anchor on the surrounding markup rather than one contiguous string.
+    assert re.search(r'Top 10 API users — <span id="userdelta-metric">requests</span> in window',
+                     html), "user delta heading lost its metric span"
     # the aggregation wiring: owner map from budgets + the two render/load funcs
     assert "buildKeyUser" in html and "_keyUser" in html and "userOf(" in html
     assert "renderUserKeys" in html and "userKeysChart" in html
     assert "loadUserDelta" in html and "userDeltaChart" in html
     # user-delta reuses the keydelta endpoint and is refreshed on window change/pan
     assert html.count("loadUserDelta(") >= 3   # def + rangedReload + window handler
+
+
+def test_litellm_no_longer_has_the_budgets_card():
+    """The 'Spend & Quota — per-key budgets' card was removed from /litellm — that view
+    lives on the dedicated /spend page (its own card-keys section). The /api/budgets
+    FETCH must survive, though: buildKeyUser() still needs it to build the alias→owner
+    map the per-user usage charts (test above) depend on."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    for gone in ("card-budgets", "bud-badge", "bud-body", "loadBudgets", "per-key budgets"):
+        assert gone not in html, f"{gone!r} should have been removed with the budgets card"
+    # the underlying fetch + owner-map builder must remain — a different feature depends on it
+    assert 'await api("/api/budgets")' in html
+    assert "buildKeyUser(budgets)" in html
 
 
 def test_windowed_pages_have_live_button():
@@ -401,7 +428,7 @@ def test_windowed_pages_have_live_button():
         assert 'id="nav-live"' in html, name
         # click handler snaps to live; disabled state tracks TIMEEND
         assert 'getElementById("nav-live").addEventListener' in html, name
-        assert "TIMEEND=null; _winSave(WIN, null); updateRangeUI()" in html, name
+        assert "TIMEEND=null; _winMark(false); _winSave(WIN, null); updateRangeUI()" in html, name
         assert '_liveBtn.disabled=!TIMEEND' in html, name
 
 
@@ -526,7 +553,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.5"
+    assert config.VERSION == "AI-Monitoring_1.8.6"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -535,7 +562,7 @@ def test_all_version_surfaces_match_config_version():
     offline-install snippet must equal config.VERSION — these lagged in past releases
     (deploy/k8s + prometheus-example + README were the repeat offenders). Derives the
     version from config so it can't go stale itself."""
-    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.5"
+    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.6"
     other = re.compile(r"(?:ai[-_]monitoring|ai_monitoring):(\d+\.\d+\.\d+)")
 
     def stale_tags(text):
@@ -786,6 +813,15 @@ def test_litellm_page_exists_and_secure():
     # dedicated over-time charts: one CPU, one RAM (per serving process)
     assert 'id="svc-cpu-chart"' in html and 'id="svc-ram-chart"' in html
     assert "svcCpuChart" in html and "svcRamChart" in html
+    # The serving-process filter must recognize vLLM (process names "vllm" /
+    # "VLLM::EngineCor"), not just llama.cpp/Ollama — a GB10 box running vLLM
+    # as its local backend previously left both over-time charts permanently
+    # empty because the filter regex only matched llama|ollama.
+    assert "/llama/i.test(a)" not in html, "serving-process filter regressed to llama-only"
+    assert "/llama|ollama/i.test(a)" not in html, "serving-process filter missing vllm"
+    assert html.count("/llama|ollama|vllm/i.test(a)") == 2, (
+        "expected both serving-process filters (_svcDatasets + loadImpact's align) "
+        "to include vllm")
     # per-model resource cost columns sourced from the procs collector
     assert "svcProc" in html and "svc CPU" in html and "svc RAM" in html
     assert 'type:"bar"' in html
@@ -1222,6 +1258,21 @@ def test_spend_budget_card_shows_owner_details():
     assert 'email.split("@")[0]:r.key' in html
 
 
+def test_ruff_ruleset_is_explicit_not_the_moving_default():
+    """CI installs ruff unpinned (`pip install ruff`), so `ruff check .` uses whatever ruff
+    ships as its DEFAULT rule set. That default is not stable: ruff 0.16.0 broadened it to
+    also enable BLE/S/I/PL/etc. (300+ new findings), reddening CI on a linter upgrade with no
+    code change. Pin the intended rules EXPLICITLY in ruff.toml so lint is reproducible across
+    ruff versions. (verified identical on 0.15.13 and 0.16.0.)"""
+    cfg = (ROOT / "ruff.toml").read_text(encoding="utf-8")
+    assert re.search(r'(?m)^\[lint\]\s*$', cfg), "ruff.toml must declare an explicit [lint] table"
+    m = re.search(r'select\s*=\s*\[([^\]]*)\]', cfg)
+    assert m, "ruff.toml [lint] must set an explicit `select` (else CI rides ruff's moving default)"
+    sel = {s.strip().strip('\'"') for s in m.group(1).split(",") if s.strip()}
+    assert {"E4", "E7", "E9", "F"} <= sel, \
+        f"the explicit select must keep ruff's historical E/F default, got {sel}"
+
+
 def test_supply_chain_scorecard_invariants():
     """Lock in the OpenSSF Scorecard checks that reached 10/10 so a later edit can't
     silently regress them: SHA-pinned actions, minimal top-level workflow permissions,
@@ -1406,6 +1457,15 @@ def test_spend_model_user_cost_time_card():
     assert 'id="mu-mode"' in html and 'id="mu-group"' in html
     assert "window=\"+SPWIN" in html                         # model×user follows the page window
     assert "stacked:true" in html                          # it's a STACKED area chart
+    # Same fill-to-origin defect as bug-registry class #1 (gpu.html's per-app CPU stack):
+    # fill:true fills every dataset to the zero axis, so translucent bands stack on top of
+    # each other and blend together instead of reading as a clean stack.
+    m = re.search(r"function renderModelUserCostTime\(.*?\n\}", html, re.S)
+    assert m, "renderModelUserCostTime not found"
+    assert re.search(r'fill:\s*i\s*\?\s*["\']-1["\']\s*:\s*["\']origin["\']', m.group(0)), \
+        "model×user stacked chart must fill to previous dataset, not to zero"
+    assert "fill:true" not in m.group(0), \
+        "model×user stacked chart regressed to filling every band to the zero axis"
     # placed AFTER 'cost per model over time', BEFORE the per-key budgets table
     assert (html.index('id="card-model-cost-time"')
             < html.index('id="card-model-user-cost-time"')
@@ -1593,7 +1653,10 @@ def test_settings_model_cost_override_ui():
     # the card breaks the cost into the THREE LiteLLM per-type rates (input/output/cache),
     # instead of a single summed blend (which read double)
     assert "m.in_1m" in html and "m.out_1m" in html and "m.cache_1m" in html
-    assert '"mcosts"' in html and 'mcell(' in html
+    # the per-type rates render as their own cells via mcell(); the surrounding container
+    # class was renamed away from "mcosts" in a card refactor, so anchor on the cell
+    # builder (which still proves the three-rate layout) rather than the dropped class name.
+    assert 'mcell(' in html
 
 
 def test_config_tunables_exclude_secrets_and_switches():
@@ -1757,6 +1820,124 @@ def test_drag_to_zoom_wired_on_every_win_page():
             f"{name}: drag overlay CSS missing"
 
 
+def test_every_chart_is_reachable_by_the_drag_handler():
+    """The drag handler finds its chart via closest('.chart-wrap'), so a chart that is NOT
+    inside one is silently NOT drag-zoomable. Asserting only that the handler exists in the
+    file would pass on a page with zero chart-wraps — this checks the containers instead:
+    every static <canvas> sits in a .chart-wrap (the host sparkline is deliberately exempt),
+    and pages that build charts at runtime create the wrapper around the canvas."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        statics = re.findall(r'<div class="chart-wrap"[^>]*>\s*<canvas', html)
+        dynamic = ('wrap.className="chart-wrap"' in html
+                   and "wrap.appendChild(cv)" in html)
+        assert statics or dynamic, f"{name}: no chart lives inside a .chart-wrap"
+        # every static canvas is either wrapped or an explicitly-exempt sparkline
+        for m in re.finditer(r'<div class="([a-z-]+)"[^>]*>\s*<canvas id="([\w-]+)"', html):
+            cls, cid = m.group(1), m.group(2)
+            assert cls == "chart-wrap" or cid.endswith("-spark"), \
+                f"{name}: canvas #{cid} sits in .{cls}, so it cannot be drag-zoomed"
+
+
+def test_drag_only_starts_on_a_time_series_plot_area():
+    """Two ways a naive drag handler goes wrong, both guarded here:
+    (1) Chart.js paints the LEGEND on the same canvas, so starting a drag anywhere in the
+        wrap swallows the click that toggles a series — the drag must begin inside chartArea;
+    (2) a by-key BAR chart's x-axis is key names, not time, so mapping pixels to a time range
+        there is meaningless — only charts stamped with real timestamps ($ts) are draggable.
+    preventDefault must also wait for the 5px threshold, or it fires on every plain click."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert "if(x<a.left||x>a.right||y<a.top||y>a.bottom) return;" in html, \
+            f"{name}: drag may start outside the plot area (legend clicks get swallowed)"
+        assert "if(!ch.$ts || ch.$ts.length<2) return;" in html, \
+            f"{name}: non-time-series charts must not be draggable"
+        assert "if(Math.abs(e.clientX-dg.x0)<5) return;      // still a click, not a drag" in html, \
+            f"{name}: drag threshold must precede preventDefault"
+        assert 'addEventListener("pointercancel",abort)' in html and \
+               'window.addEventListener("blur",abort)' in html, \
+            f"{name}: a lost pointer must not leave a stuck selection overlay"
+
+
+def test_drag_maps_pixels_to_real_timestamps_not_window_fractions():
+    """The server omits empty buckets (GROUP BY only yields buckets holding rows), so plotted
+    points are NOT evenly spread across the window after a restart/outage. Mapping a drag by
+    pixel fraction alone would then select the wrong times, silently. Every time-series chart
+    records its points' real timestamps via stampTs(), and the drag resolves pixel → point
+    index → that point's timestamp."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert "function stampTs(ch, pts)" in html, f"{name}: stampTs helper missing"
+        assert "xs.getValueForPixel(px1)" in html and "ts[i1]" in html, \
+            f"{name}: drag must resolve pixels through the chart's own timestamps"
+        # every path that feeds a time series into a chart must stamp it
+        for m in re.finditer(r'^\s*(\w[\w.$\[\]]*)\.data\.labels\s*=\s*(?!\[\])', html, re.M):
+            line = html[m.start():html.index("\n", m.start())]
+            if "spark" in line.lower() or "keysChart" in line or "userKeysChart" in line:
+                continue                       # sparkline + by-key bar charts: not draggable
+            assert "stampTs" in line or "stampTs" in html[m.start() - 120:m.start()], \
+                f"{name}: chart data set without stampTs → drag would fall back to guessing: {line.strip()}"
+
+
+def test_custom_window_token_never_reaches_the_ui():
+    """Bug-registry class #3/#4 (a raw token rendered as user-visible text): window badges
+    must go through wlabel(), which shows 'custom' instead of 'custom:900'. A restored custom
+    range must also be visibly marked as not-live."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert "function wlabel(w)" in html, f"{name}: wlabel helper missing"
+        assert not re.search(r'textContent\s*=\s*WIN\b', html), \
+            f"{name}: a window badge still renders the raw WIN token"
+        assert ".custom-win{" in html and "_winMark(true)" in html, \
+            f"{name}: a restored custom range must be marked as not-live"
+
+
+def test_restored_window_value_is_injection_hardened():
+    """SECURITY: the persisted window value comes from localStorage (attacker-writable in a
+    same-origin compromise). Two sinks must be guarded:
+    (1) `_winCustom` must match STRICT `custom:<digits>` only — a loose check let
+        `custom:3600&x=1` through, and WIN flows unencoded into the export URL + api() query
+        string (parameter injection);
+    (2) the restored value is interpolated into a `querySelector('… [data-w="'+w+'"]')`, so it
+        must be charset-guarded first or a malformed value throws and crashes page init."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert '/^custom:[0-9]+$/.test(w)' in html, \
+            f"{name}: _winCustom must strictly match custom:<digits> (anti param-injection)"
+        assert "/^[a-z0-9]+$/i.test(w) && document.querySelector(sel+' button[data-w=" in html, \
+            f"{name}: restored value must be charset-guarded before the querySelector interpolation"
+
+
+def test_custom_marker_is_cleared_when_returning_to_a_named_window():
+    """Regression: the not-live marker set on a drag-selected range must be CLEARED when the
+    user picks a named window or hits Live — otherwise the badge keeps reading e.g. '1h (not
+    live)' after leaving the custom range. Both the window-button handler and the Live handler
+    must call _winMark(false)."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        # window buttons: clear the marker and re-label to the (named) window
+        assert 'WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); _winMark(false);' in html, \
+            f"{name}: window-button must clear the custom marker"
+        assert 'if(_wl)_wl.textContent=wlabel(WIN)' in html, \
+            f"{name}: window-button must reset the label off 'custom'"
+        # Live also clears it
+        assert 'TIMEEND=null; _winMark(false); _winSave(WIN, null);' in html, \
+            f"{name}: Live must clear the custom marker"
+
+
+def test_export_follows_the_zoom_and_pan_cursor():
+    """CSV export took only `window=`, so a zoomed/panned view exported a same-duration
+    window ending NOW — not the range on screen."""
+    for name in _WIN_PAGES:
+        html = _page(name)
+        assert '"/api/export?window="+WIN+"&format=csv"' in html, f"{name}: export link changed"
+        assert '(TIMEEND?("&end="+Math.round(TIMEEND)):"")' in html, \
+            f"{name}: export must forward the pan/zoom cursor"
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "db.series, window, 1000, end=_q_end(request)" in src, \
+        "export_handler must honour ?end= (via the off-loop to_thread read)"
+
+
 def test_custom_window_flows_through_api_and_wsecs_on_every_win_page():
     """A custom range must reach the server: wsecs() resolves 'custom:<secs>' to its
     seconds, and api() appends the absolute end for every windowed endpoint (not a
@@ -1776,8 +1957,8 @@ def test_custom_window_persistence_is_restored_on_refresh():
         assert 'JSON.stringify({w:w, end:(end||null)})' in html, \
             f"{name}: window state must be persisted as {{w,end}}"
         assert 'function _winCustom(w)' in html, f"{name}: _winCustom helper missing"
-        assert 'TIMEEND=(s&&s.end)||null;' in html, \
-            f"{name}: custom range must restore its absolute end on load"
+        assert 'TIMEEND=Number(s&&s.end)||null;' in html, \
+            f"{name}: custom range must restore its absolute end, coerced to a number"
 
 
 def test_gpu_name_in_header_via_textcontent():
@@ -1851,6 +2032,21 @@ def test_gpu_stacked_per_app_cpu_chart():
         "absent app must map to 0 (not null) on the stacked chart"
     assert re.search(r'spanGaps:\s*false', html), \
         "stacked appcpu chart must not spanGaps (0-fill instead)"
+
+
+def test_gpu_stacked_per_core_cpu_chart_fills_to_previous_dataset():
+    """Same fill-to-origin defect as the per-app CPU stack (bug-registry class #1), found in
+    a SECOND stacked chart on the same page: the per-core CPU stack shares the identical
+    y:{stacked:true} + fill:true pattern, so its translucent bands blend into each other too.
+    Scoped to renderCpuCoresStack specifically so a regression here can't hide behind the
+    per-app chart's (already-correct) occurrence of the same substring."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    m = re.search(r"function renderCpuCoresStack\(\)\{.*?\n\}", html, re.S)
+    assert m, "renderCpuCoresStack not found"
+    assert re.search(r'fill:\s*i\s*\?\s*["\']-1["\']\s*:\s*["\']origin["\']', m.group(0)), \
+        "per-core CPU stack must fill to previous dataset, not to zero"
+    assert "fill:true" not in m.group(0), \
+        "per-core CPU stack regressed to filling every band to the zero axis"
 
 
 def test_llamacpp_page_shows_cpu_threads_against_core_count():
@@ -2654,6 +2850,108 @@ def test_litellm_page_init_executes_without_js_error():
     assert decl < use, "_keytimeMetric must be declared BEFORE keyTimeChart (TDZ guard)"
 
 
+def test_drag_to_zoom_actually_produces_the_selected_range_at_runtime():
+    """QA (behavioural, not source-inspection): perform a real drag against the page's own
+    handlers and assert the window it produces.
+
+    The static checks prove the code is present; only running it proves the drag resolves to
+    the right TIMES. The stub chart plots points at known timestamps and reports a known
+    pixel→index mapping, so the assertion is exact: dragging px 10→60 must select the range
+    between the points at those indices — proving the handler reads the chart's real
+    timestamps rather than interpolating across the requested window. Skipped without node."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = _page("litellm")
+    combined = "\n".join(m.group(1) for m in re.finditer(r"<script>([\s\S]*?)</script>", html))
+    harness = r"""
+    process.on('unhandledRejection', () => {});
+    global.window = global; global.CUR = "$";
+    const LISTENERS = {};                         // capture the delegated drag handlers
+    const STORE = {};
+    const style = () => new Proxy({}, { get:(t,p)=> t[p]||"", set:(t,p,v)=>{t[p]=v; return true;} });
+    function mkEl(extra){
+      const e = Object.assign({
+        style: style(), dataset:{}, className:"", textContent:"", title:"",
+        classList:{add(){},remove(){},toggle(){},contains(){return false}},
+        appendChild(c){ e._kids=(e._kids||[]).concat([c]); c.parentNode=e; return c; },
+        append(){ for (const c of arguments){ if (c && typeof c==="object"){ e._kids=(e._kids||[]).concat([c]); c.parentNode=e; } } },
+        prepend(){}, remove(){},
+        removeChild(c){ e._kids=(e._kids||[]).filter(k=>k!==c); c.parentNode=null; },
+        setAttribute(){}, getAttribute(){ return null; }, addEventListener(){},
+        querySelectorAll(){ return []; }, getContext(){ return {}; },
+        getBoundingClientRect(){ return {left:0, top:0, right:200, bottom:100}; },
+      }, extra||{});
+      return e;
+    }
+    const CANVAS = mkEl({});
+    const WRAP = mkEl({ querySelector: () => CANVAS });
+    CANVAS.closest = (sel) => sel === ".chart-wrap" ? WRAP : null;
+    // a chart whose points sit at KNOWN timestamps, with a known pixel->index mapping
+    const TS = [1000,1100,1200,1300,1400,1500,1600,1700,1800,1900,2000];
+    const CHART = { chartArea:{left:0,right:100,top:0,bottom:50}, $ts:TS,
+                    scales:{ x:{ getValueForPixel:(px)=> px/10 } },
+                    data:{labels:[],datasets:[]}, update(){}, destroy(){}, options:{} };
+    const el = new Proxy(function(){}, { apply: () => el, get(t,p){
+      if (typeof p === "symbol") return t[p];
+      if (["style","dataset","classList"].includes(p)) return t[p] || (t[p] = {add(){},remove(){},toggle(){},contains(){return false}});
+      if (["getContext","querySelector","createElement","closest"].includes(p)) return () => el;
+      if (p === "querySelectorAll") return () => [];
+      if (p === "getAttribute") return () => null;
+      if (typeof t[p] === "function") return t[p];
+      if (p in t) return t[p];
+      return () => {};
+    }, set(t,p,v){ t[p]=v; return true; }});
+    global.addEventListener = (ty,fn) => { (LISTENERS[ty]=LISTENERS[ty]||[]).push(fn); };
+    global.removeEventListener = () => {};
+    global.document = { getElementById: () => el, querySelector: () => el,
+      querySelectorAll: () => [], createElement: () => mkEl({}),
+      addEventListener: (ty,fn) => { (LISTENERS[ty]=LISTENERS[ty]||[]).push(fn); },
+      body: el, documentElement: el, head: el, cookie: "", title: "" };
+    global.location = { search:"?token=x", pathname:"/litellm", href:"", hostname:"x" };
+    global.localStorage = { getItem:(k)=> (k in STORE ? STORE[k] : null),
+                            setItem:(k,v)=>{ STORE[k]=String(v); } };
+    global.matchMedia = () => ({ matches:false, addEventListener(){} });
+    global.setInterval = () => 0; global.clearInterval = () => {}; global.setTimeout = () => 0;
+    global.fetch = () => Promise.resolve({ ok:true, status:200, json:()=>Promise.resolve({}), text:()=>Promise.resolve("") });
+    global.getComputedStyle = () => ({ getPropertyValue: () => "" });
+    global.Chart = function(_c, cfg){
+      const data = (cfg && cfg.data) || { labels:[], datasets:[] };
+      (data.datasets || []).forEach(ds => { if (!ds.data) ds.data = []; });
+      return { data, update(){}, destroy(){}, options:(cfg && cfg.options) || {} };
+    };
+    global.Chart.defaults = {};
+    global.Chart.getChart = () => CHART;
+    global.DOMPurify = { sanitize: s => s };
+    global.__fire = function(type, x){
+      (LISTENERS[type]||[]).forEach(fn => fn({ button:0, clientX:x, clientY:10,
+        target: CANVAS, preventDefault(){}, }));
+    };
+    global.__store = STORE;
+    """
+    # probe() closes over the page's own `let` bindings, so we can read them after the drag
+    probe = '\nglobal.__probe = function(){ return {WIN:WIN, TIMEEND:TIMEEND}; };\n'
+    drive = r"""
+    __fire("pointerdown", 10);          // index 1 -> t=1100
+    __fire("pointermove", 60);          // past the 5px threshold -> drag starts
+    __fire("pointerup",   60);          // index 6 -> t=1600
+    const s = __probe();
+    console.log(JSON.stringify({win:s.WIN, end:s.TIMEEND, saved:__store["aimon-win:/litellm"]}));
+    """
+    script = (harness + "\ntry {\n" + combined + probe +
+              '\n} catch (e) { console.error("PAGE_INIT_THREW: " + e.message); process.exit(3); }\n'
+              + drive)
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, f"drag run failed:\n{out.stderr.strip()}"
+    res = json.loads(out.stdout.strip().splitlines()[-1])
+    # points at index 1 (t=1100) and index 6 (t=1600) → a 500s window ending at 1600
+    assert res["win"] == "custom:500", \
+        f"drag must select the range between the dragged POINTS, got {res['win']}"
+    assert res["end"] == 1600, f"window must end at the drag's right-hand point, got {res['end']}"
+    assert res["saved"] and '"custom:500"' in res["saved"] and "1600" in res["saved"], \
+        f"the custom range must be persisted for this page, got {res['saved']}"
+
+
 def test_litellm_request_delta_charts_hide_when_no_request_data():
     """The 'Top keys/users — requests in window' charts plot per-key REQUEST counts,
     which lite/off spend mode doesn't have (only per-key spend) — so they came back
@@ -2670,6 +2968,152 @@ def test_litellm_request_delta_charts_hide_when_no_request_data():
     assert re.search(r'card-keydelta"\)?;?\s*\n?\s*if\(_kdCard\)\s*_kdCard\.style\.display', html)
 
 
+_PAGE_JS_HARNESS = r"""
+process.on('unhandledRejection', () => {});
+global.window = global; global.CUR = "€";
+global.addEventListener = () => {}; global.removeEventListener = () => {};
+const REG = {};
+function mk(id){ return REG[id] || (REG[id] = { id, textContent:"", innerHTML:"", _attrs:{},
+  style:{}, dataset:{}, classList:{add(){},remove(){},toggle(){},contains(){return false}},
+  setAttribute(k,v){ this._attrs[k]=v; }, getAttribute(k){ return this._attrs[k]||null; },
+  getContext(){ return mk(id+":ctx"); }, appendChild(){}, addEventListener(){},
+  append(){}, prepend(){}, before(){}, after(){}, replaceChildren(){},
+  querySelector(){ return mk(id+":q"); }, querySelectorAll(){ return []; },
+  insertAdjacentHTML(){}, remove(){}, focus(){}, closest(){ return mk(id+":c"); } }); }
+global.document = { getElementById: id => mk(id), querySelector: () => mk("q"),
+  querySelectorAll: () => [], createElement: () => mk("new"), addEventListener: () => {},
+  body: mk("body"), documentElement: mk("html"), head: mk("head"), cookie:"", title:"" };
+global.location = { search:"?token=x", pathname:"/litellm", href:"", hostname:"x" };
+global.localStorage = { getItem: () => null, setItem: () => {} };
+global.matchMedia = () => ({ matches:false, addEventListener(){} });
+global.setInterval = () => 0; global.clearInterval = () => {}; global.setTimeout = () => 0;
+global.fetch = () => Promise.resolve({ ok:true, status:200,
+  json:()=>Promise.resolve({}), text:()=>Promise.resolve("") });
+global.getComputedStyle = () => ({ getPropertyValue: () => "" });
+global.Chart = function(_c, cfg){
+  const data = (cfg && cfg.data) || { labels:[], datasets:[] };
+  (data.datasets || []).forEach(ds => { if (!ds.data) ds.data = []; });
+  return { data, update(){}, destroy(){}, options:(cfg && cfg.options) || {} };
+};
+global.Chart.defaults = {}; global.DOMPurify = { sanitize: s => s };
+"""
+
+
+def _probe_page_js(page, probe):
+    """Execute a dashboard page's inline JS under a DOM/Chart stub, then run `probe`
+    (which must `console.log("PROBE:" + JSON.stringify(obj))`) inside the same scope so
+    it can reach the page's `let`-scoped state and functions. Returns the parsed object.
+
+    This exercises RUNTIME behaviour — the static `new Function()` syntax check compiles
+    the page but never runs it, so it cannot catch a mislabelled control or a TDZ error.
+    Skips when node is unavailable. `REG[id]` is the recorded element for each id.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / page).read_text(encoding="utf-8")
+    combined = "\n".join(m.group(1) for m in
+                         re.finditer(r"<script>([\s\S]*?)</script>", html))
+    script = _PAGE_JS_HARNESS + "\ntry {\n" + combined + "\n" + probe + \
+        '\n} catch (e) { console.error("THREW: " + e.message); process.exit(3); }\n'
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, f"{page} JS threw:\n{out.stderr.strip()}"
+    line = next((ln for ln in out.stdout.splitlines() if ln.startswith("PROBE:")), None)
+    assert line, f"probe produced no output for {page}:\n{out.stdout}\n{out.stderr}"
+    return json.loads(line[len("PROBE:"):])
+
+
+def test_litellm_reqs_kpi_switches_on_requests_basis():
+    """Behavioural counterpart to the static check: renderKpis() must print
+    "Reqs (today)" when the collector says the count is a UTC day total, and keep
+    "Reqs (win)" for a real rolling window — including when `requests_basis` is absent
+    entirely (older snapshot / off mode), which must not regress to the day wording."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    const base = { available:true, backlog:0, tokens_today:1000 };
+    renderKpis(Object.assign({}, base, {requests_window:52, requests_basis:"today_utc"}));
+    out.lite = REG["ll-kpis"].innerHTML;
+    renderKpis(Object.assign({}, base, {requests_window:7, requests_basis:"window"}));
+    out.full = REG["ll-kpis"].innerHTML;
+    renderKpis(Object.assign({}, base, {requests_window:3}));   // basis absent
+    out.absent = REG["ll-kpis"].innerHTML;
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert "Reqs (today)" in seen["lite"] and "52" in seen["lite"]
+    assert "Reqs (win)" in seen["full"] and "Reqs (today)" not in seen["full"]
+    # missing basis must fall back to the window wording, never the day wording
+    assert "Reqs (win)" in seen["absent"] and "Reqs (today)" not in seen["absent"]
+
+
+def test_litellm_top_key_bars_badge_cumulative_spend_in_lite():
+    """The two top-key bars rank by CUMULATIVE lifetime spend in lite mode (LiteLLM
+    /global/spend/keys has no per-key requests), so the rolling "last Nm" badge was
+    doubly wrong there. Behavioural check on both bars via keysBadge()."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    const keys = [{key:"h1", alias:"team-a", reqs:null, cost:9.26}];
+    renderKeys({available:true, spend_mode:"lite", spend_window_min:15, top_keys:keys});
+    out.liteKeys = REG["keys-win"].textContent;
+    renderUserKeys({available:true, spend_mode:"lite", spend_window_min:15, top_keys:keys});
+    out.liteUsers = REG["userkeys-win"].textContent;
+    renderKeys({available:true, spend_mode:"full", spend_window_min:15,
+                top_keys:[{key:"h1", alias:"team-a", reqs:12, cost:1.0}]});
+    out.fullKeys = REG["keys-win"].textContent;
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert seen["liteKeys"] == "cumulative spend"
+    assert seen["liteUsers"] == "cumulative spend"
+    assert seen["fullKeys"] == "last 15m"
+
+
+def test_litellm_delta_cards_relabel_to_spend_in_lite_mode():
+    """In lite/off spend mode the key_series column holds per-key SPEND (the collector
+    reports reqs=None and db.insert_key_series falls back to cost), so the
+    '\u2026 \u2014 requests in window' cards are drawing currency. Executing the page JS must
+    show labelDeltaCard() retitling heading, sub-line and aria-label to 'spend' when
+    _spendMode != 'full', and leaving 'requests' alone in full mode."""
+    seen = _probe_page_js("litellm.html", r"""
+    const seen = {};
+    _spendMode = "lite";
+    labelDeltaCard("keydelta"); labelDeltaCard("userdelta");
+    seen.liteKeyMetric  = REG["keydelta-metric"].textContent;
+    seen.liteUserMetric = REG["userdelta-metric"].textContent;
+    seen.liteKeySub     = REG["keydelta-sub"].textContent;
+    seen.liteAria       = REG["keydelta-chart"].getAttribute("aria-label");
+    _spendMode = "full";
+    labelDeltaCard("keydelta"); labelDeltaCard("userdelta");
+    seen.fullKeyMetric  = REG["keydelta-metric"].textContent;
+    seen.fullUserMetric = REG["userdelta-metric"].textContent;
+    seen.fullKeySub     = REG["keydelta-sub"].textContent;
+    seen.fullAria       = REG["keydelta-chart"].getAttribute("aria-label");
+    console.log("PROBE:" + JSON.stringify(seen));
+    """)
+    # lite -> spend everywhere, and the sub-line explains WHY (no per-key request counts)
+    assert seen["liteKeyMetric"] == "spend" and seen["liteUserMetric"] == "spend"
+    assert "spend" in seen["liteKeySub"] and "request counts" in seen["liteKeySub"]
+    assert "spend" in seen["liteAria"].lower()
+    # full -> the original request wording is preserved
+    assert seen["fullKeyMetric"] == "requests" and seen["fullUserMetric"] == "requests"
+    assert "cumulative requests" in seen["fullKeySub"]
+    assert "requests" in seen["fullAria"].lower()
+
+
+def test_litellm_lite_requests_kpi_is_labelled_today_not_window():
+    """Lite mode's requests count is the UTC day-to-date total from /global/activity,
+    not a rolling window — an idle proxy otherwise reads as permanently busy under a
+    'last 15m' badge. The collector declares requests_basis and the KPI honours it."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert 'l.requests_basis==="today_utc"' in html, "KPI must switch on requests_basis"
+    assert '"Reqs (today)"' in html and '"Reqs (win)"' in html
+    # the two top-key bars rank by CUMULATIVE spend in lite mode, so the "last Nm"
+    # badge is wrong there too
+    assert "function keysBadge(" in html
+    assert '"cumulative spend"' in html
+    src = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    assert 'out["requests_basis"] = "today_utc"' in src
+    assert 'res["requests_basis"] = "window"' in src
+
+
 def test_services_toggle_tunables_and_bool_ui():
     """Settings → Services exposes a per-backend monitor on/off for litellm/ollama/
     llamacpp/vllm as bool tunables, and the Settings page renders bool as an On/Off
@@ -2681,3 +3125,275 @@ def test_services_toggle_tunables_and_bool_ui():
     html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
     assert 's.type==="bool"' in html, "settings page must render bool tunables"
     assert re.search(r'\["1","On"\]', html) and re.search(r'\["0","Off"\]', html)
+
+
+def test_by_key_stack_cards_show_empty_state_instead_of_vanishing():
+    """Live regression: switching /litellm to 15m/1h made "Concurrent LLM work — by key"
+    and "LLM Backlog — by key" DISAPPEAR. In lite/off mode the split is weighted by each
+    key's per-bucket spend delta, so an idle window legitimately yields no bands and the
+    server returns an empty series — but the page then set the whole card to
+    display:none, so the section vanished and the page reflowed around it, which reads
+    as a broken chart. The card must stay visible and state that there's no activity."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    const EMPTY = {labels: [], series: [], weight_basis: "spend"};
+    const FULL  = {labels: [1, 2], weight_basis: "spend",
+                   series: [{label: "team-a", data: [1, 2]}]};
+    renderStackByKey(EMPTY, concByKeyChart, "card-conc-by-key", "conc-by-key-basis");
+    out.emptyCard  = REG["card-conc-by-key"].style.display;
+    out.emptyWrap  = REG["conc-by-key-wrap"].style.display;
+    out.emptyMsg   = REG["conc-by-key-empty"].style.display;
+    out.emptyBadge = REG["conc-by-key-basis"].textContent;
+    renderStackByKey(FULL, concByKeyChart, "card-conc-by-key", "conc-by-key-basis");
+    out.fullCard   = REG["card-conc-by-key"].style.display;
+    out.fullWrap   = REG["conc-by-key-wrap"].style.display;
+    out.fullMsg    = REG["conc-by-key-empty"].style.display;
+    out.fullBadge  = REG["conc-by-key-basis"].textContent;
+    // the sibling backlog card shares the same renderer and must behave identically
+    renderStackByKey(EMPTY, backlogByKeyChart, "card-backlog-by-key", "backlog-by-key-basis");
+    out.blCard = REG["card-backlog-by-key"].style.display;
+    out.blMsg  = REG["backlog-by-key-empty"].style.display;
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    # idle window: card stays, chart hidden, message shown
+    assert seen["emptyCard"] != "none", "by-key card must not vanish on an idle window"
+    assert seen["emptyWrap"] == "none", "chart canvas should be hidden when there's no data"
+    assert seen["emptyMsg"] != "none", "empty-state message must be shown"
+    assert seen["emptyBadge"] == "", "basis badge should clear when nothing is attributed"
+    # data present: chart back, message gone
+    assert seen["fullCard"] != "none" and seen["fullWrap"] != "none"
+    assert seen["fullMsg"] == "none"
+    assert "estimated" in seen["fullBadge"]
+    # sibling behaves the same
+    assert seen["blCard"] != "none" and seen["blMsg"] != "none"
+
+
+def test_by_key_empty_state_text_is_present_for_both_cards():
+    """Both stacked by-key cards ship the empty-state element the renderer toggles."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    for cid in ("conc-by-key", "backlog-by-key"):
+        assert f'id="{cid}-wrap"' in html, f"{cid} chart wrapper missing"
+        assert f'id="{cid}-empty"' in html, f"{cid} empty-state missing"
+    assert html.count("no per-key activity in this window") == 2
+
+
+def test_settings_unassigned_group_has_a_show_hide_switch():
+    """Settings → the Unassigned group (every key LiteLLM reports no owner for) carries a
+    Show | Hide segmented control wired to the HIDE_UNASSIGNED_KEYS tunable, and only that
+    group does — a real user's row must not grow a visibility control."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    assert "HIDE_UNASSIGNED_KEYS" in html, "settings page must know the tunable"
+    assert "_hideUnassigned" in html, "live value must be mirrored for the button state"
+    # the control is built inside the `unassigned` branch, not for every user block
+    i_branch = html.index("if(unassigned){")
+    i_post = html.index("post({HIDE_UNASSIGNED_KEYS:")
+    assert i_branch < i_post, "the control must live in the unassigned-only branch"
+    assert 'aria-pressed' in html, "active side must be exposed assistively"
+    # two explicit buttons, not a blind toggle: distinct Show and Hide, each posting the
+    # right value through the normal (CSRF-guarded, persisted) admin settings endpoint
+    assert 'bShow.textContent="Show"' in html and 'bHide.textContent="Hide"' in html
+    assert 'post({HIDE_UNASSIGNED_KEYS: hide?"1":"0"})' in html
+    # the active side is highlighted so the CURRENT state is visible at a glance
+    assert '.uvis.on{' in html, "active side must have a highlighted style"
+    # NOTE: settings.html wraps its JS in an IIFE, so userBlock() is not reachable from
+    # the node probe harness the way litellm.html's helpers are. This stays a structural
+    # test rather than exposing page internals purely to make them testable.
+
+
+def test_hide_unassigned_tunable_is_not_rendered_as_a_settings_card():
+    """HIDE_UNASSIGNED_KEYS is served for its value (env default + persistence + the
+    Show/Hide button's live state all read it) but must NOT render as its own settings
+    card — that card duplicated the button. It carries card=False, tunables_view()
+    exposes that, and render() drops non-card tunables."""
+    import config
+    assert config.TUNABLES["HIDE_UNASSIGNED_KEYS"].get("card") is False, \
+        "the tunable must be flagged non-card"
+    view = {t["name"]: t for t in config.tunables_view()}
+    assert view["HIDE_UNASSIGNED_KEYS"]["card"] is False, "tunables_view must carry card"
+    # every normal tunable still defaults to being a card
+    assert view["SAMPLE_INTERVAL"]["card"] is True
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    assert "s.card!==false" in html, "render() must skip non-card tunables"
+
+
+def test_model_costs_is_an_aligned_grid_with_a_shared_header():
+    """The MODEL COSTS card was a ragged flex row: each in/out/cache cell stacked its label
+    OVER its value (`flex-direction:column`) and floated, and the override input drifted, so
+    nothing lined up row-to-row. It is now a grid — a header row (.mhdr) labels in/out/cache/
+    override ONCE and every model row (.srow.tmodel) right-aligns its values in those columns.
+    The header and the rows MUST share the exact same column template or they would not line
+    up; that shared rule is the alignment invariant."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    # header and rows are declared in ONE combined rule → identical tracks by construction
+    m = re.search(r"\.srow\.tmodel,\.mhdr\{grid-template-columns:([^;]+);", html)
+    assert m, "the .srow.tmodel + .mhdr shared grid rule is missing"
+    tracks = m.group(1).split()
+    assert len(tracks) == 7, f"expected 7 columns (name·kind·in·out·cache·override·actions), got {tracks}"
+    # the header exists and labels every numeric/override column
+    assert 'className="mhdr"' in html or 'class="mhdr"' in html or '"mhdr"' in html, "no header row"
+    assert '.mhdr{display:grid' in html, "header must use the same grid"
+    for col in ('"in"', '"out"', '"cch"', '"override"'):
+        assert col in html, f"header is missing the {col} column label"
+    # the old ragged structure is gone (no per-cell label-over-value flex column)
+    assert ".mcosts" not in html and 'class="mc"' not in html, \
+        "the old floating .mcosts/.mc cell structure must be removed"
+
+
+def test_model_costs_grid_actions_column_is_fixed_not_auto():
+    """Alignment bug guard: the actions (✓ ↺) column MUST be a fixed width, not `auto`. An
+    `auto` track is 0-wide in the header (its cell is empty) but ~64px in a data row (the
+    buttons), so the flexible name column would absorb different slack and the numeric columns
+    would NOT line up between the header and the rows."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    m = re.search(r"\.srow\.tmodel,\.mhdr\{grid-template-columns:([^;]+);", html)
+    assert m, "shared grid rule missing"
+    last = m.group(1).split()[-1]
+    assert last != "auto", "the actions column must be a fixed width, not auto (breaks alignment)"
+    assert re.match(r"^\d+px$", last), f"actions column should be a fixed px width, got {last!r}"
+    # save + reset ride in ONE actions cell so they occupy a single grid column
+    assert 'acts.className="macts"' in html or 'class="macts"' in html, "actions must share one cell"
+    assert ".macts{" in html, "the actions cell needs its own layout rule"
+
+
+def test_model_costs_row_children_match_the_header_cells():
+    """A grid only aligns if every row has the same number of direct children as the header
+    has cells (7). modelRow must append, in column order: name · kind select · in · out ·
+    cache · override input · actions — the three rates as DIRECT cells (not wrapped), so they
+    land in their own columns."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    start = html.index("function modelRow(")
+    body = html[start:html.index("\n  function ", start + 1)]
+    # the three rate values are appended straight onto the row (own columns), not wrapped
+    assert body.count("mcell(m.in_1m)") and "mcell(m.out_1m)" in body and "mcell(m.cache_1m)" in body, \
+        "the three rate cells must be direct grid children"
+    # exactly seven direct grid children, in order
+    kids = re.findall(r"row\.appendChild\(([^)]+)\)", body)
+    # normalise the mcell(...) appends to a single token for counting
+    norm = ["mcell" if k.startswith("mcell(") else k.strip() for k in kids]
+    assert norm == ["lbl", "sel", "mcell", "mcell", "mcell", "cost", "acts"], norm
+
+
+def test_model_name_click_opens_an_info_popover():
+    """Clicking a model name opens an info popover with the full name, provider, parameter
+    count (parsed from the name — MoE total·active aware), kind, 30d usage, and rates. The
+    name is a keyboard-reachable button, the popover is position:fixed (so the card's
+    overflow:auto can't clip it) and closes on an outside click or Escape, and every field is
+    written via textContent (never an HTML sink)."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    # the name is interactive + wired to the popover
+    assert 'lbl.setAttribute("role","button")' in html and 'lbl.setAttribute("tabindex","0")' in html, \
+        "the model name must be a keyboard-reachable button"
+    assert "openModelInfo(m,lbl)" in html, "clicking the name must open the info popover"
+    assert 'lbl.addEventListener("keydown"' in html, "Enter/Space must also open it"
+    # the popover builds the promised fields
+    assert "function openModelInfo(" in html
+    for field in ('"Provider"', '"Parameters"', '"30d usage"', '"Input"', '"Output"',
+                  '"Cache read"', '"Effective"'):
+        assert field in html, f"popover is missing the {field} row"
+    # parameter parsing incl. the MoE total·active form vLLM models use
+    assert "function paramSize(" in html and "function modelParams(" in html
+    assert "B total · " in html and "B active" in html, "MoE total/active params not surfaced"
+    # dismissable + not clipped
+    assert ".mpop{" in html and "position:fixed" in html.split(".mpop{")[1][:80], \
+        "popover must be position:fixed so the card overflow can't clip it"
+    assert 'e.key==="Escape"' in html and "_mpopOut" in html, "must close on Escape / outside click"
+    # security: no HTML sink for model-supplied strings — content is textContent only
+    body = html[html.index("function openModelInfo("):html.index("function modelRow(")]
+    assert "innerHTML" not in body, "popover must not use an innerHTML sink"
+
+
+def test_model_param_parsing_is_correct_for_real_model_names():
+    """Behavioural (not source-inspection): extract the popover's `paramSize` + `modelParams`
+    from settings.html and RUN them in node against real model names. This is what actually
+    verifies the parameter figure shown to the operator — a structural test only proves the
+    function exists, not that `Qwen3-Coder-30B-A3B` reads as `30B total · 3B active`."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioural test")
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+
+    def _extract(fn):
+        i = html.index("function " + fn + "(")
+        depth, j = 0, i
+        while j < len(html):
+            if html[j] == "{":
+                depth += 1
+            elif html[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return html[i:j + 1]
+            j += 1
+        raise AssertionError(f"could not extract {fn}")
+
+    cases = [
+        # MoE "total-Active" form vLLM/Qwen use → total · active
+        ("vllm/Qwen3-Coder-30B-A3B-Instruct-NVFP4", "30B total · 3B active"),
+        ("vllm/MiniMax-M2.5-REAP-139B-A10B-NVFP4", "139B total · 10B active"),
+        # classic mixture-of-experts NxM
+        ("mistralai/Mixtral-8x7B-Instruct", "8×7B"),
+        # plain billions / fractional billions / millions
+        ("meta-llama/Llama-3.1-70B-Instruct", "70B"),
+        ("Qwen2.5-Coder-1.5B", "1.5B"),
+        ("some/embed-model-270m", "270M"),
+        # no parameter figure in the name → the em dash the popover shows
+        ("azure_ai/gpt-5-mini", "—"),
+        ("llama-cpp/Qwen3-Coder-Next", "—"),
+    ]
+    harness = _extract("paramSize") + "\n" + _extract("modelParams") + "\n"
+    harness += "const C=" + json.dumps(cases) + ";\n"
+    harness += ("let bad=[]; for(const [name,exp] of C){ const got=modelParams(name);"
+                " if(got!==exp) bad.push(name+' => '+got+' (want '+exp+')'); }"
+                " if(bad.length){ console.error(bad.join('\\n')); process.exit(1); }"
+                " console.log('ok');")
+    out = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, f"parameter parsing wrong:\n{out.stderr.strip()}"
+
+
+def test_settings_unassigned_switch_does_not_break_the_row_grid():
+    """.urow is a FIXED 5-column grid (uid | team | budget | actions | keys). Appending the
+    visibility switch straight onto the row made it a 6th direct child, which silently took
+    the 150px team column and shoved every later cell one slot right — the key strip wrapped
+    onto its own line below. The switch must go INSIDE the actions cell instead, keeping the
+    row at exactly five children."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    # the grid still declares five tracks
+    m = re.search(r"\.urow\{display:grid;grid-template-columns:([^;]+);", html)
+    assert m, "could not find the .urow grid definition"
+    assert len(m.group(1).split()) == 5, f"expected 5 grid tracks, got {m.group(1)!r}"
+    # the switch is appended to the actions container, never directly to the row
+    assert "if(vis) btns.appendChild(vis);" in html, "switch must ride in the actions cell"
+    assert "row.appendChild(vis)" not in html, "switch must NOT be a direct grid child"
+    # exactly the five intended direct children of .urow, in order
+    start = html.index("function userBlock(")
+    body = html[start:html.index("\n  function ", start + 1)]
+    kids = re.findall(r"row\.appendChild\((\w+)\)", body)
+    assert kids == ["uname", "teamcell", "bud", "btns", "strip"], kids
+    # the control is a segmented Show|Hide group with its own sizing class (not a bare
+    # .ib, which is icon-sized)
+    assert 'vis.className="uvis-grp"' in html and ".uvis-grp{" in html
+
+
+def test_every_snapshot_serving_endpoint_applies_the_key_visibility_filter():
+    """The rule must hold on EVERY page, which means every endpoint that ships the live
+    LiteLLM snapshot has to pass it through _snapshot_for_display: /api/data (all the
+    dashboards poll it), the SSE /api/stream (same data, different transport — a page on
+    the stream would otherwise see the unfiltered list), and /api/budgets via
+    _visible_top_keys (the Spend page's cost-by-key, by-team and per-key budgets).
+
+    Storage and the admin board are deliberately NOT filtered — history must stay
+    complete, and unassigned keys must remain assignable in Settings."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert '"latest": _snapshot_for_display(_latest)' in src, "/api/data unfiltered"
+    assert "_disp = _snapshot_for_display(_latest)" in src, "/api/stream unfiltered"
+    assert "merge_key_budgets(live, _visible_top_keys(" in src, "/api/budgets unfiltered"
+    # storage keeps every key — the read paths filter at query time instead
+    assert 'db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])' in src, \
+        "stored history must NOT be pre-filtered"
+
+
+def test_overview_kpis_use_prefilter_totals():
+    """Hiding a key removes its bar, never a measured total: the Overview's spend and key
+    KPIs must prefer the pre-filter aggregates the display filter carries."""
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert "l.cost_all_keys!=null" in html, "spend KPI must use the pre-filter total"
+    assert "l.keys_total!=null" in html, "key count must use the pre-filter count"

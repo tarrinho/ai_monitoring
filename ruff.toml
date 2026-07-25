@@ -2,5 +2,14 @@
 # compact fixture style — semicolon one-liners and grouped imports — that ruff's
 # E702/E401/E701 flag. Keep those relaxed in tests only, so `ruff check .` (as CI
 # runs it, rules.md §9) stays green without loosening the app code.
+
+# Pin the rule set EXPLICITLY to ruff's historical default (E4/E7/E9 + F). CI installs
+# ruff unpinned (`pip install ruff`), and ruff 0.16.0 BROADENED its implicit default to
+# also enable BLE/S/I/PL/etc. — 300+ new findings — which reds CI on a linter upgrade
+# alone, with no code change. Selecting the intended rules here makes `ruff check .`
+# reproducible across ruff versions (verified identical on 0.15.13 and 0.16.0).
+[lint]
+select = ["E4", "E7", "E9", "F"]
+
 [lint.per-file-ignores]
 "tests/**" = ["E701", "E702", "E401", "E402"]

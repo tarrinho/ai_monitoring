@@ -465,10 +465,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.8.5-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.8.6-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.5-armv7 ai-monitoring:1.8.5
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.6-armv7 ai-monitoring:1.8.6
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```
@@ -517,7 +517,8 @@ All gated by the dashboard token when set; `/healthz` is always open.
 |----------|---------|
 | `GET /api/data?history=N` | latest snapshot + recent samples |
 | `GET /api/series?window=&end=` | downsampled metric series (panning via `end`) |
-| `GET /api/keyseries?window=&end=` | top-10 API keys over time (multi-line) |
+| `GET /api/keyrequests?top=&metric=reqs\|cost` | top-10 API keys, cumulative all-time (the dashboard's "top-10 API keys over time" chart) |
+| `GET /api/keyseries?window=&end=` | top-10 API keys, rolling per-window counts (multi-line) — not used by any current dashboard chart; kept as a read-only API for external consumers |
 | `GET /api/procseries?kind=cpu\|ram&window=&end=` | top-5 apps over time |
 | `GET /api/uptime?window=` | per-backend uptime % + transition events |
 | `GET /api/anomalies` | active + recent per-key anomalies |
@@ -596,7 +597,7 @@ pip install -r requirements-dev.txt && pytest
 ## Development
 
 This project was built with AI assistance (Claude Code). All code is human-reviewed and
-gated by an extensive CI pipeline that runs on every push: 600+ tests, ruff / semgrep /
+gated by an extensive CI pipeline that runs on every push: 700+ tests, ruff / semgrep /
 bandit static analysis, gitleaks + trufflehog secret scanning, Trivy CVE scans
 (filesystem + image), and cosign image signing.
 

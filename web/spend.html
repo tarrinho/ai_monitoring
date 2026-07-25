@@ -260,7 +260,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.5</div>
+      <div id="sidebar-brand-ver">v1.8.6</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -727,6 +727,9 @@ function renderModelUserCostTime(d){
     : (a.model===b.model?(b.total-a.total):String(a.model).localeCompare(String(b.model))));
   // per-bucket totals for the % share view
   const totals=labels.map((_,i)=>series.reduce((s,x)=>s+((x.costs||[])[i]||0),0));
+  // A plain fill-to-origin would stack translucent layers on top of each other so each band
+  // blends with the ones below it — fill to the PREVIOUS dataset instead, so the bands read
+  // as a clean stack that visually sums to the total.
   updateSeries(modelUserChart,
     labels.map(function(l){ return axisSp(Date.parse((gran==="month"?l+"-01":l)+"T00:00:00Z")/1000, gran); }),
     series.map(function(s,i){
@@ -736,7 +739,7 @@ function renderModelUserCostTime(d){
       return {_k:MUGROUP+"|"+s.label,
         label:s.label+" · "+CUR+Number(s.total||0).toFixed(2),
         data:data, borderColor:col, backgroundColor:col+"cc",
-        borderWidth:1, pointRadius:0, tension:.2, fill:true};
+        borderWidth:1, pointRadius:0, tension:.2, fill:i?"-1":"origin"};
     }));
 }
 async function loadModelUserCostSeries(){

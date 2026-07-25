@@ -444,6 +444,123 @@ async def test_litellm_heavy_calls_are_throttled(monkeypatch):
         await srv.close()
 
 
+async def test_litellm_heavy_sample_surfaces_known_keys(monkeypatch):
+    """_heavy_sample() piggy-backs collectors.litellm.key_budgets() (/key/list) onto the
+    same HEAVY cadence as /spend/logs and surfaces the confirmed aliases as
+    `known_keys` — the write side that lets the by-key charts fold a real-but-INVALID
+    auth attempt into 'Other' (db.known_keys_upsert/known_keys_set, config.key_known).
+    A /key/list failure must NOT crash the sample or drop the rest of the heavy fields."""
+    async def _live(_r): return web.json_response({"status": "healthy"})
+    async def _models(_r): return web.json_response({"data": []})
+    async def _backlog(_r): return web.json_response({"in_flight_requests": 1})
+    async def _spend(_r): return web.json_response([])
+
+    async def _keylist(r):
+        if int(r.query.get("page", "1")) > 1:
+            return web.json_response({"keys": []})
+        return web.json_response({"keys": [
+            {"key_alias": "alex-batista", "max_budget": 10.0, "spend": 1.0},
+            {"key_alias": "claude-code", "max_budget": 0, "spend": 0.5},
+        ], "total_pages": 1})
+
+    app = web.Application()
+    app.router.add_get("/health/liveliness", _live)
+    app.router.add_get("/v1/models", _models)
+    app.router.add_get("/health/backlog", _backlog)
+    app.router.add_get("/spend/logs", _spend)
+    app.router.add_get("/key/list", _keylist)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LITELLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
+        monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
+        monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)
+        litellm._KEY_BUDGETS_CACHE = None                # isolate from other tests
+        async with aiohttp.ClientSession() as s:
+            out = await litellm.sample(s)
+        assert set(out.get("known_keys") or []) == {"alex-batista", "claude-code"}
+    finally:
+        await srv.close()
+
+
+async def test_litellm_heavy_sample_key_list_failure_is_non_fatal(monkeypatch):
+    """A /key/list failure (e.g. scope-limited master key) must not crash the sample or
+    drop already-derived heavy fields — key_budgets() degrades to its own cache/None and
+    `known_keys` is simply absent that tick."""
+    async def _live(_r): return web.json_response({"status": "healthy"})
+    async def _models(_r): return web.json_response({"data": []})
+    async def _backlog(_r): return web.json_response({"in_flight_requests": 2})
+    async def _spend(_r): return web.json_response([])
+    async def _keylist(_r): return web.json_response({"error": "forbidden"}, status=403)
+
+    app = web.Application()
+    app.router.add_get("/health/liveliness", _live)
+    app.router.add_get("/v1/models", _models)
+    app.router.add_get("/health/backlog", _backlog)
+    app.router.add_get("/spend/logs", _spend)
+    app.router.add_get("/key/list", _keylist)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LITELLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
+        monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
+        monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)
+        litellm._KEY_BUDGETS_CACHE = None
+        async with aiohttp.ClientSession() as s:
+            out = await litellm.sample(s)
+        assert out["available"] is True
+        assert out["backlog"] == 2               # rest of the sample is unaffected
+        assert not out.get("known_keys")          # no confirmed keys this tick
+    finally:
+        await srv.close()
+
+
+async def test_known_keys_baseline_survives_a_failed_key_list_poll(tmp_path, monkeypatch):
+    """Not just the cold-start-empty case: a /key/list poll can also fail on a LATER heavy
+    cycle, AFTER known_keys already has a real baseline from earlier successful polls (a
+    scope change on the master key, a transient 403/500, ...). The sampler only calls
+    db.known_keys_upsert() when the tick's `known_keys` field is present (see app.py's
+    `if _ll.get("known_keys"): db.known_keys_upsert(...)` — mirrored here); a failed tick
+    carries no `known_keys` field at all, so that call is simply skipped and the
+    already-persisted baseline must be read back unchanged, not wiped or replaced."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kk_stale_baseline.db"))
+    db.init()
+    db.known_keys_upsert(["pedro", "alex-batista"], 1000.0)   # baseline from earlier polls
+    assert db.known_keys_set() == {"pedro", "alex-batista"}
+
+    async def _live(_r): return web.json_response({"status": "healthy"})
+    async def _models(_r): return web.json_response({"data": []})
+    async def _backlog(_r): return web.json_response({"in_flight_requests": 1})
+    async def _spend(_r): return web.json_response([])
+    async def _keylist(_r): return web.json_response({"error": "internal"}, status=500)
+
+    app = web.Application()
+    app.router.add_get("/health/liveliness", _live)
+    app.router.add_get("/v1/models", _models)
+    app.router.add_get("/health/backlog", _backlog)
+    app.router.add_get("/spend/logs", _spend)
+    app.router.add_get("/key/list", _keylist)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LITELLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
+        monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
+        monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)
+        litellm._KEY_BUDGETS_CACHE = None
+        async with aiohttp.ClientSession() as s:
+            out = await litellm.sample(s)
+        assert not out.get("known_keys")            # this tick confirmed nothing
+        # app.py's write-side guard, mirrored exactly:
+        if out.get("known_keys"):
+            db.known_keys_upsert(out["known_keys"], 2000.0)
+        assert db.known_keys_set() == {"pedro", "alex-batista"}   # stale baseline intact
+    finally:
+        await srv.close()
+
+
 async def test_sample_once_not_stalled_by_slow_backend():
     """Host/GPU/procs sampling must NOT wait on the HTTP backends — a slow LiteLLM
     can't make host CPU/RAM go stale. _sample_once reads the decoupled backends'
@@ -1074,6 +1191,40 @@ def test_keyrequests_falls_back_to_spend_when_no_request_data(tmp_path, monkeypa
     d = _json.loads(r.body.decode())
     assert d["metric"] == "spend", "must fall back to spend when no request data"
     assert "alice" in d["labels"] and d["points"], "fallback series must not be empty"
+
+
+def test_keyrequests_spend_fallback_only_rises_when_counter_rebases(tmp_path, monkeypatch):
+    """The 'Top 10 API keys over time' chart promises a running total that ONLY RISES.
+    Its lite-mode fallback reads per-key cumulative spend from key_series — but LiteLLM's
+    total_spend is NOT monotonic: it re-bases when a key is re-issued / a budget period
+    rolls / a replica reports a different view (observed live dropping 697 -> 11), which
+    made this 'only rises' line FALL. The fallback must sum positive steps (reset-safe),
+    so the served series is monotonic non-decreasing regardless of the raw counter."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kr2.db"))
+    db.init()
+    now = 1_800_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    # a re-basing cumulative counter spread over ~27 days (the 12mo chart reads the 1h
+    # tier), climbing then re-basing DOWN twice — the live 697 -> 11 shape in miniature.
+    seq = [100.0, 130.0, 160.0, 20.0, 45.0, 70.0, 5.0, 25.0, 40.0]
+    db.known_keys_upsert({"key-r": "u-1"}, now)
+    with db._connect() as conn:
+        conn.executemany(
+            "INSERT INTO key_series_1h(bucket,label,reqs) VALUES (?,?,?)",
+            [(now - 86400 * 30 + i * 86400 * 3, "key-r", v) for i, v in enumerate(seq)])
+    import asyncio, json as _json
+
+    class _Req:
+        def __init__(self, q): self.query = q
+    import app as _app
+    monkeypatch.setattr(_app, "_q_end", lambda r: now)
+    d = _json.loads(asyncio.run(_app.keyrequests_handler(_Req({}))).body.decode())
+    assert d["metric"] == "spend"
+    vals = [p.get("key-r") for p in d["points"] if p.get("key-r") is not None]
+    assert vals, "fallback must still produce the series"
+    drops = [(a, b) for a, b in zip(vals, vals[1:]) if b < a - 1e-9]
+    assert not drops, f"'only rises' chart fell on a re-basing counter: {drops}"
+    assert vals[-1] > 0, "a key that kept spending must end above zero"
 
 
 def test_concurrency_by_key_attribution_sums_to_aggregate(tmp_path, monkeypatch):
@@ -7111,12 +7262,18 @@ def test_user_delete_cascades_api_tokens():
 # ── Top-10 keys "requests in window" delta chart (1.3.2) ──────────────────────
 def _clear_key_series():
     """Isolate per-key delta tests from cross-run pollution (the shared test DB is
-    not reset for key_series between runs)."""
+    not reset for key_series between runs). Also clears `known_keys`: these tests seed
+    key_series with their own labels but never register them as /key/list-confirmed, and
+    `key_series_window_delta`/`key_delta_series`/`concurrency_by_key` fold any UNKNOWN label
+    into "Other" once known_keys is non-empty (permissive only while it's empty). A handler
+    test that populates known_keys — e.g. the board write-through, `_store_owners_from_live` —
+    would otherwise strip these labels and the read comes back empty."""
     db.init()
     with db._connect() as conn:
         conn.execute("DELETE FROM key_series")
         conn.execute("DELETE FROM key_series_1m")
         conn.execute("DELETE FROM key_series_1h")
+        conn.execute("DELETE FROM known_keys")
 
 
 def test_key_series_window_delta_computes_net_requests():
@@ -7135,13 +7292,40 @@ def test_key_series_window_delta_computes_net_requests():
 
 
 def test_key_series_window_delta_is_reset_safe():
+    """A counter that resets mid-window still reports the work done AFTER the reset,
+    and never a negative delta.
+
+    The window delta sums POSITIVE STEPS across the samples rather than comparing only
+    the endpoints, because two endpoints cannot distinguish "reset to 0, then 50 real
+    requests" from "baseline re-based to 50 with no traffic" — both read 900 → 50. The
+    sampler runs every few seconds, so a real reset always leaves the intermediate
+    samples that tell them apart; this test now supplies them, as production would.
+    See test_key_series_window_delta_ignores_a_plateau_drop_plateau for the other half.
+    """
     _clear_key_series()
     now = time.time()
-    db.insert_key_series(now - 1800, [{"key": "kr", "alias": "RST_delta", "reqs": 900}])
-    db.insert_key_series(now - 60,   [{"key": "kr", "alias": "RST_delta", "reqs": 50}])  # daily reset
+    for ts, v in ((now - 1800, 900), (now - 1500, 900),   # steady before the reset
+                  (now - 1200, 0),                        # daily reset
+                  (now - 900, 20), (now - 600, 35), (now - 60, 50)):   # work after it
+        db.insert_key_series(ts, [{"key": "kr", "alias": "RST_delta", "reqs": v}])
     res = db.key_series_window_delta("1h")
     m = dict(zip(res["labels"], res["deltas"]))
-    assert m.get("RST_delta") == 50                        # end value, never negative
+    assert m.get("RST_delta") == 50            # the 50 done after the reset, never negative
+
+
+def test_key_series_window_delta_ignores_a_plateau_drop_plateau():
+    """The live regression: a key's cumulative value sat flat, re-based DOWNWARD, then
+    sat flat again — no traffic anywhere in the window. Crediting the new end value (the
+    old endpoints-only fallback) charged it a full band of phantom activity on an idle
+    proxy, and ranked it into the top-N. A series that only ever plateaus scores 0."""
+    _clear_key_series()
+    now = time.time()
+    for ts, v in ((now - 1800, 2.72), (now - 1500, 2.72), (now - 1200, 2.72),
+                  (now - 900, 0.86), (now - 600, 0.86), (now - 60, 0.86)):
+        db.insert_key_series(ts, [{"key": "kq", "alias": "QUIET_delta", "reqs": v}])
+    res = db.key_series_window_delta("1h")
+    m = dict(zip(res["labels"], res["deltas"]))
+    assert m.get("QUIET_delta") == 0.0, "idle key charged phantom activity by a re-base"
 
 
 def test_key_delta_series_is_cumulative_timeline():
@@ -7280,6 +7464,24 @@ def test_concurrency_by_key_hides_excluded_label(tmp_path, monkeypatch):
     # alice's band to the whole aggregate — the excluded weight still counts in the
     # split denominator, so alice gets only her true (small) proportional share.
     assert last["alice"] < 1.0
+
+
+def test_known_keys_upsert_and_set_roundtrip(tmp_path, monkeypatch):
+    """db.known_keys_upsert() persists labels LiteLLM's /key/list confirmed valid;
+    known_keys_set() reads them back. Re-upserting (a later poll re-confirming the
+    same key) must NOT create duplicate rows or drop an already-known label — the
+    table only ever grows (see the known_keys schema comment: history for a
+    rotated/deleted key must survive)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kk.db"))
+    db.init()
+    assert db.known_keys_set() == set()               # nothing confirmed yet
+    db.known_keys_upsert(["alex-batista", "claude-code"], 1000.0)
+    assert db.known_keys_set() == {"alex-batista", "claude-code"}
+    # a later poll re-confirms one key and adds a new one — old one must persist
+    db.known_keys_upsert(["claude-code", "key-r-santos"], 2000.0)
+    assert db.known_keys_set() == {"alex-batista", "claude-code", "key-r-santos"}
+    db.known_keys_upsert([], 3000.0)                    # empty poll is a no-op, never wipes
+    assert db.known_keys_set() == {"alex-batista", "claude-code", "key-r-santos"}
 
 
 def test_spend_model_user_upsert_is_idempotent(tmp_path, monkeypatch):
@@ -8330,7 +8532,7 @@ def test_concurrency_by_key_hides_when_no_activity_despite_baseline_backlog():
         for t in (now - 90, now - 65, now - 40, now - 15):
             c.execute("INSERT INTO metrics(ts,conc,backlog) VALUES(?,?,?)", (t, 1.0, 1.0))
             # keys with lifetime spend but NO change across the window = idle
-            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "rodolfo", 9.2))
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "key-r", 9.2))
             c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "leonor", 8.8))
     try:
         for metric in ("conc", "backlog"):
@@ -8362,6 +8564,74 @@ async def test_backlog_subtracts_own_probe(monkeypatch):
     assert await L._fetch_backlog(None, "x", {}) == 3        # toggle off → raw count
 
 
+def test_zooming_into_a_spike_keeps_its_key_attribution():
+    """FIELD BUG: on the 24h view "Concurrent LLM work — by key" attributed a spike to a
+    key (blue band), but zooming into that same spike showed 100% "Other".
+
+    Cause: the per-key weight is the STEP of a cumulative counter, and the baseline was the
+    FIRST sample INSIDE the window. A zoomed window holds only one per-key sample, so that
+    sample WAS the baseline, scored 0, and the whole aggregate fell into "Other". The
+    baseline now comes from the sample BEFORE the window, so the attribution is identical
+    at any zoom level."""
+    import time
+    import db as dbmod
+    dbmod.init()
+    now = time.time()
+    spike = now - 300                      # the moment the key spent (and conc rose)
+    with dbmod._connect() as c:
+        c.execute("DELETE FROM metrics")
+        c.execute("DELETE FROM key_series")
+        for t in [now - 1800 + 60 * i for i in range(30)]:
+            conc = 5.0 if abs(t - spike) < 1e-6 else 0.0
+            c.execute("INSERT INTO metrics(ts,conc) VALUES(?,?)", (t, conc))
+            # cumulative spend: flat 1.0, steps to 1.143 at the spike and stays there
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)",
+                      (t, "pedro", 1.0 if t < spike else 1.143))
+    try:
+        wide = {s["label"]: sum(s["data"]) for s in dbmod.concurrency_by_key(
+            "1h", "conc", end=now, cumulative=True)["series"]}
+        assert wide.get("pedro", 0) > 0, "precondition: wide view attributes the spike"
+
+        # zoom onto the spike: a 60s window whose ONLY per-key sample is the spike itself
+        zoom = {s["label"]: sum(s["data"]) for s in dbmod.concurrency_by_key(
+            "custom:60", "conc", end=spike + 30, cumulative=True)["series"]}
+        assert zoom.get("pedro", 0) > 0, \
+            f"zoomed view lost the key attribution (all 'Other'): {zoom}"
+        assert zoom.get("Other", 0) == 0, f"zoomed spike must not fall into Other: {zoom}"
+    finally:
+        with dbmod._connect() as c:
+            c.execute("DELETE FROM metrics")
+            c.execute("DELETE FROM key_series")
+
+
+def test_prewindow_baseline_does_not_invent_activity_on_a_flat_counter():
+    """The pre-window baseline must not manufacture a band: a key whose cumulative value is
+    unchanged across the window (and across the boundary) still scores 0, and a counter that
+    went BACKWARDS before the window (re-based key) contributes 0, not a negative/huge step."""
+    import time
+    import db as dbmod
+    dbmod.init()
+    now = time.time()
+    with dbmod._connect() as c:
+        c.execute("DELETE FROM metrics")
+        c.execute("DELETE FROM key_series")
+        for t in [now - 600 + 60 * i for i in range(10)]:
+            c.execute("INSERT INTO metrics(ts,conc) VALUES(?,?)", (t, 2.0))
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "flat", 7.0))
+            # 'rebased' drops from 9 to 3 halfway: a backwards step is unknowable → 0
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)",
+                      (t, "rebased", 9.0 if t < now - 300 else 3.0))
+    try:
+        out = {s["label"]: sum(s["data"]) for s in dbmod.concurrency_by_key(
+            "custom:120", "conc", end=now, cumulative=True)["series"]}
+        assert out.get("flat", 0) == 0, f"flat counter must not get a band: {out}"
+        assert out.get("rebased", 0) == 0, f"backwards step must score 0, got {out}"
+    finally:
+        with dbmod._connect() as c:
+            c.execute("DELETE FROM metrics")
+            c.execute("DELETE FROM key_series")
+
+
 def test_custom_window_secs_parsed_and_clamped():
     """Drag-to-zoom encodes a range as WIN='custom:<secs>'. window_secs must return those
     seconds, clamped to [CUSTOM_WIN_MIN, CUSTOM_WIN_MAX] so a bogus/huge drag can't blow up
@@ -8373,6 +8643,17 @@ def test_custom_window_secs_parsed_and_clamped():
     assert db.window_secs("1h") == 3600.0                                  # named still works
 
 
+def test_custom_window_rejects_non_finite_without_raising():
+    """SECURITY/robustness: the 'custom:<secs>' token is caller-supplied (a query param).
+    `int(float("inf"))` / `int(float("1e400"))` raise OverflowError — which, if uncaught,
+    500s the request and logs a traceback on a crafted `?window=custom:inf`. Every non-finite
+    / unparseable form must degrade to the page default, never raise."""
+    for tok in ("custom:inf", "custom:1e400", "custom:-inf", "custom:nan", "custom:1e309"):
+        assert db._custom_secs(tok) is None, f"{tok} must not parse to a number"
+        assert db.norm_window(tok, "1h") == "1h", f"{tok} must fall back to the default"
+        assert db.window_secs(tok) == db.window_secs("1h"), f"{tok} must span the default window"
+
+
 def test_norm_window_accepts_custom_or_falls_back():
     """norm_window is the endpoint gate: it must pass a valid custom token through, canonicalise
     it (clamped int), keep named windows, and reject junk to the page default."""
@@ -8381,3 +8662,185 @@ def test_norm_window_accepts_custom_or_falls_back():
     assert db.norm_window("24h", "1h") == "24h"
     assert db.norm_window("bogus", "1h") == "1h"
     assert db.norm_window("custom:", "24h") == "24h"
+
+
+def test_key_delta_series_monotonic_under_repeated_rebases():
+    """key_delta_series backs the 'only rises' all-time chart's lite fallback, so its
+    monotonicity must hold for MULTIPLE keys and repeated re-bases in one series — not
+    just the single climb-then-reset the timeline test covers."""
+    _clear_key_series()
+    now = time.time()
+    # two keys, each re-basing at different points; alice also plateaus (idle stretch)
+    a = [10.0, 40.0, 40.0, 5.0, 25.0, 25.0, 2.0, 12.0]     # up, flat, reset, up, flat, reset, up
+    b = [3.0, 3.0, 9.0, 9.0, 1.0, 1.0, 6.0, 20.0]          # flat, up, flat, reset, flat, up
+    for i in range(len(a)):
+        db.insert_key_series(now - len(a) * 300 + i * 300,
+                             [{"key": "ka", "alias": "alice", "reqs": a[i]},
+                              {"key": "kb", "alias": "bob", "reqs": b[i]}])
+    res = db.key_delta_series("1h")
+    for lab in ("alice", "bob"):
+        s = [p.get(lab) for p in res["points"] if p.get(lab) is not None]
+        assert s == sorted(s), f"{lab} not monotonic: {s}"
+        assert s[0] == 0.0, f"{lab} must start at 0 (window start): {s[0]}"
+    # sums only the UPWARD movement: alice 30+20+10 = 60, never crediting the resets
+    sa = [p.get("alice") for p in res["points"] if p.get("alice") is not None]
+    assert sa[-1] == 60.0, f"alice upward total wrong: {sa[-1]}"
+
+
+def test_key_delta_series_empty_when_no_keys():
+    """The fallback guards on `points` being non-empty; an empty window must return a
+    clean empty shape, not raise, so keyrequests_handler falls through safely."""
+    _clear_key_series()
+    out = db.key_delta_series("1h", 200, top_n=10, end=time.time())
+    assert out == {"labels": [], "points": []}
+
+
+def test_key_cumulative_full_mode_path_unchanged_and_monotonic(tmp_path, monkeypatch):
+    """The full-mode primary path (per-key REQUESTS from the daily rollup) was already
+    monotonic by construction and this fix must not touch it — a regression guard so the
+    lite-fallback change can't be blamed for the full-mode chart later."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kc.db"))
+    db.init()
+    now = 1_800_000_000.0
+    # daily rollup rows: per-day request counts (already deltas) → cumulative only rises
+    with db._connect() as conn:
+        for i, day in enumerate(range(5)):
+            conn.execute(
+                "INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (f"2026-07-0{day+1}", "m", "hA", "alice", 1.0, 100, 3 + i))
+    out = db.key_cumulative(metric="reqs", days_back=3650, top_n=10, end=now)
+    s = [p.get("alice") for p in out["points"] if p.get("alice") is not None]
+    assert s == sorted(s) and s[-1] == 3 + 4 + 5 + 6 + 7, f"full-mode cumulative wrong: {s}"
+
+
+async def test_scan_heavy_reads_run_off_the_event_loop(monkeypatch):
+    """PHASE-1 observer-effect (§6 covers SERVES, not just pulls): a scan-heavy DB read must
+    not run on the event loop — a large/custom-window query would otherwise stall the sampler.
+    Proven by capturing the thread `db.series` executes on: off-loop (asyncio.to_thread) runs
+    it in a worker thread, never the loop's main thread. A regression to a blocking inline
+    call would run it on the main thread and fail this."""
+    import threading
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "supersecrettoken1234")
+    main = threading.main_thread()
+    seen = {}
+    orig = db.series
+
+    def spy(*a, **k):
+        seen["on_main"] = threading.current_thread() is main
+        return orig(*a, **k)
+
+    monkeypatch.setattr(db, "series", spy)
+    c = await _client()
+    try:
+        r = await c.get("/api/series?window=1h&token=supersecrettoken1234")
+        assert r.status == 200
+        assert seen.get("on_main") is False, \
+            "db.series ran on the event loop — a scan-heavy read must go through to_thread"
+    finally:
+        await c.close()
+
+
+def test_pos_step_kernel_is_reset_safe():
+    """PHASE-2 (#5): the reset-safe positive-step kernel every per-key delta chart shares.
+    0 on the first reading and on any backwards move (re-based counter); the plain increase
+    otherwise."""
+    assert db._pos_step(5.0, None) == 0.0          # first reading — no baseline
+    assert db._pos_step(5.0, 3.0) == 2.0           # normal increase
+    assert db._pos_step(3.0, 5.0) == 0.0           # counter re-based DOWN → 0, not -2
+    assert db._pos_step(5.0, 5.0) == 0.0           # unchanged → 0
+
+
+def test_three_per_key_read_paths_agree_on_a_reset(tmp_path, monkeypatch):
+    """The three delta read paths (`key_series_window_delta`, `key_delta_series`,
+    `concurrency_by_key`) now derive their step from the ONE `_pos_step` kernel, so they must
+    treat a re-based counter identically: a key that climbs, drops (reset), then climbs again
+    counts only the two positive climbs — never the drop — in all three."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "t.db"))
+    db.init()
+    now = 1_800_000_000.0
+    # one key 'k', cumulative spend: 2 → 6 (climb +4), 6 → 1 (reset), 1 → 4 (climb +3)
+    seq = [2.0, 6.0, 1.0, 4.0]
+    with db._connect() as c:
+        c.execute("DELETE FROM metrics"); c.execute("DELETE FROM key_series")
+        for i, v in enumerate(seq):
+            t = now - 1800 + i * 300
+            c.execute("INSERT INTO metrics(ts,conc) VALUES(?,?)", (t, 3.0))
+            c.execute("INSERT INTO key_series(ts,label,reqs) VALUES(?,?,?)", (t, "k", v))
+    end = now
+    # (1) window_delta: sum of positive steps = 4 + 3 = 7 (the drop contributes 0)
+    wd = db.key_series_window_delta("1h", 10, end=end)
+    assert wd["labels"] == ["k"] and abs(wd["deltas"][0] - 7.0) < 1e-6, wd
+    # (2) delta_series: the running total ends at 7, never dips below its running max
+    ds = db.key_delta_series("1h", 300, top_n=10, end=end)
+    vals = [p.get("k") for p in ds["points"] if p.get("k") is not None]
+    assert vals == sorted(vals), f"cumulative line must never fall (reset-safe): {vals}"
+    assert abs(vals[-1] - 7.0) < 1e-6, vals
+    # (3) concurrency_by_key (cumulative basis): the reset bucket contributes no weight, so
+    #     the key is attributed only where it actually climbed — total weight > 0, never NaN
+    ck = db.concurrency_by_key("1h", "conc", end=end, cumulative=True)
+    kseries = [s for s in ck["series"] if s["label"] == "k"]
+    assert kseries and sum(kseries[0]["data"]) > 0, ck
+    with db._connect() as c:
+        c.execute("DELETE FROM metrics"); c.execute("DELETE FROM key_series")
+
+
+def _seed_spend_mu(tmp_path, monkeypatch, rows, owners):
+    """Seed the spend_model_user_daily rollup + known_keys for the rollup-backed by-key
+    charts (key_cumulative / key_cost_window). rows: [(label, cost, reqs)]."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mu.db"))
+    db.init()
+    now = 1_800_000_000.0
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    db.known_keys_upsert(owners, now)
+    with db._connect() as conn:
+        for lab, cost, reqs in rows:
+            conn.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                         "VALUES(?,?,?,?,?,?,?)", (day, "m", lab, lab, cost, 1000, reqs))
+    return now
+
+
+def test_key_cost_window_folds_hidden_keys_into_other(tmp_path, monkeypatch):
+    """PHASE-2 gap fix: the Spend 'Cost by key' chart (`key_cost_window`) reads the
+    spend_model_user_daily rollup and used to skip EVERY label filter — showing the operator's
+    excluded key, unconfirmed/garbage labels, AND ownerless keys as their own bands. They now
+    fold into 'Other', so the window's total spend is preserved (a hidden key's money stays
+    visible in aggregate) while it loses its named band."""
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", ["selfkey"])
+    monkeypatch.setattr(config, "HIDE_UNASSIGNED_KEYS", True)
+    now = _seed_spend_mu(
+        tmp_path, monkeypatch,
+        rows=[("alice", 5.0, 50), ("bob", 3.0, 30), ("orphan", 1.0, 10),
+              ("selfkey", 9.0, 90), ("garbage", 4.0, 40)],
+        owners={"alice": "u1", "bob": "u2", "orphan": ""})   # orphan = owner empty; garbage unknown
+    cw = db.key_cost_window(30, end=now + 86400)
+    assert set(cw) == {"alice", "bob", "Other"}, f"only real keys keep a band: {cw}"
+    assert round(cw["Other"], 2) == 14.0, f"orphan+selfkey+garbage folded: {cw}"
+    assert round(sum(cw.values()), 2) == 22.0, f"total spend must be preserved: {cw}"
+
+
+def test_key_cumulative_drops_hidden_keys_from_topn(tmp_path, monkeypatch):
+    """Same rollup, the 'Top 10 API keys over time' chart in FULL spend mode (`key_cumulative`):
+    excluded / unconfirmed / hidden-unassigned labels are dropped from top-N candidacy, exactly
+    like the sibling `key_series` over-time chart (which this rollup-backed path used to skip)."""
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", ["selfkey"])
+    monkeypatch.setattr(config, "HIDE_UNASSIGNED_KEYS", True)
+    now = _seed_spend_mu(
+        tmp_path, monkeypatch,
+        rows=[("alice", 5.0, 50), ("bob", 3.0, 30), ("orphan", 1.0, 99),
+              ("selfkey", 9.0, 90), ("garbage", 4.0, 40)],
+        owners={"alice": "u1", "bob": "u2", "orphan": ""})
+    kc = db.key_cumulative(metric="reqs", top_n=10, end=now + 86400)
+    assert set(kc["labels"]) == {"alice", "bob"}, \
+        f"orphan(hidden)/selfkey(excluded)/garbage(unknown) must not appear: {kc['labels']}"
+
+
+def test_label_hidden_predicate_covers_all_three_classes(tmp_path, monkeypatch):
+    """The one shared predicate every per-key chart applies: excluded, unconfirmed, hidden."""
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", ["selfkey"])
+    known = {"alice", "selfkey"}          # /key/list-confirmed labels
+    hidden = {"orphan"}                    # the hidden Unassigned set
+    assert db._label_hidden("alice", known, hidden) is False       # real, known, shown
+    assert db._label_hidden("selfkey", known, hidden) is True      # operator-excluded
+    assert db._label_hidden("garbage", known, hidden) is True      # never confirmed by /key/list
+    assert db._label_hidden("orphan", known, hidden) is True       # hidden Unassigned

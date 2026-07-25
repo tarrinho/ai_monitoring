@@ -14,7 +14,7 @@ server** that serves dashboards + a JSON API reading from that same store.
              │  → db.insert / insert_metrics       │                        │
              │  → db.insert_key_series/proc_series │        ┌── JSON API handlers ──┐
              │  → _track_events (uptime)           │        │ /api/series /api/data │
-             │  → anomaly.detect → notifier.process│        │ /api/keyseries …      │
+             │  → anomaly.detect → notifier.process│        │ /api/keyrequests …    │
              │  → every 60s: db.rollup()           │        └───────────┬───────────┘
              │  → every 1h:  db.prune*()           │                    │
              └──────┬─────────────────────────────┘                    │
@@ -57,7 +57,7 @@ Each tick (`MONITOR_SAMPLE_INTERVAL`, default 5s):
 |-------|---------|-----------|---------|
 | `metrics` | every tick | `ROLLUP_RAW_HOURS` (24h) | series ≤1h |
 | `metrics_1m` / `metrics_1h` | rollup() | `ROLLUP_MIN_DAYS` / `ROLLUP_HOUR_DAYS` | series ≤24h / beyond |
-| `key_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/keyseries` |
+| `key_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/keyrequests` · `/api/keydelta` · `/api/litellm/concurrency-by-key` (`/api/keyseries` also reads it — kept as a read-only API, not used by any current dashboard chart) |
 | `proc_series` (+`_1m`/`_1h`) | every tick / rollup | raw 24h / 30d / 1y | `/api/procseries` |
 | `samples` | every tick | `MONITOR_DB_RETENTION_HOURS` | boot warm-load |
 | `spend_daily` | sampler hourly (`_capture_spend_daily`) + `/api/spend/series` write-through | `SPEND_DAILY_RETENTION_DAYS` (~5y) | `/api/spend/series` (merged with LiteLLM's live 7-day window) |
