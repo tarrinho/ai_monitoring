@@ -37,15 +37,15 @@ numbers**, not just system metrics.
 > the roadmap.
 
 <p align="center">
-  <img src="docs/img/dash-ov-dark.png" alt="Overview dashboard" width="100%">
+  <img src="docs/img/dash-ov-light.png" alt="Overview dashboard" width="100%">
   <br><em>Overview — LLM spend, tokens, and per-key usage up top, then GPU / host /
-  containers / top apps, every metric as live time-series.</em>
+  containers / top apps, every metric as live time-series. (Demo data.)</em>
 </p>
 
 ### Spend & Quota — the cost-first landing page
 
 <p align="center">
-  <img src="docs/img/dash-spend-dark.png" alt="Spend &amp; Quota dashboard" width="100%">
+  <img src="docs/img/dash-spend-light.png" alt="Spend &amp; Quota dashboard" width="100%">
   <br><em>Spend &amp; Quota — LLM cost and usage first: real-cash summary, usage and
   real-vs-estimated cost over time, cost-by-key for every key, by-team rollup, and
   per-key budgets ranked closest-to-cap. (Demo data.)</em>
@@ -149,24 +149,55 @@ any page when an alert is firing.
 
 ### Gallery
 
+<sub>All screenshots below are generated from the synthetic local demo server (`scripts/shoot_screenshots.py`) — no real deployment data.</sub>
+
 <table>
   <tr>
-    <td width="50%"><img src="docs/img/dash-spend-dark.png" alt="Spend &amp; Quota page"><br><sub><b>Spend &amp; Quota</b> — cost summary, usage + real/estimated cost over time, <b>cost-by-key (all keys)</b>, by-team rollup, per-key budgets ranked by risk.</sub></td>
-    <td width="50%"><img src="docs/img/dash-settings-dark.png" alt="Settings page"><br><sub><b>Settings</b> — live tuning + <b>Teams board</b> (email · team · budget · keys, ranked by usage, click for details) + Model costs. <sub>(demo data)</sub></sub></td>
+    <td width="50%"><img src="docs/img/dash-spend-light.png" alt="Spend &amp; Quota page"><br><sub><b>Spend &amp; Quota</b> — cost summary, usage + real/estimated cost over time, <b>cost-by-key (all keys)</b>, by-team rollup, per-key budgets ranked by risk.</sub></td>
+    <td width="50%"><img src="docs/img/dash-settings-light.png" alt="Settings page"><br><sub><b>Settings</b> — live tuning + <b>Teams board</b> (email · team · budget · keys, ranked by usage, click for details) + Model costs.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/img/dash-litellm-dark.png" alt="LiteLLM dashboard"><br><sub><b>LiteLLM</b> — latency p50/p95/p99, req/s, cost, backlog, per-model + top keys.</sub></td>
-    <td width="50%"><img src="docs/img/dash-llamacpp-dark.png" alt="llama.cpp dashboard"><br><sub><b>llama.cpp</b> — tokens/s, slots, KV-cache, context, loaded model.</sub></td>
+    <td width="50%"><img src="docs/img/dash-litellm-light.png" alt="LiteLLM dashboard"><br><sub><b>LiteLLM</b> — latency p50/p95/p99, req/s, cost, backlog, per-model + top keys.</sub></td>
+    <td width="50%"><img src="docs/img/dash-llamacpp-light.png" alt="llama.cpp dashboard"><br><sub><b>llama.cpp</b> — tokens/s, slots, KV-cache, context, loaded model.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/img/dash-gpu-dark.png" alt="GPU dashboard"><br><sub><b>GPU</b> — util, power, temp, tokens/watt, per-GPU table.</sub></td>
-    <td width="50%"><img src="docs/img/dash-ollama-dark.png" alt="Ollama dashboard"><br><sub><b>Ollama</b> — running/installed models, %-on-GPU, RAM/VRAM, unload countdown.</sub></td>
+    <td width="50%"><img src="docs/img/dash-gpu-light.png" alt="GPU dashboard"><br><sub><b>GPU</b> — util, power, temp, tokens/watt, per-GPU table.</sub></td>
+    <td width="50%"><img src="docs/img/dash-ollama-light.png" alt="Ollama dashboard"><br><sub><b>Ollama</b> — running/installed models, %-on-GPU, RAM/VRAM, unload countdown.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/img/dash-alerts-dark.png" alt="Alerts dashboard"><br><sub><b>Alerts</b> — channel, thresholds, active breaches, test button, history.</sub></td>
-    <td width="50%"><img src="docs/img/dash-ov-light.png" alt="Light theme"><br><sub><b>Light theme</b> — every page is day/night, persisted per browser.</sub></td>
+    <td width="50%"><img src="docs/img/dash-alerts-light.png" alt="Alerts dashboard"><br><sub><b>Alerts</b> — channel, thresholds, active breaches, test button, history.</sub></td>
+    <td width="50%" align="center" valign="middle"><sub>Every page is day/night, persisted per browser.<br>🌙 <a href="#dark-theme-gallery">See the dark-theme gallery below</a>.</sub></td>
   </tr>
 </table>
+
+<a id="dark-theme-gallery"></a>
+<details>
+<summary><b>🌙 Dark theme gallery</b> (click to expand — same 8 pages, dark theme)</summary>
+
+<p align="center">
+  <img src="docs/img/dash-ov-dark.png" alt="Overview dashboard, dark theme" width="100%">
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/img/dash-spend-dark.png" alt="Spend &amp; Quota page, dark theme"><br><sub><b>Spend &amp; Quota</b></sub></td>
+    <td width="50%"><img src="docs/img/dash-settings-dark.png" alt="Settings page, dark theme"><br><sub><b>Settings</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/img/dash-litellm-dark.png" alt="LiteLLM dashboard, dark theme"><br><sub><b>LiteLLM</b></sub></td>
+    <td width="50%"><img src="docs/img/dash-llamacpp-dark.png" alt="llama.cpp dashboard, dark theme"><br><sub><b>llama.cpp</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/img/dash-gpu-dark.png" alt="GPU dashboard, dark theme"><br><sub><b>GPU</b></sub></td>
+    <td width="50%"><img src="docs/img/dash-ollama-dark.png" alt="Ollama dashboard, dark theme"><br><sub><b>Ollama</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/img/dash-alerts-dark.png" alt="Alerts dashboard, dark theme"><br><sub><b>Alerts</b></sub></td>
+    <td width="50%"></td>
+  </tr>
+</table>
+
+</details>
 
 ---
 

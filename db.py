@@ -417,9 +417,20 @@ def init() -> None:
         # UNASSIGNED key (no owner anywhere) from an owned one without re-querying
         # LiteLLM. Empty string = LiteLLM reports no user for this key. Existing rows
         # backfill to '' and are corrected on the next /key/list poll.
-        if "owner" not in {r[1] for r in conn.execute("PRAGMA table_info(known_keys)")}:
+        _kkcols = {r[1] for r in conn.execute("PRAGMA table_info(known_keys)")}
+        if "owner" not in _kkcols:
             try:
                 conn.execute("ALTER TABLE known_keys ADD COLUMN owner TEXT DEFAULT ''")
+            except Exception:
+                pass
+        # How many CONSECUTIVE successful polls have reported this key's owner as blank
+        # while we still hold a known owner. A key transitions owned -> unassigned only
+        # after the streak reaches OWNER_BLANK_THRESHOLD, so a one-off owner-resolution
+        # blip inside a successful /key/list poll never flaps it (see known_keys_upsert).
+        if "owner_blank_streak" not in _kkcols:
+            try:
+                conn.execute("ALTER TABLE known_keys "
+                             "ADD COLUMN owner_blank_streak INTEGER DEFAULT 0")
             except Exception:
                 pass
         # per-user alert webhook (1.2.2): each user can set their own webhook URL.
@@ -536,27 +547,67 @@ def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float) 
 
     Accepts either a plain sequence of labels or a {label: owner} mapping. The owner is
     LiteLLM's user-id for the key ('' when it reports none) and is what
-    unassigned_labels() keys off — passing a sequence records an empty owner, which is
-    indistinguishable from 'LiteLLM says nobody owns it', so prefer the mapping."""
+    unassigned_labels() keys off. A plain SEQUENCE carries no owner information (owner
+    "unknown", NOT "blank"), so it only records validity/last_seen and never touches a
+    stored owner; prefer the mapping, which drives the owned<->unassigned transition."""
     if not labels:
-        return
-    owners = labels if isinstance(labels, dict) else {}
-    rows = [(str(lab)[:80], ts, ts, str(owners.get(lab, "") or "")[:120])
-            for lab in labels if lab]
-    if not rows:
         return
     try:
         with _connect() as conn:
-            conn.executemany(
-                "INSERT INTO known_keys(label, first_seen, last_seen, owner) "
-                "VALUES (?,?,?,?) "
-                "ON CONFLICT(label) DO UPDATE SET last_seen=excluded.last_seen, "
-                # only overwrite a known owner with another KNOWN owner — a transient
-                # /key/list response that lost the user must not blank an existing one
-                "owner=CASE WHEN excluded.owner<>'' THEN excluded.owner "
-                "           ELSE known_keys.owner END", rows)
+            if isinstance(labels, dict):
+                _upsert_known_with_owners(conn, labels, ts)
+            else:
+                # owner UNKNOWN (no per-key owner info): touch last_seen only, insert new
+                # rows with a blank owner, and leave any existing owner/streak untouched.
+                conn.executemany(
+                    "INSERT INTO known_keys(label, first_seen, last_seen, owner, "
+                    "owner_blank_streak) VALUES (?,?,?,'',0) "
+                    "ON CONFLICT(label) DO UPDATE SET last_seen=excluded.last_seen",
+                    [(str(lab)[:80], ts, ts) for lab in labels if lab])
     except Exception:
         pass
+
+
+# Consecutive successful polls that must all report a key's owner as blank before we
+# accept the owned -> unassigned transition. At the 60s heavy-poll cadence this is a few
+# minutes — long enough to ride out a one-off owner-resolution blip, short enough that a
+# genuine un-assignment shows up promptly.
+OWNER_BLANK_THRESHOLD = 3
+
+
+def _upsert_known_with_owners(conn: Any, owners: dict[str, str], ts: float) -> None:
+    """UPSERT known_keys from a {label: owner} map with a DEBOUNCED owner transition.
+
+    Per key, on each successful poll:
+      * owner reported NON-blank -> take it, reset the blank streak (the common case);
+      * owner blank while we already hold one -> DON'T blank it yet; count the blank. Only
+        once OWNER_BLANK_THRESHOLD consecutive polls agree the owner is gone do we clear it
+        (owned -> unassigned). One transient blip resets on the next non-blank poll, so the
+        key never flaps in/out of "Unassigned";
+      * owner blank while already unassigned -> stays unassigned (no-op).
+
+    Done in a single UPSERT: every SET expression reads the OLD row (`known_keys.*`) and the
+    proposed insert (`excluded.*`), so the streak increment and the owner decision use the
+    same pre-update streak value and stay consistent without a read-then-write race."""
+    t = int(OWNER_BLANK_THRESHOLD)
+    rows = [(str(lab)[:80], ts, ts, str(owners.get(lab, "") or "")[:120])
+            for lab in owners if lab]
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT INTO known_keys(label, first_seen, last_seen, owner, owner_blank_streak) "
+        "VALUES (?,?,?,?,0) "
+        "ON CONFLICT(label) DO UPDATE SET last_seen=excluded.last_seen, "
+        "owner_blank_streak = CASE "
+        "    WHEN excluded.owner <> '' THEN 0 "                       # owner seen → reset
+        "    WHEN known_keys.owner = '' THEN 0 "                      # already unassigned
+        "    ELSE known_keys.owner_blank_streak + 1 END, "            # blank + owned → count
+        "owner = CASE "
+        "    WHEN excluded.owner <> '' THEN excluded.owner "          # trust a named owner
+        "    WHEN known_keys.owner = '' THEN '' "                     # already unassigned
+        f"    WHEN known_keys.owner_blank_streak + 1 >= {t} THEN '' " # streak met → clear
+        "    ELSE known_keys.owner END",                             # else hold the owner
+        rows)
 
 
 def hidden_unassigned() -> set[str]:

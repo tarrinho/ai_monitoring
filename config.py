@@ -179,6 +179,14 @@ EXCLUDE_KEYS = {
 HIDE_UNASSIGNED_KEYS = (_str("MONITOR_HIDE_UNASSIGNED_KEYS", "0") or "0").lower() in (
     "1", "true", "yes", "on")
 
+# Pentest F-2: the container panel exposes the host's container NAMES via the read-only
+# docker socket. That is the tool's purpose, but on a shared-token / multi-viewer deployment
+# it hands full host topology to every dashboard user. Set this to restrict container NAMES
+# to admin sessions — non-admins still see health (count + running/stopped), just not names.
+# Default off (unchanged behaviour: any authenticated user sees names).
+CONTAINERS_ADMIN_ONLY = (_str("MONITOR_CONTAINERS_ADMIN_ONLY", "0") or "0").lower() in (
+    "1", "true", "yes", "on")
+
 
 def key_excluded(*identifiers: object) -> bool:
     """True if ANY identifier (key hash, key alias, or resolved owner user/email) matches

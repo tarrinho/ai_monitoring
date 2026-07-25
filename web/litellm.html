@@ -249,19 +249,17 @@ function updateSeries(chart,labels,next){
     <h2>Key anomalies <span class="badge" id="anom-badge"></span></h2>
     <div id="anom-body"><div class="unavail">none</div></div>
   </section>
-
-  <section class="card span-2" id="card-keys">
-    <h2>Top 10 API keys by requests <span class="badge" id="keys-win"></span>
-      <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 keys — requests in window' below.">ⓘ</span></h2>
-    <div class="chart-wrap" style="height:240px"><canvas id="keys-chart" role="img" aria-label="Requests by API key"></canvas></div>
+  <section class="card span-2" id="card-keys-winspend">
+    <h2>Top 10 API keys — spend in window <span class="badge" id="keys-winspend-win"></span>
+      <span class="info" title="Cumulative spend per API key WITHIN the page time-window (from the local per-day rollup, so it follows the window selector — unlike the all-time cards at the bottom). Excluded / unconfirmed / hidden-unassigned keys fold into 'Other'.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:240px"><canvas id="keys-winspend-chart" role="img" aria-label="Spend by API key in the window"></canvas></div>
   </section>
 
-  <section class="card span-2" id="card-userkeys">
-    <h2>Top 10 API users by requests <span class="badge" id="userkeys-win"></span>
-      <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 users — requests in window' below.">ⓘ</span></h2>
-    <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
-      keys aggregated per owner (username = email local part; a key with no resolved owner is shown by its key)</div>
-    <div class="chart-wrap" style="height:240px"><canvas id="user-keys-chart" role="img" aria-label="Requests by user"></canvas></div>
+  <section class="card span-2" id="card-userkeys-winspend">
+    <h2>Top 10 API users — spend in window <span class="badge" id="userkeys-winspend-win"></span>
+      <span class="info" title="Cumulative spend per user (keys aggregated per owner) WITHIN the page time-window.">ⓘ</span></h2>
+    <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">keys aggregated per owner; follows the page time-window</div>
+    <div class="chart-wrap" style="height:240px"><canvas id="userkeys-winspend-chart" role="img" aria-label="Spend by user in the window"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-keytime">
@@ -326,6 +324,22 @@ function updateSeries(chart,labels,next){
       <a id="export-btn" class="badge" style="cursor:pointer" title="download CSV">⬇ CSV</a>
     </h2>
     <div class="chart-grid" id="chart-grid"></div>
+  </section>
+
+
+  <section class="card span-2" id="card-userkeys">
+    <h2>Top 10 API users by requests <span class="badge" id="userkeys-win"></span>
+      <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 users — requests in window' below.">ⓘ</span></h2>
+    <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
+      keys aggregated per owner (username = email local part; a key with no resolved owner is shown by its key)</div>
+    <div class="chart-wrap" style="height:240px"><canvas id="user-keys-chart" role="img" aria-label="Requests by user"></canvas></div>
+  </section>
+
+
+  <section class="card span-2" id="card-keys">
+    <h2>Top 10 API keys by requests <span class="badge" id="keys-win"></span>
+      <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 keys — requests in window' below.">ⓘ</span></h2>
+    <div class="chart-wrap" style="height:240px"><canvas id="keys-chart" role="img" aria-label="Requests by API key"></canvas></div>
   </section>
 
 </main>
@@ -611,7 +625,7 @@ function keyLabel(k){
 // both counts. Say "cumulative spend" there and keep the real window label for full mode.
 function keysBadge(l){
   if(!l) return "";
-  if(l.reqs_per_key_unavailable || l.spend_mode==="lite") return "cumulative spend";
+  if(l.reqs_per_key_unavailable || l.spend_mode==="lite") return "all time cumulative spend";
   return l.spend_window_min ? ("last "+l.spend_window_min+"m") : "";
 }
 function renderKeys(l){
@@ -661,6 +675,47 @@ function renderUserKeys(l){
   userKeysChart.data.labels = top.map(keyDisp);
   userKeysChart.data.datasets[0].data = top.map(u=>agg[u]);
   userKeysChart.update("none");
+}
+
+// ── Windowed cumulative spend, per key and per user — follows the PAGE time-window (via
+// /api/spend/keycost → db.key_cost_window). The sibling "by requests" cards at the bottom
+// show all-time cumulative spend (LiteLLM's lifetime per-key total); these two follow the
+// selector instead. One fetch feeds both. Currency bars.
+function _mkSpendBar(id, color){
+  return new Chart(document.getElementById(id), {
+    type:"bar",
+    data:{labels:[],datasets:[{label:"spend",data:[],
+      backgroundColor:color+"88",borderColor:color,borderWidth:1}]},
+    options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false},
+        tooltip:{callbacks:{label:c=>" "+CUR+(+c.raw).toLocaleString(undefined,{maximumFractionDigits:4})}}},
+      scales:{x:{beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9},callback:v=>CUR+v},grid:{color:"#30363d33"}},
+              y:{ticks:{color:cssv("--fg"),font:{size:10}},grid:{display:false}}}}
+  });
+}
+const keysWinSpendChart = _mkSpendBar("keys-winspend-chart", "#58a6ff");
+const userWinSpendChart = _mkSpendBar("userkeys-winspend-chart", "#3fb950");
+function _shortLbl(s){ s=String(s||"?"); return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s; }
+async function loadWinSpend(){
+  const kwl=document.getElementById("keys-winspend-win"); if(kwl) kwl.textContent=wlabel(WIN);
+  const uwl=document.getElementById("userkeys-winspend-win"); if(uwl) uwl.textContent=wlabel(WIN);
+  const d=await api("/api/spend/keycost?window="+WIN);
+  const cost=(d&&d.cost)||{};
+  const r4=v=>Math.round(v*10000)/10000;
+  // per key
+  const krows=Object.keys(cost).map(k=>({k:k,v:cost[k]})).filter(r=>r.v>0)
+    .sort((a,b)=>b.v-a.v).slice(0,10);
+  keysWinSpendChart.data.labels=krows.map(r=>_shortLbl(r.k));
+  keysWinSpendChart.data.datasets[0].data=krows.map(r=>r4(r.v));
+  keysWinSpendChart.update("none");
+  // per user (aggregate the same keycost by owner; "Other" stays "Other")
+  const byUser={};
+  Object.keys(cost).forEach(k=>{ const u=(k==="Other")?"Other":userOf(k); byUser[u]=(byUser[u]||0)+cost[k]; });
+  const urows=Object.keys(byUser).map(u=>({u:u,v:byUser[u]})).filter(r=>r.v>0)
+    .sort((a,b)=>b.v-a.v).slice(0,10);
+  userWinSpendChart.data.labels=urows.map(r=>_shortLbl(r.u));
+  userWinSpendChart.data.datasets[0].data=urows.map(r=>r4(r.v));
+  userWinSpendChart.update("none");
 }
 
 // "reqs" (full mode) or "spend" (off/lite: no per-key requests). MUST be declared
@@ -1028,7 +1083,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -1147,7 +1202,7 @@ document.querySelectorAll("#windows button[data-w]").forEach(b=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
     b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); _winMark(false); var _wl=document.getElementById("win-label"); if(_wl)_wl.textContent=wlabel(WIN); updateRangeUI();
     document.getElementById("win-label").textContent=wlabel(WIN);
-    loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels();
+    loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -1177,6 +1232,7 @@ async function tick(){
   await loadKeyTime();
   await loadKeyDelta();
   await loadUserDelta();
+  await loadWinSpend();
   await loadConcByKey();
   await loadBacklogByKey();
   await loadCorr();

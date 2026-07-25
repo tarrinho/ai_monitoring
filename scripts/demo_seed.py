@@ -255,11 +255,17 @@ def _serve_with_theme(path, prefix="", **kw):
     resp = _orig_serve(path, prefix, **kw)
     html = resp.text
     if html:
-        shim = ("<script>(function(){var p=new URLSearchParams(location.search)"
+        # F5 (app.py) gives every response a per-request CSP nonce and only allows an
+        # inline script carrying it — one injected without it is silently CSP-blocked
+        # (no console error in a non-headful check, so this shipped broken for a while).
+        # _orig_serve already stamped the header; read it back and stamp our own tags too.
+        nonce = resp.headers.get(A._NONCE_HDR)
+        nattr = f' nonce="{nonce}"' if nonce else ""
+        shim = (f"<script{nattr}>(function(){{var p=new URLSearchParams(location.search)"
                 ".get('theme');if(p){localStorage.setItem('aimon-theme',p);"
                 "document.documentElement.setAttribute('data-theme',p);}})();</script>")
         # ?pop=1 forces the Host hardware popover open (so it can be screenshot)
-        shim += ("<style id='_popforce'></style><script>(function(){"
+        shim += (f"<style id='_popforce'></style><script{nattr}>(function(){{"
                  "if(new URLSearchParams(location.search).get('pop'))"
                  "document.getElementById('_popforce').textContent="
                  "'.hw-pop{display:block!important;position:static!important;box-shadow:none;margin-top:8px}';"

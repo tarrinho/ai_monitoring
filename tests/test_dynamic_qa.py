@@ -255,8 +255,36 @@ async def test_auth_rate_limit_locks_out(monkeypatch):
             assert (await c.get("/api/data?token=wrong")).status == 401
         r = await c.get("/api/data?token=wrong")          # 4th → locked
         assert r.status == 429 and r.headers.get("Retry-After")
-        # a CORRECT token is still refused while the IP is locked out
-        assert (await c.get("/api/data?token=supersecrettoken1234")).status == 429
+        # a WRONG token stays refused while the IP is locked
+        assert (await c.get("/api/data?token=wrong")).status == 429
+        # F-1 fix: a CORRECT token is HONOURED even from a locked IP — the lockout gates
+        # FAILED auth only. (Was 429: a shared proxy/tunnel IP let one attacker DoS everyone.)
+        assert (await c.get("/api/data?token=supersecrettoken1234")).status == 200
+    finally:
+        a._auth_fails.clear(); a._auth_locked_until.clear()
+        await c.close()
+
+
+async def test_lockout_never_denies_a_valid_credential_pentest_f1(monkeypatch):
+    """PENTEST F-1 (shared-IP lockout DoS): behind a reverse proxy / tunnel with
+    AUTH_TRUSTED_PROXY=0, every client shares one source IP, so an attacker spamming bad
+    tokens could lock out ALL legitimate users. The brute-force lockout must gate FAILED auth
+    only — a request that presents a VALID token/session is always served, so the attacker
+    can no longer deny service to the clients sharing that IP. Direct-exposure lockout of
+    WRONG attempts is unchanged."""
+    import app as a
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "supersecrettoken1234")
+    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 5)
+    a._auth_fails.clear(); a._auth_locked_until.clear()
+    c = await _client()
+    try:
+        # attacker locks the shared IP
+        for _ in range(6):
+            await c.get("/api/data?token=attacker-guess")
+        assert (await c.get("/api/data?token=attacker-guess")).status == 429, "IP must be locked"
+        # legitimate client on the SAME IP, holding the real token, is still served
+        assert (await c.get("/api/data?token=supersecrettoken1234")).status == 200, \
+            "F-1: a valid credential must never be denied by the lockout"
     finally:
         a._auth_fails.clear(); a._auth_locked_until.clear()
         await c.close()
@@ -3734,6 +3762,58 @@ async def test_per_model_series_surfaces_unpriced_instead_of_dropping(monkeypatc
         None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001})
     assert "mystery-model" in out["unpriced"], "unvaluable model must be surfaced"
     assert all(m["model"] != "mystery-model" for m in out["models"])   # no fake $ invented
+
+
+async def test_per_model_series_survives_a_transient_failure(monkeypatch):
+    """FIELD BUG: the Spend 'Cost per model over time' card sometimes DISAPPEARED. It
+    hides on an empty payload, and a single transient /global/activity/model failure
+    (timeout / circuit-breaker cooldown / mid-reload) returned None → the whole card
+    blinked off until the next good poll. A blip must now serve the LAST-GOOD series
+    (same rule as the price cache), so the chart persists across it."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-CHANGE_ME")
+    monkeypatch.setattr(litellm, "_MODEL_SERIES_CACHE", None)   # cold start
+    good = [{"model": "gpt-4o", "daily_data": [
+        {"date": "2026-07-01", "total_tokens": 1000, "spend": 5.0}]}]
+
+    async def _ok(session, url, headers=None, timeout_s=None):
+        return good, None
+    monkeypatch.setattr(litellm, "fetch_json", _ok)
+    first = await litellm.per_model_daily_series(
+        None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001})
+    assert first and [m["model"] for m in first["models"]] == ["gpt-4o"]
+
+    # now the endpoint blips: a transient error (err != None)
+    async def _fail(session, url, headers=None, timeout_s=None):
+        return None, "timeout"
+    monkeypatch.setattr(litellm, "fetch_json", _fail)
+    during = await litellm.per_model_daily_series(
+        None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001})
+    assert during is not None, "a transient blip must NOT blank the chart"
+    assert [m["model"] for m in during["models"]] == ["gpt-4o"], "must serve last-good"
+
+    # an ANSWERED-but-empty poll (no priced data this tick) also keeps last-good
+    async def _empty(session, url, headers=None, timeout_s=None):
+        return [], None
+    monkeypatch.setattr(litellm, "fetch_json", _empty)
+    empty = await litellm.per_model_daily_series(
+        None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001})
+    assert empty is not None and empty["models"], "answered-empty must keep last-good too"
+
+
+async def test_per_model_series_blank_before_first_success_still_hides(monkeypatch):
+    """The persistence must not resurrect a card that never had data: with an empty
+    cache (fresh deploy) a failing poll still returns None so the card stays hidden."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-CHANGE_ME")
+    monkeypatch.setattr(litellm, "_MODEL_SERIES_CACHE", None)   # never succeeded yet
+
+    async def _fail(session, url, headers=None, timeout_s=None):
+        return None, "timeout"
+    monkeypatch.setattr(litellm, "fetch_json", _fail)
+    out = await litellm.per_model_daily_series(
+        None, "2026-07-01", "2026-07-02", {"gpt-4o": 0.001})
+    assert out is None, "no last-good yet → hide (don't invent an empty card)"
 
 
 def test_bucket_model_series_carries_cost_provenance():
@@ -8844,3 +8924,46 @@ def test_label_hidden_predicate_covers_all_three_classes(tmp_path, monkeypatch):
     assert db._label_hidden("selfkey", known, hidden) is True      # operator-excluded
     assert db._label_hidden("garbage", known, hidden) is True      # never confirmed by /key/list
     assert db._label_hidden("orphan", known, hidden) is True       # hidden Unassigned
+
+
+async def test_spend_keycost_accepts_litellm_page_windows(monkeypatch):
+    """The LiteLLM 'spend in window' cards pass the page window (15m/1h/24h/custom) to
+    /api/spend/keycost, which used to hard-restrict to 30d/12mo/month and silently coerce
+    everything else to 30d. It now accepts any windowed token via norm_window."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "supersecrettoken1234")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://x")   # gate open
+    c = await _client()
+    try:
+        for w in ("1h", "24h", "30d", "custom:3600"):
+            r = await c.get(f"/api/spend/keycost?window={w}&token=supersecrettoken1234")
+            assert r.status == 200, f"{w}: {r.status}"
+            body = await r.json()
+            assert body["window"] == w, f"{w} was coerced to {body['window']}"
+            assert "cost" in body
+    finally:
+        await c.close()
+
+
+async def test_containers_admin_only_redacts_names_for_non_admin_pentest_f2(monkeypatch):
+    """PENTEST F-2 (host container-inventory disclosure): with MONITOR_CONTAINERS_ADMIN_ONLY
+    on, a non-admin session sees container health (count + running/status) but NOT the host's
+    container NAMES; admins (and the default-off config) see everything."""
+    import app as a
+    snap = {"collectors": {"containers": {"available": True, "containers": [
+        {"name": "aimon-litellm-db", "running": True, "status": "Up"},
+        {"name": "customer-secrets", "running": False, "status": "Exited"}]}}}
+    # default OFF → names shown to everyone (unchanged behaviour)
+    monkeypatch.setattr(config, "CONTAINERS_ADMIN_ONLY", False)
+    names = [c["name"] for c in a._redact_containers(snap, "viewer")["collectors"]["containers"]["containers"]]
+    assert names == ["aimon-litellm-db", "customer-secrets"]
+    # ON + admin → still full
+    monkeypatch.setattr(config, "CONTAINERS_ADMIN_ONLY", True)
+    names = [c["name"] for c in a._redact_containers(snap, "admin")["collectors"]["containers"]["containers"]]
+    assert names == ["aimon-litellm-db", "customer-secrets"]
+    # ON + non-admin (or token-auth role=None) → names redacted, health preserved
+    for r in ("viewer", None):
+        red = a._redact_containers(snap, r)["collectors"]["containers"]["containers"]
+        assert [c["name"] for c in red] == ["container-1", "container-2"], f"role={r}"
+        assert [c["status"] for c in red] == ["Up", "Exited"], "health must be preserved"
+    # the original snapshot is not mutated
+    assert snap["collectors"]["containers"]["containers"][0]["name"] == "aimon-litellm-db"

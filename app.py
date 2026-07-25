@@ -723,14 +723,22 @@ async def _auth_mw(request: web.Request, handler):
     ip = _client_ip(request)
     now = time.time()
     _prune_auth_state(now)
-    locked = _auth_locked_until.get(ip, 0.0)
-    if locked > now:
-        return web.json_response(
-            {"error": "too many attempts"}, status=429,
-            headers={"Retry-After": str(int(locked - now))})
 
     authed, role, _sess = _auth_ctx(request)
     if not authed:
+        # The brute-force lockout gates FAILED auth ONLY — it must never refuse a request
+        # that presents a VALID credential. Checking the credential BEFORE the lockout means
+        # an attacker spamming bad tokens from a shared reverse-proxy / tunnel IP
+        # (AUTH_TRUSTED_PROXY=0, so every client looks like one IP) can no longer lock out the
+        # legitimate clients that share that IP — that was a denial-of-service. Validating the
+        # token is a constant-time compare plus a cheap session lookup (NO scrypt; password
+        # brute-force is throttled separately in login_submit), so doing it first adds no
+        # DoS amplification.
+        locked = _auth_locked_until.get(ip, 0.0)
+        if locked > now:
+            return web.json_response(
+                {"error": "too many attempts"}, status=429,
+                headers={"Retry-After": str(int(locked - now))})
         # Count a lockout strike only when a credential was actually PRESENTED and
         # rejected (real brute-force) — not for a browser that simply isn't logged
         # in yet (that just gets bounced to /login). Only a presented BEARER/query
@@ -1395,17 +1403,34 @@ async def settings_page_handler(request: web.Request) -> web.Response:
     return _serve_page(_WEB / "settings.html", _fwd_prefix(request), user=user, role=role)
 
 
+def _redact_containers(snap: dict, role: str | None) -> dict:
+    """Pentest F-2: with MONITOR_CONTAINERS_ADMIN_ONLY on, a non-admin session sees container
+    HEALTH (count + running/stopped + status) but NOT the host's container NAMES — the shared
+    dashboard token must not hand full host topology to every viewer. Admin sees everything;
+    default-off keeps the current behaviour. A no-op when there are no containers."""
+    if role == "admin" or not getattr(config, "CONTAINERS_ADMIN_ONLY", False):
+        return snap
+    cols = snap.get("collectors") or {}
+    cont = cols.get("containers")
+    if not isinstance(cont, dict) or not isinstance(cont.get("containers"), list):
+        return snap
+    reds = [{**{k: v for k, v in c.items() if k != "name"}, "name": f"container-{i + 1}"}
+            for i, c in enumerate(cont["containers"])]
+    return {**snap, "collectors": {**cols, "containers": {**cont, "containers": reds}}}
+
+
 async def data_handler(request: web.Request) -> web.Response:
     try:
         n = int(request.query.get("history", "180"))
     except ValueError:
         n = 180
     n = max(1, min(n, config.RETENTION_SAMPLES))
-    hist = list(_ring)[-n:]
+    _, _role, _ = _auth_ctx(request)               # role gates container-name visibility (F-2)
+    hist = [_redact_containers(h, _role) for h in list(_ring)[-n:]]
     return web.json_response({
         "version": config.VERSION,
         "now": time.time(),
-        "latest": _snapshot_for_display(_latest),
+        "latest": _redact_containers(_snapshot_for_display(_latest), _role),
         "history": hist,
     })
 
@@ -1540,6 +1565,32 @@ async def keydelta_handler(request: web.Request) -> web.Response:
     return web.json_response({"window": window, **data})
 
 
+# _visible_top_keys runs on EVERY /api/data poll and inside the SSE /api/stream loop
+# (once per SAMPLE_INTERVAL PER connected client), and its two db reads each open a fresh
+# sqlite connection on the event loop. Memoize them for a few seconds so a fleet of open
+# dashboards doesn't reopen the DB every tick (§6 observer-effect). The inputs change
+# slowly — known_keys grows only on the heavy /key/list poll, overrides only on an admin
+# action — so brief staleness is invisible. Keyed on DB_PATH too, so a test swapping
+# MONITOR_DB_PATH force-refreshes rather than reading another test's cached set.
+_VIS_GATE_TTL = 5.0
+_vis_gate: dict = {"mono": -1e9, "db": None, "known": frozenset(), "unassigned": frozenset()}
+
+
+def _visible_gate_inputs() -> tuple:
+    """(known_keys, hidden_unassigned_labels) for the per-request visibility filter,
+    cached for _VIS_GATE_TTL. The config toggle is read LIVE (not cached) so Show/Hide
+    still takes effect on the next poll; only the underlying label SETS are memoized."""
+    now = time.monotonic()
+    if now - _vis_gate["mono"] >= _VIS_GATE_TTL or _vis_gate["db"] != config.DB_PATH:
+        _vis_gate["known"] = db.known_keys_set()
+        _vis_gate["unassigned"] = db.unassigned_labels()
+        _vis_gate["mono"] = now
+        _vis_gate["db"] = config.DB_PATH
+    hidden = (_vis_gate["unassigned"]
+              if getattr(config, "HIDE_UNASSIGNED_KEYS", False) else frozenset())
+    return _vis_gate["known"], hidden
+
+
 def _visible_top_keys(rows: list) -> list:
     """The per-key rows allowed to appear as their OWN entry on a chart.
 
@@ -1563,8 +1614,7 @@ def _visible_top_keys(rows: list) -> list:
     if not rows:
         return rows
     try:
-        known = db.known_keys_set()
-        hidden = db.hidden_unassigned()
+        known, hidden = _visible_gate_inputs()
     except Exception:
         return rows
     out = []
@@ -2996,9 +3046,10 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
     LiteLLM's all-time per-key total. LiteLLM-gated like the rest of Spend; no /spend/logs pull."""
     if not _litellm_configured():
         raise web.HTTPNotFound()
-    window = request.query.get("window", "30d")
-    if window not in ("30d", "12mo", "month"):
-        window = "30d"
+    # accept any windowed token (the Spend page uses 30d/12mo/month; the LiteLLM page's
+    # "spend in window" cards pass 15m/1h/24h/custom) — the rollup is day-granular, so a
+    # sub-day window rounds up to one day. norm_window also validates custom:<secs>.
+    window = db.norm_window(request.query.get("window", "30d"), "30d")
     end = _q_end(request) or time.time()
     secs = (end - db.month_start(end)) if window == "month" else db.window_secs(window)
     days = int(secs // 86400) + 1

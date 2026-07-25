@@ -1385,6 +1385,25 @@ def test_demo_seed_theme_shim_forwards_kwargs():
         "theme shim must forward **kw to the real _serve_page"
 
 
+def test_demo_seed_theme_shim_stamps_the_csp_nonce():
+    """F5's per-response CSP nonce (app.py) blocks any <script> tag without it. The theme
+    shim injects its own <script> tags AFTER _orig_serve already nonce-stamped the page,
+    so an un-stamped shim tag is silently dropped by CSP — the ?theme= query param then
+    does nothing and every screenshot renders in the default (dark) theme regardless of
+    what was requested. The shim must read the nonce _orig_serve already put in the
+    response header and stamp its own tags with the same value."""
+    src = (ROOT / "scripts" / "demo_seed.py").read_text(encoding="utf-8")
+    assert "resp.headers.get(A._NONCE_HDR)" in src, \
+        "shim must read the nonce _orig_serve already stamped into the response header"
+    m = re.search(r"def _serve_with_theme\(.*?\n(?=def |\Z)", src, re.S)
+    assert m, "_serve_with_theme not found"
+    body = m.group(0)
+    assert body.count("<script{nattr}>") >= 2, \
+        "both injected <script> tags (theme setter + popover forcer) must carry the nonce"
+    assert "<script>" not in body, \
+        "an injected <script> tag without the nonce attribute is silently CSP-blocked"
+
+
 def test_settings_page_exists_with_tunables_and_teams():
     html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
     assert 'id="board"' in html and 'id="teams"' in html, "settings page missing sections"
@@ -1873,7 +1892,8 @@ def test_drag_maps_pixels_to_real_timestamps_not_window_fractions():
         # every path that feeds a time series into a chart must stamp it
         for m in re.finditer(r'^\s*(\w[\w.$\[\]]*)\.data\.labels\s*=\s*(?!\[\])', html, re.M):
             line = html[m.start():html.index("\n", m.start())]
-            if "spark" in line.lower() or "keysChart" in line or "userKeysChart" in line:
+            if ("spark" in line.lower() or "keysChart" in line or "userKeysChart" in line
+                    or "WinSpend" in line):   # the by-key/by-user SPEND bars are not time-series
                 continue                       # sparkline + by-key bar charts: not draggable
             assert "stampTs" in line or "stampTs" in html[m.start() - 120:m.start()], \
                 f"{name}: chart data set without stampTs → drag would fall back to guessing: {line.strip()}"
@@ -2304,6 +2324,19 @@ def test_regression_env_and_publisher_excluded_from_public_repo():
     pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
     pm = re.search(r'PRIVATE_FILES=\((.*?)\n\)', pub, re.S)
     assert pm and "publish-github.sh" in pm.group(1) and "rules.md" in pm.group(1)
+
+
+def test_regression_readme_images_are_all_allow_listed():
+    """Every docs/img/*.png|svg README references must ship in the publish
+    ALLOW-list — a screenshot added to the README but never added to ALLOW silently
+    404s for every public reader (the exact gap that slipped through when the
+    light-theme gallery's images were first added)."""
+    allow = _publish_allow_list()
+    if allow is None:
+        return
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for m in re.finditer(r'docs/img/[\w.-]+\.(?:png|svg)', readme):
+        assert m.group(0) in allow, f"README references {m.group(0)!r}, missing from publish ALLOW-list"
 
 
 def test_regression_no_internal_markers_in_published_files():
@@ -3061,8 +3094,8 @@ def test_litellm_top_key_bars_badge_cumulative_spend_in_lite():
     out.fullKeys = REG["keys-win"].textContent;
     console.log("PROBE:" + JSON.stringify(out));
     """)
-    assert seen["liteKeys"] == "cumulative spend"
-    assert seen["liteUsers"] == "cumulative spend"
+    assert seen["liteKeys"] == "all time cumulative spend"
+    assert seen["liteUsers"] == "all time cumulative spend"
     assert seen["fullKeys"] == "last 15m"
 
 
@@ -3383,7 +3416,10 @@ def test_every_snapshot_serving_endpoint_applies_the_key_visibility_filter():
     Storage and the admin board are deliberately NOT filtered — history must stay
     complete, and unassigned keys must remain assignable in Settings."""
     src = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert '"latest": _snapshot_for_display(_latest)' in src, "/api/data unfiltered"
+    # /api/data still passes _latest through the key-visibility filter; it may be wrapped
+    # (e.g. _redact_containers(...) for the F-2 container-name gate), so match the filter call
+    # applied to _latest rather than the exact surrounding literal.
+    assert '"latest": ' in src and "_snapshot_for_display(_latest)" in src, "/api/data unfiltered"
     assert "_disp = _snapshot_for_display(_latest)" in src, "/api/stream unfiltered"
     assert "merge_key_budgets(live, _visible_top_keys(" in src, "/api/budgets unfiltered"
     # storage keeps every key — the read paths filter at query time instead
@@ -3397,3 +3433,30 @@ def test_overview_kpis_use_prefilter_totals():
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert "l.cost_all_keys!=null" in html, "spend KPI must use the pre-filter total"
     assert "l.keys_total!=null" in html, "key count must use the pre-filter count"
+
+
+def test_litellm_windowed_spend_cards_and_layout():
+    """LiteLLM page: two new 'spend in window' cards (keys + users) follow the page window via
+    /api/spend/keycost; the all-time 'by requests' pair is moved to the bottom and swapped
+    (users before keys), and its badge now reads 'all time cumulative spend'."""
+    html = _page("litellm")
+    # the two new windowed-spend cards exist and are wired to the windowed keycost endpoint
+    assert 'id="card-keys-winspend"' in html and 'id="card-userkeys-winspend"' in html, \
+        "the two windowed-spend cards must exist"
+    assert 'id="keys-winspend-chart"' in html and 'id="userkeys-winspend-chart"' in html
+    assert '"/api/spend/keycost?window="+WIN' in html, "windowed cards must follow the page window"
+    assert "function loadWinSpend(" in html
+    # loaded on the tick AND on a window change (rangedReload)
+    assert "loadUserDelta(); loadWinSpend();" in html, "loadWinSpend must be in the reload path"
+    assert "await loadWinSpend();" in html, "loadWinSpend must run on the tick too"
+    # the badge rename
+    assert 'return "all time cumulative spend";' in html
+    assert 'return "cumulative spend";' not in html
+    # the by-requests pair is moved BELOW the full-width charts card, swapped (users then keys)
+    i_charts = html.index('id="card-charts"')
+    i_users = html.index('id="card-userkeys"')
+    i_keys = html.index('id="card-keys"')
+    assert i_charts < i_users < i_keys, \
+        "the all-time by-requests pair must sit at the bottom, users before keys"
+    # and the NEW windowed cards sit near the top (before the moved originals)
+    assert html.index('id="card-keys-winspend"') < i_users
