@@ -362,14 +362,17 @@ async def _sampling_loop(app: web.Application) -> None:
                     and (_vl.get("running") is not None or _vl.get("waiting") is not None)):
                 db.insert_model_conc_series(snap["ts"], f"vllm/{_vl['model']}",
                                             _vl.get("running"), _vl.get("waiting"))
-                if _mu_rows:
-                    db.spend_model_user_upsert(_mu_rows, snap["ts"])
-                # /key/list-confirmed labels (collectors.litellm._heavy_sample), for the
-                # by-key charts to fold a real-but-INVALID auth attempt (garbage bearer
-                # token) into 'Other' instead of it claiming its own band — see
-                # db.known_keys_set()/config.key_known(). Only present on a HEAVY tick.
-                if _ll.get("known_keys"):
-                    db.known_keys_upsert(_ll["known_keys"], snap["ts"])
+            # LiteLLM per-(day,model,key) spend rollup + /key/list-confirmed key labels.
+            # These are pure LiteLLM concerns and MUST persist independently of vLLM — they
+            # were previously mis-nested under the vLLM guard above, so on a LiteLLM-only or
+            # multi-model-vLLM stack the "cost per model & user over time" forward-store and
+            # the by-key 'Other'-folding baseline (db.known_keys_set()/config.key_known())
+            # never updated from live samples (only the one-time backfill). Both only carry
+            # data on a HEAVY tick.
+            if _mu_rows:
+                db.spend_model_user_upsert(_mu_rows, snap["ts"])
+            if _ll.get("known_keys"):
+                db.known_keys_upsert(_ll["known_keys"], snap["ts"])
             _pr = snap["collectors"].get("procs", {})
             if _pr.get("available"):
                 db.insert_proc_series(snap["ts"], "cpu", _pr.get("top_cpu") or [], "cpu")
@@ -390,16 +393,20 @@ async def _sampling_loop(app: web.Application) -> None:
             except asyncio.TimeoutError:
                 print("[alert] notifier exceeded 15s — skipped this tick",
                       file=sys.stderr)
+            # rollup + prune do multi-table INSERT…SELECT / DELETE scans; run them OFF the
+            # event loop (like the read paths) so a big aggregation/prune can't stall every
+            # concurrent HTTP handler (§6 observer-effect — the write path was still on-loop).
             if snap["ts"] - last_rollup > 60:
-                db.rollup()
+                await asyncio.to_thread(db.rollup)
                 last_rollup = snap["ts"]
             if snap["ts"] - last_prune > 3600:
-                db.prune()
-                db.prune_metrics()
-                db.prune_key_series()
-                db.prune_spend_model_user()
-                db.prune_spend_daily()
-                db.audit_prune(snap["ts"] - config.AUDIT_RETENTION_DAYS * 86400)
+                await asyncio.to_thread(db.prune)
+                await asyncio.to_thread(db.prune_metrics)
+                await asyncio.to_thread(db.prune_key_series)
+                await asyncio.to_thread(db.prune_spend_model_user)
+                await asyncio.to_thread(db.prune_spend_daily)
+                await asyncio.to_thread(db.audit_prune,
+                                        snap["ts"] - config.AUDIT_RETENTION_DAYS * 86400)
                 last_prune = snap["ts"]
         except asyncio.CancelledError:
             raise
@@ -427,23 +434,29 @@ def _csp(nonce: str | None = None) -> str:
             "frame-ancestors 'none'")
 
 
-def _apply_sec_headers(resp) -> None:
+def _apply_sec_headers(resp, secure: bool = False) -> None:
     nonce = resp.headers.pop(_NONCE_HDR, None)   # set by _serve_page for HTML pages
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Content-Security-Policy"] = _csp(nonce)
     resp.headers["Server"] = "AI-Monitoring"
+    # HSTS only over HTTPS (a header on a plain-HTTP response is ignored by browsers and can
+    # brick a later HTTP-only deploy). Emitted when the request arrived over TLS directly or
+    # via a terminating proxy (X-Forwarded-Proto: https).
+    if secure:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
 
 @web.middleware
 async def _sechdr_mw(request: web.Request, handler):
+    secure = _is_https(request)
     try:
         resp = await handler(request)
     except web.HTTPException as e:
-        _apply_sec_headers(e)   # headers on redirects/errors too, then re-raise
+        _apply_sec_headers(e, secure)   # headers on redirects/errors too, then re-raise
         raise
-    _apply_sec_headers(resp)
+    _apply_sec_headers(resp, secure)
     return resp
 
 
@@ -638,6 +651,15 @@ _OPEN = ("/healthz", "/login", "/logout", "/metrics")
 # legacy master token). Enforced at the middleware in addition to each handler.
 _ADMIN_PAGES = ("/admin/users", "/settings")
 _ADMIN_API_PREFIX = "/api/admin/"
+# Per-key / per-user COST + owner-email attribution surfaces. When SPEND_REQUIRE_ADMIN is on,
+# these must be admin-only too: the Spend page's real data lives here, NOT only under
+# /api/spend/*, so gating just the /spend prefix left per-key cost + resolved user emails
+# readable by any viewer (/api/budgets carries emails; keyseries/keydelta/keyrequests carry
+# cumulative per-key spend; litellm/models + concurrency-by-key carry per-model cost/attribution).
+_SPEND_SENSITIVE_API = frozenset({
+    "/api/budgets", "/api/keyrequests", "/api/keyseries", "/api/keydelta",
+    "/api/litellm/models", "/api/litellm/concurrency-by-key",
+})
 # The only surfaces a must-change-password session may reach before resetting.
 _MUST_CHANGE_OK = ("/account", "/logout", "/api/me", "/api/account/password")
 
@@ -723,6 +745,16 @@ async def _auth_mw(request: web.Request, handler):
         if _is_alerts_path(request.path):
             return web.json_response(
                 {"error": "alerts require authentication"}, status=403)
+        # User management is meaningless in open (no-auth) mode and is a pure attack
+        # surface: without this, an anonymous caller could create/DELETE admin users
+        # (a backdoor that persists if auth is later enabled) since the admin handlers
+        # rely on the middleware gate that open mode otherwise skips. Deny it like alerts.
+        _op = request.path
+        if _op == "/admin/users" or _op.startswith("/api/admin/users"):
+            if _op.startswith("/api/"):
+                return web.json_response(
+                    {"error": "user management requires authentication"}, status=403)
+            return web.Response(text="403 — authentication required", status=403)
         return await handler(request)
     p = request.path
     if p in _OPEN or p.startswith("/assets/"):
@@ -794,10 +826,13 @@ async def _auth_mw(request: web.Request, handler):
         if p.startswith("/api/"):
             return web.json_response({"error": "forbidden"}, status=403)
         return web.Response(text="403 — admin access required", status=403)
-    # Optional: restrict the Spend surface (page + /api/spend/*) to admins, since per-user
-    # cost attribution can be sensitive. Off by default → viewers keep access (unchanged).
+    # Optional: restrict the Spend surface to admins, since per-user cost attribution can be
+    # sensitive. Off by default → viewers keep access (unchanged). Covers the /spend page,
+    # /api/spend/*, AND the sibling per-key cost/email endpoints (_SPEND_SENSITIVE_API) that
+    # feed the same data but sit outside the /api/spend/ prefix.
     if (config.SPEND_REQUIRE_ADMIN and role != "admin"
-            and (p == "/spend" or p.startswith("/api/spend/") or p == "/api/spend")):
+            and (p == "/spend" or p.startswith("/api/spend/") or p == "/api/spend"
+                 or p in _SPEND_SENSITIVE_API)):
         if p.startswith("/api/"):
             return web.json_response({"error": "forbidden"}, status=403)
         return web.Response(text="403 — admin access required", status=403)
@@ -2486,6 +2521,13 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
                               else litellm.last_key_list_error()})
 
 
+# Short-TTL cache for the heavy per-model token-type pull, keyed on (start, end). Bounds the
+# /spend/logs fan-out to at most one real pull per window per _TT_TTL, no matter how many
+# dashboards/tabs poll it. At most a handful of window entries.
+_TT_CACHE: dict[tuple, tuple[float, dict]] = {}
+_TT_TTL = 60.0
+
+
 async def api_admin_model_token_types_handler(request: web.Request) -> web.Response:
     """Per-model INPUT / CACHED / OUTPUT token counts for the selected window, from the
     heavy /spend/logs endpoint — the ONLY source with the prompt/completion/cache split
@@ -2510,8 +2552,24 @@ async def api_admin_model_token_types_handler(request: web.Request) -> web.Respo
         win_start = db.month_start(now) if window == "month" else now - db.window_secs(window)
         start = time.strftime("%Y-%m-%d", time.gmtime(win_start))
     end = end_q if re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_q) else None
+    # Short-TTL cache: the pull is HEAVY (multi-day /spend/logs) and a day's tokens only grow,
+    # so serving a cached payload for a minute costs no meaningful staleness but spares the
+    # proxy a full re-pull on every dashboard poll / concurrent admin tab.
+    now_c = time.time()
+    ck = (start, end or "")
+    hit = _TT_CACHE.get(ck)
+    if hit and now_c - hit[0] < _TT_TTL:
+        return web.json_response(hit[1])
     try:
-        tt = await litellm.per_model_token_types(request.app[_SESSION], start, end)
+        # Hard ceiling on the whole fan-out so a slow proxy can never wedge this aiohttp worker
+        # for minutes; the collector self-bounds at TOKEN_TYPES_MAX_SECONDS, this is the backstop.
+        tt = await asyncio.wait_for(
+            litellm.per_model_token_types(request.app[_SESSION], start, end),
+            timeout=litellm.TOKEN_TYPES_MAX_SECONDS + 20)
+    except asyncio.TimeoutError:
+        return web.json_response({"window": window, "start_date": start, "end_date": end,
+                                  "available": False, "models": [],
+                                  "diag": {"days_ok": 0, "aborted": "timeout"}})
     except Exception as e:      # heavy pull is best-effort — never 500 the settings page
         print(f"[warn] /api/admin/model-token-types {type(e).__name__}: {e}", file=sys.stderr)
         tt = None
@@ -2523,12 +2581,17 @@ async def api_admin_model_token_types_handler(request: web.Request) -> web.Respo
                "output": v["output"], "total": v["total"]}
               for m, v in sorted(per.items(), key=lambda kv: -kv[1]["total"])]
     # available only if at least one day's logs actually came back; diag surfaces which days
-    # failed and why (byte cap / timeout / HTTP) so the operator can see the real reason.
+    # failed and why (byte cap / timeout / HTTP / circuit-open / load-shed) so the operator
+    # sees the real reason instead of a bare false.
     diag = {"days_ok": tt.get("days_ok", 0), "total_days": tt.get("total_days", 0),
             "days_failed": tt.get("days_failed", [])}
-    return web.json_response({"window": window, "start_date": start, "end_date": end,
-                              "available": bool(tt.get("days_ok")), "models": models,
-                              "diag": diag})
+    if tt.get("aborted"):
+        diag["aborted"] = tt["aborted"]
+    payload = {"window": window, "start_date": start, "end_date": end,
+               "available": bool(tt.get("days_ok")), "models": models, "diag": diag}
+    if payload["available"]:            # only cache real, useful results — never a transient abort
+        _TT_CACHE[ck] = (now_c, payload)
+    return web.json_response(payload)
 
 
 async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
@@ -3349,10 +3412,27 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no",     # don't let a reverse proxy buffer the stream
     })
+    # Resolve role at connect so the SSE feed honours the same container-name redaction as
+    # /api/data (F-2). Without this, a non-admin viewer streaming here would receive full host
+    # container names that MONITOR_CONTAINERS_ADMIN_ONLY hides on the polled endpoint.
+    _authed, _role, _ = _auth_ctx(request)
     await resp.prepare(request)
+    _started = _last_auth = time.time()
     try:
         while True:
-            _disp = _snapshot_for_display(_latest)
+            _now = time.time()
+            # This is ONE long-lived request, so the per-request auth check doesn't re-run.
+            # Re-validate every ~30s (cheap: token compare / session lookup, no scrypt) so a
+            # disabled/revoked user — or a role change — takes effect on the live channel, and
+            # cap total lifetime so the client periodically reconnects (and re-auths).
+            if _now - _started > 3600:
+                break
+            if _now - _last_auth > 30:
+                _authed, _role, _ = _auth_ctx(request)
+                if not _authed:
+                    break
+                _last_auth = _now
+            _disp = _redact_containers(_snapshot_for_display(_latest), _role)
             data = json.dumps({"ts": _disp.get("ts"),
                                "collectors": _disp.get("collectors", {})})
             await resp.write(b"data: " + data.encode() + b"\n\n")

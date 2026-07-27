@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS events (
     kind     TEXT DEFAULT 'state'  -- 'state' = up/down transition, 'model' = load/unload
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+-- uptime() filters `backend=? AND ts<?/>=?` per backend; a composite index avoids a ts-range
+-- scan-then-filter as the events table grows.
+CREATE INDEX IF NOT EXISTS idx_events_backend_ts ON events(backend, ts);
 
 -- Per-key request counts over time (top-N keys as separate colored lines).
 -- `label` is the alias when set, else the hashed key id. Pruned at raw retention.
@@ -376,6 +379,10 @@ def _connect():
     conn = sqlite3.connect(path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Wait up to 5s for a write lock at STATEMENT level (the connect `timeout` only covers
+    # acquiring the connection). Without it, a reader/writer colliding with the rollup/prune
+    # transaction fails immediately with 'database is locked' instead of briefly waiting.
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()

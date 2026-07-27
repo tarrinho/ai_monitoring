@@ -14,3 +14,11 @@ paths = [
   '''tests/.*''',
   '''\.env\.example''',
 ]
+# Documentation prose that reads like a credential but isn't. `generic-api-key` matched the
+# phrase describing the by-key candidacy filter in a CHANGELOG entry (and in an earlier
+# .gitleaksignore comment that quoted it). Matching on the SECRET value is commit-independent,
+# so this clears the historical commits too — no per-commit fingerprint chase. Not a real key;
+# real secrets never live in docs (git-ignored `.env`, pre-publish scan + TruffleHog also cover).
+regexes = [
+  '''exclude/known/hidden''',
+]

@@ -570,7 +570,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.9"
+    assert config.VERSION == "AI-Monitoring_1.8.10"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -3649,7 +3649,11 @@ def test_every_snapshot_serving_endpoint_applies_the_key_visibility_filter():
     # (e.g. _redact_containers(...) for the F-2 container-name gate), so match the filter call
     # applied to _latest rather than the exact surrounding literal.
     assert '"latest": ' in src and "_snapshot_for_display(_latest)" in src, "/api/data unfiltered"
-    assert "_disp = _snapshot_for_display(_latest)" in src, "/api/stream unfiltered"
+    # /api/stream passes _latest through the SAME filter, wrapped in _redact_containers so the
+    # SSE feed also honours the F-2 container-name gate (a viewer streaming here must not see
+    # host topology that /api/data hides).
+    assert "_disp = _redact_containers(_snapshot_for_display(_latest)" in src, \
+        "/api/stream must filter AND redact the snapshot"
     assert "merge_key_budgets(live, _visible_top_keys(" in src, "/api/budgets unfiltered"
     # storage keeps every key — the read paths filter at query time instead
     assert 'db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])' in src, \

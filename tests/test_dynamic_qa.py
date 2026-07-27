@@ -4877,6 +4877,40 @@ def test_fold_model_token_types_splits_input_cached_output():
     assert agg["m1"] == {"input": 500, "cached": 1000, "output": 300, "total": 1800}
 
 
+def test_classify_model_provider_prefix_beats_family_substring(monkeypatch):
+    """Tier-1 #11: a provider-PREFIXED paid model whose name contains an open-weight family
+    token must classify as REAL (external) spend, not reference — the family fallback only
+    applies to a BARE name. Fixes real cost being dropped from budgets for vendor-hosted
+    open-weight models."""
+    monkeypatch.setattr(config, "INTERNAL_PROVIDERS", {"vllm", "llama-cpp", "ollama"})
+    monkeypatch.setattr(config, "INTERNAL_MODEL_FAMILIES", {"qwen", "mistral", "gemma"})
+    # external provider prefix + family token in the name → REAL, not reference
+    assert litellm.classify_model("azure_ai/qwen-max")["cost_kind"] == "real"
+    assert litellm.classify_model("openai/mistral-large")["cost_kind"] == "real"
+    # genuinely self-hosted (internal provider prefix) → reference (unchanged)
+    assert litellm.classify_model("vllm/Qwen3-Coder")["cost_kind"] == "reference"
+    # bare open-weight name (no provider) → reference via the family heuristic (unchanged)
+    assert litellm.classify_model("qwen3-coder")["cost_kind"] == "reference"
+    # bare external name → real
+    assert litellm.classify_model("gpt-5-mini")["cost_kind"] == "real"
+
+
+def test_fold_model_token_types_bounds_the_day(monkeypatch):
+    """Tier-3 #24: the per-day fold must EXCLUDE rows at/after end_epoch so a boundary row
+    isn't double-counted across two adjacent days' pulls."""
+    import datetime as _dt
+    start = _dt.datetime(2026, 7, 15, tzinfo=_dt.timezone.utc).timestamp()
+    end = start + 86400
+    rows = [
+        {"startTime": "2026-07-15T23:59:00Z", "model": "m", "prompt_tokens": 10,
+         "completion_tokens": 2, "api_key": "k"},                     # in-day → counted
+        {"startTime": "2026-07-16T00:00:30Z", "model": "m", "prompt_tokens": 999,
+         "completion_tokens": 999, "api_key": "k"},                   # next day → excluded
+    ]
+    agg = litellm._fold_model_token_types(rows, start, end)
+    assert agg["m"] == {"input": 10, "cached": 0, "output": 2, "total": 12}
+
+
 def test_row_cached_tokens_never_counts_cache_creation():
     """Cache-CREATION tokens are a write, not a read — they must NOT land in the cached (read)
     bucket, which maps to the discounted cached-input meter."""
@@ -4931,6 +4965,7 @@ async def test_per_model_token_types_endpoint(monkeypatch):
                                              "output": 200, "total": 1200}},
                 "days_ok": 3, "total_days": 3, "days_failed": []}
     monkeypatch.setattr(litellm, "per_model_token_types", _fake)
+    appmod._TT_CACHE.clear()            # deterministic: no cached window from a prior run
     c, _csrf = await _admin_client(monkeypatch)
     try:
         # explicit ?start=/?end= are honored verbatim (match an invoice's exact billing window)
@@ -4967,6 +5002,11 @@ async def test_per_model_token_types_chunks_by_day_and_surfaces_failures(monkeyp
     days, and records a day whose pull errors (byte cap / timeout) instead of aborting all."""
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    # deterministic freeze-gate state regardless of test ordering
+    litellm._CB.pop("spend", None)
+    monkeypatch.setattr(litellm, "_AUTH_BAD", False)
+    monkeypatch.setattr(litellm, "_LOAD_PER_CORE", 0.0)
+    monkeypatch.setattr(config, "LITELLM_CB_THRESHOLD", 5)   # 1 failed day must NOT trip it
     calls = []
     # day 1 ok (1 row), day 2 byte-capped, day 3 ok (1 row)
     payloads = {
@@ -4989,6 +5029,40 @@ async def test_per_model_token_types_chunks_by_day_and_surfaces_failures(monkeyp
     assert res["days_failed"] == [{"day": "2026-07-16", "err": "too_big:>67108864"}]
     # summed across the two good days: in=(100-40)+200=260, cached=40, out=20+50=70
     assert res["per_model"]["m"] == {"input": 260, "cached": 40, "output": 70, "total": 370}
+
+
+async def test_per_model_token_types_honors_freeze_gates(monkeypatch):
+    """The heavy fan-out must SKIP up-front (no /spend/logs calls) when the spend circuit
+    breaker is open, the key is known-bad, or the host is load-shedding — mirroring the
+    sampler's _heavy_sample, so an HTTP handler can't hammer a struggling proxy."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    called = {"n": 0}
+
+    async def _boom(*a, **k):
+        called["n"] += 1
+        return b"[]", None
+    monkeypatch.setattr(litellm, "_fetch_spend_raw", _boom)
+
+    # circuit open
+    litellm._CB["spend"] = {"fails": 99, "until": 9e18}
+    monkeypatch.setattr(litellm, "_AUTH_BAD", False)
+    monkeypatch.setattr(litellm, "_LOAD_PER_CORE", 0.0)
+    r = await litellm.per_model_token_types(None, "2026-07-15", "2026-07-17")
+    assert r["aborted"] == "circuit_open" and called["n"] == 0
+    litellm._CB.pop("spend", None)
+
+    # bad key
+    monkeypatch.setattr(litellm, "_AUTH_BAD", True)
+    r = await litellm.per_model_token_types(None, "2026-07-15", "2026-07-17")
+    assert r["aborted"] == "auth_bad" and called["n"] == 0
+    monkeypatch.setattr(litellm, "_AUTH_BAD", False)
+
+    # host load-shed
+    monkeypatch.setattr(config, "LITELLM_LOAD_SHED", 1.0)
+    monkeypatch.setattr(litellm, "_LOAD_PER_CORE", 5.0)
+    r = await litellm.per_model_token_types(None, "2026-07-15", "2026-07-17")
+    assert r["aborted"] == "load_shed" and called["n"] == 0
 
 
 def test_model_cost_overrides_db_beats_env(monkeypatch):
@@ -7935,6 +8009,73 @@ async def test_spend_require_admin_gates_viewer(monkeypatch):
         monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
         assert (await c.get("/api/spend/model-user-series")).status == 403
         assert (await c.get("/spend")).status == 403
+        # T0-3: the sibling per-key COST + owner-email endpoints (outside the /api/spend/
+        # prefix) must ALSO be gated — else the flag is trivially bypassed.
+        for ep in ("/api/budgets", "/api/keyrequests", "/api/keyrequests?metric=cost",
+                   "/api/keyseries", "/api/keydelta", "/api/litellm/models",
+                   "/api/litellm/concurrency-by-key"):
+            assert (await c.get(ep)).status == 403, f"{ep} must be admin-gated when SPEND_REQUIRE_ADMIN"
+        # flag off again → those endpoints are reachable by a viewer (unchanged default)
+        monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", False)
+        assert (await c.get("/api/budgets")).status != 403
+    finally:
+        await c.close()
+
+
+def test_litellm_persistence_not_nested_under_vllm_guard():
+    """T0-1: the LiteLLM spend rollup + known-keys upserts must persist independently of vLLM.
+    They were mis-nested under the single-model-vLLM guard, so on a LiteLLM-only or
+    multi-model-vLLM stack they never ran from live samples (silent data loss)."""
+    import pathlib
+    loop = pathlib.Path(appmod.__file__).read_text(encoding="utf-8") \
+        .split("async def _sampling_loop", 1)[1].split("\nasync def ", 1)[0]
+    # both upserts sit at loop-body indent (12 spaces), NOT inside the 16-space vLLM `if`
+    assert "\n            if _mu_rows:\n                db.spend_model_user_upsert(" in loop
+    assert '\n            if _ll.get("known_keys"):' in loop
+    assert "\n                if _mu_rows:" not in loop, "spend upsert must NOT be nested under vLLM"
+
+
+def test_heavy_fetchers_refuse_redirects():
+    """T0-4 (SSRF): the master-key-authed /spend/logs reader and the vLLM /metrics reader must
+    set allow_redirects=False so a 3xx can't bounce them (and the bearer token) to an internal
+    target — matching fetch_json's existing guard."""
+    import pathlib
+    ll = pathlib.Path(litellm.__file__).read_text(encoding="utf-8")
+    fsr = ll.split("async def _fetch_spend_raw", 1)[1].split("\nasync def ", 1)[0]
+    assert "allow_redirects=False" in fsr, "_fetch_spend_raw must not follow redirects"
+    import collectors.vllm as _vll
+    vl = pathlib.Path(_vll.__file__).read_text(encoding="utf-8")
+    ft = vl.split("async def fetch_text", 1)[1].split("\nasync def ", 1)[0]
+    assert "allow_redirects=False" in ft, "vllm.fetch_text must not follow redirects"
+
+
+def test_stream_handler_redacts_containers_for_non_admin():
+    """T0-2: the SSE stream must run _snapshot_for_display through _redact_containers (with the
+    connection role) exactly like /api/data — otherwise a viewer streaming here bypasses the
+    MONITOR_CONTAINERS_ADMIN_ONLY host-topology redaction on a sibling route."""
+    import pathlib
+    src = pathlib.Path(appmod.__file__).read_text(encoding="utf-8")
+    body = src.split("async def stream_handler", 1)[1].split("\nasync def ", 1)[0]
+    assert "_redact_containers(_snapshot_for_display(_latest)" in body, \
+        "stream_handler must redact the snapshot with the role"
+    assert "_auth_ctx(request)" in body, "stream_handler must resolve the role at connect"
+
+
+async def test_open_mode_denies_user_management(monkeypatch):
+    """T0-6: in open (no-auth) mode the middleware skips the admin gate, so the user-management
+    endpoints (create/DELETE admin users) must be denied explicitly — an anonymous caller must
+    not be able to bootstrap/remove admins."""
+    monkeypatch.setattr(appmod, "_auth_enabled", lambda: False)
+    c = await _client()
+    try:
+        # user-management is denied outright in open mode …
+        assert (await c.get("/api/admin/users")).status == 403
+        assert (await c.post("/api/admin/users",
+                             data={"username": "x", "email": "x@y.z",
+                                   "password": "pw12345678", "role": "admin"})).status == 403
+        assert (await c.post("/api/admin/users/action", data={})).status == 403
+        # … while a normal dashboard data route stays open (open mode = intended)
+        assert (await c.get("/api/data")).status == 200
     finally:
         await c.close()
 

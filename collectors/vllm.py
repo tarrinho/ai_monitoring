@@ -223,8 +223,12 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, *,
     shape as fetch_json — /metrics is not JSON, so it needs its own reader."""
     try:
         timeout = aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            if resp.status >= 400:
+        # allow_redirects=False (SSRF guard, matches fetch_json): a metrics endpoint never
+        # legitimately 3xx-redirects; refuse to chase it to an internal target. A 3xx (or any
+        # non-2xx) is an error.
+        async with session.get(url, headers=headers, timeout=timeout,
+                               allow_redirects=False) as resp:
+            if resp.status >= 300:
                 return None, f"http {resp.status}"
             raw = await resp.content.read(config.HTTP_MAX_BYTES)
             return raw.decode("utf-8", "replace"), None

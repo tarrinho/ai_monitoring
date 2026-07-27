@@ -335,7 +335,12 @@ async def _fetch_spend_raw(session: aiohttp.ClientSession, url: str, headers: di
     Body read is async/chunked; the caller does json.loads off-thread."""
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_s)
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
+        # allow_redirects=False (SSRF guard, matches fetch_json in collectors/__init__): the
+        # master-key-authenticated /spend/logs must never chase a 3xx to an attacker-chosen
+        # host, which would replay the bearer token off-target. A redirect status is treated
+        # as an error below (status != 200).
+        async with session.get(url, headers=headers, timeout=timeout,
+                               allow_redirects=False) as resp:
             if resp.status != 200:
                 return None, f"HTTP {resp.status}"
             if resp.content_length and resp.content_length > max_bytes:
@@ -405,18 +410,23 @@ def _row_cached_tokens(row: dict) -> int:
     return _pick(row) or _pick(row.get("metadata"))
 
 
-def _fold_model_token_types(logs: list, start_epoch: float) -> dict[str, dict]:
-    """Aggregate raw /spend/logs rows into per-model token TYPE counts for rows at/after
-    `start_epoch`: {model: {"input": uncached-prompt, "cached": prompt-cache-read,
+def _fold_model_token_types(logs: list, start_epoch: float,
+                            end_epoch: float | None = None) -> dict[str, dict]:
+    """Aggregate raw /spend/logs rows into per-model token TYPE counts for rows in
+    [start_epoch, end_epoch): {model: {"input": uncached-prompt, "cached": prompt-cache-read,
     "output": completion, "total": …}}. Input is prompt MINUS cached (the two are separate
     Azure meters and cached is a subset of prompt), clamped ≥ 0. Pure + sync — runs in the
-    parse thread. The monitor's own /health-check pseudo-key is dropped."""
+    parse thread. The monitor's own /health-check pseudo-key is dropped.
+
+    `end_epoch` bounds the top of the window so a per-day pull counts ONLY its own UTC day even
+    if the proxy's date filtering is inclusive/local-tz — without it a boundary row could be
+    double-counted across two adjacent days' pulls."""
     out: dict[str, dict] = {}
     for row in logs:
         if not isinstance(row, dict):
             continue
         st = _parse_ts(row.get("startTime") or row.get("start_time"))
-        if st is None or st < start_epoch:
+        if st is None or st < start_epoch or (end_epoch is not None and st >= end_epoch):
             continue
         meta = row.get("metadata")
         meta = meta if isinstance(meta, dict) else {}
@@ -439,7 +449,8 @@ def _fold_model_token_types(logs: list, start_epoch: float) -> dict[str, dict]:
     return out
 
 
-def _parse_token_types_bytes(raw: bytes, start_epoch: float) -> dict[str, dict]:
+def _parse_token_types_bytes(raw: bytes, start_epoch: float,
+                             end_epoch: float | None = None) -> dict[str, dict]:
     """json.loads + shape-normalize + per-model token-type fold — ALL off the event loop
     (runs in a worker thread; deserializing a multi-day payload would freeze the loop)."""
     import json
@@ -449,7 +460,8 @@ def _parse_token_types_bytes(raw: bytes, start_epoch: float) -> dict[str, dict]:
         return {}
     if isinstance(logs, dict):
         logs = logs.get("data") or logs.get("logs") or []
-    return _fold_model_token_types(logs, start_epoch) if isinstance(logs, list) else {}
+    return (_fold_model_token_types(logs, start_epoch, end_epoch)
+            if isinstance(logs, list) else {})
 
 
 # Host load-per-core, fed in by the sampling loop each tick (the collector runs
@@ -952,9 +964,15 @@ def classify_model(model: str | None, overrides: dict | None = None) -> dict:
         return {"internal": ov == "reference",
                 "provider": provider or ("internal" if ov == "reference" else "external"),
                 "cost_kind": ov, "overridden": True}
-    internal = (provider in config.INTERNAL_PROVIDERS
-                or any(tok in m for tok in config.INTERNAL_PROVIDERS)
-                or any(fam in m for fam in config.INTERNAL_MODEL_FAMILIES))
+    internal = provider in config.INTERNAL_PROVIDERS
+    if not internal and not provider:
+        # Name heuristic ONLY for a BARE model name (no provider prefix). When a provider
+        # prefix IS present but isn't in INTERNAL_PROVIDERS, the model is external/paid and the
+        # open-weight-FAMILY fallback must not reclaim it — e.g. a vendor-hosted, billed
+        # `azure_ai/qwen-max` or `openai/mistral-large` is REAL spend, not self-hosted 'qwen'.
+        # That substring misclassification silently dropped real cost from budgets + the split.
+        internal = (any(tok in m for tok in config.INTERNAL_PROVIDERS)
+                    or any(fam in m for fam in config.INTERNAL_MODEL_FAMILIES))
     return {"internal": internal,
             "provider": provider or ("internal" if internal else "external"),
             "cost_kind": "reference" if internal else "real", "overridden": False}
@@ -1788,6 +1806,7 @@ async def model_user_backfill(session: aiohttp.ClientSession, days: int) -> list
 
 
 TOKEN_TYPES_MAX_DAYS = 92          # bound the on-demand pull (a quarter) — see below
+TOKEN_TYPES_MAX_SECONDS = 90.0     # hard wall-clock ceiling across ALL day-pulls (see below)
 
 
 async def per_model_token_types(session: aiohttp.ClientSession, start_date: str,
@@ -1827,28 +1846,55 @@ async def per_model_token_types(session: aiohttp.ClientSession, start_date: str,
     days_ok = 0
     days_failed: list[dict] = []
     total_days = 0
+    started = time.time()
+    # This is a HEAVY /spend/logs fan-out (up to TOKEN_TYPES_MAX_DAYS pulls). Honour the SAME
+    # freeze-safety gates as the sampler's _heavy_sample so a struggling/auth-broken proxy or a
+    # saturated host can't be hammered from an HTTP handler: skip up-front on a bad key, host
+    # load-shed, or an open circuit; trip out mid-loop if the breaker opens; and cap total
+    # wall-clock so the caller (and its aiohttp worker) can never be wedged for minutes.
+    if _AUTH_BAD:
+        return {"per_model": {}, "days_ok": 0, "days_failed": [], "total_days": 0,
+                "aborted": "auth_bad"}
+    if _load_shed():
+        return {"per_model": {}, "days_ok": 0, "days_failed": [], "total_days": 0,
+                "aborted": "load_shed"}
+    if _cb_open("spend", started):
+        return {"per_model": {}, "days_ok": 0, "days_failed": [], "total_days": 0,
+                "aborted": "circuit_open"}
+    aborted = None
     d = start_dt
     while d.date() <= end_dt.date():
+        if time.time() - started > TOKEN_TYPES_MAX_SECONDS:
+            aborted = "time_budget"       # remaining days left unpulled, surfaced to caller
+            break
         ds = d.strftime("%Y-%m-%d")
         total_days += 1
         raw, err = await _fetch_spend_raw(
             session, f"{base}/spend/logs?start_date={ds}&end_date={ds}", _headers(),
             config.LITELLM_SPEND_TIMEOUT, config.LITELLM_SPEND_MAX_BYTES)
+        _cb_record("spend", err is None, time.time())      # feed the shared spend breaker
         if err is not None or not raw:
             days_failed.append({"day": ds, "err": err or "empty"})
+            if _cb_open("spend", time.time()):             # breaker just tripped → stop hammering
+                aborted = "circuit_open"
+                break
         else:
-            agg = await asyncio.to_thread(_parse_token_types_bytes, raw, d.timestamp())
+            agg = await asyncio.to_thread(_parse_token_types_bytes, raw,
+                                          d.timestamp(), d.timestamp() + 86400)
             for m, v in agg.items():
                 e = out.setdefault(m, {"input": 0, "cached": 0, "output": 0, "total": 0})
                 for k in ("input", "cached", "output", "total"):
                     e[k] += v[k]
             days_ok += 1
         d += timedelta(days=1)
-    if days_failed:
+    if days_failed or aborted:
         _dbg(f"per_model_token_types: {days_ok}/{total_days} days ok, "
-             f"failed={days_failed[:3]}")
-    return {"per_model": out, "days_ok": days_ok, "days_failed": days_failed,
-            "total_days": total_days}
+             f"aborted={aborted}, failed={days_failed[:3]}")
+    res = {"per_model": out, "days_ok": days_ok, "days_failed": days_failed,
+           "total_days": total_days}
+    if aborted:
+        res["aborted"] = aborted
+    return res
 
 
 def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, int, int]:
