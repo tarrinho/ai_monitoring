@@ -65,7 +65,10 @@ def wait_for_server(proc, base, timeout=15):
         if proc.poll() is not None:
             raise RuntimeError("demo server exited early — check its stderr above")
         try:
-            urllib.request.urlopen(f"{base}/healthz", timeout=1)
+            # `base` is this script's OWN localhost demo URL (http://127.0.0.1:<port> it just
+            # launched) — never user input, so there is no file://-scheme / SSRF surface here.
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+            urllib.request.urlopen(f"{base}/healthz", timeout=1)  # noqa: S310
             return
         except Exception:
             time.sleep(0.5)
@@ -82,7 +85,9 @@ def verify_own_server(base):
     data = f"username={ADMIN_USER}&password={ADMIN_PASSWORD}".encode()
     req = urllib.request.Request(f"{base}/login", data=data, method="POST")
     try:
-        resp = urllib.request.urlopen(req, timeout=5)
+        # `base` is this script's OWN localhost demo URL, not user input — no file:// / SSRF risk.
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        resp = urllib.request.urlopen(req, timeout=5)  # noqa: S310
     except urllib.error.HTTPError as e:
         resp = e
     if resp.status not in (200, 302):

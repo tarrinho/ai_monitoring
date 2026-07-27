@@ -1,0 +1,8 @@
+# gitleaks fingerprints of REVIEWED false positives to ignore (commit:file:rule:startline).
+# These are documentation strings in CHANGELOG.md, not real secrets — the head of the file
+# has since been reworded so the pattern can't recur, but gitleaks still scans the historical
+# commit that introduced it, so the fingerprint is pinned here.
+#
+# 2026-07-27 — generic-api-key matched the prose `key: exclude/known/hidden` in a CHANGELOG
+# entry describing the by-key candidacy filter. Not a credential.
+0d569a81b97d1d38b236a980b9b5b805b2f62a78:CHANGELOG.md:generic-api-key:88

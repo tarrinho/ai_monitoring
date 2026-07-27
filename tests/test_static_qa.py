@@ -3766,9 +3766,13 @@ def test_shared_core_module_dedups_api_across_pages_d3():
     for fn in WIN_HELPERS:
         assert f"function {fn}(" not in sp, f"spend: {fn}() must not shadow the shared core"
     assert "function _spWinRestore(" in sp, "spend: its own coarser persistence must be _spWin*"
-    # published (else it 404s on a fresh clone)
-    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
-    assert "web/assets/aimon-core.js" in pub, "aimon-core.js must be in the publish ALLOW-list"
+    # published (else it 404s on a fresh clone). publish-github.sh is itself intentionally NOT
+    # in the public repo, so skip this assertion when it isn't vendored (e.g. CI on the public
+    # checkout) — matches the other publish-ALLOW-list tests.
+    pub = ROOT / "deploy" / "publish-github.sh"
+    if pub.exists():
+        assert "web/assets/aimon-core.js" in pub.read_text(encoding="utf-8"), \
+            "aimon-core.js must be in the publish ALLOW-list"
 
 
 def test_by_key_stack_cards_have_clickable_why_other_explainer():
