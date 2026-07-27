@@ -53,7 +53,7 @@ RUN if [ "$RUN_TESTS" = "1" ]; then \
 FROM base AS runtime
 
 # app files only (no tests, no dev deps)
-COPY config.py db.py auth.py app.py alerts.py anomaly.py metrics_prom.py ./
+COPY config.py db.py dbutil.py auth.py app.py alerts.py anomaly.py metrics_prom.py ./
 COPY collectors/ ./collectors/
 COPY web/ ./web/
 

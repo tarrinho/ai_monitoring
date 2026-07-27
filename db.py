@@ -11,11 +11,25 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any, cast
 
 import config
+
+
+def _dberr(exc: BaseException) -> None:
+    """Log a swallowed DB error with the FAILING FUNCTION's name (review D-2). A monitoring
+    tool must not fail its own storage silently: every `except Exception` in this module now
+    surfaces the exception type + where it happened, so a query bug / schema drift / locked DB
+    is diagnosable instead of an indistinguishable empty result. Best-effort; never raises."""
+    try:
+        fn = sys._getframe(1).f_code.co_name
+        sys.stderr.write(f"[db] {fn}: {type(exc).__name__}: {exc}\n")
+    except Exception:
+        pass
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
@@ -62,6 +76,39 @@ CREATE TABLE IF NOT EXISTS key_series_1m (bucket REAL, label TEXT, reqs REAL,
     PRIMARY KEY(bucket,label));
 CREATE TABLE IF NOT EXISTS key_series_1h (bucket REAL, label TEXT, reqs REAL,
     PRIMARY KEY(bucket,label));
+
+-- Per-MODEL activity over time — the model analogue of key_series, driving the
+-- 'Concurrent LLM work — by model' stacked split. `label` is the model name; `reqs` is
+-- that model's request count this sample (day-cumulative in lite mode, windowed in full;
+-- concurrency_by_model applies the same reset-safe delta as the by-key split). Same
+-- tiering/retention as key_series (raw 24h, 1-min + 1-hour rollups to 1 year).
+CREATE TABLE IF NOT EXISTS model_series (
+    ts     REAL NOT NULL,
+    label  TEXT NOT NULL,
+    reqs   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_model_series_ts ON model_series(ts);
+CREATE TABLE IF NOT EXISTS model_series_1m (bucket REAL, label TEXT, reqs REAL,
+    PRIMARY KEY(bucket,label));
+CREATE TABLE IF NOT EXISTS model_series_1h (bucket REAL, label TEXT, reqs REAL,
+    PRIMARY KEY(bucket,label));
+
+-- Real-time in-flight concurrency for a LOCALLY-served model (vLLM's own running/waiting
+-- gauges, not LiteLLM's completed-request delta). model_series infers a model's activity
+-- from the CHANGE in its completed-request/token count between samples — for a slow,
+-- self-hosted model a request can take longer to finish than the polling cadence, so it
+-- shows real backlog/conc but a zero completion-delta the whole time it's in flight, and
+-- concurrency_by_key(source="model") folds it into "Other" despite it clearly being that
+-- model's work. running/waiting are raw point-in-time gauges (not cumulative), so no
+-- delta logic applies — concurrency_by_key overrides the completion-delta weight with
+-- these directly wherever available. Raw tier only (≤1h window; see concurrency_by_key).
+CREATE TABLE IF NOT EXISTS model_conc_series (
+    ts      REAL NOT NULL,
+    label   TEXT NOT NULL,
+    running REAL,
+    waiting REAL
+);
+CREATE INDEX IF NOT EXISTS idx_model_conc_series_ts ON model_conc_series(ts);
 
 -- Labels (key alias, or hash when no alias resolves) LiteLLM's OWN /key/list has ever
 -- confirmed as a currently-registered key. Written by the sampler each time
@@ -300,64 +347,21 @@ _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
 # Tables that carry the metric columns (raw + rollups).
 _METRIC_TABLES = ["metrics", "metrics_1m", "metrics_1h"]
 
-# Named windows -> seconds.
-WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "30d": 2592000,
-           "12mo": 31536000}
-
-
-def month_start(ref: float | None = None) -> float:
-    """UTC epoch of 00:00 on the 1st of `ref`'s month (default: now)."""
-    ref = time.time() if ref is None else ref
-    lt = time.gmtime(ref)
-    return ref - ((lt.tm_mday - 1) * 86400 + lt.tm_hour * 3600
-                  + lt.tm_min * 60 + lt.tm_sec)
-
-
-# Bounds for a drag-selected custom window (chart drag-to-zoom). Min 60s so a bucket
-# grid is meaningful; max = 1 year (matches the rollup retention).
-CUSTOM_WIN_MIN = 60
-CUSTOM_WIN_MAX = 366 * 86400
-
-
-def _custom_secs(window: str) -> int | None:
-    """If `window` is a drag-selected 'custom:<secs>' token, return the clamped seconds;
-    else None. Lets an arbitrary time range flow through the same named-window plumbing."""
-    if not isinstance(window, str) or not window.startswith("custom:"):
-        return None
-    try:
-        # OverflowError: int(float("inf")) / int(float("1e400")) — a crafted 'custom:inf'
-        # would otherwise raise uncaught here and 500 the request (window is caller-supplied).
-        return max(CUSTOM_WIN_MIN, min(CUSTOM_WIN_MAX, int(float(window[7:]))))
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def window_secs(window: str, ref: float | None = None) -> float:
-    """Seconds spanned by a window. Fixed durations come from WINDOWS; the special
-    'month' window is MONTH-TO-DATE (from the 1st of the current UTC month), so its
-    length grows through the month — used to reconcile against a provider's monthly bill.
-    A 'custom:<secs>' token (chart drag-to-zoom) spans that many seconds, clamped."""
-    cs = _custom_secs(window)
-    if cs is not None:
-        return float(cs)
-    if window == "month":
-        ref = time.time() if ref is None else ref
-        return max(60.0, ref - month_start(ref))
-    return float(WINDOWS.get(window, WINDOWS["1h"]))
-
-
-def norm_window(window: str, default: str = "1h") -> str:
-    """Validate an incoming window: a named window, or a clamped 'custom:<secs>' token.
-    Anything else falls back to `default`. Used by every windowed API handler so drag-zoom
-    ranges pass through while junk is rejected."""
-    cs = _custom_secs(window)
-    if cs is not None:
-        return "custom:%d" % cs
-    return window if window in VALID_WINDOWS else default
-
-
-# Every window the API/series layer accepts (WINDOWS + the dynamic 'month').
-VALID_WINDOWS = frozenset(WINDOWS) | {"month"}
+# Window math + the shared per-key hide predicate live in dbutil (review D-4): pure helpers
+# with no DB/state coupling. Re-exported so db.window_secs / db.norm_window / db.WINDOWS /
+# db.month_start / db._pos_step / db._label_hidden / … keep resolving from here unchanged.
+from dbutil import (  # noqa: E402,F401  (deliberate re-export facade, beside its callers)
+    CUSTOM_WIN_MAX,
+    CUSTOM_WIN_MIN,
+    VALID_WINDOWS,
+    WINDOWS,
+    _custom_secs,
+    _label_hidden,
+    _pos_step,
+    month_start,
+    norm_window,
+    window_secs,
+)
 
 
 @contextmanager
@@ -375,7 +379,8 @@ def _connect():
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         conn.rollback()
         raise
     finally:
@@ -393,7 +398,8 @@ def init() -> None:
                 if col not in existing:
                     try:
                         conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} REAL")
-                    except Exception:
+                    except Exception as _e:
+                        _dberr(_e)
                         pass
         # events.kind: split up/down transitions ('state') from model load/unload
         # ('model') so the model timeline never pollutes the uptime calc.
@@ -406,12 +412,14 @@ def init() -> None:
         if "reqs" not in {r[1] for r in conn.execute("PRAGMA table_info(spend_model_user_daily)")}:
             try:
                 conn.execute("ALTER TABLE spend_model_user_daily ADD COLUMN reqs REAL NOT NULL DEFAULT 0")
-            except Exception:
+            except Exception as _e:
+                _dberr(_e)
                 pass
         if "kind" not in {r[1] for r in conn.execute("PRAGMA table_info(events)")}:
             try:
                 conn.execute("ALTER TABLE events ADD COLUMN kind TEXT DEFAULT 'state'")
-            except Exception:
+            except Exception as _e:
+                _dberr(_e)
                 pass
         # Owner (LiteLLM user-id) per known key, so the read paths can tell an
         # UNASSIGNED key (no owner anywhere) from an owned one without re-querying
@@ -421,7 +429,8 @@ def init() -> None:
         if "owner" not in _kkcols:
             try:
                 conn.execute("ALTER TABLE known_keys ADD COLUMN owner TEXT DEFAULT ''")
-            except Exception:
+            except Exception as _e:
+                _dberr(_e)
                 pass
         # How many CONSECUTIVE successful polls have reported this key's owner as blank
         # while we still hold a known owner. A key transitions owned -> unassigned only
@@ -431,8 +440,31 @@ def init() -> None:
             try:
                 conn.execute("ALTER TABLE known_keys "
                              "ADD COLUMN owner_blank_streak INTEGER DEFAULT 0")
-            except Exception:
+            except Exception as _e:
+                _dberr(_e)
                 pass
+        # Resolved owner NAME (email/alias) per known key — the human label the by-user charts
+        # need, distinct from `owner` (the user-id they key off). LiteLLM's /user/list directory
+        # is flaky, so the live email blips empty on some polls; persisting the last-known name
+        # here (cleared only when the owner itself clears, via the same streak) lets the budgets
+        # path fall back to it instead of dropping the key to "Unassigned" on a one-off blip.
+        if "owner_name" not in _kkcols:
+            try:
+                conn.execute("ALTER TABLE known_keys ADD COLUMN owner_name TEXT DEFAULT ''")
+            except Exception as _e:
+                _dberr(_e)
+                pass
+        # Per-type cost overrides (input / output / cache-read $ per 1M tokens) so an admin
+        # can pin each rate individually, not just the single blended usd_1m. usd_1m stays
+        # the value the cost pipeline reads (derived from these when they're set), so this
+        # is additive — old rows keep working with in/out/cache NULL.
+        _mcp = {r[1] for r in conn.execute("PRAGMA table_info(model_cost_price)")}
+        for col in ("in_1m", "out_1m", "cache_1m"):
+            if col not in _mcp:
+                try:
+                    conn.execute(f"ALTER TABLE model_cost_price ADD COLUMN {col} REAL")
+                except Exception as _e:
+                    _dberr(_e)
         # per-user alert webhook (1.2.2): each user can set their own webhook URL.
         _ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
         for col, ddl in (("webhook_url", "TEXT"),
@@ -441,14 +473,16 @@ def init() -> None:
             if col not in _ucols:
                 try:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
-                except Exception:
+                except Exception as _e:
+                    _dberr(_e)
                     pass
         # team_detect.user_name (Settings → Teams, user-grouped view): resolved
         # LiteLLM username persisted so the board groups by user without a re-poll.
         if "user_name" not in {r[1] for r in conn.execute("PRAGMA table_info(team_detect)")}:
             try:
                 conn.execute("ALTER TABLE team_detect ADD COLUMN user_name TEXT")
-            except Exception:
+            except Exception as _e:
+                _dberr(_e)
                 pass
 
 
@@ -459,7 +493,8 @@ def insert(ts: float, payload: dict[str, Any]) -> None:
                 "INSERT INTO samples(ts, payload) VALUES (?, ?)",
                 (ts, json.dumps(payload, separators=(",", ":"))),
             )
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         # Persistence is best-effort; a failed write must never break sampling.
         pass
 
@@ -472,7 +507,8 @@ def insert_metrics(ts: float, row: dict[str, Any]) -> None:
         with _connect() as conn:
             conn.execute(
                 f"INSERT INTO metrics(ts,{cols}) VALUES (?,{ph})", (ts, *vals))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -512,7 +548,8 @@ def series(window: str, max_points: int = 300,
             pt.update({c: r[i + 1] for i, c in enumerate(_METRIC_COLS)})
             out.append(pt)
         return out
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -534,11 +571,57 @@ def insert_key_series(ts: float, top_keys: list[dict[str, Any]]) -> None:
         with _connect() as conn:
             conn.executemany(
                 "INSERT INTO key_series(ts,label,reqs) VALUES (?,?,?)", rows)
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
-def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float) -> None:
+def insert_model_series(ts: float, per_model: list[dict[str, Any]]) -> None:
+    """Store this tick's per-MODEL activity (one row per model) — the model analogue of
+    insert_key_series, feeding the 'Concurrent LLM work — by model' split. Value is the
+    model's request count (falls back to tokens if reqs is absent); day-cumulative in
+    lite mode, windowed in full — concurrency_by_model applies the reset-safe delta."""
+    if not per_model:
+        return
+    rows = []
+    for m in per_model:
+        label = m.get("model") or ""
+        if not label or label == "?":
+            continue
+        val = m.get("reqs")
+        if val is None:
+            val = m.get("tokens") or 0
+        rows.append((ts, str(label)[:80], float(val or 0)))
+    if not rows:
+        return
+    try:
+        with _connect() as conn:
+            conn.executemany(
+                "INSERT INTO model_series(ts,label,reqs) VALUES (?,?,?)", rows)
+    except Exception as _e:
+        _dberr(_e)
+
+
+def insert_model_conc_series(ts: float, label: str, running: float | None,
+                             waiting: float | None) -> None:
+    """Store this tick's REAL-TIME in-flight count for a locally-served model (vLLM's own
+    running/waiting gauges) — see the model_conc_series schema comment for why this exists
+    alongside model_series's completion-delta. No-op when there's nothing to attribute
+    (no label, or both gauges absent)."""
+    if not label or (running is None and waiting is None):
+        return
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO model_conc_series(ts,label,running,waiting) VALUES (?,?,?,?)",
+                (ts, str(label)[:80], float(running) if running is not None else None,
+                 float(waiting) if waiting is not None else None))
+    except Exception as _e:
+        _dberr(_e)
+
+
+def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float,
+                      names: dict[str, str] | None = None) -> None:
     """Record `labels` (aliases, or hashes for alias-less keys) as CONFIRMED-valid by
     LiteLLM's own /key/list as of `ts`. Called by the sampler whenever
     collectors.litellm.key_budgets() succeeds. Rows accumulate forever (no delete) —
@@ -549,13 +632,17 @@ def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float) 
     LiteLLM's user-id for the key ('' when it reports none) and is what
     unassigned_labels() keys off. A plain SEQUENCE carries no owner information (owner
     "unknown", NOT "blank"), so it only records validity/last_seen and never touches a
-    stored owner; prefer the mapping, which drives the owned<->unassigned transition."""
+    stored owner; prefer the mapping, which drives the owned<->unassigned transition.
+
+    `names` (optional {label: owner_name}) persists the resolved owner EMAIL/alias alongside
+    the owner-id, so the by-user charts can fall back to it when LiteLLM's live /user/list
+    resolution blips empty. Only meaningful with a {label: owner} mapping."""
     if not labels:
         return
     try:
         with _connect() as conn:
             if isinstance(labels, dict):
-                _upsert_known_with_owners(conn, labels, ts)
+                _upsert_known_with_owners(conn, labels, ts, names)
             else:
                 # owner UNKNOWN (no per-key owner info): touch last_seen only, insert new
                 # rows with a blank owner, and leave any existing owner/streak untouched.
@@ -564,7 +651,8 @@ def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float) 
                     "owner_blank_streak) VALUES (?,?,?,'',0) "
                     "ON CONFLICT(label) DO UPDATE SET last_seen=excluded.last_seen",
                     [(str(lab)[:80], ts, ts) for lab in labels if lab])
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -575,7 +663,8 @@ def known_keys_upsert(labels: list[str] | set[str] | dict[str, str], ts: float) 
 OWNER_BLANK_THRESHOLD = 3
 
 
-def _upsert_known_with_owners(conn: Any, owners: dict[str, str], ts: float) -> None:
+def _upsert_known_with_owners(conn: Any, owners: dict[str, str], ts: float,
+                              names: dict[str, str] | None = None) -> None:
     """UPSERT known_keys from a {label: owner} map with a DEBOUNCED owner transition.
 
     Per key, on each successful poll:
@@ -586,17 +675,24 @@ def _upsert_known_with_owners(conn: Any, owners: dict[str, str], ts: float) -> N
         key never flaps in/out of "Unassigned";
       * owner blank while already unassigned -> stays unassigned (no-op).
 
+    `names` (optional {label: owner_name email/alias}) rides alongside the owner: a fresh
+    non-blank name is taken; a blank name is HELD while the owner is still held (so the by-user
+    charts keep the last-known email through a /user/list blip) and is cleared only when the
+    owner itself clears. A name-less caller (names=None) never blanks a stored name.
+
     Done in a single UPSERT: every SET expression reads the OLD row (`known_keys.*`) and the
     proposed insert (`excluded.*`), so the streak increment and the owner decision use the
     same pre-update streak value and stay consistent without a read-then-write race."""
     t = int(OWNER_BLANK_THRESHOLD)
-    rows = [(str(lab)[:80], ts, ts, str(owners.get(lab, "") or "")[:120])
+    nm = names or {}
+    rows = [(str(lab)[:80], ts, ts, str(owners.get(lab, "") or "")[:120],
+             str(nm.get(lab, "") or "")[:200])
             for lab in owners if lab]
     if not rows:
         return
     conn.executemany(
-        "INSERT INTO known_keys(label, first_seen, last_seen, owner, owner_blank_streak) "
-        "VALUES (?,?,?,?,0) "
+        "INSERT INTO known_keys(label, first_seen, last_seen, owner, owner_blank_streak, "
+        "owner_name) VALUES (?,?,?,?,0,?) "
         "ON CONFLICT(label) DO UPDATE SET last_seen=excluded.last_seen, "
         "owner_blank_streak = CASE "
         "    WHEN excluded.owner <> '' THEN 0 "                       # owner seen → reset
@@ -606,7 +702,13 @@ def _upsert_known_with_owners(conn: Any, owners: dict[str, str], ts: float) -> N
         "    WHEN excluded.owner <> '' THEN excluded.owner "          # trust a named owner
         "    WHEN known_keys.owner = '' THEN '' "                     # already unassigned
         f"    WHEN known_keys.owner_blank_streak + 1 >= {t} THEN '' " # streak met → clear
-        "    ELSE known_keys.owner END",                             # else hold the owner
+        "    ELSE known_keys.owner END, "                            # else hold the owner
+        "owner_name = CASE "
+        "    WHEN excluded.owner_name <> '' THEN excluded.owner_name "  # fresh email → take it
+        "    WHEN known_keys.owner = '' THEN '' "                       # unassigned → no name
+        f"    WHEN known_keys.owner_blank_streak + 1 >= {t} "
+        "         AND excluded.owner = '' THEN '' "                     # owner clearing → drop name
+        "    ELSE known_keys.owner_name END",                          # else hold last-known email
         rows)
 
 
@@ -642,22 +744,9 @@ def unassigned_labels() -> set[str]:
         if not any((o or "") for _, o in rows):
             return set()                     # owner never resolved → hide is a no-op
         return {lab for lab, o in rows if not (o or "") and not ovr.get(lab)}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return set()
-
-
-def _label_hidden(label: str, known: set[str], hidden: set[str]) -> bool:
-    """Whether a per-key `label` must be dropped from a NAMED band — folded into 'Other' on
-    the aggregate/cost charts, simply omitted from a top-N ranking. True for an operator
-    -excluded key (`MONITOR_EXCLUDE_KEYS`), a label LiteLLM's /key/list never confirmed (an
-    unexpanded `${...}` bearer, a garbage/revoked hash — but only once a known-keys baseline
-    exists, so cold start stays permissive), or a hidden 'Unassigned' key. THE one predicate
-    every per-key chart applies, so a new chart can't silently skip a class — the two
-    spend_model_user_daily-backed charts (`key_cumulative`, `key_cost_window`) did exactly
-    that and surfaced excluded/garbage/ownerless keys the sibling charts already dropped."""
-    return (config.key_excluded(label)
-            or not config.key_known(label, known)
-            or label in hidden)
 
 
 def known_keys_set() -> set[str]:
@@ -668,17 +757,40 @@ def known_keys_set() -> set[str]:
     try:
         with _connect() as conn:
             return {r[0] for r in conn.execute("SELECT label FROM known_keys")}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return set()
 
 
+def known_owner_names() -> dict[str, str]:
+    """{label: owner_name} for every known key that carries a persisted owner EMAIL/alias.
+    The last-known name, held through a /user/list blip (see _upsert_known_with_owners) and
+    cleared with the owner. Lets the budgets path name a key whose live email came back empty
+    instead of dropping it to "Unassigned". Empty labels/names are omitted."""
+    try:
+        with _connect() as conn:
+            return {r[0]: r[1] for r in
+                    conn.execute("SELECT label, owner_name FROM known_keys "
+                                 "WHERE owner_name IS NOT NULL AND owner_name <> ''")}
+    except Exception as _e:
+        _dberr(_e)
+        return {}
+
+
 def key_series(window: str, max_points: int = 300,
-               top_n: int = 10, end: float | None = None) -> dict[str, Any]:
+               top_n: int = 10, end: float | None = None,
+               monotonic: bool = False) -> dict[str, Any]:
     """Multi-series per-key request counts for the top-N keys in the window.
 
     Returns {"labels": [...top-N labels...], "points": [{t, <label>: v, ...}]}.
     Each label becomes its own line on the chart. `end` shifts the window back.
-    """
+
+    `monotonic=True` makes each line non-decreasing for an "over time" cumulative view:
+    it plots a running total seeded at the first in-window value, adding only POSITIVE
+    steps. The raw stored value is LiteLLM's cumulative spend, which RE-BASES DOWN when a
+    key is re-issued / a budget period rolls (observed live: Rodolfo 699 -> 1), so the
+    raw line falls — wrong for an "only rises" chart. Summing positive steps ignores the
+    drop while still counting activity after it (reset-safe, same kernel as key_delta)."""
     secs = window_secs(window)
     end = end or time.time()
     start = end - secs
@@ -719,9 +831,23 @@ def key_series(window: str, max_points: int = 300,
         for bkt, avg_ts, label, avg_reqs in rows:
             b = buckets.setdefault(bkt, {"t": avg_ts})
             b[label] = round(avg_reqs, 2)
-        return {"labels": top,
-                "points": [buckets[k] for k in sorted(buckets)]}
-    except Exception:
+        ordered = [buckets[k] for k in sorted(buckets)]
+        if monotonic:
+            # per label, replace the raw (possibly re-basing) value with a running total
+            # of positive steps seeded at its first in-window value → never decreases
+            for lab in top:
+                prev_raw = None
+                cum = None
+                for pt in ordered:
+                    if lab not in pt:
+                        continue
+                    raw = pt[lab]
+                    cum = raw if cum is None else cum + _pos_step(raw, prev_raw)
+                    prev_raw = raw
+                    pt[lab] = round(cum, 2)
+        return {"labels": top, "points": ordered}
+    except Exception as _e:
+        _dberr(_e)
         return {"labels": [], "points": []}
 
 
@@ -755,22 +881,9 @@ def _prewindow_baseline(conn: Any, table: str, tc: str, start: float,
             if v is not None:
                 out[label] = float(v)          # ascending ts → last write = latest before start
         return out
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
-
-
-def _pos_step(cur: float, prev: float | None) -> float:
-    """Reset-safe positive step of a cumulative counter: the increase since the previous
-    reading. Returns 0 on the FIRST reading (prev is None) or when the counter moved
-    BACKWARDS — a re-based key / rolled budget / a replica with a different view. Crediting a
-    backwards move would manufacture activity, and 0 is the only honest answer across a
-    baseline change; the climb after it is picked up by the next positive step.
-
-    THE single definition of the delta semantics every per-key chart shares
-    (`key_series_window_delta`, `key_delta_series`, `concurrency_by_key`). It lived inline in
-    all three, and getting it wrong in lockstep is exactly what silently broke zoom
-    attribution — one place now, so the three cannot drift apart again."""
-    return max(0.0, cur - prev) if prev is not None else 0.0
 
 
 def key_series_window_delta(window: str, top_n: int = 10,
@@ -830,7 +943,8 @@ def key_series_window_delta(window: str, top_n: int = 10,
         out = out[:top_n]
         return {"labels": [o["label"] for o in out],
                 "deltas": [o["delta"] for o in out]}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {"labels": [], "deltas": []}
 
 
@@ -885,7 +999,8 @@ def key_delta_series(window: str, max_points: int = 300, top_n: int = 10,
                 prev[label] = v
             points.append(pt)
         return {"labels": ranked, "points": points}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {"labels": [], "points": []}
 
 
@@ -900,10 +1015,14 @@ def prune_key_series() -> None:
     try:
         with _connect() as conn:
             conn.execute("DELETE FROM key_series WHERE ts < ?", (raw_cut,))
+            conn.execute("DELETE FROM model_series WHERE ts < ?", (raw_cut,))
+            conn.execute("DELETE FROM model_conc_series WHERE ts < ?", (raw_cut,))
             conn.execute("DELETE FROM proc_series WHERE ts < ?", (raw_cut,))
             conn.execute("DELETE FROM key_series_1m WHERE bucket < ?", (min_cut,))
+            conn.execute("DELETE FROM model_series_1m WHERE bucket < ?", (min_cut,))
             conn.execute("DELETE FROM proc_series_1m WHERE bucket < ?", (min_cut,))
             conn.execute("DELETE FROM key_series_1h WHERE bucket < ?", (hour_cut,))
+            conn.execute("DELETE FROM model_series_1h WHERE bucket < ?", (hour_cut,))
             conn.execute("DELETE FROM proc_series_1h WHERE bucket < ?", (hour_cut,))
             conn.execute("DELETE FROM cpu_core_series WHERE ts < ?", (raw_cut,))
             conn.execute("DELETE FROM cpu_core_series_1m WHERE bucket < ?", (min_cut,))
@@ -911,7 +1030,8 @@ def prune_key_series() -> None:
             # keep alert/anomaly history for the full hour-rollup horizon (1y)
             conn.execute("DELETE FROM anomalies WHERE ts < ?", (hour_cut,))
             conn.execute("DELETE FROM alert_log WHERE ts < ?", (hour_cut,))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -937,14 +1057,29 @@ def key_rate_baselines(recent_s: float = 300.0,
         for label, r in recent.items():
             out[label] = {"recent": r or 0.0, "baseline": base.get(label) or 0.0}
         return out
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
 def concurrency_by_key(window: str, metric: str, max_points: int = 200,
-                       top_n: int = 8, end: float | None = None,
-                       cumulative: bool = False) -> dict[str, Any]:
+                       top_n: int = 12, end: float | None = None,
+                       cumulative: bool = False, source: str = "key") -> dict[str, Any]:
     """ESTIMATED per-key attribution of a proxy-wide aggregate over time.
+
+    `source` selects the label dimension: 'key' splits by API key (key_series), 'model'
+    splits by model (model_series) for the 'Concurrent LLM work — by model' card. Model
+    labels are not keys, so the key-only candidacy filters (key_excluded / key_known /
+    hidden_unassigned) are skipped for source='model'. Everything else — the reset-safe
+    delta, the nearest-bucket bridging, and 'Other' preserving the total — is identical.
+
+    For source='model' on a ≤1h window, a bucket/label with real-time data in
+    model_conc_series (vLLM's own running/waiting gauges) uses THAT instead of the
+    completion-delta weight above: a slow, self-hosted model's request can still be
+    generating when the bucket closes, so its completed-request count (and therefore its
+    delta) reads zero the entire time it's in flight, even though it clearly has real
+    backlog/conc — the exact live symptom was MiniMax's own concurrent work folding
+    into "Other" while a fast API model (quick completions) attributed correctly.
 
     `metric` is 'conc' (concurrent LLM work) or 'backlog' (in-flight requests). LiteLLM
     reports ONE total for these with no per-key breakdown, so each time bucket's total is
@@ -972,12 +1107,18 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
+    stab = "model_series" if source == "model" else "key_series"
     if secs <= WINDOWS["1h"]:
-        mtab, ktab, tc = "metrics", "key_series", "ts"
+        mtab, ktab, tc = "metrics", stab, "ts"
     elif secs <= WINDOWS["24h"]:
-        mtab, ktab, tc = "metrics_1m", "key_series_1m", "bucket"
+        mtab, ktab, tc = "metrics_1m", f"{stab}_1m", "bucket"
     else:
-        mtab, ktab, tc = "metrics_1h", "key_series_1h", "bucket"
+        mtab, ktab, tc = "metrics_1h", f"{stab}_1h", "bucket"
+    # Real-time override source (model_conc_series): raw tier only — see the schema
+    # comment for why the completion-delta weight above can be misleadingly zero for a
+    # slow, still-running request, and why this is scoped to the ≤1h window.
+    rt_col = "running" if metric == "conc" else "waiting"
+    fetch_rt = source == "model" and secs <= WINDOWS["1h"]
     try:
         with _connect() as conn:
             agg = conn.execute(
@@ -989,6 +1130,10 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
                 f"FROM {ktab} WHERE {tc}>=? AND {tc}<=? GROUP BY bkt, label",
                 (start, bsize, start, end)).fetchall()
             kbase = _prewindow_baseline(conn, ktab, tc, start, bsize)
+            rt_rows = conn.execute(
+                f"SELECT CAST((ts-?)/? AS INT) bkt, label, AVG({rt_col}) "
+                f"FROM model_conc_series WHERE ts>=? AND ts<=? AND {rt_col} IS NOT NULL "
+                f"GROUP BY bkt, label", (start, bsize, start, end)).fetchall() if fetch_rt else []
         aggv: dict[int, float] = {}
         ts: dict[int, float] = {}
         for bkt, t, v in agg:
@@ -1019,6 +1164,14 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
                     cur = weights[bkt][lab]
                     weights[bkt][lab] = _pos_step(cur, prev)   # reset-safe; shared kernel
                     prev = cur                       # baseline against the raw cumulative
+        # Overwrite (not add — the two signals measure the same concept for the same
+        # label) with vLLM's real-time gauge wherever available. Point-in-time, not
+        # cumulative, so no delta logic applies — a direct replacement of whatever the
+        # completion-delta computed for that exact bucket/label.
+        for bkt, label, val in rt_rows:
+            if val is None:
+                continue
+            weights.setdefault(bkt, {})[label] = float(val)
         totals: dict[str, float] = {}
         for bw in weights.values():
             for label, f in bw.items():
@@ -1048,11 +1201,22 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
         # string was presented. That activity is genuine backlog/concurrency load —
         # its weight stays in the split denominator below — but it must fold into
         # 'Other' rather than get its own named band, same as an excluded key.
-        known = known_keys_set()
-        hidden = hidden_unassigned()
-        top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
-               if not config.key_excluded(lab) and config.key_known(lab, known)
-               and lab not in hidden][:top_n]
+        # ELIGIBLE labels = those allowed to be NAMED (as a band or in the "why Other?"
+        # popover's list). Model labels are always eligible; key labels drop the ones
+        # excluded/hidden/never-confirmed — their weight still counts in the split
+        # denominator, but they must never be surfaced by name (that's the whole point of
+        # MONITOR_EXCLUDE_KEYS / hide-unassigned / key_known). Computed ONCE so top,
+        # other_labels and labels_total all agree — else the popover would name a hidden
+        # key and inflate the "N beyond the top-N" count.
+        if source == "model":
+            eligible = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])]
+        else:
+            known = known_keys_set()
+            hidden = hidden_unassigned()
+            eligible = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
+                        if not config.key_excluded(lab) and config.key_known(lab, known)
+                        and lab not in hidden]
+        top = eligible[:top_n]
         # The aggregate (fast, ~SAMPLE_INTERVAL) and per-key spend (slow,
         # ~LITELLM_HEAVY_INTERVAL) are polled independently, so a short, isolated
         # request's backlog blip and its matching key_series sample rarely land in
@@ -1100,8 +1264,23 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
         series = [{"label": lab, "data": data[lab]} for lab in top]
         if any(o > 0 for o in other):
             series.append({"label": "Other", "data": other})
-        return {"labels": [ts[b] for b in buckets], "metric": metric, "series": series}
-    except Exception:
+        # Diagnostics for the "why Other?" popover: how much of the measured aggregate we
+        # could attribute vs not, and whether "Other" hides labels BEYOND the top-N or is
+        # purely unattributed spikes (labels seen in the window vs shown as bands).
+        agg_sum = round(sum(aggv.values()), 3)
+        attr_sum = round(sum(sum(v for v in data[lab]) for lab in top), 3)
+        # NAMES of the ELIGIBLE labels folded into "Other" because they ranked beyond the
+        # top-N — so the popover can list which models/keys are in there, not just count
+        # them. Drawn from `eligible` (not `totals`), so excluded/hidden/unconfirmed key
+        # labels are never named and never inflate the count. Capped for the tooltip.
+        other_labels = eligible[top_n:top_n + 12]
+        return {"labels": [ts[b] for b in buckets], "metric": metric, "series": series,
+                "attribution": {"aggregate": agg_sum, "attributed": attr_sum,
+                                "other": round(max(0.0, agg_sum - attr_sum), 3),
+                                "labels_total": len(eligible), "shown": len(top),
+                                "other_labels": other_labels}}
+    except Exception as _e:
+        _dberr(_e)
         return {"labels": [], "metric": metric, "series": []}
 
 
@@ -1116,7 +1295,8 @@ def insert_proc_series(ts: float, kind: str, items: list[dict],
         with _connect() as conn:
             conn.executemany(
                 "INSERT INTO proc_series(ts,kind,app,val) VALUES (?,?,?,?)", rows)
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1163,7 +1343,8 @@ def proc_series(kind: str, window: str, max_points: int = 200,
                 b.setdefault(app, 0)
             pts.append(b)
         return {"apps": top, "points": pts}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {"apps": [], "points": []}
 
 
@@ -1177,7 +1358,8 @@ def insert_cpu_core_series(ts: float, per_core: list | None) -> None:
         with _connect() as conn:
             conn.executemany(
                 "INSERT INTO cpu_core_series(ts,core,pct) VALUES (?,?,?)", rows)
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1216,7 +1398,8 @@ def cpu_core_series(window: str, max_points: int = 200,
             b[str(int(core))] = round(pct, 1)
         pts = [buckets[k] for k in sorted(buckets)]
         return {"cores": cores, "points": pts}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {"cores": [], "points": []}
 
 
@@ -1240,7 +1423,8 @@ def ncpu(window: str = "1h", end: float | None = None) -> int:
                 f"SELECT COUNT(DISTINCT core) FROM {table} WHERE {tc}>=? AND {tc}<=?",
                 (start, end)).fetchone()
         return int(r[0]) if r and r[0] else 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0
 
 
@@ -1250,7 +1434,8 @@ def record_alert(ts: float, akey: str, kind: str, msg: str = "") -> None:
             conn.execute(
                 "INSERT INTO alert_log(ts,akey,kind,msg) VALUES (?,?,?,?)",
                 (ts, str(akey)[:80], kind, str(msg)[:300]))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1262,7 +1447,8 @@ def recent_alerts(limit: int = 50) -> list[dict[str, Any]]:
                 (int(limit),)).fetchall()
         return [{"ts": t, "key": k, "kind": kd, "msg": m}
                 for t, k, kd, m in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1272,7 +1458,8 @@ def record_anomaly(ts: float, label: str, kind: str, detail: str = "") -> None:
             conn.execute(
                 "INSERT INTO anomalies(ts,label,kind,detail) VALUES (?,?,?,?)",
                 (ts, str(label)[:80], kind, detail[:200]))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1284,7 +1471,8 @@ def recent_anomalies(limit: int = 30) -> list[dict[str, Any]]:
                 "ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
         return [{"ts": t, "label": lbl, "kind": k, "detail": d}
                 for t, lbl, k, d in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1295,7 +1483,8 @@ def record_event(ts: float, backend: str, up: bool, detail: str = "",
             conn.execute(
                 "INSERT INTO events(ts,backend,up,detail,kind) VALUES (?,?,?,?,?)",
                 (ts, backend, 1 if up else 0, detail[:200], kind))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1313,7 +1502,8 @@ def recent_events(limit: int = 50, kind: str | None = None) -> list[dict[str, An
                     "ORDER BY ts DESC LIMIT ?", (kind, int(limit))).fetchall()
         return [{"ts": t, "backend": b, "up": bool(u), "detail": d, "kind": k}
                 for t, b, u, d, k in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1360,7 +1550,8 @@ def uptime(window: str) -> dict[str, dict]:
                 out[b] = {"uptime_pct": round(up_time / secs * 100, 2),
                           "outages": down_count}
             return out
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -1384,14 +1575,15 @@ def rollup() -> None:
                     f"(bucket,{','.join(_METRIC_COLS)}) "
                     f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, {cols} "
                     f"FROM metrics WHERE ts >= ? GROUP BY bucket", (now - look,))
-            # key_series (per-key)
-            for tbl, bsize, look in (("key_series_1m", 60, 2 * 3600),
-                                     ("key_series_1h", 3600, 3 * 86400)):
-                conn.execute(
-                    f"INSERT OR REPLACE INTO {tbl}(bucket,label,reqs) "
-                    f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, label, "
-                    f"AVG(reqs) FROM key_series WHERE ts >= ? "
-                    f"GROUP BY bucket, label", (now - look,))
+            # key_series (per-key) + model_series (per-model) — identical shape
+            for src in ("key_series", "model_series"):
+                for tbl, bsize, look in ((f"{src}_1m", 60, 2 * 3600),
+                                         (f"{src}_1h", 3600, 3 * 86400)):
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO {tbl}(bucket,label,reqs) "
+                        f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, label, "
+                        f"AVG(reqs) FROM {src} WHERE ts >= ? "
+                        f"GROUP BY bucket, label", (now - look,))
             # proc_series (per-app)
             for tbl, bsize, look in (("proc_series_1m", 60, 2 * 3600),
                                      ("proc_series_1h", 3600, 3 * 86400)):
@@ -1408,7 +1600,8 @@ def rollup() -> None:
                     f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, core, "
                     f"AVG(pct) FROM cpu_core_series WHERE ts >= ? "
                     f"GROUP BY bucket, core", (now - look,))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1427,7 +1620,8 @@ def prune_metrics() -> int:
             conn.execute("DELETE FROM metrics_1m WHERE bucket < ?", (min_cut,))
             conn.execute("DELETE FROM metrics_1h WHERE bucket < ?", (hour_cut,))
             conn.execute("DELETE FROM events WHERE ts < ?", (hour_cut,))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
     return removed
 
@@ -1443,10 +1637,12 @@ def recent(limit: int = 720) -> list[dict[str, Any]]:
         for (payload,) in reversed(rows):
             try:
                 out.append(json.loads(payload))
-            except Exception:
+            except Exception as _e:
+                _dberr(_e)
                 continue
         return out
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1457,7 +1653,8 @@ def prune() -> int:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
             return cur.rowcount or 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0
 
 
@@ -1475,7 +1672,8 @@ def user_create(name: str, email: str, pw_hash: str, role: str,
                 "must_change_pw) VALUES (?,?,?,?,?,0,?)",
                 (name, email, pw_hash, role, created, 1 if must_change_pw else 0))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1491,7 +1689,8 @@ def user_get(name: str) -> dict[str, Any] | None:
         return {"name": r[0], "email": r[1], "pw_hash": r[2], "role": r[3],
                 "created": r[4], "last_login": r[5], "disabled": bool(r[6]),
                 "must_change_pw": bool(r[7])}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return None
 
 
@@ -1505,7 +1704,8 @@ def user_list() -> list[dict[str, Any]]:
         return [{"name": r[0], "email": r[1], "role": r[2], "created": r[3],
                  "last_login": r[4], "disabled": bool(r[5]),
                  "must_change_pw": bool(r[6])} for r in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1519,7 +1719,8 @@ def user_count(role: str | None = None) -> int:
             else:
                 r = conn.execute("SELECT COUNT(*) FROM users").fetchone()
         return int(r[0]) if r else 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0
 
 
@@ -1529,7 +1730,8 @@ def user_set_disabled(name: str, disabled: bool) -> bool:
             cur = conn.execute("UPDATE users SET disabled = ? WHERE name = ?",
                                (1 if disabled else 0, name))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1539,7 +1741,8 @@ def user_set_password(name: str, pw_hash: str) -> bool:
             cur = conn.execute("UPDATE users SET pw_hash = ? WHERE name = ?",
                                (pw_hash, name))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1550,7 +1753,8 @@ def user_set_must_change(name: str, must_change: bool) -> bool:
             cur = conn.execute("UPDATE users SET must_change_pw = ? WHERE name = ?",
                                (1 if must_change else 0, name))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1560,7 +1764,8 @@ def user_delete(name: str) -> bool:
             conn.execute("DELETE FROM api_tokens WHERE owner = ?", (name,))  # cascade
             cur = conn.execute("DELETE FROM users WHERE name = ?", (name,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1586,7 +1791,8 @@ def user_delete_guarded(name: str) -> bool:
             if deleted:
                 conn.execute("DELETE FROM api_tokens WHERE owner = ?", (name,))
         return deleted
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1598,7 +1804,8 @@ def user_disable_guarded(name: str) -> bool:
                 f"UPDATE users SET disabled = 1 WHERE name = ? "
                 f"AND (role != 'admin' OR {_ADMIN_LEFT})", (name,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1614,7 +1821,8 @@ def user_update_guarded(name: str, email: str, role: str) -> bool:
                 f"AND (? = 'admin' OR role != 'admin' OR {_ADMIN_LEFT})",
                 (email, role, name, role))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1625,7 +1833,8 @@ def settings_all() -> dict[str, str]:
         with _connect() as conn:
             return {r[0]: r[1] for r in
                     conn.execute("SELECT key, value FROM settings").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -1637,7 +1846,8 @@ def settings_set(key: str, value: str, now: float) -> bool:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
                 "updated = excluded.updated", (key, str(value), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1647,7 +1857,8 @@ def settings_delete(key: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1672,7 +1883,8 @@ def spend_model_user_upsert(rows: list[dict[str, Any]], now: float) -> None:
                 "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(day,model,key) DO UPDATE SET "
                 "alias=excluded.alias, cost=excluded.cost, tokens=excluded.tokens, "
                 "reqs=excluded.reqs, updated=excluded.updated", payload)
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1688,7 +1900,8 @@ def spend_model_user_rows(days_back: int, end: float | None = None) -> list[dict
                 "WHERE day >= ? ORDER BY day", (start_day,)).fetchall()
         return [{"day": r[0], "model": r[1], "key": r[2], "alias": r[3] or "",
                  "cost": float(r[4] or 0), "tokens": float(r[5] or 0)} for r in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1750,7 +1963,8 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
                 pt[lab] = round(cum[lab], ndp)
             pts.append(pt)
         return {"labels": top, "metric": metric, "points": pts}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {"labels": [], "metric": metric, "points": []}
 
 
@@ -1783,7 +1997,8 @@ def key_cost_window(days_back: int, end: float | None = None) -> dict[str, float
         if other > 0:
             out["Other"] = out.get("Other", 0.0) + other
         return {k: round(v, 4) for k, v in out.items()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -1796,7 +2011,8 @@ def prune_spend_model_user() -> int:
             cur = conn.execute(
                 "DELETE FROM spend_model_user_daily WHERE day < ?", (cutoff,))
             return cur.rowcount or 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0
 
 
@@ -1829,7 +2045,8 @@ def spend_daily_upsert(rows: list[dict[str, Any]], now: float) -> None:
                 f"VALUES (?,{','.join('?' for _ in _SPEND_DAILY_COLS)},?) "
                 f"ON CONFLICT(date) DO UPDATE SET {setter}, updated=excluded.updated",
                 payload)
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -1847,7 +2064,8 @@ def spend_daily_range(start: str, end: str) -> list[dict[str, Any]]:
                 rec.update({c: row[i + 1] for i, c in enumerate(_SPEND_DAILY_COLS)})
                 out.append(rec)
             return out
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -1859,7 +2077,8 @@ def prune_spend_daily() -> int:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM spend_daily WHERE date < ?", (cutoff,))
             return cur.rowcount or 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0
 
 
@@ -1870,7 +2089,8 @@ def team_overrides() -> dict[str, str]:
         with _connect() as conn:
             return {r[0]: r[1] for r in
                     conn.execute("SELECT key, team FROM key_teams").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -1882,7 +2102,8 @@ def team_set(key: str, team: str, now: float) -> bool:
                 "ON CONFLICT(key) DO UPDATE SET team = excluded.team, "
                 "updated = excluded.updated", (key, str(team), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1892,7 +2113,8 @@ def team_delete(key: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM key_teams WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1903,7 +2125,8 @@ def ui_layout_get(name: str) -> list | dict | None:
             r = conn.execute("SELECT value FROM ui_layout WHERE name = ?",
                              (str(name),)).fetchone()
         return json.loads(r[0]) if r and r[0] else None
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return None
 
 
@@ -1917,7 +2140,8 @@ def ui_layout_set(name: str, value, now: float) -> bool:
                 "updated = excluded.updated",
                 (str(name), json.dumps(value, separators=(",", ":")), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1927,7 +2151,8 @@ def key_user_overrides() -> dict[str, str]:
         with _connect() as conn:
             return {r[0]: r[1] for r in
                     conn.execute("SELECT key, user_name FROM key_user_ovr").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -1940,7 +2165,8 @@ def key_user_set(key: str, user_name: str, now: float) -> bool:
                 "ON CONFLICT(key) DO UPDATE SET user_name = excluded.user_name, "
                 "updated = excluded.updated", (str(key), str(user_name), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1950,7 +2176,8 @@ def key_user_delete(key: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM key_user_ovr WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1965,7 +2192,8 @@ def team_detect_all() -> dict[str, dict]:
                     for r in conn.execute(
                         'SELECT key, team, "user", user_name, budget, spent '
                         "FROM team_detect").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -1983,7 +2211,8 @@ def team_detect_set(key: str, team: str, user: str, user_name: str, budget: floa
                 (str(key), str(team or ""), str(user or ""), str(user_name or ""),
                  float(budget or 0), float(spent or 0), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -1995,7 +2224,8 @@ def key_budget_overrides() -> dict[str, float]:
         with _connect() as conn:
             return {r[0]: float(r[1]) for r in
                     conn.execute("SELECT key, budget FROM key_budgets_ovr").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -2007,7 +2237,8 @@ def key_budget_set(key: str, budget: float, now: float) -> bool:
                 "ON CONFLICT(key) DO UPDATE SET budget = excluded.budget, "
                 "updated = excluded.updated", (key, float(budget), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2017,7 +2248,8 @@ def key_budget_delete(key: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM key_budgets_ovr WHERE key = ?", (key,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2029,7 +2261,8 @@ def team_budgets() -> dict[str, float]:
         with _connect() as conn:
             return {r[0]: float(r[1]) for r in
                     conn.execute("SELECT team, budget FROM team_budgets").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -2041,7 +2274,8 @@ def team_budget_set(team: str, budget: float, now: float) -> bool:
                 "ON CONFLICT(team) DO UPDATE SET budget = excluded.budget, "
                 "updated = excluded.updated", (team, float(budget), now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2050,7 +2284,8 @@ def team_budget_delete(team: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM team_budgets WHERE team = ?", (team,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2065,7 +2300,8 @@ def model_kind_overrides() -> dict[str, str]:
         with _connect() as conn:
             return {r[0]: r[1] for r in
                     conn.execute("SELECT model, kind FROM model_cost_kind").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
@@ -2083,7 +2319,8 @@ def model_kind_set(model: str, kind: str, now: float) -> bool:
                 "ON CONFLICT(model) DO UPDATE SET kind = excluded.kind, "
                 "updated = excluded.updated", (model, kind, now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2095,30 +2332,109 @@ def model_cost_prices() -> dict[str, float]:
         with _connect() as conn:
             return {r[0]: float(r[1]) for r in
                     conn.execute("SELECT model, usd_1m FROM model_cost_price").fetchall()}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return {}
 
 
-def model_cost_price_set(model: str, usd_1m: float, now: float) -> bool:
-    """Pin a model's cost to USD-per-1M-tokens. False on a bad value or DB error."""
+def _ok_rate(x: object) -> float | None:
+    """Parse a non-negative finite rate, or None if blank/absent; raises on a bad value."""
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return None
+    v = float(cast(Any, x))                       # ValueError → caller rejects
+    if v < 0 or v != v or v == float("inf"):
+        raise ValueError("rate must be finite and >= 0")
+    return v
+
+
+def _blend_1m(in_1m: float | None, out_1m: float | None,
+              cache_1m: float | None = None,
+              vin: float | None = None, vout: float | None = None,
+              vcache: float | None = None) -> float:
+    """Blended $/1M from per-type rates — the single number the cost pipeline multiplies by a
+    model's TOTAL tokens.
+
+    VOLUME-WEIGHTED when token volumes are supplied: usd_1m = Σ(rate·volume) / Σ(volume) over
+    input+cached+output, i.e. total-cost ÷ total-tokens — the only blend that keeps
+    usd_1m·total_tokens equal to the real bill. A naive (in+out)/2 average over-weights the
+    (expensive, low-volume) output rate and can inflate cost many-fold; that's the trap the
+    volume weighting removes.
+
+    NAIVE FALLBACK when no volumes are given: AVERAGE when both input+output are priced (so an
+    input==output blended rate reads once, not doubled); the single non-zero side otherwise —
+    cache stays out of this legacy path (a read-discount, not the headline token cost)."""
+    i, o, c = in_1m or 0.0, out_1m or 0.0, cache_1m or 0.0
+    wi, wo, wc = vin or 0.0, vout or 0.0, vcache or 0.0
+    tot = wi + wo + wc
+    if tot > 0:                                   # volume-weighted = total cost ÷ total tokens
+        return (i * wi + o * wo + c * wc) / tot
+    return (i + o) / 2 if (i > 0 and o > 0) else (i + o)
+
+
+def model_cost_price_set(model: str, usd_1m: float, now: float,
+                         in_1m: object = None, out_1m: object = None,
+                         cache_1m: object = None,
+                         vol_in: object = None, vol_out: object = None,
+                         vol_cache: object = None) -> bool:
+    """Pin a model's cost. Either a single blended `usd_1m`, or per-type in/out/cache rates
+    ($ per 1M tokens) — when any per-type rate is given, `usd_1m` (what the cost pipeline
+    reads) is DERIVED from the per-type rates so both stay consistent.
+
+    When per-type token VOLUMES are also supplied (vol_in/vol_out/vol_cache, e.g. from
+    /api/admin/model-token-types), the derived usd_1m is VOLUME-WEIGHTED (total-cost ÷
+    total-tokens) instead of a naive input/output average — so usd_1m·total_tokens matches the
+    real bill even when output is expensive but low-volume. False on a bad value/DB error."""
     model = str(model or "").strip()
     if not model:
         return False
     try:
-        v = float(usd_1m)
+        pin, pout, pcache = _ok_rate(in_1m), _ok_rate(out_1m), _ok_rate(cache_1m)
+        wi, wo, wc = _ok_rate(vol_in), _ok_rate(vol_out), _ok_rate(vol_cache)
+        per_type = any(x is not None for x in (pin, pout, pcache))
+        v = _blend_1m(pin, pout, pcache, wi, wo, wc) if per_type else float(usd_1m)
+        if v < 0 or v != v or v == float("inf"):
+            return False
     except (TypeError, ValueError):
-        return False
-    if v < 0 or v != v or v == float("inf"):     # reject negative / NaN / inf
         return False
     try:
         with _connect() as conn:
             conn.execute(
-                "INSERT INTO model_cost_price(model, usd_1m, updated) VALUES (?, ?, ?) "
-                "ON CONFLICT(model) DO UPDATE SET usd_1m = excluded.usd_1m, "
-                "updated = excluded.updated", (model, v, now))
+                "INSERT INTO model_cost_price(model, usd_1m, in_1m, out_1m, cache_1m, "
+                "updated) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(model) DO UPDATE SET usd_1m=excluded.usd_1m, "
+                "in_1m=excluded.in_1m, out_1m=excluded.out_1m, "
+                "cache_1m=excluded.cache_1m, updated=excluded.updated",
+                (model, v, pin if per_type else None, pout if per_type else None,
+                 pcache if per_type else None, now))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
+
+
+def model_cost_details() -> dict[str, dict]:
+    """Per-model per-type cost overrides {model: {in,out,cache}} — only the rates an admin
+    pinned individually (NULLs omitted). The GET merges these over LiteLLM's own rates so
+    the card shows (and edits) the effective per-type values."""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT model, in_1m, out_1m, cache_1m FROM model_cost_price").fetchall()
+    except Exception as _e:
+        _dberr(_e)
+        return {}
+    out: dict[str, dict] = {}
+    for m, i, o, c in rows:
+        d = {}
+        if i is not None:
+            d["in"] = float(i)
+        if o is not None:
+            d["out"] = float(o)
+        if c is not None:
+            d["cache"] = float(c)
+        if d:
+            out[m] = d
+    return out
 
 
 def model_cost_price_delete(model: str) -> bool:
@@ -2127,7 +2443,8 @@ def model_cost_price_delete(model: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM model_cost_price WHERE model = ?", (model,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2137,7 +2454,8 @@ def model_kind_delete(model: str) -> bool:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM model_cost_kind WHERE model = ?", (model,))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2152,7 +2470,8 @@ def api_token_create(tid: str, owner: str, role: str, label: str,
                 "created) VALUES (?,?,?,?,?,?,?)",
                 (tid, owner, role, label, token_hash, prefix, created))
         return True
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2169,7 +2488,8 @@ def api_token_lookup(token_hash: str) -> dict[str, Any] | None:
         if not r:
             return None
         return {"id": r[0], "owner": r[1], "role": r[2]}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return None
 
 
@@ -2184,7 +2504,8 @@ def api_token_list(owner: str) -> list[dict[str, Any]]:
         return [{"id": r[0], "role": r[1], "label": r[2], "prefix": r[3],
                  "created": r[4], "last_used": r[5], "disabled": bool(r[6])}
                 for r in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -2194,7 +2515,8 @@ def api_token_count(owner: str) -> int:
             r = conn.execute("SELECT COUNT(*) FROM api_tokens WHERE owner = ?",
                              (owner,)).fetchone()
         return int(r[0]) if r else 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0
 
 
@@ -2205,7 +2527,8 @@ def api_token_revoke(tid: str, owner: str) -> bool:
             cur = conn.execute("DELETE FROM api_tokens WHERE id = ? AND owner = ?",
                                (tid, owner))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2214,7 +2537,8 @@ def api_token_touch(tid: str, ts: float) -> None:
     try:
         with _connect() as conn:
             conn.execute("UPDATE api_tokens SET last_used = ? WHERE id = ?", (ts, tid))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -2226,7 +2550,8 @@ def user_update(name: str, email: str, role: str) -> bool:
             cur = conn.execute("UPDATE users SET email = ?, role = ? WHERE name = ?",
                                (email, role, name))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2240,7 +2565,8 @@ def user_get_webhook(name: str) -> dict[str, Any] | None:
         if not r:
             return None
         return {"url": r[0] or "", "enabled": bool(r[1])}
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return None
 
 
@@ -2251,7 +2577,8 @@ def user_set_webhook(name: str, url: str, enabled: bool) -> bool:
                 "UPDATE users SET webhook_url = ?, webhook_enabled = ? WHERE name = ?",
                 (url or None, 1 if enabled else 0, name))
         return (cur.rowcount or 0) > 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return False
 
 
@@ -2265,7 +2592,8 @@ def user_webhooks_enabled() -> list[dict[str, Any]]:
                 "AND webhook_url IS NOT NULL AND webhook_url <> '' "
                 "AND disabled = 0 ORDER BY name").fetchall()
         return [{"user": r[0], "url": r[1]} for r in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -2274,7 +2602,8 @@ def user_touch_login(name: str, ts: float) -> None:
         with _connect() as conn:
             conn.execute("UPDATE users SET last_login = ? WHERE name = ?",
                          (ts, name))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -2289,7 +2618,8 @@ def audit_add(ts: float, actor: str | None, action: str,
             conn.execute(
                 "INSERT INTO audit_log(ts, actor, action, target, ip, detail) "
                 "VALUES (?,?,?,?,?,?)", (ts, actor, action, target, ip, detail))
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         pass
 
 
@@ -2311,7 +2641,8 @@ def audit_list(limit: int = 200, action_prefix: str | None = None
                     "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
         return [{"ts": r[0], "actor": r[1], "action": r[2], "target": r[3],
                  "ip": r[4], "detail": r[5]} for r in rows]
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return []
 
 
@@ -2321,5 +2652,6 @@ def audit_prune(cutoff: float) -> int:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM audit_log WHERE ts < ?", (cutoff,))
             return cur.rowcount or 0
-    except Exception:
+    except Exception as _e:
+        _dberr(_e)
         return 0

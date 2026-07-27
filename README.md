@@ -496,10 +496,10 @@ arm64/amd64 run the full pytest gate natively; armv7 builds emulated with
 
 ### Ship a pre-built image to a server (no registry)
 ```bash
-docker save ai-monitoring:1.8.6-armv7 | gzip > aimon.tar.gz
+docker save ai-monitoring:1.8.9-armv7 | gzip > aimon.tar.gz
 scp aimon.tar.gz deploy/docker-compose.server.yml .env.example user@server:~/aimon/
 # on the server:
-docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.6-armv7 ai-monitoring:1.8.6
+docker load < aimon.tar.gz && docker tag ai-monitoring:1.8.9-armv7 ai-monitoring:1.8.9
 mv docker-compose.server.yml docker-compose.yml && cp .env.example .env  # fill in
 docker compose up -d
 ```
@@ -549,7 +549,7 @@ All gated by the dashboard token when set; `/healthz` is always open.
 | `GET /api/data?history=N` | latest snapshot + recent samples |
 | `GET /api/series?window=&end=` | downsampled metric series (panning via `end`) |
 | `GET /api/keyrequests?top=&metric=reqs\|cost` | top-10 API keys, cumulative all-time (the dashboard's "top-10 API keys over time" chart) |
-| `GET /api/keyseries?window=&end=` | top-10 API keys, rolling per-window counts (multi-line) — not used by any current dashboard chart; kept as a read-only API for external consumers |
+| `GET /api/keyseries?window=&end=` | top-10 API keys, rolling per-window counts (multi-line) — the LiteLLM page's windowed "Top 10 API keys over time" card (distinct from the all-time one, which reads `/api/keyrequests`) |
 | `GET /api/procseries?kind=cpu\|ram&window=&end=` | top-5 apps over time |
 | `GET /api/uptime?window=` | per-backend uptime % + transition events |
 | `GET /api/anomalies` | active + recent per-key anomalies |

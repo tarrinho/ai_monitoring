@@ -16,7 +16,7 @@ import asyncio
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
@@ -44,6 +44,29 @@ def _is_team_id(s) -> bool:
     alias. Such values must NEVER be surfaced as a team NAME — callers blank them so the
     sticky detection cache keeps the last readable alias instead of a UUID."""
     return bool(s) and bool(_TEAM_ID_RE.match(str(s).strip()))
+
+
+# ── canonical key IDENTITY (review D-1) ──────────────────────────────────────────────────
+# LiteLLM reports a key's identity under many different field names depending on the endpoint:
+# `key_alias`/`key_name` on /spend/keys, `alias`/`key` on our own top_keys, `token` on
+# /key/list, `api_key` on the raw list. Resolving it a slightly-different way at each call
+# site (five divergent inline chains existed) is exactly what broke the recurring by-key /
+# by-user attribution: a key STORED under one label (known_keys, spend_model_user_daily,
+# key_series) but LOOKED UP by another silently misses the join. `key_label` is THE one
+# canonical JOIN key every producer must use so the labels line up. Prefers the human alias,
+# falls back to the raw key hash, never empty ("?" only when a row carries no identity at all).
+_KEY_ID_FIELDS = ("alias", "key_alias", "key_name", "key", "api_key", "token")
+
+
+def key_label(k: dict) -> str:
+    """Canonical join label for a key dict from ANY LiteLLM shape (see note above)."""
+    if not isinstance(k, dict):
+        return "?"
+    for f in _KEY_ID_FIELDS:
+        v = k.get(f)
+        if v:
+            return str(v).strip()
+    return "?"
 
 
 def _email_like(s) -> bool:
@@ -359,6 +382,74 @@ def _parse_backfill_bytes(raw: bytes) -> list[dict]:
     if isinstance(logs, dict):
         logs = logs.get("data") or logs.get("logs") or []
     return _fold_model_user(logs) if isinstance(logs, list) else []
+
+
+def _row_cached_tokens(row: dict) -> int:
+    """Cached (prompt-cache read) tokens for a /spend/logs row, tolerant of the several
+    shapes LiteLLM/providers emit: a top-level `cache_read_input_tokens`, or nested in
+    `prompt_tokens_details.cached_tokens` (OpenAI/Azure usage shape), possibly under
+    `metadata`. 0 when none reported. Never counts cache-CREATION tokens (a write, not a
+    read) — those are billed as normal input, not the cached meter."""
+    def _pick(d: object) -> int:
+        if not isinstance(d, dict):
+            return 0
+        v = d.get("cache_read_input_tokens")
+        if v is None:
+            det = d.get("prompt_tokens_details")
+            if isinstance(det, dict):
+                v = det.get("cached_tokens")
+        try:
+            return max(0, int(v or 0))
+        except (TypeError, ValueError):
+            return 0
+    return _pick(row) or _pick(row.get("metadata"))
+
+
+def _fold_model_token_types(logs: list, start_epoch: float) -> dict[str, dict]:
+    """Aggregate raw /spend/logs rows into per-model token TYPE counts for rows at/after
+    `start_epoch`: {model: {"input": uncached-prompt, "cached": prompt-cache-read,
+    "output": completion, "total": …}}. Input is prompt MINUS cached (the two are separate
+    Azure meters and cached is a subset of prompt), clamped ≥ 0. Pure + sync — runs in the
+    parse thread. The monitor's own /health-check pseudo-key is dropped."""
+    out: dict[str, dict] = {}
+    for row in logs:
+        if not isinstance(row, dict):
+            continue
+        st = _parse_ts(row.get("startTime") or row.get("start_time"))
+        if st is None or st < start_epoch:
+            continue
+        meta = row.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        kid = str(row.get("api_key") or meta.get("user_api_key") or "?")
+        if _is_health_check_key(kid):
+            continue
+        alias = str(row.get("key_alias") or row.get("api_key_alias")
+                    or meta.get("user_api_key_alias") or "")
+        if config.key_excluded(kid, alias):
+            continue
+        model = str(row.get("model") or row.get("model_name") or "?")
+        pt = int(row.get("prompt_tokens", 0) or 0)
+        ct = int(row.get("completion_tokens", 0) or 0)
+        cached = min(pt, _row_cached_tokens(row))   # cached is a subset of prompt
+        e = out.setdefault(model, {"input": 0, "cached": 0, "output": 0, "total": 0})
+        e["input"] += max(0, pt - cached)
+        e["cached"] += cached
+        e["output"] += ct
+        e["total"] += pt + ct
+    return out
+
+
+def _parse_token_types_bytes(raw: bytes, start_epoch: float) -> dict[str, dict]:
+    """json.loads + shape-normalize + per-model token-type fold — ALL off the event loop
+    (runs in a worker thread; deserializing a multi-day payload would freeze the loop)."""
+    import json
+    try:
+        logs = json.loads(raw)
+    except Exception:
+        return {}
+    if isinstance(logs, dict):
+        logs = logs.get("data") or logs.get("logs") or []
+    return _fold_model_token_types(logs, start_epoch) if isinstance(logs, list) else {}
 
 
 # Host load-per-core, fed in by the sampling loop each tick (the collector runs
@@ -803,6 +894,26 @@ def price_for(model: str, prices: dict) -> float:
         if k == model or kb == bare or kb == model or k == bare:
             return v
     return 0.0
+
+
+def detail_for(model: str, detail: dict) -> dict:
+    """The {"in","out","cache"} per-type rate breakdown for a model name, tolerant of
+    `provider/model` prefixes exactly like price_for() — model_price_detail() keys its
+    dict by LiteLLM's own model_name, which doesn't always carry the same provider
+    prefix as the canonical name used everywhere else (activity reports, price_for()'s
+    own prices dict). An exact-only lookup here silently returned {} for EVERY model,
+    even correctly-priced ones, because the two dicts' keys never matched — the
+    Settings model-costs card's IN/OUT/CCH columns read as permanently blank."""
+    if not detail:
+        return {}
+    if model in detail:
+        return detail[model]
+    bare = model.split("/", 1)[1] if "/" in model else model
+    for k, v in detail.items():
+        kb = k.split("/", 1)[1] if "/" in k else k
+        if k == model or kb == bare or kb == model or k == bare:
+            return v
+    return {}
 
 
 def _override_kind(model: str, m: str, overrides: dict | None) -> str | None:
@@ -1325,9 +1436,9 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     for k in rows:
         if not isinstance(k, dict):
             continue
-        alias = (k.get("key_alias") or k.get("key_name") or k.get("token") or "")
-        if not alias:
-            continue
+        alias = key_label(k)                 # D-1: canonical join label (was a local chain)
+        if alias == "?":
+            continue                         # a row with no identity at all — skip, as before
         # Owner user-id can live on ANY of several fields: `user_id` (owner), `created_by`
         # (a user_id string), the nested `created_by_user` object, or `user`. LiteLLM's
         # /key/list commonly leaves `user_id` NULL while the owner is only on created_by /
@@ -1459,8 +1570,7 @@ def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[di
     rows = []
     day = max(1, int(month_day))
     for k in top_keys or []:
-        alias = (k.get("alias") or k.get("key_alias") or k.get("key_name")
-                 or k.get("key") or "?")
+        alias = key_label(k)                 # D-1: canonical join label
         total = float(k.get("cost") or k.get("total_spend") or k.get("spend") or 0)
         # Budgets cap REAL cash. A key can mix external (real) + self-hosted
         # (reference) usage; only the real portion counts against the budget.
@@ -1675,6 +1785,70 @@ async def model_user_backfill(session: aiohttp.ClientSession, days: int) -> list
     rows = await asyncio.to_thread(_parse_backfill_bytes, raw)
     _dbg(f"model_user_backfill: {len(rows)} (day,model,key) rows")
     return rows
+
+
+TOKEN_TYPES_MAX_DAYS = 92          # bound the on-demand pull (a quarter) — see below
+
+
+async def per_model_token_types(session: aiohttp.ClientSession, start_date: str,
+                                end_date: str | None = None) -> dict | None:
+    """Per-model {input, cached, output, total} token counts over [start_date, end_date] (UTC,
+    both inclusive; end defaults to today), from the HEAVY /spend/logs endpoint — the only
+    source with the prompt/completion/cache split (`/global/activity/model` reports total
+    tokens only).
+
+    Pulled DAY-BY-DAY (`start_date=D&end_date=D`) so each request is bounded to one day's logs
+    and stays under `LITELLM_SPEND_MAX_BYTES`; a single open-ended `start_date=` pull returns
+    the whole firehose (LiteLLM doesn't shrink it without an end bound) and trips the byte cap.
+    Each day is parsed off-thread; a day that errors (cap/timeout/HTTP) is recorded in
+    `days_failed` and skipped, so a partial result still comes back instead of nothing.
+
+    Returns None only when LiteLLM is unconfigured or the dates are unparseable. Otherwise a
+    dict {"per_model": {model: {...}}, "days_ok": int, "days_failed": [{"day","err"}],
+    "total_days": int} — the caller decides `available` from days_ok."""
+    base = config.LITELLM_BASE_URL
+    if not base or not config.LITELLM_MASTER_KEY:
+        return None
+    base = base.rstrip("/")
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = (datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                  if end_date else datetime.fromtimestamp(time.time(), tz=timezone.utc))
+    except (TypeError, ValueError):
+        return None
+    # clamp: no inverted range, and cap the span so a stray far-past start can't fan out into
+    # hundreds of daily pulls (each is a heavy call).
+    if end_dt.date() < start_dt.date():
+        return None
+    max_end = start_dt + timedelta(days=TOKEN_TYPES_MAX_DAYS - 1)
+    if end_dt > max_end:
+        end_dt = max_end
+    out: dict[str, dict] = {}
+    days_ok = 0
+    days_failed: list[dict] = []
+    total_days = 0
+    d = start_dt
+    while d.date() <= end_dt.date():
+        ds = d.strftime("%Y-%m-%d")
+        total_days += 1
+        raw, err = await _fetch_spend_raw(
+            session, f"{base}/spend/logs?start_date={ds}&end_date={ds}", _headers(),
+            config.LITELLM_SPEND_TIMEOUT, config.LITELLM_SPEND_MAX_BYTES)
+        if err is not None or not raw:
+            days_failed.append({"day": ds, "err": err or "empty"})
+        else:
+            agg = await asyncio.to_thread(_parse_token_types_bytes, raw, d.timestamp())
+            for m, v in agg.items():
+                e = out.setdefault(m, {"input": 0, "cached": 0, "output": 0, "total": 0})
+                for k in ("input", "cached", "output", "total"):
+                    e[k] += v[k]
+            days_ok += 1
+        d += timedelta(days=1)
+    if days_failed:
+        _dbg(f"per_model_token_types: {days_ok}/{total_days} days ok, "
+             f"failed={days_failed[:3]}")
+    return {"per_model": out, "days_ok": days_ok, "days_failed": days_failed,
+            "total_days": total_days}
 
 
 def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, int, int]:

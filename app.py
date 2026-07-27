@@ -350,6 +350,18 @@ async def _sampling_loop(app: web.Application) -> None:
             db.insert_metrics(snap["ts"], _metrics_row(snap))
             if _ll.get("available"):
                 db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])
+                db.insert_model_series(snap["ts"], _ll.get("per_model") or [])
+            _vl = snap["collectors"].get("vllm", {})
+            # Real-time in-flight count for the "Concurrent LLM work — by model" split (see
+            # model_conc_series schema comment): model_series infers a model's activity from
+            # completed-request deltas, which is blind to a slow, still-running request — a
+            # single-model vLLM instance's own running/waiting gauges have no such lag.
+            # Skipped when multi_model (the figures are summed across models there, so
+            # attributing them to just the first model name would be wrong).
+            if (_vl.get("available") and _vl.get("model") and not _vl.get("multi_model")
+                    and (_vl.get("running") is not None or _vl.get("waiting") is not None)):
+                db.insert_model_conc_series(snap["ts"], f"vllm/{_vl['model']}",
+                                            _vl.get("running"), _vl.get("waiting"))
                 if _mu_rows:
                     db.spend_model_user_upsert(_mu_rows, snap["ts"])
                 # /key/list-confirmed labels (collectors.litellm._heavy_sample), for the
@@ -1494,7 +1506,11 @@ async def keyseries_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 200
     pts = max(30, min(pts, 1000))
-    data = await asyncio.to_thread(db.key_series, window, pts, end=_q_end(request))
+    # monotonic: the windowed 'Top 10 API keys over time' card is an "only rises"
+    # cumulative view, but the raw stored value re-bases DOWN on key re-issue / budget
+    # roll — so plot a running total of positive steps instead (see db.key_series).
+    data = await asyncio.to_thread(db.key_series, window, pts,
+                                   end=_q_end(request), monotonic=True)
     return web.json_response({"window": window, **data})
 
 
@@ -1537,14 +1553,22 @@ async def concurrency_by_key_handler(request: web.Request) -> web.Response:
     metric = "backlog" if request.query.get("metric") == "backlog" else "conc"
     window = request.query.get("window", "1h")
     window = db.norm_window(window, "1h")
-    # weight basis: full mode records per-key REQUESTS (already a recent-activity level);
-    # lite/off records per-key CUMULATIVE spend, so the split must weight by the per-bucket
-    # spend DELTA (recent activity) — else a key that only spent in the PAST gets a band for
-    # current work it isn't doing. Determine the basis from the live top-key shape.
-    tk = (_backend_latest.get("litellm", {}) or {}).get("top_keys") or []
-    basis = "requests" if any(k.get("reqs") is not None for k in tk) else "spend"
+    # source: split the same proxy-wide aggregate by API key (default) or by MODEL.
+    source = "model" if request.query.get("by") == "model" else "key"
+    _ll = _backend_latest.get("litellm", {}) or {}
+    # weight basis: full mode records REQUESTS per bucket (already a recent-activity level);
+    # lite/off records CUMULATIVE values (per-key spend / per-model day totals), so the split
+    # must weight by the per-bucket DELTA (recent activity) — else something active only in
+    # the PAST gets a band for current work it isn't doing.
+    if source == "model":
+        # per_model.reqs is windowed in full spend mode, day-cumulative in lite/off.
+        basis = "requests" if _ll.get("spend_mode") == "full" else "spend"
+    else:
+        tk = _ll.get("top_keys") or []
+        basis = "requests" if any(k.get("reqs") is not None for k in tk) else "spend"
     data = await asyncio.to_thread(db.concurrency_by_key, window, metric,
-                                   end=_q_end(request), cumulative=(basis == "spend"))
+                                   end=_q_end(request), cumulative=(basis == "spend"),
+                                   source=source)
     data["weight_basis"] = basis
     return web.json_response({"window": window, **data})
 
@@ -1885,18 +1909,18 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
     Spend 'Cost by key' chart must still show it, so the two sources are UNIONED (was
     live-OR-snapshot, which silently dropped those keys). MONITOR_KEY_BUDGETS always wins."""
     def _alias(k):
-        return str(k.get("alias") or k.get("key_alias") or k.get("key_name")
-                   or k.get("key") or "")
+        return litellm.key_label(k)          # D-1: one canonical join label
     keys: list = []
     seen: set = set()
     if live:
         for alias, info in live.items():
-            keys.append({"alias": alias, "cost": info.get("spend", 0.0),
-                         "team": info.get("team", ""), "budget": info.get("budget", 0.0),
-                         # carry the resolved owner through so the budget rows can show
-                         # email + user id (was dropped here → budgets card had no user).
-                         "user": info.get("user", ""), "user_name": info.get("user_name", "")})
-            seen.add(str(alias))
+            row = {"alias": alias, "cost": info.get("spend", 0.0),
+                   "team": info.get("team", ""), "budget": info.get("budget", 0.0),
+                   # carry the resolved owner through so the budget rows can show
+                   # email + user id (was dropped here → budgets card had no user).
+                   "user": info.get("user", ""), "user_name": info.get("user_name", "")}
+            keys.append(row)
+            seen.add(_alias(row))        # dedup on the CANONICAL label (both paths agree — D-1)
     for sk in (snapshot_keys or []):     # fold in snapshot spend keys not already present
         a = _alias(sk)
         if a and a not in seen:
@@ -1923,9 +1947,12 @@ async def _store_owners_from_live(live: dict | None) -> None:
     if not live:
         return
     owners = {a: str((info or {}).get("user") or "") for a, info in live.items()}
+    # Persist the resolved owner NAME (email/alias) too, so the by-user charts can fall back to
+    # the last-known name when LiteLLM's live /user/list resolution blips empty on a later poll.
+    names = {a: str((info or {}).get("user_name") or "") for a, info in live.items()}
     if any(owners.values()):          # only touch the store when we actually resolved someone
         try:
-            await asyncio.to_thread(db.known_keys_upsert, owners, time.time())
+            await asyncio.to_thread(db.known_keys_upsert, owners, time.time(), names)
         except Exception:
             pass
 
@@ -1962,6 +1989,8 @@ async def budgets_handler(request: web.Request) -> web.Response:
     keys = merge_key_budgets(live, _visible_top_keys(snap.get("top_keys") or []),
                              _key_budget_map())
     _apply_team_overrides(keys)          # admin-assigned team wins over LiteLLM's
+    _apply_user_overrides(keys)          # admin per-key user reassignment wins (board parity)
+    _apply_stored_owner_names(keys)      # else last-known email, so a /user/list blip ≠ Unassigned
     rows = litellm.budget_rows(keys, _resolve_budget_map(keys), lt.tm_mday, mlen)
     # per-key `spend` is LIFETIME, so the monthly figures come from the daily series
     mtd = await _mtd_real_spend(request.app[_SESSION], now)
@@ -1976,8 +2005,10 @@ async def budgets_handler(request: web.Request) -> web.Response:
 
 
 def _team_key_id(k: dict) -> str:
-    """Stable identity a team override keys on — the key alias, else the raw key."""
-    return str(k.get("alias") or k.get("key_alias") or k.get("key") or "").strip()
+    """Stable identity a team override keys on — the SAME canonical join label the budget
+    rows and _keyUser use (D-1), so a team override can't key on a different id than the row
+    it's meant to overlay (it previously skipped `key_name`, a subtle divergence)."""
+    return litellm.key_label(k)
 
 
 def _apply_team_overrides(keys: list) -> None:
@@ -1991,6 +2022,42 @@ def _apply_team_overrides(keys: list) -> None:
         t = ov.get(_team_key_id(k))
         if t:
             k["team"] = t
+
+
+def _apply_user_overrides(keys: list) -> None:
+    """Overlay the admin per-key user/email reassignment (db.key_user_overrides) onto each
+    key's resolved owner name, keyed on the SAME canonical label the Settings board uses.
+
+    Without this, `/api/budgets` carried only LiteLLM's LIVE `user_name`, so a key the operator
+    reassigned on the board — or one whose live `/user/list` email resolution blipped empty —
+    fell into "Unassigned" on the /litellm by-user charts while the board correctly named its
+    user. The board's `api_admin_teams_get` already lets the override win 'for display AND
+    grouping'; this makes the budgets path (the charts' only owner source) do the same, so the
+    two can't diverge. Mirrors `_apply_team_overrides`."""
+    uov = db.key_user_overrides()
+    if not uov:
+        return
+    for k in keys:
+        name = uov.get(_team_key_id(k))
+        if name:
+            k["user_name"] = name        # budget_rows surfaces this as the row's `email`
+
+
+def _apply_stored_owner_names(keys: list) -> None:
+    """Resilience fallback: for a key whose owner name is STILL empty after the live resolution
+    and the admin override, fill it from the persisted last-known owner email (db.known_owner_names).
+    LiteLLM's /user/list is flaky, so a key that IS owned can carry a blank `user_name` on a given
+    poll; the by-user charts would then drop it to "Unassigned" for that view. This mirrors the
+    streak-buffered resilience the by-key path already has for the owner id. Precedence stays
+    override > live > stored: it only ever FILLS a blank, never overrides a resolved name."""
+    stored = db.known_owner_names()
+    if not stored:
+        return
+    for k in keys:
+        if not (k.get("user_name") or ""):
+            name = stored.get(_team_key_id(k))
+            if name:
+                k["user_name"] = name
 
 
 # Sticky cache of LiteLLM-detected teams: key_id -> {detected, user, budget, spent}.
@@ -2376,6 +2443,7 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
     names.update(k for k in ov if k)
     cost_ov = db.model_cost_prices()          # {model: USD per 1M} admin cost overrides
     all_cost = model_cost_overrides()         # merged env+DB, USD per token (override wins)
+    cost_det = db.model_cost_details()        # {model: {in,out,cache}} per-type overrides
     names.update(k for k in cost_ov if k)
     models = []
     for name in names:
@@ -2396,15 +2464,71 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
                        "eff_cost_1m": round(eff_cpt * 1_000_000.0, 6) if eff_cpt else 0.0,
                        "cost_overridden": name in all_cost,
                        # the three LiteLLM per-type rates (currency per 1M) for the card's
-                       # input / output / cache breakdown — None when LiteLLM doesn't price it
-                       "in_1m": (detail.get(name) or {}).get("in"),
-                       "out_1m": (detail.get(name) or {}).get("out"),
-                       "cache_1m": (detail.get(name) or {}).get("cache")})
+                       # input / output / cache breakdown — None when LiteLLM doesn't price it.
+                       # Tolerant lookup (matches price_for()'s provider-prefix handling above):
+                       # detail is keyed by LiteLLM's own model_name, which doesn't always carry
+                       # the same provider prefix as `name`.
+                       # an admin per-type override wins over LiteLLM's own rate; `*_pinned`
+                       # flags tell the card which cells to highlight as overridden.
+                       "in_1m": cost_det.get(name, {}).get(
+                           "in", litellm.detail_for(name, detail).get("in")),
+                       "out_1m": cost_det.get(name, {}).get(
+                           "out", litellm.detail_for(name, detail).get("out")),
+                       "cache_1m": cost_det.get(name, {}).get(
+                           "cache", litellm.detail_for(name, detail).get("cache")),
+                       "in_pinned": "in" in cost_det.get(name, {}),
+                       "out_pinned": "out" in cost_det.get(name, {}),
+                       "cache_pinned": "cache" in cost_det.get(name, {})})
     # most-used first; unused models fall to the bottom, alphabetical as the tiebreak
     models.sort(key=lambda m: (-int(m["tokens"]), str(m["model"]).lower()))
     return web.json_response({"models": models,
                               "error": None if prices or models
                               else litellm.last_key_list_error()})
+
+
+async def api_admin_model_token_types_handler(request: web.Request) -> web.Response:
+    """Per-model INPUT / CACHED / OUTPUT token counts for the selected window, from the
+    heavy /spend/logs endpoint — the ONLY source with the prompt/completion/cache split
+    (`/global/activity/model` reports total tokens only). Admin-only (via /api/admin/* gate).
+
+    This is what lets an operator derive true per-type cost rates: rate = (currency the meter
+    billed) ÷ (that meter's token count). On-demand only (never on the sample loop); byte-
+    capped + parsed off-thread like the rollup backfill, so a big window can't freeze the loop.
+    """
+    if not _litellm_configured():
+        raise web.HTTPNotFound()
+    # An explicit ?start=YYYY-MM-DD (and optional ?end=) wins — lets an operator match the EXACT
+    # billing window a provider invoice covers (the window presets snap to now-relative or month
+    # boundaries, which rarely line up with an invoice's start day). Else derive from window.
+    start_q = str(request.query.get("start") or "").strip()
+    end_q = str(request.query.get("end") or "").strip()
+    window = db.norm_window(request.query.get("window", "month"), "month")
+    if start_q and re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_q):
+        start = start_q
+    else:
+        now = time.time()
+        win_start = db.month_start(now) if window == "month" else now - db.window_secs(window)
+        start = time.strftime("%Y-%m-%d", time.gmtime(win_start))
+    end = end_q if re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_q) else None
+    try:
+        tt = await litellm.per_model_token_types(request.app[_SESSION], start, end)
+    except Exception as e:      # heavy pull is best-effort — never 500 the settings page
+        print(f"[warn] /api/admin/model-token-types {type(e).__name__}: {e}", file=sys.stderr)
+        tt = None
+    if tt is None:
+        return web.json_response({"window": window, "start_date": start, "end_date": end,
+                                  "available": False, "models": [], "diag": None})
+    per = tt.get("per_model") or {}
+    models = [{"model": m, "input": v["input"], "cached": v["cached"],
+               "output": v["output"], "total": v["total"]}
+              for m, v in sorted(per.items(), key=lambda kv: -kv[1]["total"])]
+    # available only if at least one day's logs actually came back; diag surfaces which days
+    # failed and why (byte cap / timeout / HTTP) so the operator can see the real reason.
+    diag = {"days_ok": tt.get("days_ok", 0), "total_days": tt.get("total_days", 0),
+            "days_failed": tt.get("days_failed", [])}
+    return web.json_response({"window": window, "start_date": start, "end_date": end,
+                              "available": bool(tt.get("days_ok")), "models": models,
+                              "diag": diag})
 
 
 async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
@@ -2433,6 +2557,27 @@ async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
         _audit(request, actor, "model_cost.reset", target=model)
         return web.json_response({"ok": True, "model": model, "cost_overridden": False})
     if action == "cost":
+        # Per-type override (input/output/cache $ per 1M) OR a single blended usd_1m. When
+        # any per-type rate is given, usd_1m is derived from input+output server-side.
+        pin = str(data.get("in_1m") or "").strip()
+        pout = str(data.get("out_1m") or "").strip()
+        pcache = str(data.get("cache_1m") or "").strip()
+        # Optional per-type token VOLUMES (from /api/admin/model-token-types) → the derived
+        # usd_1m becomes volume-weighted (total-cost ÷ total-tokens) instead of a naive
+        # input/output average. Blank/absent → legacy naive blend, unchanged.
+        vin = str(data.get("vol_in") or "").strip()
+        vout = str(data.get("vol_out") or "").strip()
+        vcache = str(data.get("vol_cache") or "").strip()
+        per_type = any((pin, pout, pcache))
+        if per_type:
+            if not db.model_cost_price_set(model, 0.0, time.time(),
+                                           in_1m=pin, out_1m=pout, cache_1m=pcache,
+                                           vol_in=vin, vol_out=vout, vol_cache=vcache):
+                return web.json_response(
+                    {"error": "rates must be numbers ≥ 0 (per 1M tokens)"}, status=400)
+            _audit(request, actor, "model_cost.set", target=model,
+                   detail=f"in={pin} out={pout} cache={pcache} vol=({vin},{vout},{vcache})")
+            return web.json_response({"ok": True, "model": model, "cost_overridden": True})
         try:
             usd_1m = float(str(data.get("usd_1m") or "").strip())
         except (TypeError, ValueError):
@@ -3053,8 +3198,18 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
     end = _q_end(request) or time.time()
     secs = (end - db.month_start(end)) if window == "month" else db.window_secs(window)
     days = int(secs // 86400) + 1
-    return web.json_response({"window": window,
-        "cost": await asyncio.to_thread(db.key_cost_window, days, end=end)})
+    cost = await asyncio.to_thread(db.key_cost_window, days, end=end)
+    # The day-granular rollup this reads is fed only from /spend/logs (full mode) — in
+    # lite/off mode it never gets a single row, so the LiteLLM page's "spend in window"
+    # cards were permanently empty even with real, active spend (observed live). Fall
+    # back to the same per-bucket delta the sibling "requests/spend in window" bar chart
+    # already uses successfully in lite mode. Gated on spend_mode, not just "cost is
+    # empty": in full mode that delta is REQUEST COUNTS, not dollars, and plotting it
+    # here would silently mislabel units.
+    if not cost and (_backend_latest.get("litellm", {}) or {}).get("spend_mode") != "full":
+        wd = await asyncio.to_thread(db.key_series_window_delta, window, 50, end)
+        cost = {lab: d for lab, d in zip(wd["labels"], wd["deltas"]) if d > 0}
+    return web.json_response({"window": window, "cost": cost})
 
 
 async def spend_model_series_handler(request: web.Request) -> web.Response:
@@ -3462,6 +3617,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/admin/ui-layout", api_admin_ui_layout_get)
     app.router.add_post("/api/admin/ui-layout", api_admin_ui_layout_set)
     app.router.add_get("/api/admin/model-kinds", api_admin_model_kinds_get)
+    app.router.add_get("/api/admin/model-token-types", api_admin_model_token_types_handler)
     app.router.add_post("/api/admin/model-kinds", api_admin_model_kinds_set)
     app.router.add_get("/api/data", data_handler)
     app.router.add_get("/api/series", series_handler)

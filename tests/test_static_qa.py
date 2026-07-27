@@ -14,6 +14,13 @@ import pytest
 import config
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _core_js():
+    """The shared self-hosted core module (aimon-core.js) that every page loads via a
+    <script src>. The runtime harnesses collect only inline <script> blocks, so they must
+    prepend this or api() (extracted there, review D-3) is undefined at runtime."""
+    return (ROOT / "web" / "assets" / "aimon-core.js").read_text(encoding="utf-8")
 WEB = ROOT / "web" / "index.html"
 
 
@@ -214,7 +221,7 @@ def test_windowed_pages_have_time_nav_arrows():
     for name in ("index", "litellm", "gpu", "ollama", "llamacpp"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert 'id="nav-left"' in html and 'id="nav-right"' in html, name
-        assert "TIMEEND" in html and 'end="+TIMEEND' in html, name   # panned query
+        assert "TIMEEND" in html and "/assets/aimon-core.js" in html, name   # panned query via shared api()
         assert 'id="range-lbl"' in html, name
 
 
@@ -344,15 +351,25 @@ def test_spend_all_charts_follow_time_window():
 
 
 def test_litellm_concurrency_backlog_by_key_stacked_and_labeled_estimated():
-    """The two new stacked charts (Concurrent work / Backlog by key) exist, read the
-    attribution endpoint, follow the window, and are HONESTLY labeled as estimated — because
-    LiteLLM gives no per-key breakdown for these aggregates (the split is inferred)."""
+    """The two stacked charts (Concurrent work / Backlog) exist, read the attribution endpoint,
+    follow the window, and are HONESTLY labeled as estimated — LiteLLM gives no per-key
+    breakdown for these aggregates (the split is inferred). They are titled 'by user', so the
+    server's per-key bands are folded to OWNERS before rendering (a 'by user' chart must never
+    show a raw key id — see test_by_user_charts_never_show_a_key_id)."""
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
     for cid in ("card-conc-by-key", "card-backlog-by-key",
                 "conc-by-key-chart", "backlog-by-key-chart"):
         assert cid in html, f"missing {cid}"
     assert "/api/litellm/concurrency-by-key" in html
     assert "loadConcByKey" in html and "loadBacklogByKey" in html
+    # titled "by user" → both loaders must fold the per-key server bands to users, so a key id
+    # can never surface under a "by user" heading (regression guard for the exact bug fixed).
+    assert re.search(r"<h2>Concurrent LLM work — by user", html), "conc card must be titled 'by user'"
+    assert re.search(r"<h2>LLM Backlog — by user", html), "backlog card must be titled 'by user'"
+    for fn in ("loadConcByKey", "loadBacklogByKey"):
+        m = re.search(r"async function " + fn + r"\(\)\{.*?\n\}", html, re.S)
+        assert m and "_foldSeriesByUser(d.series)" in m.group(0), \
+            f"{fn} must fold per-key bands to users (else a 'by user' chart shows key ids)"
     # both reload on window change / tick (search for them in rangedReload)
     assert re.search(r"function rangedReload\(\)\{[^}]*loadConcByKey\(\)[^}]*loadBacklogByKey\(\)", html)
     # stacked area (bands sum to the total) and the "estimated" honesty must be present
@@ -553,7 +570,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.6"
+    assert config.VERSION == "AI-Monitoring_1.8.9"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -562,7 +579,7 @@ def test_all_version_surfaces_match_config_version():
     offline-install snippet must equal config.VERSION — these lagged in past releases
     (deploy/k8s + prometheus-example + README were the repeat offenders). Derives the
     version from config so it can't go stale itself."""
-    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.6"
+    ver = config.VERSION.split("_", 1)[1]              # e.g. "1.8.8"
     other = re.compile(r"(?:ai[-_]monitoring|ai_monitoring):(\d+\.\d+\.\d+)")
 
     def stale_tags(text):
@@ -976,9 +993,14 @@ def test_dockerfile_alpine_multiarch_hardened():
 
 
 def test_dockerfile_copies_every_top_level_module():
-    # guard: every top-level .py the app imports must be COPYed into the image
+    # guard: EVERY top-level .py the app ships must be COPYed into the runtime image, or the
+    # container crashes on import. Derived from the tree (not a hand-list) so a newly-extracted
+    # module — e.g. dbutil.py (review D-4) — can't be forgotten in the Dockerfile.
     df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    for mod in ("config.py", "db.py", "app.py", "alerts.py", "anomaly.py"):
+    mods = {p.name for p in ROOT.glob("*.py")
+            if p.name not in ("conftest.py", "setup.py")}
+    assert "dbutil.py" in mods, "sanity: dbutil.py should be a top-level module"
+    for mod in sorted(mods):
         assert mod in df, f"Dockerfile does not COPY {mod} — container will crash"
 
 
@@ -1550,9 +1572,14 @@ def test_all_pages_have_consistent_time_window_with_mtd():
             f"{name}: window buttons missing aria-pressed"
         assert sum('aria-pressed="true"' in b for b in wbtns) == 1, \
             f"{name}: exactly one window button must be aria-pressed=true"
-        assert "function wsecs(" in html, f"{name}: missing month-aware wsecs() helper"
+        # wsecs() now lives in the shared core module (review D-3), so every page must load it.
+        assert "/assets/aimon-core.js" in html, f"{name}: does not load aimon-core.js"
         assert "WSECS[WIN]" not in html, f"{name}: stale WSECS[WIN] (not month-aware)"
         assert "unified time-window control" in html, f"{name}: missing unified pill styling"
+    # The month-aware wsecs() helper is defined once, in the shared core module.
+    core = (ROOT / "web" / "assets" / "aimon-core.js").read_text(encoding="utf-8")
+    assert "function wsecs(" in core, "core: missing month-aware wsecs() helper"
+    assert "getUTCMonth()" in core, "core: wsecs() no longer month-aware"
     # spend uses the same pill styling too (its windows are card-scoped / coarser)
     assert "unified time-window control" in (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
 
@@ -1665,17 +1692,21 @@ def test_settings_model_cost_override_ui():
     cost input + action=cost / cost_reset), so an unreliable LiteLLM price can be corrected
     from the UI. Guards the wiring + the fields it reads."""
     html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
-    assert '"min mcost"' in html                             # the per-model cost input (JS-built)
-    assert 'action:"cost"' in html and "usd_1m" in html      # Save posts a cost override
-    assert 'action:"cost_reset"' in html                     # Reset clears it
-    assert "m.cost_1m" in html                                # the set override value
-    # the card breaks the cost into the THREE LiteLLM per-type rates (input/output/cache),
-    # instead of a single summed blend (which read double)
-    assert "m.in_1m" in html and "m.out_1m" in html and "m.cache_1m" in html
-    # the per-type rates render as their own cells via mcell(); the surrounding container
-    # class was renamed away from "mcosts" in a card refactor, so anchor on the cell
-    # builder (which still proves the three-rate layout) rather than the dropped class name.
-    assert 'mcell(' in html
+    # the three per-type rates (input/output/cache) are now EDITABLE inputs, each pinnable
+    assert 'input.mrate' in html                             # editable per-type rate cells
+    assert "function mcellEdit(" in html
+    assert "mcellEdit(m.in_1m" in html and "mcellEdit(m.out_1m" in html \
+        and "mcellEdit(m.cache_1m" in html
+    # Save posts a per-type cost override (in/out/cache); Reset clears it
+    assert 'action:"cost"' in html and "in_1m:vi" in html and "out_1m:vo" in html \
+        and "cache_1m:vc" in html
+    assert 'action:"cost_reset"' in html
+    # a card-level Refresh re-pulls all costs from LiteLLM
+    assert 'id="models-refresh"' in html and "loadModels(true)" in html
+    # IN/OUT/CCH each keep their OWN explanatory tooltip, now also click-openable
+    assert "var MCOL_TIP" in html
+    assert "PROMPT tokens" in html and "COMPLETION tokens" in html and "PROMPT-CACHE hit" in html
+    assert "function showTip(" in html and '"r tiplbl"' in html   # clickable column labels
 
 
 def test_config_tunables_exclude_secrets_and_switches():
@@ -1746,7 +1777,7 @@ def test_vllm_page_static_invariants():
     # unified header window control incl. month-to-date + range wiring
     for w in ("15m", "1h", "24h", "30d", "12mo", "month"):
         assert f'data-w="{w}"' in html, f"vllm: missing window {w}"
-    assert "function wsecs(" in html and "WSECS[WIN]" not in html   # month-aware
+    assert "function wsecs(" in _core_js() and "WSECS[WIN]" not in html   # month-aware (core)
     assert 'id="range-dates"' in html and "function fmtRange(" in html
     # vLLM-specific KPIs surfaced (queue pressure / KV cache — the headline signals)
     assert "waiting" in html and "kv_cache" in html
@@ -1807,16 +1838,20 @@ def test_window_selection_persists_per_page():
     """The time-window selection must stick PER PAGE across refresh: restored from a
     path-keyed localStorage entry on load, saved on change. Guards the wiring on every
     windowed page (WIN pages via #windows, spend via #sp-windows)."""
+    # The persistence machinery (_winKey/_winSave/_winRestore) lives in the shared core module
+    # (review D-3); each WIN page just CALLS it. Guard both halves.
+    core = _core_js()
+    assert 'localStorage.setItem(_winKey()' in core and 'function _winKey(' in core, \
+        "core: window persistence machinery missing"
+    assert '"aimon-win:"+location.pathname' in core, "core: window key must be per-page (path)"
     for name in ("index", "gpu", "ollama", "llamacpp", "litellm", "vllm", "network"):
         html = _page(name)
-        assert 'localStorage.setItem(_winKey()' in html and '_winKey()' in html, \
-            f"{name}: window not persisted to localStorage"
-        assert '"aimon-win:"+location.pathname' in html, f"{name}: window key must be per-page (path)"
         assert '_winRestore("#windows"' in html, f"{name}: window not restored on load"
         assert "WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null)" in html, \
             f"{name}: window change must reset the pan cursor and be saved as a live named window"
+    # spend keeps its OWN coarser persistence (_spWin*, bare window name, no pan cursor)
     sp = _page("spend")
-    assert '_winRestore("#sp-windows"' in sp and "SPWIN=b.dataset.w; _winSave(SPWIN)" in sp, \
+    assert '_spWinRestore("#sp-windows"' in sp and "SPWIN=b.dataset.w; _spWinSave(SPWIN)" in sp, \
         "spend page window must persist per page too"
 
 
@@ -1825,16 +1860,18 @@ _WIN_PAGES = ["index", "gpu", "ollama", "llamacpp", "litellm", "vllm", "network"
 
 def test_drag_to_zoom_wired_on_every_win_page():
     """Kibana-style drag-to-zoom: dragging across any chart sets a custom time window.
-    Each WIN page must carry the delegated pointer-drag handler, the selection overlay,
-    and encode the range through the existing window+end plumbing (WIN='custom:<secs>')."""
+    The delegated pointer-drag handler lives in the shared core module (review D-3); each WIN
+    page loads it and supplies the overlay CSS + chart-wraps it operates on."""
+    core = _core_js()
+    assert "drag-to-zoom: drag across ANY chart" in core, "core: drag handler missing"
+    assert "addEventListener(\"pointerdown\"" in core, "core: no pointerdown listener"
+    assert "addEventListener(\"pointerup\"" in core, "core: no pointerup listener"
+    assert 'WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND)' in core, \
+        "core: drag must set a custom window + absolute end and persist it"
+    assert 'ov.className="drag-sel"' in core, "core: selection overlay not created"
     for name in _WIN_PAGES:
         html = _page(name)
-        assert "drag-to-zoom: drag across ANY chart" in html, f"{name}: drag handler missing"
-        assert "addEventListener(\"pointerdown\"" in html, f"{name}: no pointerdown listener"
-        assert "addEventListener(\"pointerup\"" in html, f"{name}: no pointerup listener"
-        assert 'WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND)' in html, \
-            f"{name}: drag must set a custom window + absolute end and persist it"
-        assert 'ov.className="drag-sel"' in html, f"{name}: selection overlay not created"
+        assert "/assets/aimon-core.js" in html, f"{name}: does not load the shared drag handler"
         assert ".drag-sel{" in html and ".chart-wrap{position:relative}" in html, \
             f"{name}: drag overlay CSS missing"
 
@@ -1864,18 +1901,18 @@ def test_drag_only_starts_on_a_time_series_plot_area():
         wrap swallows the click that toggles a series — the drag must begin inside chartArea;
     (2) a by-key BAR chart's x-axis is key names, not time, so mapping pixels to a time range
         there is meaningless — only charts stamped with real timestamps ($ts) are draggable.
-    preventDefault must also wait for the 5px threshold, or it fires on every plain click."""
-    for name in _WIN_PAGES:
-        html = _page(name)
-        assert "if(x<a.left||x>a.right||y<a.top||y>a.bottom) return;" in html, \
-            f"{name}: drag may start outside the plot area (legend clicks get swallowed)"
-        assert "if(!ch.$ts || ch.$ts.length<2) return;" in html, \
-            f"{name}: non-time-series charts must not be draggable"
-        assert "if(Math.abs(e.clientX-dg.x0)<5) return;      // still a click, not a drag" in html, \
-            f"{name}: drag threshold must precede preventDefault"
-        assert 'addEventListener("pointercancel",abort)' in html and \
-               'window.addEventListener("blur",abort)' in html, \
-            f"{name}: a lost pointer must not leave a stuck selection overlay"
+    preventDefault must also wait for the 5px threshold, or it fires on every plain click.
+    The handler lives in the shared core module (review D-3)."""
+    core = _core_js()
+    assert "if(x<a.left||x>a.right||y<a.top||y>a.bottom) return;" in core, \
+        "core: drag may start outside the plot area (legend clicks get swallowed)"
+    assert "if(!ch.$ts || ch.$ts.length<2) return;" in core, \
+        "core: non-time-series charts must not be draggable"
+    assert "if(Math.abs(e.clientX-dg.x0)<5) return;      // still a click, not a drag" in core, \
+        "core: drag threshold must precede preventDefault"
+    assert 'addEventListener("pointercancel",abort)' in core and \
+           'window.addEventListener("blur",abort)' in core, \
+        "core: a lost pointer must not leave a stuck selection overlay"
 
 
 def test_drag_maps_pixels_to_real_timestamps_not_window_fractions():
@@ -1883,12 +1920,14 @@ def test_drag_maps_pixels_to_real_timestamps_not_window_fractions():
     points are NOT evenly spread across the window after a restart/outage. Mapping a drag by
     pixel fraction alone would then select the wrong times, silently. Every time-series chart
     records its points' real timestamps via stampTs(), and the drag resolves pixel → point
-    index → that point's timestamp."""
+    index → that point's timestamp. The helper + resolver live in the shared core (D-3); the
+    per-page duty is to CALL stampTs() on every time series it plots."""
+    core = _core_js()
+    assert "function stampTs(ch, pts)" in core, "core: stampTs helper missing"
+    assert "xs.getValueForPixel(px1)" in core and "ts[i1]" in core, \
+        "core: drag must resolve pixels through the chart's own timestamps"
     for name in _WIN_PAGES:
         html = _page(name)
-        assert "function stampTs(ch, pts)" in html, f"{name}: stampTs helper missing"
-        assert "xs.getValueForPixel(px1)" in html and "ts[i1]" in html, \
-            f"{name}: drag must resolve pixels through the chart's own timestamps"
         # every path that feeds a time series into a chart must stamp it
         for m in re.finditer(r'^\s*(\w[\w.$\[\]]*)\.data\.labels\s*=\s*(?!\[\])', html, re.M):
             line = html[m.start():html.index("\n", m.start())]
@@ -1903,13 +1942,15 @@ def test_custom_window_token_never_reaches_the_ui():
     """Bug-registry class #3/#4 (a raw token rendered as user-visible text): window badges
     must go through wlabel(), which shows 'custom' instead of 'custom:900'. A restored custom
     range must also be visibly marked as not-live."""
+    assert "function wlabel(w)" in _core_js(), "core: wlabel helper missing"
     for name in _WIN_PAGES:
         html = _page(name)
-        assert "function wlabel(w)" in html, f"{name}: wlabel helper missing"
         assert not re.search(r'textContent\s*=\s*WIN\b', html), \
             f"{name}: a window badge still renders the raw WIN token"
-        assert ".custom-win{" in html and "_winMark(true)" in html, \
-            f"{name}: a restored custom range must be marked as not-live"
+        # .custom-win{ styling is per-page; _winMark(true) is invoked from the shared core's
+        # _winRestore/drag handler when a frozen custom range is restored.
+        assert ".custom-win{" in html, f"{name}: missing not-live marker styling"
+    assert "_winMark(true)" in _core_js(), "core: restored custom range must be marked not-live"
 
 
 def test_restored_window_value_is_injection_hardened():
@@ -1919,13 +1960,13 @@ def test_restored_window_value_is_injection_hardened():
         `custom:3600&x=1` through, and WIN flows unencoded into the export URL + api() query
         string (parameter injection);
     (2) the restored value is interpolated into a `querySelector('… [data-w="'+w+'"]')`, so it
-        must be charset-guarded first or a malformed value throws and crashes page init."""
-    for name in _WIN_PAGES:
-        html = _page(name)
-        assert '/^custom:[0-9]+$/.test(w)' in html, \
-            f"{name}: _winCustom must strictly match custom:<digits> (anti param-injection)"
-        assert "/^[a-z0-9]+$/i.test(w) && document.querySelector(sel+' button[data-w=" in html, \
-            f"{name}: restored value must be charset-guarded before the querySelector interpolation"
+        must be charset-guarded first or a malformed value throws and crashes page init.
+        Both guards live in the shared core's _winCustom/_winRestore (review D-3)."""
+    core = _core_js()
+    assert '/^custom:[0-9]+$/.test(w)' in core, \
+        "core: _winCustom must strictly match custom:<digits> (anti param-injection)"
+    assert "/^[a-z0-9]+$/i.test(w) && document.querySelector(sel+' button[data-w=" in core, \
+        "core: restored value must be charset-guarded before the querySelector interpolation"
 
 
 def test_custom_marker_is_cleared_when_returning_to_a_named_window():
@@ -1962,23 +2003,27 @@ def test_custom_window_flows_through_api_and_wsecs_on_every_win_page():
     """A custom range must reach the server: wsecs() resolves 'custom:<secs>' to its
     seconds, and api() appends the absolute end for every windowed endpoint (not a
     hard-coded endpoint list) so the server derives start=end-secs."""
+    assert 'w.indexOf("custom:")===0' in _core_js(), "core: wsecs does not parse custom windows"
     for name in _WIN_PAGES:
         html = _page(name)
-        assert 'w.indexOf("custom:")===0' in html, f"{name}: wsecs does not parse custom windows"
-        assert 'if(TIMEEND && path.indexOf("window=")>=0)' in html, \
-            f"{name}: api() must append end for any windowed endpoint"
+        assert re.search(r'TIMEEND && path\.indexOf\("window="\)>=0', _core_js()) \
+            and 'end="+TIMEEND' in _core_js(), \
+            "the shared api() (aimon-core.js) must append end for any windowed endpoint"
+        assert "/assets/aimon-core.js" in html, f"{name}: must load the shared core module"
 
 
 def test_custom_window_persistence_is_restored_on_refresh():
     """The saved entry is {w,end}; on load a custom range restores both the window token
-    AND its absolute end (TIMEEND) so the zoom survives a refresh, per page."""
+    AND its absolute end (TIMEEND) so the zoom survives a refresh. Machinery lives in the
+    shared core (review D-3); every WIN page loads it."""
+    core = _core_js()
+    assert 'JSON.stringify({w:w, end:(end||null)})' in core, \
+        "core: window state must be persisted as {w,end}"
+    assert 'function _winCustom(w)' in core, "core: _winCustom helper missing"
+    assert 'TIMEEND=Number(s&&s.end)||null;' in core, \
+        "core: custom range must restore its absolute end, coerced to a number"
     for name in _WIN_PAGES:
-        html = _page(name)
-        assert 'JSON.stringify({w:w, end:(end||null)})' in html, \
-            f"{name}: window state must be persisted as {{w,end}}"
-        assert 'function _winCustom(w)' in html, f"{name}: _winCustom helper missing"
-        assert 'TIMEEND=Number(s&&s.end)||null;' in html, \
-            f"{name}: custom range must restore its absolute end, coerced to a number"
+        assert "/assets/aimon-core.js" in _page(name), f"{name}: does not load core persistence"
 
 
 def test_gpu_name_in_header_via_textcontent():
@@ -2164,8 +2209,9 @@ def test_gpu_per_core_charts_honour_the_window():
         "window/pan handlers must reload the per-core series"
     # pan offset (`end=`) is forwarded for cpuseries like every windowed endpoint
     assert '/api/cpuseries?window=' in html, "per-core must request the windowed cpuseries endpoint"
-    assert 'if(TIMEEND && path.indexOf("window=")>=0)' in html, \
-        "api() must attach the pan `end=` param to every windowed endpoint (incl. /api/cpuseries)"
+    assert re.search(r'TIMEEND && path\.indexOf\("window="\)>=0', _core_js()) \
+        and 'end="+TIMEEND' in _core_js(), \
+        "the shared api() (aimon-core.js) attaches the pan `end=` param for every windowed endpoint"
 
 
 def test_gpu_per_core_cpu_grid():
@@ -2831,7 +2877,7 @@ def test_litellm_page_init_executes_without_js_error():
         pytest.skip("node not available for JS behavioral test")
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
     scripts = [m.group(1) for m in re.finditer(r"<script>([\s\S]*?)</script>", html)]
-    combined = "\n".join(scripts)
+    combined = _core_js() + "\n" + "\n".join(scripts)
     harness = r"""
     process.on('unhandledRejection', () => {});
     global.window = global;
@@ -2896,7 +2942,7 @@ def test_drag_to_zoom_actually_produces_the_selected_range_at_runtime():
     if not node:
         pytest.skip("node not available for JS behavioral test")
     html = _page("litellm")
-    combined = "\n".join(m.group(1) for m in re.finditer(r"<script>([\s\S]*?)</script>", html))
+    combined = _core_js() + "\n" + "\n".join(m.group(1) for m in re.finditer(r"<script>([\s\S]*?)</script>", html))
     harness = r"""
     process.on('unhandledRejection', () => {});
     global.window = global; global.CUR = "$";
@@ -3045,7 +3091,7 @@ def _probe_page_js(page, probe):
     if not node:
         pytest.skip("node not available for JS behavioral test")
     html = (ROOT / "web" / page).read_text(encoding="utf-8")
-    combined = "\n".join(m.group(1) for m in
+    combined = _core_js() + "\n" + "\n".join(m.group(1) for m in
                          re.finditer(r"<script>([\s\S]*?)</script>", html))
     script = _PAGE_JS_HARNESS + "\ntry {\n" + combined + "\n" + probe + \
         '\n} catch (e) { console.error("THREW: " + e.message); process.exit(3); }\n'
@@ -3076,6 +3122,76 @@ def test_litellm_reqs_kpi_switches_on_requests_basis():
     assert "Reqs (win)" in seen["full"] and "Reqs (today)" not in seen["full"]
     # missing basis must fall back to the window wording, never the day wording
     assert "Reqs (win)" in seen["absent"] and "Reqs (today)" not in seen["absent"]
+
+
+def test_by_user_charts_never_show_a_key_id():
+    """A 'by user' chart must show USERS, never a key id. A key whose owner LiteLLM never
+    resolved (no email) used to fall back to its own key label in `userOf`; it now groups
+    under 'Unassigned' (matching the Settings board + the Spend page's 'Cost by user'). A key
+    WITH a resolved owner still shows the username (email local part)."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    // budgets carry the resolved owner email for 'alice-key' only; 'orphan-key' has none
+    buildKeyUser({keys:[{key:"alice-key", email:"alice.smith@example.com"},
+                        {key:"orphan-key", email:""}]});
+    out.resolved   = userOf("alice-key");     // → "alice.smith" (username)
+    out.unresolved = userOf("orphan-key");    // → "Unassigned" (NOT "orphan-key")
+    out.unknown    = userOf("some-hash-abc"); // → "Unassigned" (NOT the key id)
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert seen["resolved"] == "alice.smith", seen
+    assert seen["unresolved"] == "Unassigned", f"unresolved key must not show its id: {seen}"
+    assert seen["unknown"] == "Unassigned", f"unknown key must not show its id: {seen}"
+    # and the card copy no longer promises the old key-id fallback
+    html = _page("litellm")
+    assert "shown by its key" not in html
+    assert 'group under "Unassigned"' in html
+
+    # The Concurrent-work / Backlog "by user" cards get per-KEY bands from the server; the
+    # fold groups them by owner so a key id can NEVER surface. Two of alice's keys merge into
+    # one 'alice.smith' band; an ownerless key becomes 'Unassigned'; the server's 'Other' stays.
+    folded = _probe_page_js("litellm.html", r"""
+    buildKeyUser({keys:[{key:"alice-a", email:"alice.smith@example.com"},
+                        {key:"alice-b", email:"alice.smith@example.com"},
+                        {key:"bob-1",   email:"bob@example.com"}]});
+    const series=[{label:"alice-a", data:[1,2]}, {label:"alice-b", data:[3,4]},
+                  {label:"bob-1", data:[5,null]}, {label:"orphan-xyz", data:[1,1]},
+                  {label:"Other", data:[9,9]}];
+    const out=_foldSeriesByUser(series);
+    console.log("PROBE:"+JSON.stringify({
+      labels: out.map(s=>s.label),
+      alice:  (out.find(s=>s.label==="alice.smith")||{}).data,   // [4,6] (1+3, 2+4)
+    }));
+    """)
+    labels = folded["labels"]
+    assert "alice.smith" in labels and "bob" in labels, f"owners must show as bands: {labels}"
+    assert "Unassigned" in labels, f"ownerless key must fold to Unassigned: {labels}"
+    assert labels[-1] == "Other", f"server residual 'Other' must stay last: {labels}"
+    # NO raw key id may appear as a band label
+    for kid in ("alice-a", "alice-b", "bob-1", "orphan-xyz"):
+        assert kid not in labels, f"'by user' fold leaked a key id: {kid} in {labels}"
+    assert folded["alice"] == [4, 6], f"alice's two keys must sum element-wise: {folded['alice']}"
+
+
+def test_charts_omit_all_zero_series_from_the_legend():
+    """A series whose values are ALL zero/null must not become a chart dataset — Chart.js builds
+    the legend from its datasets, so a flat-zero band (e.g. a user with keys but no activity in
+    the window on 'Concurrent LLM work — by user') would otherwise show a dead legend entry and
+    an invisible line. Runtime-probes the shared `_nzLabels` helper and guards each builder's
+    filter so it can't silently regress."""
+    out = _probe_page_js("litellm.html", r"""
+    const pts=[{a:1,b:0,c:null},{a:2,b:0,c:0}];      // a has real values; b, c are flat zero/null
+    console.log("PROBE:"+JSON.stringify({kept:_nzLabels(["a","b","c"], pts)}));
+    """)
+    assert out["kept"] == ["a"], f"_nzLabels must drop all-zero/all-null keys: {out}"
+    html = _page("litellm")
+    # stacked attribution charts (conc/backlog by user/model/key) drop all-zero bands, incl. Other
+    assert "(d.series||[]).filter(s=>(s.data||[]).some(v=>v!=null && v!==0))" in html, \
+        "renderStackByKey must drop all-zero bands before building datasets"
+    # the per-user delta chart drops flat-zero users
+    assert "drop flat-zero users" in html, "loadUserDelta must drop users whose series is all zero"
+    # the keytime + keydelta line charts route their labels through the shared filter
+    assert html.count("_nzLabels(") >= 3, "keydelta/keytime charts must filter all-zero keys"
 
 
 def test_litellm_top_key_bars_badge_cumulative_spend_in_lite():
@@ -3129,6 +3245,47 @@ def test_litellm_delta_cards_relabel_to_spend_in_lite_mode():
     assert seen["fullKeyMetric"] == "requests" and seen["fullUserMetric"] == "requests"
     assert "cumulative requests" in seen["fullKeySub"]
     assert "requests" in seen["fullAria"].lower()
+
+
+def test_wlabel_never_leaks_the_raw_custom_token():
+    """Unit-level behavioural pin of wlabel() itself (bug-registry class #3/#4): a raw
+    'custom:<secs>' window token must never reach the UI as user-visible text — wlabel()
+    is the single choke point every window badge on the page is supposed to render
+    through. Guards the underlying utility all call sites (including loadKeyTimeWin,
+    registry #18) depend on, not just one call site's wiring."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {
+      custom900: wlabel("custom:900"),
+      custom1:   wlabel("custom:1"),
+      plain1h:   wlabel("1h"),
+      plain24h:  wlabel("24h"),
+    };
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert seen["custom900"] == "custom" and "900" not in seen["custom900"]
+    assert seen["custom1"] == "custom" and ":1" not in seen["custom1"]
+    # non-custom tokens pass through unchanged — wlabel must not mangle ordinary windows
+    assert seen["plain1h"] == "1h"
+    assert seen["plain24h"] == "24h"
+
+
+def test_load_key_time_win_renders_the_window_badge_through_wlabel():
+    """End-to-end behavioural regression for bug-registry #18: loadKeyTimeWin() used to set
+    the windowed 'Top 10 API keys over time' card's badge with the RAW WIN token
+    (w.textContent=WIN) instead of routing it through wlabel() like every other window
+    badge on the page — a custom drag-to-zoom selection would show 'custom:900' verbatim.
+    Executes the real async loader (fetch is stubbed) and reads the actual DOM text set,
+    catching a regression to the raw assignment even if it dodges a static string scan."""
+    seen = _probe_page_js("litellm.html", r"""
+    (async () => {
+      WIN = "custom:900";
+      await loadKeyTimeWin();
+      const out = { badge: REG["keytimewin-win"].textContent };
+      console.log("PROBE:" + JSON.stringify(out));
+    })();
+    """)
+    assert seen["badge"] == "custom", f"raw window token leaked into the badge: {seen}"
+    assert "900" not in seen["badge"]
 
 
 def test_litellm_lite_requests_kpi_is_labelled_today_not_window():
@@ -3202,12 +3359,15 @@ def test_by_key_stack_cards_show_empty_state_instead_of_vanishing():
 
 
 def test_by_key_empty_state_text_is_present_for_both_cards():
-    """Both stacked by-key cards ship the empty-state element the renderer toggles."""
+    """Every stacked concurrency/backlog card ships the empty-state element the renderer
+    toggles, with non-empty text (the exact wording is free to change — the cards were
+    relabelled by-user/by-model, so this pins the elements + that they carry a message,
+    not a specific string)."""
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
-    for cid in ("conc-by-key", "backlog-by-key"):
+    for cid in ("conc-by-key", "backlog-by-key", "conc-by-model"):
         assert f'id="{cid}-wrap"' in html, f"{cid} chart wrapper missing"
-        assert f'id="{cid}-empty"' in html, f"{cid} empty-state missing"
-    assert html.count("no per-key activity in this window") == 2
+        m = re.search(r'id="' + cid + r'-empty"[^>]*>([^<]+)<', html)
+        assert m and m.group(1).strip(), f"{cid} empty-state missing or blank"
 
 
 def test_settings_unassigned_group_has_a_show_hide_switch():
@@ -3219,13 +3379,19 @@ def test_settings_unassigned_group_has_a_show_hide_switch():
     assert "_hideUnassigned" in html, "live value must be mirrored for the button state"
     # the control is built inside the `unassigned` branch, not for every user block
     i_branch = html.index("if(unassigned){")
-    i_post = html.index("post({HIDE_UNASSIGNED_KEYS:")
+    i_post = html.index('name:"HIDE_UNASSIGNED_KEYS"')
     assert i_branch < i_post, "the control must live in the unassigned-only branch"
     assert 'aria-pressed' in html, "active side must be exposed assistively"
-    # two explicit buttons, not a blind toggle: distinct Show and Hide, each posting the
-    # right value through the normal (CSRF-guarded, persisted) admin settings endpoint
+    # two explicit buttons, not a blind toggle: distinct Show and Hide
     assert 'bShow.textContent="Show"' in html and 'bHide.textContent="Hide"' in html
-    assert 'post({HIDE_UNASSIGNED_KEYS: hide?"1":"0"})' in html
+    # it MUST post the shape the /api/admin/settings handler accepts —
+    # action=set&name=&value= — not a bare {NAME: value} (which the server rejects as
+    # "unknown setting", so the button clicked but nothing changed). Regression guard.
+    assert re.search(
+        r'post\(\{action:"set",\s*name:"HIDE_UNASSIGNED_KEYS",\s*value:', html), \
+        "switch must post {action:'set', name:'HIDE_UNASSIGNED_KEYS', value:…}"
+    assert 'post({HIDE_UNASSIGNED_KEYS:' not in html, \
+        "must NOT post a bare {NAME: value} — the server rejects it as 'unknown setting'"
     # the active side is highlighted so the CURRENT state is visible at a glance
     assert '.uvis.on{' in html, "active side must have a highlighted style"
     # NOTE: settings.html wraps its JS in an IIFE, so userBlock() is not reachable from
@@ -3249,6 +3415,26 @@ def test_hide_unassigned_tunable_is_not_rendered_as_a_settings_card():
     assert "s.card!==false" in html, "render() must skip non-card tunables"
 
 
+def test_model_token_types_endpoint_and_collector_are_wired():
+    """1.8.8: the per-model token-type split (input/cached/output) is exposed by an admin route
+    backed by a heavy /spend/logs collector, and the per-type cost setter is volume-aware."""
+    app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+    coll_src = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    db_src = (ROOT / "db.py").read_text(encoding="utf-8")
+    # admin-gated GET route registered (the /api/admin/* prefix enforces admin at middleware)
+    assert 'add_get("/api/admin/model-token-types"' in app_src
+    assert "async def api_admin_model_token_types_handler" in app_src
+    # collector pulls /spend/logs (the only source with the prompt/completion/cache split),
+    # DAY-BY-DAY (start_date=D&end_date=D) so each request stays under the byte cap
+    assert "async def per_model_token_types" in coll_src
+    assert "/spend/logs?start_date={ds}&end_date={ds}" in coll_src
+    assert "days_failed" in coll_src            # per-day failures surfaced, not swallowed
+    assert "def _fold_model_token_types" in coll_src and "def _row_cached_tokens" in coll_src
+    # volume-weighted blend is wired end to end
+    assert "vol_in" in app_src and "vol_out" in app_src and "vol_cache" in app_src
+    assert "def _blend_1m" in db_src and "vin" in db_src and "vcache" in db_src
+
+
 def test_model_costs_is_an_aligned_grid_with_a_shared_header():
     """The MODEL COSTS card was a ragged flex row: each in/out/cache cell stacked its label
     OVER its value (`flex-direction:column`) and floated, and the override input drifted, so
@@ -3261,11 +3447,11 @@ def test_model_costs_is_an_aligned_grid_with_a_shared_header():
     m = re.search(r"\.srow\.tmodel,\.mhdr\{grid-template-columns:([^;]+);", html)
     assert m, "the .srow.tmodel + .mhdr shared grid rule is missing"
     tracks = m.group(1).split()
-    assert len(tracks) == 7, f"expected 7 columns (name·kind·in·out·cache·override·actions), got {tracks}"
-    # the header exists and labels every numeric/override column
+    assert len(tracks) == 6, f"expected 6 columns (name·kind·in·out·cache·actions), got {tracks}"
+    # the header exists and labels every numeric column
     assert 'className="mhdr"' in html or 'class="mhdr"' in html or '"mhdr"' in html, "no header row"
     assert '.mhdr{display:grid' in html, "header must use the same grid"
-    for col in ('"in"', '"out"', '"cch"', '"override"'):
+    for col in ('"in"', '"out"', '"cch"'):
         assert col in html, f"header is missing the {col} column label"
     # the old ragged structure is gone (no per-cell label-over-value flex column)
     assert ".mcosts" not in html and 'class="mc"' not in html, \
@@ -3296,14 +3482,57 @@ def test_model_costs_row_children_match_the_header_cells():
     html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
     start = html.index("function modelRow(")
     body = html[start:html.index("\n  function ", start + 1)]
-    # the three rate values are appended straight onto the row (own columns), not wrapped
-    assert body.count("mcell(m.in_1m)") and "mcell(m.out_1m)" in body and "mcell(m.cache_1m)" in body, \
-        "the three rate cells must be direct grid children"
-    # exactly seven direct grid children, in order
+    # the three rates are EDITABLE cells built by mcellEdit, each with its own tooltip;
+    # eff is a read-only cell. All are DIRECT row children so they land in their columns.
+    assert "mcellEdit(m.in_1m, MCOL_TIP.in" in body
+    assert "mcellEdit(m.out_1m, MCOL_TIP.out" in body
+    assert "mcellEdit(m.cache_1m, MCOL_TIP.cache" in body
+    # exactly six direct grid children, in order: name · kind · in · out · cache · actions
+    # (the effective blended cost lives in the model-name popover, not a column, so the
+    # ✓/↺ actions stay visible in the narrow card)
     kids = re.findall(r"row\.appendChild\(([^)]+)\)", body)
-    # normalise the mcell(...) appends to a single token for counting
-    norm = ["mcell" if k.startswith("mcell(") else k.strip() for k in kids]
-    assert norm == ["lbl", "sel", "mcell", "mcell", "mcell", "cost", "acts"], norm
+    assert kids == ["lbl", "sel", "inC", "outC", "cacheC", "acts"], kids
+
+
+def test_model_costs_refresh_never_blanks_the_card():
+    """Regression: a per-row refresh (✓/↺) and the top 'Refresh from LiteLLM' both funnel
+    through loadModels(), which used to `el.textContent=""` BEFORE the fetch resolved — so a
+    slow/empty/flaky re-pull (or a swallowed fetch error) left the whole card blank until a
+    full page reload. loadModels now builds the rows in a fragment and swaps atomically, and an
+    empty/failed refresh keeps the values already on screen."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    start = html.index("function loadModels(force)")
+    body = html[start:html.index("\n  var _rb", start)]
+    assert "createDocumentFragment()" in body, "must build the replacement off-screen"
+    assert 'el.textContent=""; el.appendChild(frag)' in body, "must swap the card in atomically"
+    # the ONLY blank of the card is that atomic swap — never a clear-before-fetch
+    assert body.count('el.textContent=""') == 1, "card must not be cleared before data arrives"
+    # an empty result on a populated card keeps the values (doesn't wipe to 'No models')
+    assert "if(el.firstChild)" in body, "empty result must keep existing values"
+    # a fetch error keeps values too; the admin-only hint only shows on an already-empty card
+    assert 'if(!el.firstChild){ el.textContent="Model costs are admin-only."' in body
+    # errors are no longer silently swallowed into a blank card
+    assert ".catch(function(){});" not in body, "fetch errors must not be swallowed silently"
+
+
+def test_model_costs_row_refresh_routes_through_loadModels():
+    """The fix lives in loadModels(), so the per-row controls the user actually clicks — Save (✓)
+    and Reset (↺) — must re-render via loadModels (not a separate path that could still wipe the
+    card). Both handlers call loadModels after their POST completes, and they re-render WITHOUT
+    forcing a LiteLLM re-pull (no ?refresh=1), so they use the cached last-good and can't blank
+    the card on a flaky upstream."""
+    html = (ROOT / "web" / "settings.html").read_text(encoding="utf-8")
+    start = html.index("function modelRow(")
+    body = html[start:html.index("\n  function loadModels(", start)]
+    # Save and Reset both re-render through loadModels once their POSTs resolve
+    assert body.count("loadModels") >= 2, "Save and Reset must re-render via loadModels()"
+    # and they must NOT force a re-pull (loadModels() / loadModels with no truthy force) — a
+    # per-row action re-renders from the cache, never a fresh (flaky) LiteLLM pull
+    assert "loadModels(true)" not in body, "per-row refresh must not force a ?refresh=1 re-pull"
+    # the top 'Refresh from LiteLLM' button IS the only forced re-pull
+    assert 'addEventListener("click",function(){loadModels(true);})' in html \
+        or "loadModels(true)" in html[html.index("models-refresh"):], \
+        "the top Refresh button should be the only forced re-pull"
 
 
 def test_model_name_click_opens_an_info_popover():
@@ -3460,3 +3689,336 @@ def test_litellm_windowed_spend_cards_and_layout():
         "the all-time by-requests pair must sit at the bottom, users before keys"
     # and the NEW windowed cards sit near the top (before the moved originals)
     assert html.index('id="card-keys-winspend"') < i_users
+
+
+def test_litellm_windowed_keys_over_time_card():
+    """A windowed twin of "Top 10 API keys over time" sits where the all-time card used to
+    be (following the page time-window selector via /api/keyseries), and the ALL-TIME card
+    moved to 3rd-from-last. Both charts, their loaders, and the refresh wiring must exist."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # both cards present, each with its own chart canvas
+    assert 'id="card-keytime-win"' in html and 'id="keytime-win-chart"' in html
+    assert 'id="card-keytime"' in html and 'id="keytime-chart"' in html
+    # the windowed one is placed BEFORE the all-time one in the DOM (it took the old slot)
+    assert html.index('id="card-keytime-win"') < html.index('id="card-keytime"')
+    # the all-time card is 3rd from the last card
+    order = re.findall(r'<section class="card[^"]*" id="(card-[a-z0-9-]+)"', html)
+    assert order[-3] == "card-keytime", f"keytime must be 3rd from end, order tail={order[-3:]}"
+    # windowed loader follows the selector (WIN) via the per-window key series endpoint,
+    # and is TDZ-safe (its metric var declared before its chart)
+    assert 'api("/api/keyseries?window="+WIN)' in html, "windowed card must follow WIN"
+    assert html.index("let _keytimewinMetric") < html.index("keyTimeWinChart = new Chart")
+    # refreshed on every reload path the other windowed charts use
+    assert html.count("loadKeyTimeWin()") >= 3, "must run on rangedReload + window change + init"
+    # the all-time card still uses the all-time endpoint (unchanged), so the two differ
+    assert 'api("/api/keyrequests")' in html, "all-time card keeps the all-time source"
+
+
+def test_litellm_concurrency_by_model_card():
+    """A 'Concurrent LLM work — by model' stacked card sits right after the by-user one,
+    fetching the same aggregate split by model (by=model), wired into the refresh cycle."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert 'id="card-conc-by-model"' in html and 'id="conc-by-model-chart"' in html
+    assert "Concurrent LLM work — by model" in html
+    # placed immediately after the by-user (conc-by-key) card, before the backlog card
+    i_key = html.index('id="card-conc-by-key"')
+    i_model = html.index('id="card-conc-by-model"')
+    i_backlog = html.index('id="card-backlog-by-key"')
+    assert i_key < i_model < i_backlog, "by-model card must sit between by-user and backlog"
+    # loader hits the shared endpoint with by=model and is refreshed everywhere the by-key
+    # one is (rangedReload + window change + initial)
+    assert 'concurrency-by-key?metric=conc&by=model' in html
+    assert html.count("loadConcByModel()") >= 3
+    # reuses the generic stack renderer + its own empty-state element
+    assert 'id="conc-by-model-empty"' in html and "no per-model activity" in html
+
+
+def test_shared_core_module_dedups_api_across_pages_d3():
+    """REVIEW D-3: the byte-identical `api()` (its pan/zoom `end=` append drifted between ~9
+    per-page copies) is extracted to one self-hosted `aimon-core.js` that every page loads via
+    a CSP-clean <script src>. The inline copy is gone from every page."""
+    core = (ROOT / "web" / "assets" / "aimon-core.js").read_text(encoding="utf-8")
+    assert "async function api(path)" in core, "the shared api() must live in the module"
+    # the module guards TIMEEND so the Spend page (no pan cursor) doesn't ReferenceError
+    assert 'typeof TIMEEND!=="undefined"' in core
+    assert 'path.indexOf("window=")>=0' in core          # the pan/zoom end= append, once
+    for name in ("index", "gpu", "ollama", "llamacpp", "network", "vllm", "litellm", "spend"):
+        html = _page(name)
+        assert '<script src="/assets/aimon-core.js"></script>' in html, f"{name}: must load core"
+        assert "async function api(path)" not in html, f"{name}: inline api() must be removed"
+    # D-3 (rest): the per-page time-window + pan/zoom helpers (identical across every WIN page,
+    # a proven copy-paste drift source) are extracted to the same module. Each is defined ONCE
+    # in core and no longer redefined inline on any WIN page.
+    WIN_HELPERS = ("wsecs", "_winKey", "_winCustom", "_winSave", "_winRestore",
+                   "_winMark", "wlabel", "stampTs")
+    for fn in WIN_HELPERS:
+        assert core.count(f"function {fn}(") == 1, f"core: {fn}() must be defined exactly once"
+    assert "drag-to-zoom: drag across ANY chart" in core, "core: drag-zoom handler must live here"
+    for name in ("index", "gpu", "ollama", "llamacpp", "network", "vllm", "litellm"):
+        html = _page(name)
+        for fn in WIN_HELPERS:
+            assert f"function {fn}(" not in html, \
+                f"{name}: {fn}() must not be redefined inline (single source is aimon-core.js)"
+        # the page keeps only the CALL that supplies its own default window
+        assert '_winRestore("#windows"' in html, f"{name}: must still call the shared _winRestore"
+    # spend deliberately keeps its OWN coarser persistence, named _spWin* so it never clashes
+    sp = _page("spend")
+    for fn in WIN_HELPERS:
+        assert f"function {fn}(" not in sp, f"spend: {fn}() must not shadow the shared core"
+    assert "function _spWinRestore(" in sp, "spend: its own coarser persistence must be _spWin*"
+    # published (else it 404s on a fresh clone)
+    pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
+    assert "web/assets/aimon-core.js" in pub, "aimon-core.js must be in the publish ALLOW-list"
+
+
+def test_by_key_stack_cards_have_clickable_why_other_explainer():
+    """The stacked by-key/user/model cards get a clickable "why 'Other'?" link that opens a
+    popover explaining the attribution gap (measured aggregate vs per-entity activity from a
+    slower cadence) and names the active bands — so an operator can see why work landed in
+    'Other' instead of a specific model/user."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # the shared popover element + the link builder + its trigger from the renderer
+    assert 'id="other-pop"' in html, "shared Other popover element missing"
+    assert "function _wireWhyOther(" in html
+    assert "_wireWhyOther(cardId, d)" in html, "renderStackByKey must wire the explainer"
+    # link shows ONLY when an Other band actually exists
+    assert 'series.find(s=>s.label==="Other")' in html
+    assert '.whyother{' in html
+    # popover content: reads the server attribution summary, states the cadence reason,
+    # names the active bands, and distinguishes hidden-beyond-top-N from pure unattributed
+    assert "d.attribution" in html
+    assert "couldn’t be tied to a" in html
+    # names the models folded into Other (not just a count) — "models being used there"
+    assert "at.other_labels" in html and "Also in " in html
+    assert "polled every" in html and "~5s" in html
+    assert "Active " in html and "s here:" in html
+    # backend supplies the attribution summary the popover reads
+    src = (ROOT / "db.py").read_text(encoding="utf-8")
+    assert '"attribution":' in src and '"labels_total"' in src and '"shown"' in src
+
+
+def test_legend_full_names_info_recovers_truncated_labels():
+    """Long legend labels (key hashes / long model names) are truncated to first8…last4.
+    A clickable (i) per chart must reveal the FULL names. _legendFullRows (pure) recovers
+    them from each line/stacked dataset's `_k`, and from a bar chart's `$full` array —
+    returning only the entries that are actually truncated (short != full)."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    // line/stacked chart: full name on dataset._k, truncated on .label
+    const line = {data:{datasets:[
+      {_k:"vllm/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10", label:"vllm/Min…GB10"},
+      {_k:"short", label:"short"} ]}};
+    out.line = _legendFullRows(line, false);
+    // bar chart: full names parallel to data.labels on $full
+    const bar = {$full:["RodolfoSantos_ClaudeCode","x"], data:{labels:["Rodolfo…Code","x"]}};
+    out.bar = _legendFullRows(bar, true);
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    # only the truncated line entry is returned, with its full name
+    assert seen["line"] == [{"short": "vllm/Min…GB10",
+                             "full": "vllm/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10"}]
+    # only the truncated bar entry, full name from $full
+    assert seen["bar"] == [{"short": "Rodolfo…Code", "full": "RodolfoSantos_ClaudeCode"}]
+
+
+def test_every_truncating_chart_has_a_full_names_info():
+    """Every litellm chart whose legend truncates gets the (i) wired, and both bar charts
+    store the full names ($full) the (i) reads."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "function addLegendInfo(" in html and "function _legendFullRows(" in html
+    for cid in ("card-keys", "card-userkeys",                      # the by-requests bars
+                "card-keys-winspend", "card-userkeys-winspend", "card-keytime",
+                "card-keytime-win", "card-keydelta", "card-userdelta",
+                "card-conc-by-key", "card-conc-by-model", "card-backlog-by-key"):
+        assert '"' + cid + '"' in html, f"{cid} not wired to addLegendInfo"
+    # every bar chart must publish its full labels for the (i) — incl. the by-requests bars,
+    # whose y-axis truncates long key/owner names
+    for pub in ("keysChart.$full=", "userKeysChart.$full=",
+                "keysWinSpendChart.$full=", "userWinSpendChart.$full="):
+        assert pub in html, f"bar chart missing its full-label publish: {pub}"
+    # the popover goes through the sanitized shared helper (single-sink invariant)
+    assert "_showPop(ev, '<span class=\"x\">✕</span><h4>Full legend names" in html
+
+
+def test_gpu_appcpu_has_full_names_info():
+    """The GPU 'CPU usage by app' legend holds long process names. A clickable (i) lists
+    their full names via the sanitized sink (single-innerHTML-sink invariant preserved)."""
+    html = (ROOT / "web" / "gpu.html").read_text(encoding="utf-8")
+    assert "function addAppLegendInfo(" in html and "addAppLegendInfo();" in html
+    assert 'id="gpu-pop"' in html and ".appleg-i" in html
+    assert "appCpuChart.data.datasets" in html, "(i) must read the live app datasets"
+    # goes through the sanitized helper, not a raw second innerHTML sink
+    assert "_gShowPop(ev," in html and "setHtml(_gpop," in html
+    assert len(re.findall(r"innerHTML\s*=", html)) == 1, "gpu must keep ONE innerHTML sink"
+
+
+def test_shortlbl_truncation_lives_in_one_place():
+    """The first8…last4 truncation rule must exist exactly once, in aimon-core.js — not as
+    N hand-copied versions per page (litellm.html used to carry 3: keyLabel, _shortLbl,
+    keyDisp). Every page keeps working by calling the shared function."""
+    core = _core_js()
+    assert "function _shortLbl(" in core
+    assert 's.slice(0,head)+"…"+s.slice(-tail)' in core
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # litellm.html must no longer define its own copy of the slicing logic
+    assert html.count('s.slice(0,8)+"…"+s.slice(-4)') == 0, (
+        "litellm.html still hand-rolls the truncation instead of calling the shared _shortLbl()"
+    )
+    assert "function keyDisp(label){ return _shortLbl(label); }" in html
+
+
+def test_hover_reveals_full_name_on_every_truncating_litellm_chart():
+    """Every litellm.html chart that can show a shortened key/user/model name must reveal
+    the FULL name on mouseover — not require a click on a separate (i) icon. Bar charts do
+    this via a tooltip `title` callback reading `$full`; canvas-drawn legends (which have no
+    real DOM node for a native `title` attribute) do it via the shared wireLegendFullName()
+    hover-tooltip helper, keyed on each dataset's untruncated `_k`."""
+    core = _core_js()
+    for fn in ("showLblTip(", "hideLblTip(", "function wireLegendFullName("):
+        assert fn in core, f"aimon-core.js missing {fn}"
+
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # bar charts: tooltip title callback must read the chart's own $full array, not the
+    # (possibly truncated) axis label
+    for chart_var in ("keysChart", "userKeysChart"):
+        assert f"({chart_var}.$full||[])[i]" in html, (
+            f"{chart_var}'s tooltip must show the full name on hover, not the truncated label"
+        )
+    assert "(ch.$full||[])[i]" in html, "_mkSpendBar's tooltip must show the full name on hover"
+
+    # line/stacked charts: legend hover must be wired, keyed on the dataset's full name (_k)
+    for chart_var in ("keyTimeChart", "keyTimeWinChart", "keyDeltaChart", "userDeltaChart"):
+        assert f"wireLegendFullName({chart_var}," in html, (
+            f"{chart_var} legend has no hover-to-reveal-full-name wiring"
+        )
+    # the 3 mkStackByKey-built charts (conc-by-key/model, backlog-by-key) share one factory
+    assert "wireLegendFullName(ch," in html, "mkStackByKey charts have no legend hover wiring"
+
+    # the value tooltip (hovering the plotted line, not just the legend) should also show
+    # the full name — dataset._k falls back to dataset.label only when _k is absent
+    for cb in (
+        'label:c=>" "+(c.dataset._k||c.dataset.label)+": "+(_keytimeMetric',
+        'label:c=>" "+(c.dataset._k||c.dataset.label)+": "+(_keytimewinMetric',
+    ):
+        assert cb in html, "keytime tooltip must prefer the full name (_k) over the truncated label"
+
+
+def test_spend_truncated_text_has_title_fallback():
+    """spend.html has two places where text can be cut off with no other way to see the
+    rest: the 'keys used by X' detail-panel rows (CSS ellipsis) and the '(i) models could
+    not be priced' note (deliberately truncated to 3 names). Both need a `title` carrying
+    the untruncated text."""
+    html = (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
+    assert 'class="ck" title="${escapeHtml(k.key)}"' in html, (
+        "the 'keys used by X' row must carry the full key name as a title fallback"
+    )
+    assert 'title=\\""+escapeHtml(un.join(", "))+"' in html, (
+        "the unpriced-models note must carry the FULL list as a title, not just the first 3"
+    )
+
+
+def test_shortlbl_runtime_truncation_boundaries():
+    """RUNTIME proof of _shortLbl()'s exact behavior at its length boundaries — not just
+    that the function exists (the static test above), but that it truncates the right
+    strings the right way: keeps anything <=18 chars whole, shortens anything longer to
+    head(8)…tail(4), and never chokes on null/undefined/numeric input."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    out.shortUnchanged   = _shortLbl("exactly18chars12");     // 16 chars, under threshold
+    out.exactlyAtLimit   = _shortLbl("123456789012345678");   // exactly 18 chars, untouched
+    out.oneOverLimit     = _shortLbl("1234567890123456789");  // 19 chars, must truncate
+    out.longKeyHash      = _shortLbl("sk-abcdefghijklmnopqrstuvwxyz0123456789");
+    out.customHeadTail   = _shortLbl("abcdefghijklmnopqrstuvwxyz", 3, 2, 10);
+    out.nullish          = _shortLbl(null);
+    out.undef            = _shortLbl(undefined);
+    out.numeric          = _shortLbl(12345);
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert seen["shortUnchanged"] == "exactly18chars12"
+    assert seen["exactlyAtLimit"] == "123456789012345678", "exactly-18 must NOT be truncated (boundary is >18, not >=18)"
+    assert seen["oneOverLimit"] == "12345678…6789", "19 chars must truncate to head(8)…tail(4)"
+    assert seen["longKeyHash"] == "sk-abcde…6789"
+    assert seen["customHeadTail"] == "abc…yz", "custom head/tail/threshold args must be honored"
+    assert seen["nullish"] == "?"
+    assert seen["undef"] == "?"
+    assert seen["numeric"] == "12345"
+
+
+def test_bar_chart_tooltip_title_shows_full_name_runtime():
+    """RUNTIME proof: hovering a truncated bar (keysChart, userKeysChart, and both windowed
+    spend bars built by _mkSpendBar) must show the FULL key/user name in the tooltip title,
+    not Chart.js's default (the truncated axis label already sitting in data.labels)."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    function titleFor(chart, dataIndex, fallbackLabel){
+      const cb = chart.options.plugins.tooltip.callbacks.title;
+      return cb([{ dataIndex, label: fallbackLabel }]);
+    }
+    keysChart.$full = ["a-very-long-api-key-alias-that-got-truncated"];
+    keysChart.data.labels = ["a-very-l…ated"];
+    out.keys = titleFor(keysChart, 0, "a-very-l…ated");
+
+    userKeysChart.$full = ["someone.with.a.long.username"];
+    userKeysChart.data.labels = ["someone.…name"];
+    out.userKeys = titleFor(userKeysChart, 0, "someone.…name");
+
+    keysWinSpendChart.$full = ["sk-anotherlongkeyhashvalue"];
+    keysWinSpendChart.data.labels = ["sk-anoth…alue"];
+    out.keysWinSpend = titleFor(keysWinSpendChart, 0, "sk-anoth…alue");
+
+    userWinSpendChart.$full = ["yet.another.long.user.email"];
+    userWinSpendChart.data.labels = ["yet.anot…mail"];
+    out.userWinSpend = titleFor(userWinSpendChart, 0, "yet.anot…mail");
+
+    // falls back to the label when $full has nothing for that index (out-of-range / unset)
+    keysChart.$full = [];
+    out.fallback = titleFor(keysChart, 0, "some-fallback-label");
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert seen["keys"] == "a-very-long-api-key-alias-that-got-truncated"
+    assert seen["userKeys"] == "someone.with.a.long.username"
+    assert seen["keysWinSpend"] == "sk-anotherlongkeyhashvalue"
+    assert seen["userWinSpend"] == "yet.another.long.user.email"
+    assert seen["fallback"] == "some-fallback-label", "must fall back to the axis label, not crash or show 'undefined'"
+
+
+def test_legend_hover_shows_full_name_only_when_truncated_runtime():
+    """RUNTIME proof of wireLegendFullName(): hovering a legend entry whose displayed text
+    differs from its dataset's full name (_k) must show the floating tooltip with the full
+    name; hovering one that ISN'T truncated (full === shown) must show nothing; leaving
+    must always hide it. Exercises the real onHover/onLeave Chart.js wires into
+    keyTimeChart, keyDeltaChart, and the shared mkStackByKey charts (conc-by-key)."""
+    seen = _probe_page_js("litellm.html", r"""
+    const out = {};
+    const fakeEvt = { native: { clientX: 100, clientY: 50 } };
+    function hoverAndRead(chart, datasetIndex, text){
+      chart.data.datasets[datasetIndex] = Object.assign(
+        {}, chart.data.datasets[datasetIndex], {});
+      chart.options.plugins.legend.onHover(fakeEvt, { text, datasetIndex }, {});
+      return { shown: _lblTipEl.style.display, text: _lblTipEl.textContent };
+    }
+    function leaveAndRead(chart, datasetIndex, text){
+      chart.options.plugins.legend.onLeave(fakeEvt, { text, datasetIndex }, {});
+      return _lblTipEl.style.display;
+    }
+
+    keyTimeChart.data.datasets = [{ _k: "alice@example.com (long alias)", label: "alice@e…lias)" }];
+    out.truncatedHover = hoverAndRead(keyTimeChart, 0, "alice@e…lias)");
+    out.truncatedLeave = leaveAndRead(keyTimeChart, 0, "alice@e…lias)");
+
+    keyDeltaChart.data.datasets = [{ _k: "short-key", label: "short-key" }];
+    out.untruncatedHover = hoverAndRead(keyDeltaChart, 0, "short-key");
+
+    // shared mkStackByKey factory (conc-by-key-chart) — must be wired the same way
+    concByKeyChart.data.datasets = [{ _k: "vllm/A-Very-Long-Model-Name-Here", label: "vllm/A-…Here" }];
+    out.stackedHover = hoverAndRead(concByKeyChart, 0, "vllm/A-…Here");
+
+    console.log("PROBE:" + JSON.stringify(out));
+    """)
+    assert seen["truncatedHover"]["shown"] == "block", "hovering a truncated legend entry must show the tooltip"
+    assert seen["truncatedHover"]["text"] == "alice@example.com (long alias)", "tooltip must show the FULL name, not the truncated one"
+    assert seen["truncatedLeave"] == "none", "leaving the legend entry must hide the tooltip"
+    assert seen["untruncatedHover"]["shown"] == "none", "an already-full label must not pop a redundant tooltip"
+    assert seen["stackedHover"]["shown"] == "block" and seen["stackedHover"]["text"] == "vllm/A-Very-Long-Model-Name-Here", (
+        "mkStackByKey-built charts (conc-by-key/model, backlog-by-key) must get the same hover wiring"
+    )

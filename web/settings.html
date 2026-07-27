@@ -129,12 +129,23 @@
      column — an `auto` actions track would be 0-wide in the header (empty) but ~64px in a
      row, so the `1fr` name column would absorb different slack and the numeric columns would
      not line up between header and rows. A fixed 64px keeps both grids identical. */
-  .srow.tmodel,.mhdr{grid-template-columns:minmax(80px,1fr) 92px 58px 58px 58px 72px 64px;
-    column-gap:9px}
+  /* 6 columns: name · kind · in · out · cch · actions. The effective blended cost lives in
+     the model-name click popover, so it isn't a column here — that keeps the ✓/↺ actions
+     visible even in the narrow right-hand card. #models scrolls horizontally as a last
+     resort so the actions are always reachable if the card is dragged narrower still. */
+  #models{overflow-x:auto}
+  .srow.tmodel,.mhdr{grid-template-columns:minmax(68px,1fr) 86px 58px 58px 58px 54px;
+    column-gap:7px;min-width:420px}
   .srow.tmodel{display:grid;align-items:center}
   .mhdr{display:grid;font-size:9px;text-transform:uppercase;letter-spacing:.04em;
     color:var(--muted);padding:1px 0 5px;border-bottom:1px solid var(--line)}
   .mhdr .r{text-align:right}
+  .mhdr .tiplbl{cursor:pointer}
+  .mhdr .tiplbl:hover{color:var(--accent);text-decoration:underline dotted}
+  /* editable per-type rate inputs: right-aligned, compact, full column width */
+  .srow.tmodel input.mrate{width:100%;text-align:right;font-size:11px;padding:2px 3px;
+    font-variant-numeric:tabular-nums}
+  .srow.tmodel input.mrate.mod{border-color:var(--warn);color:var(--warn)}
   .srow.tmodel .lbl{flex:none;max-width:none}                 /* the grid owns the widths now */
   .srow.tmodel select.min{max-width:none;width:100%}
   .srow.tmodel .mcv{font-size:12px;font-variant-numeric:tabular-nums;color:var(--fg);
@@ -284,7 +295,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.6</div>
+      <div id="sidebar-brand-ver">v1.8.9</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -329,6 +340,8 @@
       <h2 id="sec-models" style="display:flex;align-items:center;gap:6px">
         <span id="models-info" class="cardinfo" tabindex="0" role="button"
               title="Click for info about this card">Model costs <span class="ci-i">ⓘ</span></span>
+        <button id="models-refresh" type="button" class="btn-refresh"
+                style="margin-left:auto">Refresh from LiteLLM</button>
       </h2>
       <div id="models"></div>
     </section>
@@ -610,7 +623,7 @@
       var apply=function(hide){
         if(hide===_hideUnassigned) return;              // already in that state
         bShow.disabled=bHide.disabled=true;
-        post({HIDE_UNASSIGNED_KEYS: hide?"1":"0"}).then(function(r){
+        post({action:"set",name:"HIDE_UNASSIGNED_KEYS",value:hide?"1":"0"}).then(function(r){
           bShow.disabled=bHide.disabled=false;
           if(!r.ok){flash("bad","could not change unassigned visibility");return;}
           _hideUnassigned=hide; paint();
@@ -977,12 +990,40 @@
     setTimeout(function(){ document.addEventListener("click",_mpopOut,true);
       document.addEventListener("keydown",_mpopKey); window.addEventListener("resize",closeMPop); },0);
   }
+  // Small click-popover for the in/out/cch/eff column labels — reuses the model-info
+  // popover lifecycle (closeMPop / outside-click / Esc).
+  function showTip(title, body, anchor){
+    closeMPop();
+    var p=document.createElement("div"); p.className="mpop"; p.setAttribute("role","dialog");
+    var h=document.createElement("h4"); h.textContent=title; p.appendChild(h);
+    var d=document.createElement("div"); d.style.fontSize="12px"; d.style.lineHeight="1.5";
+    d.style.maxWidth="300px"; d.textContent=body; p.appendChild(d);
+    document.body.appendChild(p);
+    var rc=anchor.getBoundingClientRect(), pw=p.offsetWidth, ph=p.offsetHeight;
+    var left=Math.min(rc.left, window.innerWidth-pw-8);
+    var top=(rc.bottom+6+ph>window.innerHeight-8)?(rc.top-ph-6):(rc.bottom+6);
+    p.style.left=Math.max(8,left)+"px"; p.style.top=Math.max(8,top)+"px"; _mpop=p;
+    setTimeout(function(){ document.addEventListener("click",_mpopOut,true);
+      document.addEventListener("keydown",_mpopKey); window.addEventListener("resize",closeMPop); },0);
+  }
   function postModel(params){
     return fetch("/api/admin/model-kinds",{method:"POST",
       headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":CSRF},
       body:new URLSearchParams(params).toString()})
       .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
   }
+  // Explanations for the IN / OUT / CCH columns — shared by the column header and every
+  // row's cell, so hovering either one explains the concept the same way.
+  var MCOL_TIP={
+    in: "Input — cost per 1M PROMPT tokens ("+CUR+"/1M): everything you SEND to the model — "
+      +"system prompt, conversation history, the user's message.",
+    out: "Output — cost per 1M COMPLETION tokens ("+CUR+"/1M): what the model GENERATES in its "
+      +"response. Usually priced higher than input.",
+    cache: "Cache read — cost per 1M tokens served from a PROMPT-CACHE hit ("+CUR+"/1M): a "
+      +"repeated/shared prefix (e.g. the same system prompt) reused from an earlier call instead "
+      +"of being reprocessed. Usually much cheaper than a fresh input token; "+CUR+"0 or blank "
+      +"means this model/provider doesn't report prompt-caching pricing."
+  };
   function modelRow(m){
     // compact one-line row: model · kind select · ✓ · ↺; auto-detect + priced in tooltip.
     var row=document.createElement("div"); row.className="srow tmodel";
@@ -1009,27 +1050,34 @@
     // Each is its OWN right-aligned grid cell so the columns line up down the card; the
     // header (.mhdr, built in loadModels) labels them once — no per-cell label to jumble
     // the row. Read-only breakdown that REPLACES the single summed blend (which read double).
-    function mcell(v){
-      var vv=document.createElement("span"); vv.className="mcv"+(v==null?" dash":"");
-      vv.title="LiteLLM price per 1M tokens";
-      vv.textContent=(v==null?"—":CUR+(+v).toLocaleString(undefined,{maximumFractionDigits:4}));
-      return vv;
+    // EDITABLE per-type rate cell ($ per 1M tokens). Blank = follow LiteLLM's own price;
+    // a value pins that rate. Pinned cells are highlighted; the placeholder shows LiteLLM's
+    // current rate as a hint so you know what you're overriding.
+    function mcellEdit(v,tip,pinned){
+      var inp=document.createElement("input"); inp.type="number"; inp.className="min mrate";
+      inp.step="any"; inp.min="0"; inp.title=tip;
+      if(v!=null){ inp.value=(+v); }
+      inp.placeholder=(v==null?"—":"= "+(+v).toLocaleString(undefined,{maximumFractionDigits:4}));
+      if(pinned) inp.classList.add("mod");
+      return inp;
     }
-    var cost=document.createElement("input"); cost.type="number"; cost.className="min mcost";
-    cost.step="any"; cost.min="0"; cost.style.width="62px";
-    cost.title="Cost override — "+CUR+" per 1M tokens. Pins this model's blended cost when "
-      +"LiteLLM's price is wrong/unreliable. Leave blank to use LiteLLM's own price (the 3 rates).";
-    if(m.cost_1m!=null){ cost.value=m.cost_1m; if(m.cost_overridden) cost.classList.add("mod"); }
-    else cost.placeholder="pin";                              // 3 cells show the live rates now
-    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓"; save.title="Save kind + cost";
+    var inC=mcellEdit(m.in_1m, MCOL_TIP.in, m.in_pinned);
+    var outC=mcellEdit(m.out_1m, MCOL_TIP.out, m.out_pinned);
+    var cacheC=mcellEdit(m.cache_1m, MCOL_TIP.cache, m.cache_pinned);
+    var save=document.createElement("button"); save.className="ib save"; save.type="button"; save.textContent="✓";
+    save.title="Confirm — save this model's kind + edited in/out/cache rates";
     function say(txt,good){ save.classList.remove("ok","bad"); if(txt)save.classList.add(good?"ok":"bad");
-      save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Save";},1600); }
-    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺"; reset.title="Reset kind + cost to auto";
+      save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Confirm — save kind + rates";},1600); }
+    var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺";
+    reset.title="Reset to LiteLLM — drop this model's rate + kind overrides";
     save.addEventListener("click",function(){
-      var cv=cost.value.trim();
+      var vi=inC.value.trim(), vo=outC.value.trim(), vc=cacheC.value.trim();
       var jobs=[postModel({action:"set",model:m.model,kind:sel.value})];
-      if(cv!=="") jobs.push(postModel({action:"cost",model:m.model,usd_1m:cv}));
-      else if(m.cost_1m!=null) jobs.push(postModel({action:"cost_reset",model:m.model})); // cleared field → drop override
+      if(vi!==""||vo!==""||vc!==""){
+        jobs.push(postModel({action:"cost",model:m.model,in_1m:vi,out_1m:vo,cache_1m:vc}));
+      }else if(m.in_pinned||m.out_pinned||m.cache_pinned||m.cost_1m!=null){
+        jobs.push(postModel({action:"cost_reset",model:m.model})); // all cleared → drop override
+      }
       Promise.all(jobs).then(function(rs){
         if(rs.some(function(r){return !r.ok;})){say((rs.find(function(r){return !r.ok;}).j||{}).error||"save failed",false);return;}
         say("saved",true); setTimeout(loadModels,900);
@@ -1042,39 +1090,70 @@
         say("reset",true); setTimeout(loadModels,900);
       }).catch(function(){say("reset failed",false);});
     });
-    // grid children, in column order: name · kind · in · out · cache · override · actions
+    // grid children, in column order: name · kind · in · out · cache · actions
     row.appendChild(sel);
-    row.appendChild(mcell(m.in_1m)); row.appendChild(mcell(m.out_1m)); row.appendChild(mcell(m.cache_1m));
-    row.appendChild(cost);
+    row.appendChild(inC);
+    row.appendChild(outC);
+    row.appendChild(cacheC);
     var acts=document.createElement("div"); acts.className="macts";
     acts.appendChild(save); acts.appendChild(reset);
     row.appendChild(acts);
     return row;
   }
-  function loadModels(){
-    fetch("/api/admin/model-kinds").then(function(r){return r.ok?r.json():null;}).then(function(d){
-      var el=document.getElementById("models"); el.textContent="";
-      if(!d){el.textContent="Model costs are admin-only.";return;}
-      var ms=d.models||[];
+  function loadModels(force){
+    var rb=document.getElementById("models-refresh");
+    if(force&&rb){ rb.disabled=true; rb.textContent="Refreshing…"; }
+    function _mflag(txt){ if(!rb) return; rb.textContent=txt;
+      setTimeout(function(){ rb.textContent="Refresh from LiteLLM"; },1600); }
+    // ?refresh=1 asks the server to re-pull prices from LiteLLM (bypass the last-good cache)
+    fetch("/api/admin/model-kinds"+(force?"?refresh=1":"")).then(function(r){
+      return r.ok?r.json():Promise.reject(new Error("http "+r.status));
+    }).then(function(d){
+      if(rb){ rb.disabled=false; rb.textContent="Refresh from LiteLLM"; }
+      var el=document.getElementById("models");
+      var ms=(d&&d.models)||[];
+      // NEVER blank the card before the data is in hand. Previously el was cleared first, then
+      // a slow / empty / flaky re-pull (or a swallowed fetch error) left the whole card blank
+      // until a full page reload — clicking one row's refresh wiped every value. Build the new
+      // content in a fragment and swap it in ONE go; an empty result keeps the values on screen.
       if(!ms.length){
-        el.textContent=d.error?("No models — "+d.error):"No models seen yet — configure LITELLM_BASE_URL / LITELLM_MASTER_KEY.";
+        if(el.firstChild){ _mflag("Refresh: no data — kept values"); return; }  // don't wipe
+        el.textContent=(d&&d.error)?("No models — "+d.error)
+          :"No models seen yet — configure LITELLM_BASE_URL / LITELLM_MASTER_KEY.";
         return;
       }
+      var frag=document.createDocumentFragment();
       var nReal=ms.filter(function(m){return m.kind==="real";}).length;
       var hd=document.createElement("div"); hd.className="tsumhd";
       hd.textContent=ms.length+" model"+(ms.length>1?"s":"")+" · "+nReal+" real, "+(ms.length-nReal)+" estimated";
-      el.appendChild(hd);
+      frag.appendChild(hd);
       // column header — labels the in/out/cache/override columns ONCE so the rows stay clean
       var mh=document.createElement("div"); mh.className="mhdr";
       [["Model",""],["Kind",""]].forEach(function(p){
         var s=document.createElement("span"); s.textContent=p[0]; mh.appendChild(s); });
-      [["in","input"],["out","output"],["cch","cache-read"],["override","pin a blended rate"]].forEach(function(p){
-        var s=document.createElement("span"); s.className="r"; s.textContent=p[0];
-        s.title=p[1]+" — "+CUR+" per 1M tokens"; mh.appendChild(s); });
+      // in/out/cch/eff labels are CLICKABLE — click opens the full explanation (the row
+      // rates are editable; eff is the read-only blended cost the spend charts use).
+      [["in","Input rate ("+CUR+"/1M)",MCOL_TIP.in],
+       ["out","Output rate ("+CUR+"/1M)",MCOL_TIP.out],
+       ["cch","Cache-read rate ("+CUR+"/1M)",MCOL_TIP.cache]
+      ].forEach(function(p){
+        var s=document.createElement("span"); s.className="r tiplbl"; s.textContent=p[0];
+        s.title=p[2]+"\n(click for details)"; s.setAttribute("role","button"); s.tabIndex=0;
+        s.addEventListener("click",function(e){ e.stopPropagation(); showTip(p[1],p[2],s); });
+        s.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); showTip(p[1],p[2],s); } });
+        mh.appendChild(s); });
       mh.appendChild(document.createElement("span"));      // actions column (no header)
-      el.appendChild(mh);
-      ms.forEach(function(m){ el.appendChild(modelRow(m)); });
-    }).catch(function(){});
+      frag.appendChild(mh);
+      ms.forEach(function(m){ frag.appendChild(modelRow(m)); });
+      el.textContent=""; el.appendChild(frag);             // atomic swap — no blank flash / wipe
+    }).catch(function(){
+      if(rb){ rb.disabled=false; }
+      var el=document.getElementById("models");
+      // transient / auth error on refresh: keep whatever values are on screen. Only show the
+      // admin-only hint when the card was empty to begin with (first load, genuinely not admin).
+      if(!el.firstChild){ el.textContent="Model costs are admin-only."; }
+      else { _mflag("Refresh failed — kept values"); }
+    });
   }
 
   var _rb=document.getElementById("teams-refresh");
@@ -1085,6 +1164,8 @@
   var _mi=document.getElementById("models-info");
   if(_mi){ _mi.addEventListener("click",openModelsInfo);
     _mi.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){e.preventDefault();openModelsInfo();} }); }
+  var _mr=document.getElementById("models-refresh");
+  if(_mr) _mr.addEventListener("click",function(){ loadModels(true); });
   var _si=document.getElementById("settings-info");
   if(_si){ _si.addEventListener("click",openSettingsInfo);
     _si.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){e.preventDefault();openSettingsInfo();} }); }

@@ -4852,6 +4852,145 @@ def test_model_cost_price_db_roundtrip():
     assert "extern/model-a" not in db.model_cost_prices()
 
 
+def test_fold_model_token_types_splits_input_cached_output():
+    """1.8.8: /spend/logs fold splits per model into uncached-input / cached / output, honors
+    the window start, drops the monitor's health-check key, and extracts cached tokens from
+    either `cache_read_input_tokens` or `prompt_tokens_details.cached_tokens`."""
+    import datetime as _dt
+    start = _dt.datetime(2026, 7, 15, tzinfo=_dt.timezone.utc).timestamp()
+    rows = [
+        # cached via top-level field: input = 1000-600 = 400, cached 600, output 200
+        {"startTime": "2026-07-20T10:00:00Z", "model": "m1", "prompt_tokens": 1000,
+         "completion_tokens": 200, "cache_read_input_tokens": 600, "api_key": "k1"},
+        # cached via prompt_tokens_details: input = 500-400 = 100, cached 400, output 100
+        {"startTime": "2026-07-21T10:00:00Z", "model": "m1", "prompt_tokens": 500,
+         "completion_tokens": 100, "prompt_tokens_details": {"cached_tokens": 400},
+         "api_key": "k1"},
+        # BEFORE the window → excluded entirely
+        {"startTime": "2026-07-01T10:00:00Z", "model": "m1", "prompt_tokens": 9999,
+         "completion_tokens": 9999, "api_key": "k1"},
+        # health-check pseudo-key → dropped
+        {"startTime": "2026-07-20T11:00:00Z", "model": "m1", "prompt_tokens": 50,
+         "completion_tokens": 5, "api_key": "sk-litellm-service-account-health-check"},
+    ]
+    agg = litellm._fold_model_token_types(rows, start)
+    assert agg["m1"] == {"input": 500, "cached": 1000, "output": 300, "total": 1800}
+
+
+def test_row_cached_tokens_never_counts_cache_creation():
+    """Cache-CREATION tokens are a write, not a read — they must NOT land in the cached (read)
+    bucket, which maps to the discounted cached-input meter."""
+    assert litellm._row_cached_tokens({"cache_creation_input_tokens": 999}) == 0
+    assert litellm._row_cached_tokens({"cache_read_input_tokens": 42}) == 42
+    assert litellm._row_cached_tokens(
+        {"metadata": {"prompt_tokens_details": {"cached_tokens": 7}}}) == 7
+    assert litellm._row_cached_tokens({}) == 0
+
+
+def test_blend_1m_is_volume_weighted_when_volumes_given():
+    """The per-type→blended derivation is total-cost ÷ total-tokens when volumes are supplied
+    (so usd_1m·total matches the bill), and the legacy naive (in+out)/2 average otherwise."""
+    # expensive output (30/1M) but tiny output volume → weighted ≈ input/cache dominated
+    w = db._blend_1m(3.75, 30.0, 0.375, 445_000, 87_000, 7_090_000)
+    assert w == pytest.approx(0.910, abs=0.01)
+    # naive fallback (no volumes) over-weights output massively — the bug this guards
+    assert db._blend_1m(3.75, 30.0) == pytest.approx(16.875)
+    # single-sided naive: only input priced
+    assert db._blend_1m(2.0, 0.0) == pytest.approx(2.0)
+
+
+def test_model_cost_price_set_volume_weighted_usd_1m():
+    """Pinning per-type rates WITH volumes stores a volume-weighted usd_1m (what the cost
+    pipeline reads); the same rates WITHOUT volumes fall back to the naive average."""
+    db.init()
+    db.model_cost_price_delete("extern/vw")
+    ok = db.model_cost_price_set("extern/vw", 0.0, time.time(),
+                                 in_1m="3.75", out_1m="30", cache_1m="0.375",
+                                 vol_in="445000", vol_out="87000", vol_cache="7090000")
+    assert ok is True
+    assert db.model_cost_prices()["extern/vw"] == pytest.approx(0.910, abs=0.01)
+    det = db.model_cost_details()["extern/vw"]
+    assert (det["in"], det["out"], det["cache"]) == (3.75, 30.0, 0.375)
+    # without volumes → naive (in+out)/2
+    db.model_cost_price_set("extern/vw", 0.0, time.time(), in_1m="3.75", out_1m="30")
+    assert db.model_cost_prices()["extern/vw"] == pytest.approx(16.875)
+    db.model_cost_price_delete("extern/vw")
+
+
+async def test_per_model_token_types_endpoint(monkeypatch):
+    """GET /api/admin/model-token-types (admin-gated) returns the per-model input/cached/output
+    split from the collector; available=False when the pull yields None."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_ENABLED", True)
+
+    seen = {}
+
+    async def _fake(session, start_date, end_date=None):
+        seen["start"], seen["end"] = start_date, end_date
+        return {"per_model": {"azure_ai/m": {"input": 400, "cached": 600,
+                                             "output": 200, "total": 1200}},
+                "days_ok": 3, "total_days": 3, "days_failed": []}
+    monkeypatch.setattr(litellm, "per_model_token_types", _fake)
+    c, _csrf = await _admin_client(monkeypatch)
+    try:
+        # explicit ?start=/?end= are honored verbatim (match an invoice's exact billing window)
+        r = await c.get("/api/admin/model-token-types?start=2026-07-15&end=2026-07-24")
+        assert r.status == 200
+        body = await r.json()
+        assert seen["start"] == "2026-07-15" and seen["end"] == "2026-07-24"
+        assert body["start_date"] == "2026-07-15" and body["end_date"] == "2026-07-24"
+        assert body["available"] is True and body["diag"]["days_ok"] == 3
+        assert body["models"][0] == {"model": "azure_ai/m", "input": 400, "cached": 600,
+                                     "output": 200, "total": 1200}
+
+        # all days failed → available False but diag surfaces the reason
+        async def _allfail(session, start_date, end_date=None):
+            return {"per_model": {}, "days_ok": 0, "total_days": 2,
+                    "days_failed": [{"day": "2026-07-15", "err": "too_big:>67108864"}]}
+        monkeypatch.setattr(litellm, "per_model_token_types", _allfail)
+        r2 = await c.get("/api/admin/model-token-types?start=2026-07-15")
+        b2 = await r2.json()
+        assert b2["available"] is False
+        assert b2["diag"]["days_failed"][0]["err"].startswith("too_big")
+
+        async def _none(session, start_date, end_date=None):
+            return None
+        monkeypatch.setattr(litellm, "per_model_token_types", _none)
+        r3 = await c.get("/api/admin/model-token-types?window=month")
+        assert (await r3.json())["available"] is False
+    finally:
+        await c.close()
+
+
+async def test_per_model_token_types_chunks_by_day_and_surfaces_failures(monkeypatch):
+    """The collector pulls /spend/logs ONE DAY AT A TIME (start_date=D&end_date=D), sums across
+    days, and records a day whose pull errors (byte cap / timeout) instead of aborting all."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    calls = []
+    # day 1 ok (1 row), day 2 byte-capped, day 3 ok (1 row)
+    payloads = {
+        "2026-07-15": b'[{"startTime":"2026-07-15T09:00:00Z","model":"m","prompt_tokens":100,'
+                      b'"completion_tokens":20,"cache_read_input_tokens":40,"api_key":"k"}]',
+        "2026-07-17": b'[{"startTime":"2026-07-17T09:00:00Z","model":"m","prompt_tokens":200,'
+                      b'"completion_tokens":50,"api_key":"k"}]',
+    }
+
+    async def _fake_fetch(session, url, headers, timeout_s, max_bytes):
+        day = url.split("start_date=")[1].split("&")[0]
+        calls.append(day)
+        if day == "2026-07-16":
+            return None, "too_big:>67108864"
+        return payloads.get(day, b"[]"), None
+    monkeypatch.setattr(litellm, "_fetch_spend_raw", _fake_fetch)
+    res = await litellm.per_model_token_types(None, "2026-07-15", "2026-07-17")
+    assert calls == ["2026-07-15", "2026-07-16", "2026-07-17"]      # one call per day
+    assert res["days_ok"] == 2 and res["total_days"] == 3
+    assert res["days_failed"] == [{"day": "2026-07-16", "err": "too_big:>67108864"}]
+    # summed across the two good days: in=(100-40)+200=260, cached=40, out=20+50=70
+    assert res["per_model"]["m"] == {"input": 260, "cached": 40, "output": 70, "total": 370}
+
+
 def test_model_cost_overrides_db_beats_env(monkeypatch):
     """The Settings-page (DB) cost override wins over the MONITOR_MODEL_COSTS env value."""
     db.init()
@@ -5167,6 +5306,74 @@ async def test_team_override_get_set_reset(monkeypatch):
         assert "langgraph-agent" not in db.team_overrides()
     finally:
         await c.close()
+
+
+def test_budgets_applies_user_override_so_by_user_charts_name_the_owner(monkeypatch):
+    """Regression: a key reassigned to a user on the Settings board (db.key_user_overrides)
+    showed correctly on the board but fell into "Unassigned" on the /litellm by-user charts.
+    Those charts build their owner map ONLY from /api/budgets' `email` field, and budgets_handler
+    applied the TEAM override but not the USER override (the board applied both). So a manual
+    reassignment — or a key whose live /user/list email blipped empty — never reached the charts.
+    `_apply_user_overrides` now overlays it on the budgets path too, keyed on the same canonical
+    label the board uses, so the two can no longer diverge."""
+    monkeypatch.setattr(db, "key_user_overrides",
+                        lambda: {"kA": "pedro.tarrinho@example.com"})
+    # kA has a BLANK live owner (the exact "live resolution came back empty" case); kB is untouched
+    keys = [{"alias": "kA", "user_name": ""},
+            {"alias": "kB", "user_name": "sam@example.com"}]
+    appmod._apply_user_overrides(keys)
+    assert keys[0]["user_name"] == "pedro.tarrinho@example.com", "override must name the owner"
+    assert keys[1]["user_name"] == "sam@example.com", "un-overridden key keeps its live owner"
+    # and it surfaces as the budget row's `email` — the exact field buildKeyUser() reads, so the
+    # by-user charts now group kA under pedro.tarrinho instead of "Unassigned".
+    rows = litellm.budget_rows(keys, {}, 1, 30)
+    email_of = {r["key"]: r["email"] for r in rows}
+    assert email_of.get("kA") == "pedro.tarrinho@example.com", \
+        f"reassigned key would still show Unassigned in the charts: {email_of}"
+    assert email_of.get("kB") == "sam@example.com"
+
+
+def test_stored_owner_name_survives_a_user_list_blip_and_backs_budgets_fallback():
+    """Resilience: LiteLLM's /user/list is flaky, so a key that IS owned can carry a BLANK live
+    email on a given poll — and the by-user charts would then drop it to "Unassigned" for that
+    view. known_keys now persists the resolved owner EMAIL (owner_name), HELD through such a blip
+    (cleared only when the owner id itself clears via the streak), and budgets_handler falls back
+    to it. Mirrors the streak-buffered resilience the by-key path already has for the owner id."""
+    db.init()
+    labs = ("blipA", "blipB")
+
+    def _clear():
+        with db._connect() as conn:
+            conn.execute("DELETE FROM known_keys WHERE label IN (?,?)", labs)
+
+    _clear()
+    try:
+        t = 1_000_000.0
+        # a good poll: blipA resolves owner-id + email; blipB is owned but LiteLLM gave no email
+        db.known_keys_upsert({"blipA": "uid-A", "blipB": "uid-B"}, t,
+                             {"blipA": "pedro.tarrinho@example.com", "blipB": ""})
+        assert db.known_owner_names().get("blipA") == "pedro.tarrinho@example.com"
+        assert "blipB" not in db.known_owner_names()          # no email → nothing to persist
+        # next poll: blipA's live email blips EMPTY while its owner-id is still present → name HELD
+        db.known_keys_upsert({"blipA": "uid-A"}, t + 60, {"blipA": ""})
+        assert db.known_owner_names().get("blipA") == "pedro.tarrinho@example.com", \
+            "a one-off /user/list blip must not blank the persisted owner name"
+        # budgets fallback: a key whose live user_name is empty gets the stored email (blipB, which
+        # never had a name, stays empty → still 'Unassigned', correctly)
+        keys = [{"alias": "blipA", "user_name": ""}, {"alias": "blipB", "user_name": ""}]
+        appmod._apply_stored_owner_names(keys)
+        assert keys[0]["user_name"] == "pedro.tarrinho@example.com", "owned key must not read Unassigned on a blip"
+        assert keys[1]["user_name"] == "", "a key with no known email stays unnamed"
+        # a resolved live name is NEVER overridden by the fallback (precedence: override > live > stored)
+        keys2 = [{"alias": "blipA", "user_name": "fresh@example.com"}]
+        appmod._apply_stored_owner_names(keys2)
+        assert keys2[0]["user_name"] == "fresh@example.com"
+        # when the owner truly clears (streak met), the persisted name clears too — no stale owner
+        for i in range(db.OWNER_BLANK_THRESHOLD + 1):
+            db.known_keys_upsert({"blipA": ""}, t + 120 + i, {"blipA": ""})
+        assert "blipA" not in db.known_owner_names(), "a genuinely un-assigned key must not keep a stale name"
+    finally:
+        _clear()          # don't leak blipA/blipB into the shared known_keys table
 
 
 async def test_teams_detection_cached_and_sticky(monkeypatch):
@@ -7759,6 +7966,53 @@ async def test_model_prices_averages_input_output_not_doubled(monkeypatch):
     assert abs(p["real"] - 1.8e-6) < 1e-15         # (1.4+2.2)/2 e-6
 
 
+async def test_model_kinds_in_out_cache_survive_a_provider_prefix_mismatch(monkeypatch):
+    """The Settings model-costs card's IN/OUT/CCH columns read permanently blank live, even
+    for models LiteLLM clearly prices (a nonzero eff_cost_1m). Root cause: model_prices()
+    (which price_for() reads, tolerant of provider/model prefixes) and model_price_detail()
+    key their dicts differently — LiteLLM's own /model/info model_name doesn't always carry
+    the same prefix as the canonical name used elsewhere (activity reports, prices). The
+    handler's old `detail.get(name)` was an EXACT lookup with no such tolerance, so it
+    silently returned {} whenever the two disagreed — which, live, was every single model.
+    Reproduces that exact mismatch: prices/activity use the prefixed name, detail uses the
+    bare one (as LiteLLM's /model/info often does for a custom/Azure deployment)."""
+    monkeypatch.setattr(appmod, "_litellm_configured", lambda: True)
+    NAME = "azure_ai/gpt-5-mini"          # what prices/activity/the models list all use
+    BARE = "gpt-5-mini"                    # what /model/info's model_name actually is here
+
+    async def _prices(_s):
+        return {NAME: 0.194e-6}
+
+    async def _detail(_s):                 # keyed by the BARE name — the live mismatch
+        return {BARE: {"in": 0.1, "out": 0.3, "cache": 0.02}}
+
+    async def _range(_s, *a, **k):
+        return [{"model": NAME, "tokens": 1_000_000, "reqs": 5}]
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "model_price_detail", _detail)
+    monkeypatch.setattr(litellm, "per_model_range", _range)
+    db.init()
+    c = await _client()
+    try:
+        d = await (await c.get("/api/admin/model-kinds")).json()
+        m = next(x for x in d["models"] if x["model"] == NAME)
+        assert m["in_1m"] == 0.1 and m["out_1m"] == 0.3 and m["cache_1m"] == 0.02, (
+            f"prefix-mismatched detail lookup lost the per-type rates: {m}")
+    finally:
+        await c.close()
+
+
+def test_detail_for_is_prefix_tolerant_like_price_for():
+    """Unit-level pin of the tolerant lookup itself, mirroring the existing price_for()
+    tolerance test — both directions (bare query / prefixed dict key, and vice versa)."""
+    detail = {"azure_ai/gpt-5-mini": {"in": 1.0, "out": 2.0, "cache": 0.1}}
+    assert litellm.detail_for("gpt-5-mini", detail) == {"in": 1.0, "out": 2.0, "cache": 0.1}
+    detail2 = {"gpt-5-mini": {"in": 1.0, "out": 2.0, "cache": 0.1}}
+    assert litellm.detail_for("azure_ai/gpt-5-mini", detail2) == {"in": 1.0, "out": 2.0, "cache": 0.1}
+    assert litellm.detail_for("nonexistent", detail) == {}
+    assert litellm.detail_for("anything", {}) == {}
+
+
 # ── QA: cost controls end-to-end (the doubling fix + overrides + per-type display) ──
 async def test_cost_controls_no_double_end_to_end(monkeypatch):
     """QA of the Model-costs controls: LiteLLM priced input==output==X ⇒ the card shows the
@@ -8519,6 +8773,19 @@ def test_spend_capture_decoupled_from_sampling_loop():
     assert "_SPEND_CAP" in cleanup, "capture task must be cancelled on cleanup"
 
 
+def test_sampling_loop_feeds_vllm_realtime_into_model_conc_series():
+    """The sampling loop must call insert_model_conc_series with vLLM's OWN running/waiting
+    gauges, gated on availability + a single resolvable model + at least one gauge present —
+    and skip a multi_model reading (summed across models; attributing it to just the first
+    model name would be wrong, not merely imprecise)."""
+    import inspect
+    import app as a
+    samp = inspect.getsource(a._sampling_loop)
+    assert "insert_model_conc_series" in samp
+    assert 'snap["collectors"].get("vllm"' in samp
+    assert "multi_model" in samp, "must skip when the reading is summed across models"
+
+
 async def test_service_toggle_disables_backend_everywhere(monkeypatch):
     """Settings → Services can turn a backend OFF. When off: its collector reports the
     'unconfigured' sentinel (so it is not polled and, per alerts.py, fires NO down-alert),
@@ -8926,6 +9193,43 @@ def test_label_hidden_predicate_covers_all_three_classes(tmp_path, monkeypatch):
     assert db._label_hidden("orphan", known, hidden) is True       # hidden Unassigned
 
 
+async def test_spend_keycost_falls_back_to_key_series_delta_in_lite_mode(monkeypatch, tmp_path):
+    """The LiteLLM page's 'Top 10 API keys/users — spend in window' cards read
+    /api/spend/keycost, backed by the day-granular spend_model_user_daily rollup — which
+    is fed ONLY from full-mode /spend/logs parsing (mu_rows). On a lite-mode deployment
+    that rollup never gets a single row, so these cards were permanently empty even with
+    real, active spend (observed live: a key's cumulative cost climbing while the window
+    cards showed nothing). Confirm the endpoint falls back to key_series_window_delta
+    (the same lite-compatible per-bucket delta the sibling 'requests/spend in window' bar
+    chart already uses) when the day rollup is empty and spend_mode isn't full."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "kc_lite.db"))
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "supersecrettoken1234")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://x")   # gate open
+    db.init()
+    now = time.time()
+    db.known_keys_upsert(["pedro"], now)
+    # lite-mode key_series holds CUMULATIVE spend; two samples establish a positive delta
+    db.insert_key_series(now - 300, [{"key": "h1", "alias": "pedro", "reqs": 1.0}])
+    db.insert_key_series(now, [{"key": "h1", "alias": "pedro", "reqs": 1.5}])
+    # spend_model_user_daily deliberately left EMPTY — the exact lite-mode gap
+    c = await _client()
+    try:
+        import app as appmod
+        monkeypatch.setitem(appmod._backend_latest, "litellm", {"spend_mode": "lite"})
+        r = await c.get("/api/spend/keycost?window=1h&token=supersecrettoken1234")
+        assert r.status == 200
+        body = await r.json()
+        assert body["cost"].get("pedro") == 0.5, f"expected the fallback delta, got {body['cost']}"
+        # full mode must NOT take this fallback — key_series_window_delta's numbers are
+        # REQUEST COUNTS there, not dollars, and plotting them here would mislabel units
+        monkeypatch.setitem(appmod._backend_latest, "litellm", {"spend_mode": "full"})
+        r2 = await c.get("/api/spend/keycost?window=1h&token=supersecrettoken1234")
+        body2 = await r2.json()
+        assert body2["cost"] == {}, f"full mode must not fall back to request-count deltas: {body2['cost']}"
+    finally:
+        await c.close()
+
+
 async def test_spend_keycost_accepts_litellm_page_windows(monkeypatch):
     """The LiteLLM 'spend in window' cards pass the page window (15m/1h/24h/custom) to
     /api/spend/keycost, which used to hard-restrict to 30d/12mo/month and silently coerce
@@ -8967,3 +9271,402 @@ async def test_containers_admin_only_redacts_names_for_non_admin_pentest_f2(monk
         assert [c["status"] for c in red] == ["Up", "Exited"], "health must be preserved"
     # the original snapshot is not mutated
     assert snap["collectors"]["containers"]["containers"][0]["name"] == "aimon-litellm-db"
+
+
+async def test_hide_unassigned_saves_through_the_real_settings_endpoint(monkeypatch):
+    """FIELD BUG: the Unassigned Show/Hide button posted `{HIDE_UNASSIGNED_KEYS: "1"}`,
+    but /api/admin/settings wants `action=set&name=&value=` — so the server answered
+    400 "unknown setting", the button clicked and nothing changed. This drives the REAL
+    handler with the shape the (fixed) button sends and asserts the tunable actually flips
+    live + persists — even though HIDE_UNASSIGNED_KEYS is card:False (not a rendered card,
+    but still settable)."""
+    c, csrf = await _admin_client(monkeypatch)
+    try:
+        r = await c.post("/api/admin/settings",
+                         data={"action": "set", "name": "HIDE_UNASSIGNED_KEYS", "value": "1"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200, f"save must be accepted, got {r.status}: {await r.text()}"
+        assert (await r.json())["overridden"] is True
+        assert config.HIDE_UNASSIGNED_KEYS is True, "must apply live (module constant)"
+        assert db.settings_all().get("HIDE_UNASSIGNED_KEYS") in ("1", "1.0", "True", "true")
+        # and back off
+        r = await c.post("/api/admin/settings",
+                         data={"action": "set", "name": "HIDE_UNASSIGNED_KEYS", "value": "0"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and config.HIDE_UNASSIGNED_KEYS is False
+        # the bare-name shape the old button used must still be REJECTED (proves the
+        # handler contract the button has to satisfy)
+        r = await c.post("/api/admin/settings",
+                         data={"HIDE_UNASSIGNED_KEYS": "1"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 400, "bare {NAME:value} must be rejected — that was the bug"
+    finally:
+        config.clear_override("HIDE_UNASSIGNED_KEYS")
+        await c.close()
+
+
+def test_db_swallowed_errors_are_logged_not_silent_d2(monkeypatch, capsys):
+    """REVIEW D-2: a monitoring tool must not fail its own storage silently. Every
+    `except Exception` in db.py logs the failing function + exception type to stderr while
+    still returning its empty default — so a query bug / schema drift / locked DB is
+    diagnosable instead of an indistinguishable empty result."""
+    # parent "/etc/hostname" is a FILE → os.makedirs in _connect raises → every read fails
+    monkeypatch.setattr(config, "DB_PATH", "/etc/hostname/nope.db")
+    assert db.series("1h", 100) == []                 # behaviour unchanged: empty default
+    err = capsys.readouterr().err
+    assert "[db] series:" in err, f"the failing function must be logged, not silent: {err!r}"
+    # a different read logs under ITS own function name (frame-accurate)
+    assert db.key_series_window_delta("1h") == {"labels": [], "deltas": []}
+    assert "[db] key_series_window_delta:" in capsys.readouterr().err
+
+
+def test_key_label_is_the_canonical_join_resolver_d1():
+    """REVIEW D-1: ONE resolver for a key's join label across every LiteLLM shape
+    (key_alias/key_name on /spend/keys, alias/key on top_keys, token on /key/list, api_key on
+    the raw list). A key STORED under one label but LOOKED UP by another silently misses the
+    join — the root of the recurring by-key / by-user attribution bugs."""
+    from collectors import litellm as L
+    # the human alias wins, whatever field name it arrives under
+    assert L.key_label({"alias": "team-a"}) == "team-a"
+    assert L.key_label({"key_alias": "team-a"}) == "team-a"
+    assert L.key_label({"key_name": "team-a"}) == "team-a"
+    # falls back to the raw key hash, never empty; "?" only when a row has no identity at all
+    for f in ("key", "api_key", "token"):
+        assert L.key_label({f: "sk-abc"}) == "sk-abc"
+    assert L.key_label({}) == "?"
+    assert L.key_label(None) == "?"          # defensive: non-dict input
+    assert L.key_label({"key_alias": "  spaced  "}) == "spaced"
+    # THE invariant: every join-key site yields the SAME label for the same key dict
+    import app as a
+    k = {"key_alias": "alice", "key": "sk-hash", "key_name": "ignored"}
+    assert a._team_key_id(k) == L.key_label(k) == "alice"
+
+
+def test_no_divergent_key_label_chains_remain_d1():
+    """Guard: the join-key sites delegate to litellm.key_label, not their own inline
+    `k.get('alias') or k.get('key_alias') or …` chains (which is exactly how they drifted)."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    app_src = (root / "app.py").read_text(encoding="utf-8")
+    ll_src = (root / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    # the specific divergent chains that caused the drift are gone
+    assert 'k.get("key_alias") or k.get("key_name") or k.get("token")' not in ll_src
+    assert 'k.get("alias") or k.get("key_alias") or k.get("key_name")\n                 or k.get("key")' not in ll_src
+    # _team_key_id + _alias delegate to the canonical resolver
+    assert "return litellm.key_label(k)" in app_src
+    # the canonical resolver + its field list exist
+    assert "def key_label(" in ll_src and "_KEY_ID_FIELDS" in ll_src
+
+
+def _seed_conc_model(tmp_path, monkeypatch, models, conc=9.0, n=20):
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cm.db"))
+    db.init()
+    now = 1_800_000_000.0
+    with db._connect() as c:
+        for i in range(n):
+            c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 1200 + i * 60, conc))
+    for i in range(n):
+        db.insert_model_series(now - 1200 + i * 60,
+                               [{"model": m, "reqs": i * w} for m, w in models.items()])
+    return now
+
+
+def test_concurrency_by_model_splits_by_model_and_sums_to_aggregate(tmp_path, monkeypatch):
+    """The new 'Concurrent LLM work — by model' card: the SAME proxy-wide aggregate as the
+    by-key card, split across models by each model's activity share. Bands must sum to the
+    measured aggregate in every bucket (only the split is inferred)."""
+    now = _seed_conc_model(tmp_path, monkeypatch,
+                           {"vllm/qwen": 6, "gpt-4o": 3, "ollama/llama": 1})
+    out = db.concurrency_by_key("1h", "conc", end=now, cumulative=True, source="model")
+    labels = [s["label"] for s in out["series"]]
+    assert labels[:3] == ["vllm/qwen", "gpt-4o", "ollama/llama"], labels
+    # proportional 6:3:1
+    tot = {s["label"]: round(sum(v for v in s["data"] if v), 2) for s in out["series"]}
+    assert tot["vllm/qwen"] == 2 * tot["gpt-4o"] == 6 * tot["ollama/llama"]
+    # bands sum to the aggregate per bucket
+    n = len(out["series"][0]["data"])
+    for j in range(n):
+        assert abs(sum(s["data"][j] for s in out["series"]) - 9.0) < 1e-6
+
+
+def test_concurrency_by_model_ignores_key_only_filters(tmp_path, monkeypatch):
+    """Model labels are not keys, so the by-KEY candidacy filters must NOT apply: a model
+    whose name collides with an excluded key, or that /key/list never confirmed, still gets
+    its own band (unlike the by-key split, which would fold those into 'Other')."""
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", {"gpt-4o"})       # would hide a KEY named gpt-4o
+    now = _seed_conc_model(tmp_path, monkeypatch, {"gpt-4o": 5, "vllm/qwen": 5})
+    out = db.concurrency_by_key("1h", "conc", end=now, cumulative=True, source="model")
+    assert "gpt-4o" in [s["label"] for s in out["series"]], "model must not be key-excluded"
+    # and by-KEY on the same excluded label WOULD fold it away (sanity that the gate exists)
+    ck = db.concurrency_by_key("1h", "conc", end=now, cumulative=True, source="key")
+    assert "gpt-4o" not in [s["label"] for s in ck["series"] if s["label"] != "Other"]
+
+
+def test_insert_model_series_stores_reqs_with_token_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "m.db"))
+    db.init()
+    db.insert_model_series(1000.0, [{"model": "a", "reqs": 7},
+                                    {"model": "b", "tokens": 50},     # no reqs → tokens
+                                    {"model": "", "reqs": 9}])         # blank model dropped
+    with db._connect() as c:
+        rows = dict(c.execute("SELECT label, reqs FROM model_series WHERE ts=1000.0").fetchall())
+    assert rows == {"a": 7.0, "b": 50.0}, rows
+
+
+def test_model_series_rolls_up_and_prunes_like_key_series(tmp_path, monkeypatch):
+    """model_series must ride the same rollup + retention plumbing as key_series, or its
+    history would never reach the 1m/1h tiers the windowed reads use."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "r.db"))
+    db.init()
+    now = 1_800_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(30):
+        db.insert_model_series(now - 30 * 120 + i * 120, [{"model": "m", "reqs": i}])
+    db.rollup()
+    with db._connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM model_series_1m").fetchone()[0] > 0
+        assert c.execute("SELECT COUNT(*) FROM model_series_1h").fetchone()[0] > 0
+    db.prune_key_series()   # shared prune — must not error and must know model_series
+    src = (__import__("pathlib").Path(__file__).resolve().parent.parent / "db.py").read_text()
+    assert "DELETE FROM model_series WHERE ts" in src, "prune must cover model_series"
+
+
+def test_insert_model_conc_series_stores_and_skips_when_nothing_to_attribute(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mcs.db"))
+    db.init()
+    db.insert_model_conc_series(1000.0, "vllm/mini", 3.0, 1.0)
+    db.insert_model_conc_series(1000.0, "vllm/waiting-only", None, 2.0)
+    db.insert_model_conc_series(1000.0, "", 5.0, 5.0)          # no label → dropped
+    db.insert_model_conc_series(1000.0, "vllm/both-none", None, None)  # nothing to store
+    with db._connect() as c:
+        rows = dict((lbl, (run, wait)) for lbl, run, wait in
+                    c.execute("SELECT label, running, waiting FROM model_conc_series").fetchall())
+    assert rows == {"vllm/mini": (3.0, 1.0), "vllm/waiting-only": (None, 2.0)}, rows
+
+
+def test_concurrency_by_model_overrides_with_realtime_running_for_a_slow_model(tmp_path, monkeypatch):
+    """Live bug: vllm/MiniMax showed 'Other' on 'Concurrent LLM work — by model' despite
+    real backlog=3, while a fast API model (azure_ai/gpt-5.4-mini) attributed correctly.
+    Root cause: model_series infers activity from the CHANGE in completed-request count —
+    a slow, self-hosted model's request can still be GENERATING when the bucket closes, so
+    its completion count (and delta) reads zero the whole time it's in flight. vLLM's own
+    real-time running/waiting gauge (model_conc_series) has no such lag and must override
+    the misleadingly-zero completion-delta weight for that label."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cm_rt.db"))
+    db.init()
+    now = 1_800_000_000.0
+    with db._connect() as c:
+        for i in range(5):
+            c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 240 + i * 60, 4.0))
+    # gpt-5.4-mini completes quickly -> a real completion-delta every bucket
+    for i in range(5):
+        db.insert_model_series(now - 240 + i * 60,
+                               [{"model": "azure_ai/gpt-5.4-mini", "reqs": i}])
+    # MiniMax: reqs count never moves all window (still generating) -> zero completion-delta,
+    # but vLLM reports real in-flight work throughout
+    for i in range(5):
+        db.insert_model_series(now - 240 + i * 60,
+                               [{"model": "vllm/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10", "reqs": 0}])
+        db.insert_model_conc_series(now - 240 + i * 60,
+                                    "vllm/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10", 3.0, None)
+    out = db.concurrency_by_key("1h", "conc", end=now, cumulative=True, source="model")
+    data = {s["label"]: s["data"] for s in out["series"]}
+    assert sum(data.get("vllm/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10", [])) > 0, (
+        f"MiniMax's real-time backlog must not fold into Other: {data}")
+    assert sum(data.get("Other", [0])) == 0, f"nothing should be left unattributed: {data}"
+    # the fast model's own attribution is unaffected by the override existing
+    assert sum(data.get("azure_ai/gpt-5.4-mini", [])) > 0
+
+
+def test_concurrency_by_model_realtime_override_is_scoped_to_the_short_window(tmp_path, monkeypatch):
+    """The override reads model_conc_series's RAW tier only (no _1m/_1h rollup exists for
+    it) — a 24h+ window must ignore it entirely rather than erroring, so a genuinely
+    completion-delta-attributed model's result is UNCHANGED whether or not a (wrongly
+    scoped) real-time row happens to also exist for the same time range."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cm_rt_scope.db"))
+    db.init()
+    now = 1_800_000_000.0
+    with db._connect() as c:
+        for i in range(5):
+            bkt = now - 3600 * 20 + i * 3600
+            c.execute("INSERT INTO metrics_1m(bucket,conc) VALUES (?,?)", (bkt, 4.0))
+            # real completion-delta activity (increasing cumulative reqs), rolled up directly
+            c.execute("INSERT INTO model_series_1m(bucket,label,reqs) VALUES (?,?,?)",
+                     (bkt, "vllm/slow-model", float(i)))
+            # a real-time row exists for the SAME window — must be ignored beyond 1h
+            c.execute("INSERT INTO model_conc_series(ts,label,running,waiting) VALUES (?,?,?,?)",
+                     (bkt, "vllm/slow-model", 999.0, None))
+    baseline = db.concurrency_by_key("24h", "conc", end=now, cumulative=True, source="model")
+    with db._connect() as c:
+        c.execute("DELETE FROM model_conc_series")
+    without_rt = db.concurrency_by_key("24h", "conc", end=now, cumulative=True, source="model")
+    assert baseline["series"] == without_rt["series"], (
+        "a >1h window must ignore model_conc_series entirely — the out-of-scope "
+        "real-time row changed the result")
+
+
+async def test_concurrency_by_model_endpoint(monkeypatch):
+    """/api/litellm/concurrency-by-key?by=model routes to the model split."""
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    import app as appmod
+    monkeypatch.setattr(appmod.db, "concurrency_by_key",
+                        lambda *a, **k: {"labels": [1], "metric": "conc",
+                                         "series": [{"label": "gpt-4o", "data": [5]}],
+                                         "_src": k.get("source")})
+    c = await _client()
+    try:
+        r = await c.get("/api/litellm/concurrency-by-key?by=model&metric=conc")
+        assert r.status == 200
+        j = await r.json()
+        assert j["_src"] == "model", "by=model must pass source='model'"
+    finally:
+        await c.close()
+
+
+def test_key_series_monotonic_never_decreases_on_a_rebase(tmp_path, monkeypatch):
+    """The windowed 'Top 10 API keys over time' card (/api/keyseries) is an "only rises"
+    cumulative view, but the raw stored value RE-BASES DOWN when a key is re-issued / a
+    budget rolls (observed live: RodolfoSantos 699 -> 1, 19 drops on the 30d window).
+    monotonic=True must plot a non-decreasing running total (positive steps only), while
+    the raw read still shows the drop."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ks.db"))
+    db.init()
+    now = 1_800_000_000.0
+    seq = [100.0, 130.0, 160.0, 20.0, 45.0, 70.0, 5.0, 25.0, 40.0]   # climbs, re-bases twice
+    with db._connect() as c:
+        c.executemany("INSERT INTO key_series_1h(bucket,label,reqs) VALUES (?,?,?)",
+                      [(now - 86400 * 30 + i * 86400 * 3, "k", v) for i, v in enumerate(seq)])
+    db.known_keys_upsert({"k": "u-1"}, now)
+
+    raw = [p["k"] for p in db.key_series("12mo", 400, end=now)["points"] if "k" in p]
+    mono = [p["k"] for p in db.key_series("12mo", 400, end=now, monotonic=True)["points"]
+            if "k" in p]
+    assert any(b < a for a, b in zip(raw, raw[1:])), "raw must still show the re-base drop"
+    assert all(b >= a for a, b in zip(mono, mono[1:])), f"monotonic must never fall: {mono}"
+    assert mono[0] == raw[0], "seeds at the first in-window value"
+    # captures activity AFTER a re-base (not frozen like a running-max would be)
+    assert mono[-1] > mono[0], "post-rebase positive steps still accrue"
+
+
+async def test_keyseries_endpoint_is_monotonic(monkeypatch):
+    """The /api/keyseries handler (windowed keytime card) must request the monotonic
+    series, so the served line for a re-basing key only rises."""
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    captured = {}
+    import app as appmod
+    real = appmod.db.key_series
+    def _spy(*a, **k):
+        captured.update(k)
+        return real(*a, **k)
+    monkeypatch.setattr(appmod.db, "key_series", _spy)
+    c = await _client()
+    try:
+        r = await c.get("/api/keyseries?window=24h")
+        assert r.status == 200
+        assert captured.get("monotonic") is True, "handler must pass monotonic=True"
+    finally:
+        await c.close()
+
+
+def test_concurrency_reports_attribution_for_the_why_other_popover(tmp_path, monkeypatch):
+    """The 'why Other?' popover needs to state how much of the aggregate was attributed vs
+    not, and whether Other hides labels beyond the top-N. concurrency_by_key must return an
+    `attribution` summary: aggregate, attributed, other (=aggregate-attributed), labels_total,
+    shown."""
+    now = _seed_conc_model(tmp_path, monkeypatch,
+                           {"a": 5, "b": 3, "c": 2, "d": 1, "e": 1, "f": 1,
+                            "g": 1, "h": 1, "i": 1, "j": 1}, conc=9.0)  # 10 models
+    out = db.concurrency_by_key("1h", "conc", end=now, cumulative=True, source="model", top_n=8)
+    at = out.get("attribution")
+    assert at, "must return an attribution summary"
+    assert at["aggregate"] >= at["attributed"] >= 0
+    assert abs(at["other"] - max(0.0, at["aggregate"] - at["attributed"])) < 1e-6
+    assert at["labels_total"] == 10 and at["shown"] == 8, at
+    # with 10 models but only 8 shown, Other legitimately hides 2 beyond top-N
+    assert at["labels_total"] > at["shown"]
+    # and the popover can NAME them (not just count) — the "models being used there"
+    assert isinstance(at.get("other_labels"), list) and len(at["other_labels"]) == 2, at
+    assert set(at["other_labels"]).isdisjoint({s["label"] for s in out["series"]})
+
+
+def test_concurrency_by_key_default_top_n_shows_more_before_folding_to_other(tmp_path, monkeypatch):
+    """Live report: with 43 total keys but only ~6 shown, most windows drew a large 'Other'
+    band even during ordinary, non-degenerate traffic. Bumped the default top_n 8 -> 12 so
+    more genuinely-active keys/models get their own band before anything folds into Other."""
+    now = _seed_conc_model(tmp_path, monkeypatch,
+                           {chr(ord("a") + i): 12 - i for i in range(12)}, conc=9.0)  # 12 models
+    out = db.concurrency_by_key("1h", "conc", end=now, cumulative=True, source="model")
+    shown = {s["label"] for s in out["series"] if s["label"] != "Other"}
+    assert len(shown) == 12, f"default top_n must show all 12, not just the old default of 8: {shown}"
+    assert "Other" not in [s["label"] for s in out["series"]], "nothing left to fold into Other"
+
+
+def test_why_other_never_names_excluded_or_garbage_keys(tmp_path, monkeypatch):
+    """CODE-REVIEW REGRESSION: the 'why Other?' popover's `other_labels` / `labels_total`
+    must be drawn from ELIGIBLE labels only — never the MONITOR_EXCLUDE_KEYS key, a hidden
+    key, or a label /key/list never confirmed (garbage like '${ENV}'). Naming them would
+    re-expose exactly what exclude/hide/known were meant to keep out of the UI and inflate
+    the 'N beyond the top-N' count."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wo.db"))
+    monkeypatch.setattr(config, "EXCLUDE_KEYS", {"svc-monitor"})
+    db.init()
+    now = 1_800_000_000.0
+    with db._connect() as c:
+        for i in range(20):
+            c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 1200 + i * 60, 9.0))
+    db.known_keys_upsert({"realkey": "u-1", "realkey2": "u-2"}, now)   # only these confirmed
+    for i in range(20):
+        db.insert_key_series(now - 1200 + i * 60, [
+            {"key": "realkey", "alias": "realkey", "reqs": i * 5},
+            {"key": "realkey2", "alias": "realkey2", "reqs": i * 4},
+            {"key": "svc-monitor", "alias": "svc-monitor", "reqs": i * 3},   # excluded
+            {"key": "${LITELLM_API_KEY}", "alias": "", "reqs": i * 2}])       # garbage/unknown
+    at = db.concurrency_by_key("1h", "conc", end=now, cumulative=True,
+                               source="key", top_n=1)["attribution"]
+    assert "svc-monitor" not in at["other_labels"], "excluded key leaked into other_labels"
+    assert "${LITELLM_API_KEY}" not in at["other_labels"], "garbage label leaked"
+    assert at["other_labels"] == ["realkey2"], at["other_labels"]
+    assert at["labels_total"] == 2, "labels_total must count only eligible keys, got %s" % at
+
+
+def test_model_cost_price_per_type_derives_blend_and_reads_back(tmp_path, monkeypatch):
+    """The editable in/out/cch cells persist per-type overrides; usd_1m (what the whole cost
+    pipeline reads) is DERIVED from input+output so a mistaken per-type edit can't desync the
+    charts, and model_cost_details() reads the per-type values back for the card to show."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mc.db"))
+    db.init()
+    assert db.model_cost_price_set("gpt-4o", 0.0, 1.0, in_1m="5", out_1m="15", cache_1m="1")
+    assert db.model_cost_prices()["gpt-4o"] == 10.0            # (5+15)/2 blend
+    assert db.model_cost_details()["gpt-4o"] == {"in": 5.0, "out": 15.0, "cache": 1.0}
+    # a single-sided rate uses that side (not halved)
+    db.model_cost_price_set("m2", 0.0, 1.0, in_1m="8")
+    assert db.model_cost_prices()["m2"] == 8.0
+    # blended-only override still works and stores no per-type detail
+    db.model_cost_price_set("claude", 7.5, 1.0)
+    assert db.model_cost_prices()["claude"] == 7.5 and "claude" not in db.model_cost_details()
+    # a bad per-type value is rejected (no partial write)
+    assert not db.model_cost_price_set("bad", 0.0, 1.0, in_1m="-3")
+    assert not db.model_cost_price_set("bad", 0.0, 1.0, out_1m="NaNish")
+    assert "bad" not in db.model_cost_prices()
+    # reset drops everything
+    db.model_cost_price_delete("gpt-4o")
+    assert "gpt-4o" not in db.model_cost_prices() and "gpt-4o" not in db.model_cost_details()
+
+
+async def test_model_kinds_post_accepts_per_type_cost(monkeypatch):
+    """The /api/admin/model-kinds handler accepts action=cost with in/out/cache and persists
+    a per-type override (deriving usd_1m); the blended usd_1m path still works too."""
+    c, csrf = await _admin_client(monkeypatch)
+    try:
+        r = await c.post("/api/admin/model-kinds",
+                         data={"action": "cost", "model": "gpt-4o",
+                               "in_1m": "4", "out_1m": "12", "cache_1m": "0.5"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200 and (await r.json())["cost_overridden"] is True
+        assert db.model_cost_prices().get("gpt-4o") == 8.0      # (4+12)/2
+        assert db.model_cost_details().get("gpt-4o", {}).get("cache") == 0.5
+    finally:
+        db.model_cost_price_delete("gpt-4o")
+        await c.close()

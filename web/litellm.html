@@ -7,6 +7,7 @@
 <link rel="icon" href="/assets/favicon.svg">
 <script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
+<script src="/assets/aimon-core.js"></script>
 <script>
 // Refresh a multi-series chart WITHOUT losing the user's legend toggles: when the set
 // of series is unchanged, update each dataset's values IN PLACE (no rebuild); when a
@@ -78,6 +79,17 @@ function updateSeries(chart,labels,next){
   .mini h3 .cur{color:var(--fg);font-variant-numeric:tabular-nums}
   .mini .chart-wrap{height:320px;margin:0}
   .unavail{color:var(--muted);font-style:italic;padding:6px 0}
+  /* clickable "why is there an Other band?" link + its popover */
+  .whyother{display:none;margin-top:6px;font-size:11px;color:var(--accent);cursor:pointer;
+    background:none;border:0;padding:0;text-align:left}
+  .whyother:hover{text-decoration:underline}
+  #other-pop{position:fixed;z-index:50;max-width:340px;background:var(--panel2,#161b22);
+    border:1px solid var(--line,#30363d);border-radius:8px;padding:12px 14px;font-size:12px;
+    line-height:1.5;color:var(--fg,#e6edf3);box-shadow:0 8px 28px #0009;display:none}
+  #other-pop h4{margin:0 0 6px;font-size:12px}
+  #other-pop .muted{color:var(--muted)}
+  #other-pop code{background:var(--panel,#0d1117);padding:0 3px;border-radius:3px}
+  #other-pop .x{float:right;cursor:pointer;color:var(--muted);margin:-4px -4px 0 0}
   .fire{color:var(--bad)} .recover{color:var(--ok)}
   .srv{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;
     padding:0 6px;margin-left:6px;vertical-align:middle}
@@ -191,7 +203,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.6</div>
+      <div id="sidebar-brand-ver">v1.8.9</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -251,7 +263,7 @@ function updateSeries(chart,labels,next){
   </section>
   <section class="card span-2" id="card-keys-winspend">
     <h2>Top 10 API keys — spend in window <span class="badge" id="keys-winspend-win"></span>
-      <span class="info" title="Cumulative spend per API key WITHIN the page time-window (from the local per-day rollup, so it follows the window selector — unlike the all-time cards at the bottom). Excluded / unconfirmed / hidden-unassigned keys fold into 'Other'.">ⓘ</span></h2>
+      <span class="info" title="Cumulative spend per API key WITHIN the page time-window (from the local per-day rollup, so it follows the window selector — unlike the all-time cards at the bottom). NOTE: the spend rollup is DAY-granular, so a sub-day window (15m/1h) shows the current day. Excluded / unconfirmed / hidden-unassigned keys fold into 'Other'.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:240px"><canvas id="keys-winspend-chart" role="img" aria-label="Spend by API key in the window"></canvas></div>
   </section>
 
@@ -262,17 +274,10 @@ function updateSeries(chart,labels,next){
     <div class="chart-wrap" style="height:240px"><canvas id="userkeys-winspend-chart" role="img" aria-label="Spend by user in the window"></canvas></div>
   </section>
 
-  <section class="card span-2" id="card-keytime">
-    <h2>Top 10 API keys over time <span id="keytime-metric" class="badge">by requests</span> — <span id="keytime-win">24h</span></h2>
-    <div class="sub" id="keytime-sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px"></div>
-    <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart" role="img" aria-label="Requests over time by key"></canvas></div>
-  </section>
-
-  <section class="card span-2" id="card-keydelta">
-    <h2>Top 10 API keys — <span id="keydelta-metric">requests</span> in window <span id="keydelta-win" class="badge"></span></h2>
-    <div class="sub" id="keydelta-sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
-      cumulative requests during the window (running total from the window start), so a key with no new activity stays flat at 0</div>
-    <div class="chart-wrap" style="height:260px"><canvas id="keydelta-chart" role="img" aria-label="Cumulative requests by key"></canvas></div>
+  <section class="card span-2" id="card-keytime-win">
+    <h2>Top 10 API keys over time <span id="keytimewin-metric" class="badge">by requests</span> — <span id="keytimewin-win">1h</span></h2>
+    <div class="sub" id="keytimewin-sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px"></div>
+    <div class="chart-wrap" style="height:260px"><canvas id="keytime-win-chart" role="img" aria-label="Requests over time by key (selected window)"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-userdelta">
@@ -282,18 +287,32 @@ function updateSeries(chart,labels,next){
     <div class="chart-wrap" style="height:260px"><canvas id="userdelta-chart" role="img" aria-label="Cumulative requests by user"></canvas></div>
   </section>
 
+  <section class="card span-2" id="card-keydelta">
+    <h2>Top 10 API keys — <span id="keydelta-metric">requests</span> in window <span id="keydelta-win" class="badge"></span></h2>
+    <div class="sub" id="keydelta-sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
+      cumulative requests during the window (running total from the window start), so a key with no new activity stays flat at 0</div>
+    <div class="chart-wrap" style="height:260px"><canvas id="keydelta-chart" role="img" aria-label="Cumulative requests by key"></canvas></div>
+  </section>
+
   <section class="card span-2" id="card-conc-by-key">
     <h2>Concurrent LLM work — by user <span id="conc-by-key-basis" class="badge"></span>
-      <span class="info" title="Estimated attribution. LiteLLM reports ONE total for concurrent work (in-flight requests + llama.cpp active slots) with no per-key breakdown, so each point's total is split across the top keys by their share of recent activity (requests in full spend mode, spend in off/lite). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top key.">ⓘ</span></h2>
-    <div class="chart-wrap" id="conc-by-key-wrap" style="height:220px"><canvas id="conc-by-key-chart" role="img" aria-label="Concurrent LLM work attributed by key (estimated)"></canvas></div>
-    <div class="unavail" id="conc-by-key-empty" style="display:none">no per-key activity in this window</div>
+      <span class="info" title="Estimated attribution. LiteLLM reports ONE total for concurrent work (in-flight requests + llama.cpp active slots) with no per-key breakdown, so each point's total is split across the top keys by their share of recent activity (requests in full spend mode, spend in off/lite), then those keys are grouped by their OWNER — the bands are users (a key with no resolved owner groups under 'Unassigned'). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top key.">ⓘ</span></h2>
+    <div class="chart-wrap" id="conc-by-key-wrap" style="height:220px"><canvas id="conc-by-key-chart" role="img" aria-label="Concurrent LLM work attributed by user (estimated)"></canvas></div>
+    <div class="unavail" id="conc-by-key-empty" style="display:none">no activity in this window</div>
+  </section>
+
+  <section class="card span-2" id="card-conc-by-model">
+    <h2>Concurrent LLM work — by model <span id="conc-by-model-basis" class="badge"></span>
+      <span class="info" title="Estimated attribution. The same proxy-wide concurrent-work total as the card above, but split across the top MODELS by each model's share of recent activity (requests in full spend mode, day-total deltas in off/lite). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top model.">ⓘ</span></h2>
+    <div class="chart-wrap" id="conc-by-model-wrap" style="height:220px"><canvas id="conc-by-model-chart" role="img" aria-label="Concurrent LLM work attributed by model (estimated)"></canvas></div>
+    <div class="unavail" id="conc-by-model-empty" style="display:none">no per-model activity in this window</div>
   </section>
 
   <section class="card span-2" id="card-backlog-by-key">
     <h2>LLM Backlog — by user <span id="backlog-by-key-basis" class="badge"></span>
-      <span class="info" title="Estimated attribution. LiteLLM's /health/backlog reports ONE total in-flight-request count with no per-key breakdown, so each point's total is split across the top keys by their share of recent activity (requests in full spend mode, spend in off/lite). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top key.">ⓘ</span></h2>
-    <div class="chart-wrap" id="backlog-by-key-wrap" style="height:220px"><canvas id="backlog-by-key-chart" role="img" aria-label="LLM backlog attributed by key (estimated)"></canvas></div>
-    <div class="unavail" id="backlog-by-key-empty" style="display:none">no per-key activity in this window</div>
+      <span class="info" title="Estimated attribution. LiteLLM's /health/backlog reports ONE total in-flight-request count with no per-key breakdown, so each point's total is split across the top keys by their share of recent activity (requests in full spend mode, spend in off/lite), then those keys are grouped by their OWNER — the bands are users (a key with no resolved owner groups under 'Unassigned'). The stacked bands sum to the real measured total; only the split is inferred. 'Other' is activity that can't be attributed to a top key.">ⓘ</span></h2>
+    <div class="chart-wrap" id="backlog-by-key-wrap" style="height:220px"><canvas id="backlog-by-key-chart" role="img" aria-label="LLM backlog attributed by user (estimated)"></canvas></div>
+    <div class="unavail" id="backlog-by-key-empty" style="display:none">no activity in this window</div>
   </section>
 
   <section class="card span-2" id="card-corr">
@@ -327,11 +346,17 @@ function updateSeries(chart,labels,next){
   </section>
 
 
+  <section class="card span-2" id="card-keytime">
+    <h2>Top 10 API keys over time <span id="keytime-metric" class="badge">by requests</span> — <span id="keytime-win">24h</span></h2>
+    <div class="sub" id="keytime-sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px"></div>
+    <div class="chart-wrap" style="height:260px"><canvas id="keytime-chart" role="img" aria-label="Requests over time by key"></canvas></div>
+  </section>
+
   <section class="card span-2" id="card-userkeys">
     <h2>Top 10 API users by requests <span class="badge" id="userkeys-win"></span>
       <span class="info" title="Live LiteLLM spend snapshot — a fixed rolling window (LITELLM_SPEND_WINDOW_MIN, default 15m) that also drives the latency p95/SLO and rate KPIs. Independent of the page time-window selector, so it stays 'last 15m' even on 1h/24h. For a ranking that follows the selector, see 'Top 10 users — requests in window' below.">ⓘ</span></h2>
     <div class="sub" style="color:var(--muted);font-size:11px;margin:-6px 0 10px">
-      keys aggregated per owner (username = email local part; a key with no resolved owner is shown by its key)</div>
+      keys aggregated per owner (username = email local part; keys with no resolved owner group under "Unassigned")</div>
     <div class="chart-wrap" style="height:240px"><canvas id="user-keys-chart" role="img" aria-label="Requests by user"></canvas></div>
   </section>
 
@@ -451,47 +476,8 @@ function lastNonNull(pts,key){ for(let i=pts.length-1;i>=0;i--){ if(pts[i][key]!
 const AUTH = new URLSearchParams(location.search).get("token");
 let TIMEEND=null;
 const WSECS={"15m":900,"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
-function wsecs(w){ if(typeof w==="string"&&w.indexOf("custom:")===0){var cs=parseInt(w.slice(7),10); if(cs>0) return cs;} return w==="month"?(Date.now()-Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth(),1))/1000:(WSECS[w]||3600);}
-// Per-page time window: remember the user's choice for THIS page (path-keyed) so a
-// refresh keeps it, and each page keeps its OWN window (not shared site-wide). Falls
-// back to the page default when nothing is saved or the saved value isn't a valid button.
-function _winKey(){ return "aimon-win:"+location.pathname; }
-function _winCustom(w){ // STRICT "custom:<digits>" only. A loose check let a poisoned localStorage value like "custom:3600&x=1" pass, then flow unencoded into the export URL + api() query string (param injection). Anchored regex closes that.
-  return typeof w==="string" && /^custom:[0-9]+$/.test(w) && parseInt(w.slice(7),10)>0; }
-// Persist {w,end}: a named window (end=null -> live) OR a drag-selected custom range
-// ("custom:<secs>" + absolute end t2). Restored on refresh so each page keeps its OWN
-// window/zoom until a NEW one is chosen (window button, Live, or a fresh drag).
-function _winSave(w, end){ try{ localStorage.setItem(_winKey(), JSON.stringify({w:w, end:(end||null)})); }catch(e){} }
-function _winRestore(sel, def, labelId){
-  var s=null; try{ s=JSON.parse(localStorage.getItem(_winKey())||"null"); }catch(e){}
-  var w=s&&s.w;
-  if(_winCustom(w)){
-    TIMEEND=Number(s&&s.end)||null;           // absolute custom range persists across refresh
-    setTimeout(function(){ _winMark(true); },0);   // mark it: a frozen window isn't a dead dashboard
-    document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
-      x.classList.remove("active"); x.setAttribute("aria-pressed","false"); });
-    if(labelId){ var lc=document.getElementById(labelId); if(lc) lc.textContent="custom"; }
-    return w;
-  }
-  // Only a safe-charset token may reach the querySelector interpolation below: a malformed restored value would otherwise throw a SyntaxError and crash page init (named windows are alphanumeric: 1h/24h/30d/12mo/month).
-  if(!(w && /^[a-z0-9]+$/i.test(w) && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
-  document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
-    var on=x.dataset.w===w; x.classList.toggle("active",on); x.setAttribute("aria-pressed", on?"true":"false"); });
-  if(labelId){ var l=document.getElementById(labelId); if(l) l.textContent=w; }
-  return w;
-}
+
 let WIN = _winRestore("#windows", "24h", "win-label");
-async function api(path){
-  if(TIMEEND && path.indexOf("window=")>=0)
-    path += (path.includes("?")?"&":"?")+"end="+TIMEEND.toFixed(0);
-  try{
-    const sep=path.includes("?")?"&":"?";
-    const url=path+(AUTH?(sep+"token="+encodeURIComponent(AUTH)):"");
-    const r=await fetch(url,{headers:AUTH?{Authorization:"Bearer "+AUTH}:{}});
-    if(!r.ok){ document.getElementById("updated").textContent="auth/error "+r.status; return null; }
-    return await r.json();
-  }catch(e){ document.getElementById("updated").textContent="disconnected"; return null; }
-}
 
 function renderKpis(l){
   const b=document.getElementById("ll-badge");
@@ -611,14 +597,17 @@ const keysChart = new Chart(document.getElementById("keys-chart"), {
   data:{labels:[],datasets:[{label:"requests",data:[],
     backgroundColor:"#58a6ff88",borderColor:"#58a6ff",borderWidth:1}]},
   options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
-    plugins:{legend:{display:false}},
+    plugins:{legend:{display:false},
+      // Hovering the bar shows the FULL key/alias in the tooltip title — the y-axis tick
+      // text itself is the truncated one (canvas text has no native hover of its own).
+      tooltip:{callbacks:{title:items=>{ const i=items[0]&&items[0].dataIndex;
+        const f=(keysChart.$full||[])[i]; return f!=null?String(f):((items[0]&&items[0].label)||""); }}}},
     scales:{x:{beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"}},
             y:{ticks:{color:cssv("--fg"),font:{size:10}},grid:{display:false}}}}
 });
 function keyLabel(k){
   if(k.alias) return k.alias;
-  const s = String(k.key||"?");
-  return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s;
+  return _shortLbl(k.key);
 }
 // Badge text for the two top-key bars. In lite mode /global/spend/keys returns each key's
 // CUMULATIVE lifetime spend — not requests in a rolling window — so "last 15m" was wrong on
@@ -632,7 +621,8 @@ function renderKeys(l){
   const win=document.getElementById("keys-win");
   if(win) win.textContent = keysBadge(l);
   const keys=(l&&l.top_keys)||[];
-  keysChart.data.labels=keys.map(keyLabel);
+  keysChart.data.labels=keys.map(k=>keyDisp(keyLabel(k)));   // short on the axis
+  keysChart.$full=keys.map(keyLabel);                        // full names for the legend (i)
   // lite mode ranks keys by spend (no per-key request counts) -> fall back to cost
   keysChart.data.datasets[0].data=keys.map(k=>k.reqs!=null?k.reqs:(k.cost||0));
   keysChart.update("none");
@@ -649,7 +639,10 @@ function buildKeyUser(budgets){
   const ks = (budgets && budgets.keys) || [];
   ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) _keyUser[k.key] = u; } });
 }
-function userOf(aliasLabel){ return _keyUser[aliasLabel] || String(aliasLabel||"?"); }
+// Resolve a key label to its OWNER for the "by user" charts. A key whose owner LiteLLM
+// never resolved must NOT be charted as its own key-id (a "by user" graph should only ever
+// show users) — it groups under "Unassigned", mirroring the Settings board's grouping.
+function userOf(aliasLabel){ return _keyUser[aliasLabel] || "Unassigned"; }
 
 // Top-10 API USERS by requests — keys aggregated per owner (mirrors keys-chart).
 const userKeysChart = new Chart(document.getElementById("user-keys-chart"), {
@@ -657,7 +650,9 @@ const userKeysChart = new Chart(document.getElementById("user-keys-chart"), {
   data:{labels:[],datasets:[{label:"requests",data:[],
     backgroundColor:"#3fb95088",borderColor:"#3fb950",borderWidth:1}]},
   options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
-    plugins:{legend:{display:false}},
+    plugins:{legend:{display:false},
+      tooltip:{callbacks:{title:items=>{ const i=items[0]&&items[0].dataIndex;
+        const f=(userKeysChart.$full||[])[i]; return f!=null?String(f):((items[0]&&items[0].label)||""); }}}},
     scales:{x:{beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"}},
             y:{ticks:{color:cssv("--fg"),font:{size:10}},grid:{display:false}}}}
 });
@@ -673,6 +668,7 @@ function renderUserKeys(l){
   });
   const top = Object.keys(agg).sort((a,b)=>agg[b]-agg[a]).slice(0,10);
   userKeysChart.data.labels = top.map(keyDisp);
+  userKeysChart.$full=top;                                   // full names for the legend (i)
   userKeysChart.data.datasets[0].data = top.map(u=>agg[u]);
   userKeysChart.update("none");
 }
@@ -682,20 +678,23 @@ function renderUserKeys(l){
 // show all-time cumulative spend (LiteLLM's lifetime per-key total); these two follow the
 // selector instead. One fetch feeds both. Currency bars.
 function _mkSpendBar(id, color){
-  return new Chart(document.getElementById(id), {
+  const ch = new Chart(document.getElementById(id), {
     type:"bar",
     data:{labels:[],datasets:[{label:"spend",data:[],
       backgroundColor:color+"88",borderColor:color,borderWidth:1}]},
     options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,animation:false,
       plugins:{legend:{display:false},
-        tooltip:{callbacks:{label:c=>" "+CUR+(+c.raw).toLocaleString(undefined,{maximumFractionDigits:4})}}},
+        tooltip:{callbacks:{
+          title:items=>{ const i=items[0]&&items[0].dataIndex; const f=(ch.$full||[])[i];
+            return f!=null?String(f):((items[0]&&items[0].label)||""); },
+          label:c=>" "+CUR+(+c.raw).toLocaleString(undefined,{maximumFractionDigits:4})}}},
       scales:{x:{beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9},callback:v=>CUR+v},grid:{color:"#30363d33"}},
               y:{ticks:{color:cssv("--fg"),font:{size:10}},grid:{display:false}}}}
   });
+  return ch;
 }
 const keysWinSpendChart = _mkSpendBar("keys-winspend-chart", "#58a6ff");
 const userWinSpendChart = _mkSpendBar("userkeys-winspend-chart", "#3fb950");
-function _shortLbl(s){ s=String(s||"?"); return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s; }
 async function loadWinSpend(){
   const kwl=document.getElementById("keys-winspend-win"); if(kwl) kwl.textContent=wlabel(WIN);
   const uwl=document.getElementById("userkeys-winspend-win"); if(uwl) uwl.textContent=wlabel(WIN);
@@ -706,6 +705,7 @@ async function loadWinSpend(){
   const krows=Object.keys(cost).map(k=>({k:k,v:cost[k]})).filter(r=>r.v>0)
     .sort((a,b)=>b.v-a.v).slice(0,10);
   keysWinSpendChart.data.labels=krows.map(r=>_shortLbl(r.k));
+  keysWinSpendChart.$full=krows.map(r=>r.k);          // full names for the legend (i)
   keysWinSpendChart.data.datasets[0].data=krows.map(r=>r4(r.v));
   keysWinSpendChart.update("none");
   // per user (aggregate the same keycost by owner; "Other" stays "Other")
@@ -714,6 +714,7 @@ async function loadWinSpend(){
   const urows=Object.keys(byUser).map(u=>({u:u,v:byUser[u]})).filter(r=>r.v>0)
     .sort((a,b)=>b.v-a.v).slice(0,10);
   userWinSpendChart.data.labels=urows.map(r=>_shortLbl(r.u));
+  userWinSpendChart.$full=urows.map(r=>r.u);          // full names for the legend (i)
   userWinSpendChart.data.datasets[0].data=urows.map(r=>r4(r.v));
   userWinSpendChart.update("none");
 }
@@ -734,15 +735,37 @@ const keyTimeChart = new Chart(document.getElementById("keytime-chart"), {
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
     plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
-      // adaptive: integer requests, or currency spend (off/lite fallback)
-      tooltip:{callbacks:{label:c=>" "+c.dataset.label+": "+(_keytimeMetric==="spend"
+      // adaptive: integer requests, or currency spend (off/lite fallback). Uses the FULL
+      // key/user name (dataset._k), not the truncated legend label, so hovering the chart
+      // body already tells you who's who without needing the legend at all.
+      tooltip:{callbacks:{label:c=>" "+(c.dataset._k||c.dataset.label)+": "+(_keytimeMetric==="spend"
         ?CUR+Number(c.parsed.y).toFixed(2):Number(c.parsed.y).toLocaleString()+" reqs")}}},
     scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
             y:{ticks:{color:cssv("--muted"),font:{size:9},callback:v=>_keytimeMetric==="spend"?CUR+v:v},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
-function keyDisp(label){
-  const s=String(label||"?");
-  return s.length>18 ? s.slice(0,8)+"…"+s.slice(-4) : s;
+wireLegendFullName(keyTimeChart, item=>{ const ds=keyTimeChart.data.datasets[item.datasetIndex]; return ds&&ds._k; });
+
+// Windowed twin of the chart above: SAME per-key over-time lines, but scoped to the page's
+// time-window selector (via /api/keyseries) instead of all-time. Declared BEFORE its chart
+// for the same TDZ reason as _keytimeMetric (the axis callback reads it at construction).
+let _keytimewinMetric = "reqs";
+const keyTimeWinChart = new Chart(document.getElementById("keytime-win-chart"), {
+  type:"line",
+  data:{labels:[],datasets:[]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{intersect:false,mode:"index"},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
+      tooltip:{callbacks:{label:c=>" "+(c.dataset._k||c.dataset.label)+": "+(_keytimewinMetric==="spend"
+        ?CUR+Number(c.parsed.y).toFixed(2):Number(c.parsed.y).toLocaleString()+" reqs")}}},
+    scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
+            y:{ticks:{color:cssv("--muted"),font:{size:9},callback:v=>_keytimewinMetric==="spend"?CUR+v:v},grid:{color:"#30363d33"},beginAtZero:true}}}
+});
+wireLegendFullName(keyTimeWinChart, item=>{ const ds=keyTimeWinChart.data.datasets[item.datasetIndex]; return ds&&ds._k; });
+function keyDisp(label){ return _shortLbl(label); }
+// Keys (of a {label: value}-per-point series) that have at least one real value in the window.
+// A flat all-zero/all-null key adds only a dead legend entry + an invisible line, so drop it.
+function _nzLabels(labels, pts){
+  return (labels||[]).filter(lab=>(pts||[]).some(p=>p[lab]!=null && p[lab]!==0));
 }
 
 // Retitle a "…in window" delta card for what it actually plots. Full spend mode gives real
@@ -773,10 +796,12 @@ const keyDeltaChart = new Chart(document.getElementById("keydelta-chart"), {
   data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
+      tooltip:{callbacks:{label:c=>" "+(c.dataset._k||c.dataset.label)+": "+Number(c.parsed.y).toLocaleString()}}},
     scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
             y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
+wireLegendFullName(keyDeltaChart, item=>{ const ds=keyDeltaChart.data.datasets[item.datasetIndex]; return ds&&ds._k; });
 async function loadKeyDelta(){
   const d=await api("/api/keydelta?window="+WIN);
   const w=document.getElementById("keydelta-win"); if(w) w.textContent=wlabel(WIN);
@@ -787,11 +812,14 @@ async function loadKeyDelta(){
   // deltas are MONEY, not request counts — label them as such rather than silently drawing
   // euros under a "requests" heading. Still hide the card when every series is flat zero.
   labelDeltaCard("keydelta");
-  const _kdAny = labels.some(lab=>pts.some(p=>p[lab]!=null && p[lab]!==0));
+  // Only keys with real activity in the window get a series — a key that is flat zero would
+  // add a dead legend entry (and an invisible line). All flat zero → hide the whole card.
+  const nzLabels = _nzLabels(labels, pts);
+  const _kdAny = nzLabels.length>0;
   const _kdCard=document.getElementById("card-keydelta");
   if(_kdCard) _kdCard.style.display=_kdAny?"":"none";
   if(!_kdAny) return;
-  stampTs(keyDeltaChart, pts); updateSeries(keyDeltaChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
+  stampTs(keyDeltaChart, pts); updateSeries(keyDeltaChart, pts.map(axisT(pts)), nzLabels.map((lab,i)=>({
     _k:lab, label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
@@ -805,10 +833,12 @@ const userDeltaChart = new Chart(document.getElementById("userdelta-chart"), {
   data:{labels:[],datasets:[]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
     interaction:{intersect:false,mode:"index"},
-    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+    plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
+      tooltip:{callbacks:{label:c=>" "+(c.dataset._k||c.dataset.label)+": "+Number(c.parsed.y).toLocaleString()}}},
     scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{color:"#30363d33"}},
             y:{ticks:{color:cssv("--muted"),font:{size:9}},grid:{color:"#30363d33"},beginAtZero:true}}}
 });
+wireLegendFullName(userDeltaChart, item=>{ const ds=userDeltaChart.data.datasets[item.datasetIndex]; return ds&&ds._k; });
 async function loadUserDelta(){
   const d=await api("/api/keydelta?window="+WIN);
   const w=document.getElementById("userdelta-win"); if(w) w.textContent=wlabel(WIN);
@@ -825,12 +855,15 @@ async function loadUserDelta(){
   const byUser={};                                   // username -> [key alias labels]
   labels.forEach(lab=>{ const u=userOf(lab); (byUser[u]=byUser[u]||[]).push(lab); });
   const last = pts.length ? pts[pts.length-1] : {};
-  const users = Object.keys(byUser).sort((a,b)=>
-    byUser[b].reduce((s,l)=>s+(last[l]||0),0) - byUser[a].reduce((s,l)=>s+(last[l]||0),0)
-  ).slice(0,10);
+  const _uSum=(u,p)=>{ let s=null; byUser[u].forEach(l=>{ const v=p[l]; if(v!=null) s=(s||0)+v; }); return s; };
+  const users = Object.keys(byUser)
+    .filter(u=>pts.some(p=>{ const s=_uSum(u,p); return s!=null && s!==0; }))  // drop flat-zero users
+    .sort((a,b)=>
+      byUser[b].reduce((s,l)=>s+(last[l]||0),0) - byUser[a].reduce((s,l)=>s+(last[l]||0),0)
+    ).slice(0,10);
   stampTs(userDeltaChart, pts); updateSeries(userDeltaChart, pts.map(axisT(pts)), users.map((u,i)=>({
     _k:u, label:keyDisp(u),
-    data:pts.map(p=>{ let s=null; byUser[u].forEach(l=>{ const v=p[l]; if(v!=null) s=(s||0)+v; }); return s; }),
+    data:pts.map(p=>_uSum(u,p)),
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
     backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
     borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
@@ -839,23 +872,153 @@ async function loadUserDelta(){
 // Estimated per-key attribution of the proxy-wide concurrency / backlog aggregates.
 // Stacked area: bands sum to the real measured total; the split is by each key's recent
 // activity share (server-side). Card auto-hides when there's no aggregate data.
+// Clickable explanation for the "Other" band of the stacked by-key/user/model charts.
+// Adds a small "why 'Other'?" link under the card (only when an Other band exists) that
+// opens a popover naming the active bands and explaining the attribution gap that put
+// work in Other instead of a specific key/model.
+function _hideOtherPop(){ const p=document.getElementById("other-pop"); if(p) p.style.display="none"; }
+// Shared popover: sanitized HTML positioned near the click. Reused by the "why Other?"
+// explainer and the per-chart "full legend names" (i).
+function _showPop(ev, html){
+  const pop=document.getElementById("other-pop"); if(!pop) return;
+  setHtml(pop, html);
+  const xb=pop.querySelector(".x"); if(xb) xb.onclick=_hideOtherPop;
+  const px=Math.min(ev.clientX, (window.innerWidth||1200)-360);
+  const py=Math.min(ev.clientY+8, (window.innerHeight||800)-240);
+  pop.style.left=Math.max(8,px)+"px"; pop.style.top=Math.max(8,py)+"px";
+  pop.style.display="block";
+}
+// The legends truncate long labels (key hashes / long model names) to first8…last4. Add a
+// clickable (i) to a chart's card header that lists the FULL names (short → full), plus any
+// owner/team detail we have. Line/stacked charts carry the full name on each dataset's `_k`;
+// bar charts store it on `chart.$full` (parallel to data.labels).
+function _legendFullRows(chart, bars){
+  const out=[];
+  if(bars){
+    const full=chart.$full||[], lbl=(chart.data&&chart.data.labels)||[];
+    lbl.forEach((s,i)=>{ const f=full[i]!=null?String(full[i]):String(s);
+      if(f!==String(s)) out.push({short:String(s), full:f}); });
+  }else{
+    ((chart.data&&chart.data.datasets)||[]).forEach(ds=>{
+      const f=ds._k!=null?String(ds._k):String(ds.label||"");
+      if(f && f!==String(ds.label||"")) out.push({short:String(ds.label||""), full:f}); });
+  }
+  return out;
+}
+function addLegendInfo(cardId, chart, bars){
+  const card=document.getElementById(cardId); if(!card) return;
+  const h2=card.querySelector("h2"); if(!h2 || h2.querySelector(".leg-i")) return;
+  const ic=document.createElement("span");
+  ic.className="info leg-i"; ic.textContent="ⓘ";
+  ic.title="Show full legend names"; ic.style.cursor="pointer"; ic.style.marginLeft="6px";
+  ic.setAttribute("role","button"); ic.setAttribute("aria-label","Show full legend names");
+  ic.onclick=function(ev){
+    ev.stopPropagation();
+    const rows=_legendFullRows(chart, bars);
+    // owner detail for keys, when the alias→owner map is known
+    const det=function(full){ const u=(typeof userOf==="function")?userOf(full):null;
+      return (u && u!==full) ? ' <span class="muted">('+escapeHtml(u)+')</span>' : ''; };
+    const body = rows.length
+      ? rows.map(r=>'<div><span class="muted">'+escapeHtml(r.short)+'</span> → '
+          +escapeHtml(r.full)+det(r.full)+'</div>').join("")
+      : '<div class="muted">All legend names fit — nothing is truncated here.</div>';
+    _showPop(ev, '<span class="x">✕</span><h4>Full legend names</h4>'+body);
+  };
+  h2.appendChild(ic);
+}
+document.addEventListener("click",function(e){
+  const p=document.getElementById("other-pop");
+  if(p && p.style.display!=="none" && !p.contains(e.target)
+     && !(e.target.classList && e.target.classList.contains("whyother"))) _hideOtherPop();
+});
+function _wireWhyOther(cardId, d){
+  const card=document.getElementById(cardId); if(!card) return;
+  const wrap=document.getElementById(cardId.replace(/^card-/,"")+"-wrap");
+  let link=document.getElementById(cardId+"-why");
+  const series=(d&&d.series)||[];
+  const other=series.find(s=>s.label==="Other");
+  const hasOther=!!(other && (other.data||[]).some(v=>v));
+  if(!hasOther){ if(link) link.style.display="none"; return; }
+  if(!link){                                   // create the link once, after the chart
+    link=document.createElement("button"); link.type="button";
+    link.id=cardId+"-why"; link.className="whyother";
+    link.textContent="ⓘ why is there an “Other” band?";
+    (wrap&&wrap.parentNode?wrap.parentNode:card).insertBefore(
+      link, wrap?wrap.nextSibling:null);
+  }
+  link.style.display="";
+  link.onclick=function(ev){
+    ev.stopPropagation();
+    const noun=cardId.indexOf("model")>=0?"model":"user";
+    const metric=cardId.indexOf("backlog")>=0?"in-flight requests (backlog)"
+                                             :"concurrent LLM work";
+    const at=d.attribution||{};
+    const agg=at.aggregate||0, oth=at.other||0;
+    const pct=agg>0?Math.round(100*oth/agg):0;
+    const bands=series.filter(s=>s.label!=="Other").map(s=>s.label);
+    const beyond=(at.labels_total||0)-(at.shown||bands.length);
+    const others=at.other_labels||[];
+    const extra = beyond>0
+      ? "Also in “Other” (beyond the top "+(at.shown||bands.length)+"): "
+        +(others.length?others.join(", "):(beyond+" more "+noun+(beyond===1?"":"s")))
+        +(beyond>others.length?", …":"")+"."
+      : "All "+noun+"s with activity in this window are shown above — so “Other” here is "
+        +"unattributed "+metric+", not a hidden "+noun+".";
+    const fresh = noun==="model"
+      ? " Per-model history is new (it only fills from recent samples), so this shrinks over time."
+      : "";
+    _showPop(ev,'<span class="x">✕</span><h4>Why the “Other” band?</h4>'
+      +'<div>In this window, <b>'+CUR+Number(oth).toFixed(2)+'</b> of '+CUR
+      +Number(agg).toFixed(2)+' ('+pct+'%) of measured '+metric+' couldn’t be tied to a '
+      +'specific '+noun+'.</div>'
+      +'<div class="muted" style="margin-top:6px">The total is measured directly every '
+      +'~5s, but per-'+noun+' activity comes from LiteLLM’s aggregate endpoint polled every '
+      +'~60s (running day-totals). A spike between those updates has no matching per-'+noun
+      +' sample, so it lands in “Other”.'+fresh+'</div>'
+      +'<div style="margin-top:6px">Active '+noun+'s here: '
+      +(bands.length?bands.map(escapeHtml).join(", "):"—")+'.</div>'
+      +'<div class="muted" style="margin-top:6px">'+escapeHtml(extra)+'</div>');
+  };
+}
 function mkStackByKey(cid){
-  return new Chart(document.getElementById(cid), {
+  const ch = new Chart(document.getElementById(cid), {
     type:"line", data:{labels:[],datasets:[]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{intersect:false,mode:"index"},
-      plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}}},
+      plugins:{legend:{labels:{color:cssv("--muted"),boxWidth:10,font:{size:10}}},
+        tooltip:{callbacks:{label:c=>" "+(c.dataset._k||c.dataset.label)+": "+Number(c.parsed.y).toLocaleString()}}},
       scales:{x:{ticks:{color:cssv("--muted"),maxTicksLimit:8,font:{size:9}},grid:{display:false}},
               y:{stacked:true,beginAtZero:true,ticks:{color:cssv("--muted"),font:{size:9}},
                  grid:{color:"#30363d33"}}}}
   });
+  wireLegendFullName(ch, item=>{ const ds=ch.data.datasets[item.datasetIndex]; return ds&&ds._k; });
+  return ch;
 }
 const concByKeyChart=mkStackByKey("conc-by-key-chart");
 const backlogByKeyChart=mkStackByKey("backlog-by-key-chart");
+const concByModelChart=mkStackByKey("conc-by-model-chart");
+// Add the "full legend names" (i) to every chart whose legend truncates long labels.
+// The (i) reads the chart's LIVE data on click, so it works before any data has loaded.
+[["card-keys",keysChart,true],
+ ["card-userkeys",userKeysChart,true],
+ ["card-keys-winspend",keysWinSpendChart,true],
+ ["card-userkeys-winspend",userWinSpendChart,true],
+ ["card-keytime",keyTimeChart,false],
+ ["card-keytime-win",keyTimeWinChart,false],
+ ["card-keydelta",keyDeltaChart,false],
+ ["card-userdelta",userDeltaChart,false],
+ ["card-conc-by-key",concByKeyChart,false],
+ ["card-conc-by-model",concByModelChart,false],
+ ["card-backlog-by-key",backlogByKeyChart,false],
+].forEach(function(x){ addLegendInfo(x[0], x[1], x[2]); });
 function renderStackByKey(d, chart, cardId, basisId){
   if(!d) return;
-  const series=d.series||[];
-  const any=series.some(s=>(s.data||[]).some(v=>v!=null && v!==0));
+  // Drop any band whose values are all zero/null: it would otherwise add a flat-zero line and a
+  // dead entry to the legend (e.g. a user with keys but no activity in the window). A zero band
+  // contributes nothing to the stack, so removing it leaves the sum — and the visible bands —
+  // unchanged.
+  const series=(d.series||[]).filter(s=>(s.data||[]).some(v=>v!=null && v!==0));
+  const any=series.length>0;
   // An idle window legitimately has nothing to attribute: in lite/off mode the split is
   // weighted by each key's per-bucket SPEND DELTA, so an hour with no spend yields no
   // bands (the server returns an empty series rather than painting a phantom "Other").
@@ -870,6 +1033,7 @@ function renderStackByKey(d, chart, cardId, basisId){
   if(empty) empty.style.display=any?"none":"";
   const b=document.getElementById(basisId);
   if(b) b.textContent=any?("estimated · by "+(d.weight_basis||"activity")+" share"):"";
+  _wireWhyOther(cardId, d);
   if(!any) return;
   const pts=(d.labels||[]).map(t=>({t}));
   // A plain fill-to-origin would stack translucent layers on top of each other so each band
@@ -882,12 +1046,42 @@ function renderStackByKey(d, chart, cardId, basisId){
       borderWidth:1, pointRadius:0, tension:.25, fill:i?"-1":"origin"};
   }));
 }
+// Fold the server's per-KEY attribution bands into per-USER bands. The concurrency/backlog
+// cards are titled "by user", so a raw key id must never appear: sum each owner's keys
+// element-wise, group a key with no resolved owner under "Unassigned", and keep the server's
+// residual "Other" band as-is (last). The measured total still sums exactly — only the
+// grouping of the (already estimated) per-key split changes. Mirrors userOf() used by the
+// other by-user charts.
+function _foldSeriesByUser(series){
+  const byUser={}; const order=[];
+  (series||[]).forEach(s=>{
+    const u = (s.label==="Other") ? "Other" : userOf(s.label);
+    if(!byUser[u]){ byUser[u]=[]; order.push(u); }
+    const acc=byUser[u], data=s.data||[];
+    for(let i=0;i<data.length;i++){
+      const v=data[i];
+      if(v==null) continue;
+      acc[i]=(acc[i]==null?0:acc[i])+v;
+    }
+  });
+  const tot=u=>byUser[u].reduce((s,v)=>s+(v||0),0);
+  const users=order.filter(u=>u!=="Other").sort((a,b)=>tot(b)-tot(a));
+  if(byUser["Other"]!==undefined) users.push("Other");   // residual stays last (grey band)
+  return users.map(u=>({label:u, data:byUser[u]}));
+}
 async function loadConcByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=conc&window="+WIN);
+  if(d && d.series) d.series=_foldSeriesByUser(d.series);   // title is "by user" → show users
   renderStackByKey(d, concByKeyChart, "card-conc-by-key", "conc-by-key-basis");
+}
+async function loadConcByModel(){
+  // Same aggregate as loadConcByKey, split by MODEL (by=model) instead of key.
+  const d=await api("/api/litellm/concurrency-by-key?metric=conc&by=model&window="+WIN);
+  renderStackByKey(d, concByModelChart, "card-conc-by-model", "conc-by-model-basis");
 }
 async function loadBacklogByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=backlog&window="+WIN);
+  if(d && d.series) d.series=_foldSeriesByUser(d.series);   // title is "by user" → show users
   renderStackByKey(d, backlogByKeyChart, "card-backlog-by-key", "backlog-by-key-basis");
 }
 async function loadAnomalies(){
@@ -1045,8 +1239,31 @@ async function loadKeyTime(){
     : "running total of each key's requests to date (all time) — only rises; for activity "
       +"in the selected window see 'requests in window' below";
   if(!d){ return; }
-  const pts=d.points||[]; const labels=d.labels||[];
+  const pts=d.points||[]; const labels=_nzLabels(d.labels||[], pts);
   stampTs(keyTimeChart, pts); updateSeries(keyTimeChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
+    _k:lab, label:keyDisp(lab),
+    data:pts.map(p=>p[lab]==null?null:p[lab]),
+    borderColor:KEY_COLORS[i%KEY_COLORS.length],
+    backgroundColor:KEY_COLORS[i%KEY_COLORS.length]+"22",
+    borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
+}
+async function loadKeyTimeWin(){
+  // Same per-key over-time lines as the all-time chart above, but for the SELECTED window
+  // (/api/keyseries follows WIN). Per-key REQUEST counts need full spend mode; lite/off
+  // store per-key SPEND, so label off _spendMode (same rule the delta cards use).
+  const d=await api("/api/keyseries?window="+WIN);
+  const spend=_spendMode!=="full"; _keytimewinMetric=spend?"spend":"reqs";
+  const m=document.getElementById("keytimewin-metric");
+  if(m) m.textContent=spend?"cumulative spend":"cumulative requests";
+  const w=document.getElementById("keytimewin-win"); if(w) w.textContent=wlabel(WIN);
+  const sub=document.getElementById("keytimewin-sub");
+  if(sub) sub.textContent=spend
+    ? "each key's cumulative spend across the selected window — only rises (per-key request "
+      +"counts need full spend mode; showing spend)"
+    : "each key's cumulative requests across the selected window — only rises";
+  if(!d){ return; }
+  const pts=d.points||[]; const labels=_nzLabels(d.labels||[], pts);
+  stampTs(keyTimeWinChart, pts); updateSeries(keyTimeWinChart, pts.map(axisT(pts)), labels.map((lab,i)=>({
     _k:lab, label:keyDisp(lab),
     data:pts.map(p=>p[lab]==null?null:p[lab]),
     borderColor:KEY_COLORS[i%KEY_COLORS.length],
@@ -1083,7 +1300,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyTimeWin(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadConcByModel(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -1105,86 +1322,7 @@ function updateRangeUI(){
   const m=Math.round((now-TIMEEND)/60);
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
-// wlabel(): a custom window's raw token ("custom:900") must never reach the UI — every
-// window badge renders it through here (bug-registry class #3/#4: raw markup/tokens shown
-// to the user).
-function wlabel(w){ return (typeof w==="string" && w.indexOf("custom:")===0) ? "custom" : w; }
-// stampTs(): remember the ACTUAL timestamp of each plotted point on the chart. The server
-// omits empty buckets (GROUP BY yields only buckets holding rows), so points are NOT evenly
-// spread across the window whenever the monitor restarted or a backend was down — mapping a
-// drag by pixel fraction alone would then select the wrong time range.
-function stampTs(ch, pts){ try{ if(ch) ch.$ts=(pts||[]).map(function(p){ return p && p.t; }); }catch(e){} }
-// ---- drag-to-zoom: drag across ANY chart to set a custom time window (Kibana-style) ----
-(function(){
-  var dg=null;
-  function chartOf(cv){ return (window.Chart && Chart.getChart) ? Chart.getChart(cv) : null; }
-  function place(x){
-    if(!dg||!dg.ov) return; var a=dg.ch.chartArea, r=dg.cv.getBoundingClientRect();
-    var lo=Math.max(a.left, Math.min(dg.x0,x)-r.left), hi=Math.min(a.right, Math.max(dg.x0,x)-r.left);
-    dg.ov.style.left=lo+"px"; dg.ov.style.width=Math.max(0,hi-lo)+"px";
-    dg.ov.style.top=a.top+"px"; dg.ov.style.height=(a.bottom-a.top)+"px";
-  }
-  function abort(){ if(dg&&dg.ov&&dg.ov.parentNode) dg.ov.parentNode.removeChild(dg.ov); dg=null; }
-  document.addEventListener("pointerdown",function(e){
-    if(e.button) return;
-    var wrap=e.target.closest && e.target.closest(".chart-wrap"); if(!wrap) return;
-    var cv=wrap.querySelector("canvas"); if(!cv) return;
-    var ch=chartOf(cv); if(!ch||!ch.chartArea) return;
-    // Time-series charts only. A by-key BAR chart's x-axis is key names, not time — a drag
-    // there would map pixels onto a time range that means nothing. $ts is set by stampTs(),
-    // so only charts plotted against real timestamps are draggable.
-    if(!ch.$ts || ch.$ts.length<2) return;
-    // Start ONLY inside the plot area: Chart.js paints the legend on the same canvas, so
-    // grabbing the whole wrap would swallow the click that toggles a series on/off.
-    var a=ch.chartArea, r=cv.getBoundingClientRect(), x=e.clientX-r.left, y=e.clientY-r.top;
-    if(x<a.left||x>a.right||y<a.top||y>a.bottom) return;
-    dg={wrap:wrap,cv:cv,ch:ch,x0:e.clientX,ov:null,moved:false};
-  });
-  document.addEventListener("pointermove",function(e){
-    if(!dg) return;
-    if(!dg.moved){
-      if(Math.abs(e.clientX-dg.x0)<5) return;      // still a click, not a drag
-      dg.moved=true;
-      dg.ov=document.createElement("div"); dg.ov.className="drag-sel"; dg.wrap.appendChild(dg.ov);
-    }
-    e.preventDefault();                            // suppress text selection ONLY while dragging
-    place(e.clientX);
-  });
-  document.addEventListener("pointercancel",abort);   // pointer lost (gesture/scroll/OS) → clean up
-  window.addEventListener("blur",abort);              // released outside the window → no stuck overlay
-  document.addEventListener("pointerup",function(e){
-    if(!dg) return; var d=dg; abort();
-    if(!d.moved) return;                           // a click: let the chart handle it
-    var a=d.ch.chartArea, r=d.cv.getBoundingClientRect(), w=a.right-a.left; if(w<=0) return;
-    var px1=Math.min(d.x0,e.clientX)-r.left, px2=Math.max(d.x0,e.clientX)-r.left;
-    var t1=null, t2=null, ts=d.ch.$ts, xs=d.ch.scales&&d.ch.scales.x;
-    if(ts&&ts.length>1&&xs&&xs.getValueForPixel){
-      // exact: pixel -> point index -> that point's real timestamp (handles data gaps)
-      var i1=Math.round(xs.getValueForPixel(px1)), i2=Math.round(xs.getValueForPixel(px2));
-      i1=Math.max(0,Math.min(ts.length-1,i1)); i2=Math.max(0,Math.min(ts.length-1,i2));
-      if(isFinite(ts[i1])&&isFinite(ts[i2])){ t1=ts[i1]; t2=ts[i2]; }
-    }
-    if(t1===null){                                 // fallback: fraction of the requested window
-      var f1=Math.max(0,Math.min(1,(px1-a.left)/w)), f2=Math.max(0,Math.min(1,(px2-a.left)/w));
-      var end=TIMEEND||Date.now()/1000, s=end-wsecs(WIN), span=end-s;
-      t1=s+f1*span; t2=s+f2*span;
-    }
-    if(!(t2-t1>=30)) return;                       // ignore < 30s selections
-    WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN, TIMEEND);
-    document.querySelectorAll("#windows button[data-w]").forEach(function(x){x.classList.remove("active");x.setAttribute("aria-pressed","false");});
-    document.querySelectorAll('#win-label,[id$="-win"]').forEach(function(el){ el.textContent="custom"; });
-    _winMark(true);
-    if(typeof updateRangeUI==="function") updateRangeUI();
-    rangedReload();
-  });
-})();
-// _winMark(): make a restored custom range unmistakable — a frozen historical window that
-// survives a refresh otherwise reads as "the dashboard stopped updating".
-function _winMark(on){
-  var l=document.getElementById("win-label"); if(!l) return;
-  l.classList.toggle("custom-win", !!on);
-  l.title = on ? "Custom range from a chart selection — click Live to resume live data" : "";
-}
+
 document.getElementById("nav-left").addEventListener("click",()=>{
   const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(WIN);
   updateRangeUI(); rangedReload();
@@ -1202,7 +1340,7 @@ document.querySelectorAll("#windows button[data-w]").forEach(b=>{
     document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
     b.classList.add("active"); b.setAttribute("aria-pressed","true"); WIN=b.dataset.w; TIMEEND=null; _winSave(WIN, null); _winMark(false); var _wl=document.getElementById("win-label"); if(_wl)_wl.textContent=wlabel(WIN); updateRangeUI();
     document.getElementById("win-label").textContent=wlabel(WIN);
-    loadSeries(); loadKeyTime(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels();
+    loadSeries(); loadKeyTime(); loadKeyTimeWin(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadConcByModel(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels();
   });
 });
 document.getElementById("export-btn").addEventListener("click",()=>{
@@ -1230,10 +1368,12 @@ async function tick(){
   }
   await loadSeries();
   await loadKeyTime();
+  await loadKeyTimeWin();
   await loadKeyDelta();
   await loadUserDelta();
   await loadWinSpend();
   await loadConcByKey();
+  await loadConcByModel();
   await loadBacklogByKey();
   await loadCorr();
   await loadImpact();
@@ -1268,5 +1408,6 @@ _timers.push(setInterval(tick,5000));
   });
 })();
 </script>
+<div id="other-pop" role="dialog" aria-label="Why Other"></div>
 </body>
 </html>

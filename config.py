@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.6"
+VERSION = "AI-Monitoring_1.8.9"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -489,9 +489,21 @@ _overrides: dict[str, str] = {}   # name -> raw string; only keys in TUNABLES
 def _apply(name: str) -> None:
     """Write the live value onto the module constant so existing consumers that
     read `config.<NAME>` directly pick up an override without any code change.
-    When the override is cleared, tunable() returns the default → resets it."""
+    When the override is cleared, tunable() returns the default → resets it.
+
+    Thread-safety (review F-1): this runs on the event loop (from the admin-settings handler)
+    while off-loaded DB reads read `config.<NAME>` in WORKER THREADS. Rebinding a module global
+    to a NEW scalar object is atomic under the GIL, so a concurrent reader sees the old-or-new
+    value, never a torn one — no lock needed. That safety depends on every tunable resolving to
+    a SCALAR (never a compound object mutated in place); the guard below flags a future
+    non-scalar tunable loudly here instead of letting it race silently."""
     try:
-        globals()[name] = tunable(name)
+        v = tunable(name)
+        if not (v is None or isinstance(v, (int, float, bool, str))):
+            import sys
+            sys.stderr.write(f"[config] tunable {name!r} is not a scalar ({type(v).__name__}) "
+                             f"— unsafe for lock-free cross-thread reads (F-1)\n")
+        globals()[name] = v
     except Exception:
         pass
 
