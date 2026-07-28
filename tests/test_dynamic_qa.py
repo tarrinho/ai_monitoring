@@ -3392,6 +3392,53 @@ async def test_spend_series_endpoint(monkeypatch):
         await c.close()
 
 
+async def test_spend_series_is_cached_within_ttl(monkeypatch):
+    """Tier-2 #16: /api/spend/series serves a short-TTL cache keyed on window, so its
+    multi-round-trip LiteLLM fan-out runs once per window per TTL no matter how many tabs poll
+    it; `?diag=1` bypasses the cache."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sp-cache-1")
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    calls = {"n": 0}
+
+    async def _daily(session, s, e):
+        calls["n"] += 1
+        return [{"date": "2026-07-01", "requests": 10, "tokens": 1000, "spend": 0.5}]
+
+    async def _prices(session):
+        return {"gpt-4o": 0.001}
+
+    async def _permodel(session, s, e, ov=None):
+        return [{"model": "gpt-4o", "tokens": 1000, "reqs": 10,
+                 "internal": False, "cost_kind": "real"}]
+    monkeypatch.setattr(litellm, "spend_activity", _daily)
+    monkeypatch.setattr(litellm, "model_prices", _prices)
+    monkeypatch.setattr(litellm, "per_model_range", _permodel)
+    # Mock ALL upstream calls the handler makes (not just the ones we assert on) so the test is
+    # deterministic — an unmocked call would hit the (unresolvable) proxy, and how that DNS
+    # failure surfaces differs by libc (glibc NXDOMAIN vs musl EAI_AGAIN), which once made this
+    # environment-fragile (passed on the host, failed in the Alpine build image).
+    async def _none3(session, s, e, *a, **k):
+        return None
+    monkeypatch.setattr(litellm, "per_model_daily_cost", _none3)
+    monkeypatch.setattr(litellm, "per_model_daily_tokens", _none3)
+
+    async def _probe(session, s, e, *a, **k):
+        return {}
+    monkeypatch.setattr(litellm, "spend_report_probe", _probe)
+    hdr = {"Authorization": "Bearer sp-cache-1"}
+    c = await _client()
+    try:
+        assert (await (await c.get("/api/spend/series?window=30d", headers=hdr)).json())["available"]
+        assert calls["n"] == 1
+        await c.get("/api/spend/series?window=30d", headers=hdr)     # 2nd poll → cache hit
+        assert calls["n"] == 1, "second poll within TTL must be served from cache"
+        await c.get("/api/spend/series?window=30d&diag=1", headers=hdr)   # diag bypasses cache
+        assert calls["n"] == 2, "?diag=1 must bypass the cache"
+    finally:
+        await c.close()
+
+
 async def test_spend_series_attaches_cost_models(monkeypatch):
     """/api/spend/series attaches cost_models {real:[…],reference:[…]} so the
     cost-over-time legend can tooltip the models in each bucket."""
@@ -4893,6 +4940,74 @@ def test_classify_model_provider_prefix_beats_family_substring(monkeypatch):
     assert litellm.classify_model("qwen3-coder")["cost_kind"] == "reference"
     # bare external name → real
     assert litellm.classify_model("gpt-5-mini")["cost_kind"] == "real"
+
+
+def test_conftest_network_guard_blocks_external_allows_loopback():
+    """The autouse hermeticity guard (conftest `_block_external_network`) must let loopback
+    through (the aiohttp TestServer) but fail any external resolution deterministically — this
+    is what stops an incompletely-mocked handler from hitting the real proxy and behaving
+    differently under glibc vs musl (the fragility the in-image gate once caught)."""
+    import socket
+    socket.getaddrinfo("127.0.0.1", 80)          # loopback OK
+    socket.getaddrinfo("localhost", 80)          # loopback OK
+    for hostname in ("litellm", "example.com", "8.8.8.8"):   # not `host` — shadows the import
+        with pytest.raises(socket.gaierror):
+            socket.getaddrinfo(hostname, 80)
+
+
+def test_match_model_is_provider_prefix_tolerant():
+    """Tier-2 #17: the single `_match_model` helper (shared by price_for/detail_for) matches a
+    model tolerant of a provider/ prefix on either side, and returns None on no match."""
+    assert litellm._match_model("azure_ai/gpt-5-mini", {"gpt-5-mini": 3.0}) == 3.0   # bare key
+    assert litellm._match_model("gpt-5-mini", {"azure_ai/gpt-5-mini": 4.0}) == 4.0   # prefixed key
+    assert litellm._match_model("x/y", {"a/b": 1.0}) is None
+    # price_for/detail_for defaults still differ (0.0 vs {})
+    assert litellm.price_for("gpt-5-mini", {"azure_ai/gpt-5-mini": 2.0}) == 2.0
+    assert litellm.price_for("nope", {"a": 1.0}) == 0.0
+    assert litellm.detail_for("nope", {"a": {"in": 1}}) == {}
+
+
+def test_rollup_incremental_skips_pre_hwm_raw(tmp_path, monkeypatch):
+    """Tier-1 #8: after the first (full) rollup advances the high-water mark, a LATER rollup
+    only re-aggregates recent raw — old raw inserted after the HWM is set is NOT folded (it
+    would already be stored in prod), so the per-tick rollup stays a small scan."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "roll2.db"))
+    db.init()
+    now = 5_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    assert db._ROLLUP_HWM == 0.0                     # conftest reset → first run is FULL
+    db.insert_key_series(now - 100, [{"key": "A", "alias": "", "reqs": 5}])  # recent
+    db.rollup()
+    assert db._ROLLUP_HWM == now                     # advanced on success
+    assert db.key_series("24h", top_n=5)["labels"] == ["A"]
+    # now insert raw 10h in the PAST and roll again — it's older than HWM-grace, so skipped
+    db.insert_key_series(now - 36000, [{"key": "OLD", "alias": "", "reqs": 9}])
+    db.rollup()
+    lbls = db.key_series("30d", top_n=5)["labels"]
+    assert "OLD" not in lbls, "incremental rollup must not re-scan pre-HWM raw"
+
+
+async def test_db_error_counter_surfaces(monkeypatch):
+    """Tier-3 #18: swallowed DB errors bump an observable counter exposed on /metrics
+    (aimon_db_errors_total) and, for authed callers, /healthz — so silent persistence
+    failure is visible instead of the ring making a broken box look healthy."""
+    import metrics_prom
+    before = db.db_error_stats()["count"]
+    db._dberr(RuntimeError("disk full"))             # simulate a swallowed failure
+    st = db.db_error_stats()
+    assert st["count"] == before + 1 and "disk full" in st["last"]
+    # prometheus text carries the gauge
+    txt = metrics_prom.render({}, {"users": 0, "sessions": 0, "alerts": 0,
+                                   "db_errors": st["count"]})
+    assert "aimon_db_errors_total" in txt
+    # /healthz exposes it to an authed caller only
+    c = await _client()
+    try:
+        j = await (await c.get("/healthz")).json()
+        assert "db_errors" not in j                   # anonymous → withheld (like version)
+    finally:
+        await c.close()
 
 
 def test_fold_model_token_types_bounds_the_day(monkeypatch):

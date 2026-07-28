@@ -2664,6 +2664,10 @@ async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
 
 # Demo/override hook for the spend timeline: fn(now, window) -> {...}.
 _spend_series_source = None
+# Short-TTL cache for /api/spend/series (keyed on window): bounds its multi-round-trip LiteLLM
+# fan-out to one real build per window per TTL, no matter how many Spend tabs poll it. ≤3 entries.
+_SPEND_SERIES_CACHE: dict[str, tuple[float, dict]] = {}
+_SPEND_SERIES_TTL = 30.0
 # Last non-zero (real $/token, reference $/token) — reused when /global/activity/model
 # momentarily returns empty so the estimated-cost chart stays put instead of blinking.
 _COST_RATES: tuple[float, float] | None = None
@@ -3135,6 +3139,15 @@ async def spend_series_handler(request: web.Request) -> web.Response:
     now = time.time()
     if _spend_series_source is not None:
         return web.json_response(_spend_series_source(now, window))
+    # Short-TTL cache: this handler fans out to several LiteLLM round-trips (spend_activity,
+    # model_prices, per_model_range, per_model_daily_cost/tokens) per call, and every open Spend
+    # tab polls it — a viewer could otherwise amplify load onto the monitored proxy. Serve a
+    # cached payload for _SPEND_SERIES_TTL (the write-through is redundant with the hourly
+    # sampler). `?diag=1` bypasses the cache so the diagnostic view is always live.
+    if not request.query.get("diag"):
+        _hit = _SPEND_SERIES_CACHE.get(window)
+        if _hit and now - _hit[0] < _SPEND_SERIES_TTL:
+            return web.json_response(_hit[1])
     # Pull the deployment's full history of daily aggregates (one small row per day) so the
     # per-year + lifetime totals are complete — not just a rolling year. The CHART still
     # renders only its own 30d/12mo window (window_and_years slices it); the extra rows just
@@ -3241,6 +3254,10 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                            "report": await litellm.spend_report_probe(
                                request.app[_SESSION], start, end),
                            "points_built": len(out.get("points", []))}
+        else:
+            # cache only the plain (non-diag) successful payload
+            if out.get("available"):
+                _SPEND_SERIES_CACHE[window] = (now, out)
         return web.json_response(out)
     except Exception as e:      # a bad LiteLLM shape must degrade, never 500 the page
         print(f"[error] /api/spend/series {type(e).__name__}: {e}", file=sys.stderr)
@@ -3493,6 +3510,9 @@ async def healthz_handler(request: web.Request) -> web.Response:
     if _auth_ctx(request)[0]:
         body["version"] = config.VERSION
         body["samples"] = len(_ring)
+        # Swallowed-DB-error telemetry: nonzero means persistence is failing while the ring
+        # still looks healthy. Authed-only (same disclosure rule as version).
+        body["db_errors"] = db.db_error_stats()["count"]
     return web.json_response(body, status=200)
 
 
@@ -3544,7 +3564,8 @@ async def metrics_handler(request: web.Request) -> web.Response:
         _auth_fails.pop(ip, None)
         _auth_locked_until.pop(ip, None)
     extra = {"users": db.user_count(), "sessions": auth.session_count(),
-             "alerts": len(_notifier.active_keys())}
+             "alerts": len(_notifier.active_keys()),
+             "db_errors": db.db_error_stats()["count"]}
     body = metrics_prom.render(_latest, extra)
     resp = web.Response(text=body)
     resp.headers["Content-Type"] = metrics_prom.CONTENT_TYPE

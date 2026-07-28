@@ -149,4 +149,8 @@ def render(latest: dict, extra: dict | None = None) -> str:
         o.gauge("aimon_users_total", extra.get("users"), help="dashboard user accounts")
         o.gauge("aimon_sessions_active", extra.get("sessions"))
         o.gauge("aimon_alerts_active", extra.get("alerts"))
+        # nonzero ⇒ the monitor is failing to persist (disk full / locked DB / schema drift)
+        # while the ring still serves — alert on rate(aimon_db_errors_total[5m]) > 0.
+        o.gauge("aimon_db_errors_total", extra.get("db_errors"),
+                help="swallowed DB write/read errors since start")
     return o.text()

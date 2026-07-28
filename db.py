@@ -19,13 +19,33 @@ from typing import Any, cast
 import config
 
 
+# Swallowed-DB-error telemetry. Every db.py `except` calls _dberr, which logs AND bumps this
+# counter so a persistently-failing store (disk full, locked DB, schema drift) is OBSERVABLE on
+# /healthz + /metrics — otherwise the dashboard keeps serving the in-memory ring and the box
+# looks healthy while nothing is being persisted. Ints/tuples → atomic under the GIL, safe from
+# the worker threads (to_thread) and the loop without a lock.
+_DB_ERR_COUNT = 0
+_DB_LAST: tuple[str, str, float] | None = None      # (fn, "Type: msg", ts)
+
+
+def db_error_stats() -> dict:
+    """{count, last, last_ts} for the swallowed-DB-error counter (0/None when healthy)."""
+    return {"count": _DB_ERR_COUNT,
+            "last": (_DB_LAST[0] + ": " + _DB_LAST[1]) if _DB_LAST else None,
+            "last_ts": _DB_LAST[2] if _DB_LAST else None}
+
+
 def _dberr(exc: BaseException) -> None:
-    """Log a swallowed DB error with the FAILING FUNCTION's name (review D-2). A monitoring
-    tool must not fail its own storage silently: every `except Exception` in this module now
-    surfaces the exception type + where it happened, so a query bug / schema drift / locked DB
-    is diagnosable instead of an indistinguishable empty result. Best-effort; never raises."""
+    """Log a swallowed DB error with the FAILING FUNCTION's name (review D-2) AND bump the
+    observable error counter (db_error_stats). A monitoring tool must not fail its own storage
+    silently: every `except Exception` in this module surfaces the exception type + where it
+    happened, so a query bug / schema drift / locked DB is diagnosable instead of an
+    indistinguishable empty result. Best-effort; never raises."""
+    global _DB_ERR_COUNT, _DB_LAST
     try:
         fn = sys._getframe(1).f_code.co_name
+        _DB_ERR_COUNT += 1
+        _DB_LAST = (fn, f"{type(exc).__name__}: {exc}", time.time())
         sys.stderr.write(f"[db] {fn}: {type(exc).__name__}: {exc}\n")
     except Exception:
         pass
@@ -1562,51 +1582,59 @@ def uptime(window: str) -> dict[str, dict]:
         return {}
 
 
+# High-water mark for incremental rollup (see rollup()). Module global, reset to 0 on process
+# start: the FIRST rollup after start re-aggregates all retained raw; subsequent ones only
+# re-touch the buckets that could have received new raw since. Advanced only on success.
+_ROLLUP_HWM = 0.0
+_ROLLUP_GRACE = 2 * 3600     # re-touch window past the HWM: covers the open + previous 1h bucket
+
+
 def rollup() -> None:
     """Fold raw rows into 1-minute and 1-hour averaged buckets (Tier 4).
 
-    Aggregation is BOUNDED to recent rows (not the whole raw table) so each
-    per-minute rollup is a small scan regardless of retention — this is what
-    keeps 1-year history cheap. INSERT OR REPLACE refreshes the in-progress
-    bucket; older buckets are already stored.
+    INCREMENTAL: the first rollup after start scans ALL retained raw (so a fresh/restarted
+    process folds pre-existing raw into the tiers before prune removes it — the 1h tier serves
+    30d/12mo windows that outlive the 24h raw window). After that, only rows newer than the last
+    successful rollup minus `_ROLLUP_GRACE` are re-aggregated: raw only ever arrives at ~now, so
+    only the open (+ previous) bucket changes between the 60s runs — the rest are already stored.
+    This is what keeps the per-minute rollup from re-scanning the whole raw table every tick.
     """
+    global _ROLLUP_HWM
     now = time.time()
+    look_from = 0.0 if _ROLLUP_HWM <= 0.0 else max(0.0, _ROLLUP_HWM - _ROLLUP_GRACE)
     try:
         with _connect() as conn:
-            # metrics — recent lookback per tier
-            for tbl, bsize, look in (("metrics_1m", 60, 2 * 3600),
-                                     ("metrics_1h", 3600, 3 * 86400)):
+            # metrics
+            for tbl, bsize in (("metrics_1m", 60), ("metrics_1h", 3600)):
                 cols = ", ".join(f"AVG({c}) AS {c}" for c in _METRIC_COLS)
                 conn.execute(
                     f"INSERT OR REPLACE INTO {tbl} "
                     f"(bucket,{','.join(_METRIC_COLS)}) "
                     f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, {cols} "
-                    f"FROM metrics WHERE ts >= ? GROUP BY bucket", (now - look,))
+                    f"FROM metrics WHERE ts >= ? GROUP BY bucket", (look_from,))
             # key_series (per-key) + model_series (per-model) — identical shape
             for src in ("key_series", "model_series"):
-                for tbl, bsize, look in ((f"{src}_1m", 60, 2 * 3600),
-                                         (f"{src}_1h", 3600, 3 * 86400)):
+                for tbl, bsize in ((f"{src}_1m", 60), (f"{src}_1h", 3600)):
                     conn.execute(
                         f"INSERT OR REPLACE INTO {tbl}(bucket,label,reqs) "
                         f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, label, "
                         f"AVG(reqs) FROM {src} WHERE ts >= ? "
-                        f"GROUP BY bucket, label", (now - look,))
+                        f"GROUP BY bucket, label", (look_from,))
             # proc_series (per-app)
-            for tbl, bsize, look in (("proc_series_1m", 60, 2 * 3600),
-                                     ("proc_series_1h", 3600, 3 * 86400)):
+            for tbl, bsize in (("proc_series_1m", 60), ("proc_series_1h", 3600)):
                 conn.execute(
                     f"INSERT OR REPLACE INTO {tbl}(bucket,kind,app,val) "
                     f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, kind, app, "
                     f"AVG(val) FROM proc_series WHERE ts >= ? "
-                    f"GROUP BY bucket, kind, app", (now - look,))
+                    f"GROUP BY bucket, kind, app", (look_from,))
             # cpu_core_series (per-core CPU%)
-            for tbl, bsize, look in (("cpu_core_series_1m", 60, 2 * 3600),
-                                     ("cpu_core_series_1h", 3600, 3 * 86400)):
+            for tbl, bsize in (("cpu_core_series_1m", 60), ("cpu_core_series_1h", 3600)):
                 conn.execute(
                     f"INSERT OR REPLACE INTO {tbl}(bucket,core,pct) "
                     f"SELECT CAST(ts/{bsize} AS INT)*{bsize} AS bucket, core, "
                     f"AVG(pct) FROM cpu_core_series WHERE ts >= ? "
-                    f"GROUP BY bucket, core", (now - look,))
+                    f"GROUP BY bucket, core", (look_from,))
+        _ROLLUP_HWM = now       # advance ONLY on success (a failed run re-covers the gap next time)
     except Exception as _e:
         _dberr(_e)
         pass

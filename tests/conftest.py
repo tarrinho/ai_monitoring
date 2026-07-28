@@ -26,6 +26,31 @@ from collectors import litellm as _litellm  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _block_external_network(monkeypatch):
+    """Make tests HERMETIC + platform-deterministic. If a test sets a fake backend URL (e.g.
+    LITELLM_BASE_URL=http://litellm:4000) but doesn't mock EVERY upstream call, the handler would
+    otherwise attempt a real DNS resolution — and how that failed leaked into assertions: glibc
+    returned NXDOMAIN fast, musl returned EAI_AGAIN (retryable) slowly, so a test could pass on the
+    host yet fail inside the Alpine build image (exactly what slipped through once). This guard
+    fails any non-loopback resolution IMMEDIATELY and identically everywhere; loopback (the aiohttp
+    TestServer) stays allowed. Handlers still catch it (best-effort), so behaviour is unchanged —
+    just deterministic. A test that needs a real upstream must mock the call, not hit the network."""
+    import socket
+    _real = socket.getaddrinfo
+
+    def _guard(host, *args, **kwargs):
+        h = str(host or "")
+        if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "") or h.startswith(("127.", "::1")):
+            return _real(host, *args, **kwargs)
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            f"test network blocked: {h!r} — mock the upstream call; tests must not hit the network")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _guard)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_litellm_heavy_cache():
     """The LiteLLM collector throttles /health + /spend/logs behind a module-level
     cache (LITELLM_HEAVY_INTERVAL). Reset it before every test so each test's stub
@@ -70,6 +95,9 @@ def _reset_auth_state():
     _app._users_seen["checked"] = 0.0
     _app._users_seen["any"] = False
     _app._MU_SERIES_CACHE.clear()          # module-level series cache — isolate per test
+    _app._TT_CACHE.clear()                 # token-types window cache — isolate per test
+    _app._SPEND_SERIES_CACHE.clear()       # spend/series window cache — isolate per test
+    _db._ROLLUP_HWM = 0.0                  # incremental-rollup HWM — a fresh test rolls up in full
     _auth._sessions.clear()
     _app._auth_fails.clear()
     _app._auth_locked_until.clear()

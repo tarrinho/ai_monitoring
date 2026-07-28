@@ -43,6 +43,16 @@ save() {    # <tag-suffix>  → $DIST/aimon-<arch>.tar.gz
   docker save "${IMAGE}:${VERSION}-$1" | gzip > "${DIST}/aimon-$1.tar.gz"
 }
 
+# Ensure QEMU binfmt is registered for the emulated arches. On an arm64 host, amd64 + arm/v7
+# are emulated; the binfmt handlers RESET ON REBOOT, and a missing arm handler makes the armv7
+# build die with a bare `exit code: 255` on the first RUN (QEMU can't exec /bin/sh). Register
+# idempotently so the build self-heals instead of failing cryptically. Skippable with BINFMT=0.
+if [ "${BINFMT:-1}" = "1" ] && ! ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -q qemu-arm; then
+  echo "── registering QEMU binfmt (qemu-arm missing) ──"
+  docker run --privileged --rm tonistiigi/binfmt --install arm,amd64 >/dev/null 2>&1 \
+    || echo "  ! binfmt register failed — emulated (armv7/amd64) builds may fail with exit 255"
+fi
+
 build linux/arm64   arm64 1     # native gate
 build linux/amd64   amd64 1     # emulated but fast enough; keep gate
 build linux/arm/v7  armv7 0     # emulated — skip slow suite

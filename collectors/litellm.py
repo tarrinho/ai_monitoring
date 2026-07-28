@@ -893,39 +893,36 @@ async def model_price_detail(session: aiohttp.ClientSession) -> dict:
     return out
 
 
-def price_for(model: str, prices: dict) -> float:
-    """$/token for a model name, tolerant of `provider/model` prefixes on either side
-    (LiteLLM activity reports `azure_ai/gpt-5-mini`; model_list may key it either way)."""
-    if not prices:
-        return 0.0
-    if model in prices:
-        return prices[model]
+def _match_model(model: str, mapping: dict):
+    """Look up `model` in `mapping` tolerant of a `provider/` prefix on EITHER side — LiteLLM
+    keys the same model with/without a provider prefix across its endpoints (activity reports
+    `azure_ai/gpt-5-mini`; model_list / model_info may key it bare, or vice-versa). Returns the
+    matched value, or None when no key matches. Single source for price_for()/detail_for() so
+    the tolerant-match rule can't drift between them (an exact-only detail_for() once returned
+    {} for every model — this is the shared fix)."""
+    if not mapping:
+        return None
+    if model in mapping:
+        return mapping[model]
     bare = model.split("/", 1)[1] if "/" in model else model
-    for k, v in prices.items():
+    for k, v in mapping.items():
         kb = k.split("/", 1)[1] if "/" in k else k
         if k == model or kb == bare or kb == model or k == bare:
             return v
-    return 0.0
+    return None
+
+
+def price_for(model: str, prices: dict) -> float:
+    """$/token for a model name, tolerant of `provider/model` prefixes on either side."""
+    v = _match_model(model, prices)
+    return v if v is not None else 0.0
 
 
 def detail_for(model: str, detail: dict) -> dict:
     """The {"in","out","cache"} per-type rate breakdown for a model name, tolerant of
-    `provider/model` prefixes exactly like price_for() — model_price_detail() keys its
-    dict by LiteLLM's own model_name, which doesn't always carry the same provider
-    prefix as the canonical name used everywhere else (activity reports, price_for()'s
-    own prices dict). An exact-only lookup here silently returned {} for EVERY model,
-    even correctly-priced ones, because the two dicts' keys never matched — the
-    Settings model-costs card's IN/OUT/CCH columns read as permanently blank."""
-    if not detail:
-        return {}
-    if model in detail:
-        return detail[model]
-    bare = model.split("/", 1)[1] if "/" in model else model
-    for k, v in detail.items():
-        kb = k.split("/", 1)[1] if "/" in k else k
-        if k == model or kb == bare or kb == model or k == bare:
-            return v
-    return {}
+    `provider/model` prefixes exactly like price_for() (same `_match_model` helper)."""
+    v = _match_model(model, detail)
+    return v if v is not None else {}
 
 
 def _override_kind(model: str, m: str, overrides: dict | None) -> str | None:

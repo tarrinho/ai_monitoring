@@ -1584,6 +1584,22 @@ def test_all_pages_have_consistent_time_window_with_mtd():
     assert "unified time-window control" in (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
 
 
+def test_wire_legend_full_name_mutates_raw_config_not_resolved_proxy():
+    """Regression (live incident 2026-07-28): wireLegendFullName() hard-hung EVERY dashboard at
+    load. On Chart.js v4.4 assigning into the RESOLVED `chart.options.plugins.legend.*` proxy
+    recurses infinitely (Object.set ↔ Object.set → RangeError / frozen page). It must mutate the
+    RAW `chart.config.options` instead (the resolved options read through to it, so hover still
+    works). The stub-based JS gate uses a fake Chart with plain options, so it can't catch this —
+    this static check guards the invariant directly."""
+    core = (ROOT / "web" / "assets" / "aimon-core.js").read_text(encoding="utf-8")
+    body = core.split("function wireLegendFullName", 1)[1].split("\nfunction ", 1)[0]
+    code = "\n".join(ln.split("//", 1)[0] for ln in body.splitlines())   # drop // comments
+    assert "chart.config.options" in code, \
+        "wireLegendFullName must mutate chart.config.options (raw), not the reactive chart.options proxy"
+    assert "chart.options.plugins" not in code, \
+        "wireLegendFullName must NOT touch chart.options.plugins (Chart.js v4 proxy recursion)"
+
+
 def test_no_duplicate_windows_css_block():
     """Regression: the header time-window widget's CSS used to be defined twice per page
     (an old faint-active block + the newer solid-accent one), the first dead-overridden
@@ -3072,7 +3088,11 @@ global.getComputedStyle = () => ({ getPropertyValue: () => "" });
 global.Chart = function(_c, cfg){
   const data = (cfg && cfg.data) || { labels:[], datasets:[] };
   (data.datasets || []).forEach(ds => { if (!ds.data) ds.data = []; });
-  return { data, update(){}, destroy(){}, options:(cfg && cfg.options) || {} };
+  // Model Chart.js v4: `chart.options` (resolved) reads through to `chart.config.options`
+  // (raw) — same object here. Post-construction option code MUST go via chart.config.options,
+  // because mutating the real resolved `chart.options` proxy recurses infinitely (v4.4).
+  const opts = (cfg && cfg.options) || {};
+  return { data, update(){}, destroy(){}, options: opts, config: { options: opts } };
 };
 global.Chart.defaults = {}; global.DOMPurify = { sanitize: s => s };
 """

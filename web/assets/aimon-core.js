@@ -180,12 +180,18 @@ function hideLblTip(){ if(_lblTipEl) _lblTipEl.style.display="none"; }
 // name in the floating tooltip; leaving it hides the tooltip. No-op when nothing is
 // truncated (getFull returns the same string, or null/undefined).
 function wireLegendFullName(chart, getFull){
-  if(!chart || !chart.options) return;
-  chart.options.plugins = chart.options.plugins || {};
-  chart.options.plugins.legend = chart.options.plugins.legend || {};
-  const prevHover = chart.options.plugins.legend.onHover;
-  const prevLeave = chart.options.plugins.legend.onLeave;
-  chart.options.plugins.legend.onHover = function(evt, item, legend){
+  // Mutate the RAW config (`chart.config.options`), NOT the resolved `chart.options` proxy.
+  // On Chart.js v4.4, assigning into the reactive `chart.options.plugins.legend.*` proxy
+  // recurses infinitely (Object.set ↔ Object.set) and hard-hangs the page at load — the
+  // resolved options read through to config, so setting onHover/onLeave on config is picked
+  // up for the legend hover events all the same, without touching the proxy.
+  const o = chart && chart.config && chart.config.options;
+  if(!o) return;
+  o.plugins = o.plugins || {};
+  o.plugins.legend = o.plugins.legend || {};
+  const prevHover = o.plugins.legend.onHover;
+  const prevLeave = o.plugins.legend.onLeave;
+  o.plugins.legend.onHover = function(evt, item, legend){
     if(prevHover) prevHover(evt, item, legend);
     const full = getFull(item);
     const shown = item && item.text;
@@ -193,7 +199,7 @@ function wireLegendFullName(chart, getFull){
       showLblTip(evt.native.clientX, evt.native.clientY, String(full));
     } else hideLblTip();
   };
-  chart.options.plugins.legend.onLeave = function(evt, item, legend){
+  o.plugins.legend.onLeave = function(evt, item, legend){
     if(prevLeave) prevLeave(evt, item, legend);
     hideLblTip();
   };
