@@ -1558,9 +1558,14 @@ def _q_end(request: web.Request) -> float | None:
     if not v:
         return None
     try:
-        return float(v)
+        f = float(v)
     except ValueError:
         return None
+    # Reject non-finite (inf/-inf/nan, incl. overflow like 1e999): float() accepts them,
+    # but they later blow up time.gmtime()/json in the pan handlers (uncaught 500). None = live.
+    if f != f or f == float("inf") or f == float("-inf"):
+        return None
+    return f
 
 
 async def procseries_handler(request: web.Request) -> web.Response:
@@ -2140,11 +2145,16 @@ async def budgets_handler(request: web.Request) -> web.Response:
     rows = litellm.budget_rows(keys, _resolve_budget_map(keys), lt.tm_mday, mlen)
     # per-key `spend` is LIFETIME, so the monthly figures come from the daily series
     mtd = await _mtd_real_spend(request.app[_SESSION], now)
+    # The persisted owner store ({label: email}) rides along so the client can seed its
+    # key->user map warm (and for historical keys), fixing "Unassigned" on ALL by-user charts —
+    # not just the ones whose keys happen to be in the current live budgets list.
+    owner_names = await asyncio.to_thread(db.known_owner_names)
     return web.json_response({"keys": rows,
                               "summary": _budget_summary(rows, mtd_real=mtd,
                                                          month_day=lt.tm_mday,
                                                          month_len=mlen),
                               "available": bool(rows),
+                              "owner_names": owner_names,
                               "budget_source": "litellm" if live else
                                                ("env" if _key_budget_map() else "none"),
                               "budget_error": None if live else litellm.last_key_list_error()})
@@ -2897,7 +2907,8 @@ def bucket_model_series(series: dict, window: str, now: float, top_n: int = 10) 
     else:
         cutoff_ts = db.month_start(now) if window == "month" else now - 2592000  # month | 30d
         cutoff = time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts))
-        labels = sorted(d for d in series.get("dates", []) if d >= cutoff)
+        top = time.strftime("%Y-%m-%d", time.gmtime(now))    # clamp RIGHT edge to the anchor too
+        labels = sorted(d for d in series.get("dates", []) if cutoff <= d <= top)
         bucket = lambda d: d                     # noqa: E731
     lidx = {lab: i for i, lab in enumerate(labels)}
     rows: list = []
@@ -3246,12 +3257,19 @@ def window_and_years(daily_full: list, window: str, now: float) -> dict:
     """Chart points respect the selected window (last 30 days daily, or 12 months
     monthly), but the per-year totals ALWAYS reflect the full year — so '2026 total'
     is year-to-date, not just the 30-day window's slice."""
-    if window in ("30d", "month"):
-        cutoff_ts = db.month_start(now) if window == "month" else now - 2592000
-        cutoff = time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts))
-        wdaily = [r for r in daily_full if r["date"] >= cutoff]
-    else:
-        wdaily = daily_full
+    # `now` is the window END — real now, or a past ◀▶ pan cursor. Bound BOTH edges to
+    # [cutoff, top] so a panned window SHIFTS to that range instead of widening to today
+    # (30d/month) or ignoring the cursor entirely (12mo was a pan no-op). bucket_spend just
+    # folds whatever rows it is handed, so clamping the input rows defines the window.
+    top = time.strftime("%Y-%m-%d", time.gmtime(now))
+    if window == "month":
+        cutoff_ts = db.month_start(now)
+    elif window == "30d":
+        cutoff_ts = now - 2592000
+    else:                                            # 12mo
+        cutoff_ts = now - 31536000
+    cutoff = time.strftime("%Y-%m-%d", time.gmtime(cutoff_ts))
+    wdaily = [r for r in daily_full if cutoff <= r["date"] <= top]
     out = bucket_spend(wdaily, window)              # points + real/ref split
     out["years"] = bucket_spend(daily_full, "12mo")["years"]   # full-year totals
     return out

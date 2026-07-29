@@ -261,7 +261,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.12</div>
+      <div id="sidebar-brand-ver">v1.8.13</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -399,13 +399,19 @@ const SLBL={bad:"Critical",warn:"Watch",ok:"On track",none:"No budget"};
 // refresh keeps it, and each page keeps its OWN window (not shared site-wide). Falls
 // back to the page default when nothing is saved or the saved value isn't a valid button.
 // Spend keeps its OWN coarser persistence (a bare window NAME, no pan cursor), distinct from
-// the WIN pages' JSON {w,end} in aimon-core.js — named _spWin* so the two never clash even
+// the WIN pages' JSON {w,end} in aimon-core.js. NOTE: the storage KEY is the same
+// (aimon-win:<path>); non-collision relies only on spend never calling aimon-core's
+// _winSave — so _spWinRestore below MUST guard the restored value (poisoned-key defense) —
 // though this page loads the shared core too (review D-3).
 function _spWinKey(){ return "aimon-win:"+location.pathname; }
 function _spWinSave(w){ try{ localStorage.setItem(_spWinKey(), w); }catch(e){} }
 function _spWinRestore(sel, def, labelId){
   var w=null; try{ w=localStorage.getItem(_spWinKey()); }catch(e){}
-  if(!(w && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
+  // SHARED KEY with aimon-core (_winKey == this key on /spend): a stale/poisoned value
+  // (e.g. aimon-core's JSON {"w":...} form, which contains a `"`) would otherwise flow
+  // unescaped into the querySelector below → SyntaxError crashing page init. Only a safe
+  // alphanumeric window name may reach the interpolation (mirrors aimon-core.js guard).
+  if(!(w && /^[a-z0-9]+$/i.test(w) && document.querySelector(sel+' button[data-w="'+w+'"]'))) w=def;
   document.querySelectorAll(sel+' button[data-w]').forEach(function(x){
     var on=x.dataset.w===w; x.classList.toggle("active",on); x.setAttribute("aria-pressed", on?"true":"false"); });
   if(labelId){ var l=document.getElementById(labelId); if(l) l.textContent=w; }
@@ -435,14 +441,14 @@ function updateRangeUI(){
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
 function rangedReload(){ loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost(); }
-document.getElementById("nav-left").addEventListener("click",()=>{
+document.getElementById("nav-left")?.addEventListener("click",()=>{
   const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(SPWIN); updateRangeUI(); rangedReload();
 });
-document.getElementById("nav-right").addEventListener("click",()=>{
+document.getElementById("nav-right")?.addEventListener("click",()=>{
   if(!TIMEEND) return; TIMEEND+=wsecs(SPWIN);
   if(TIMEEND>=Date.now()/1000) TIMEEND=null; updateRangeUI(); rangedReload();
 });
-document.getElementById("nav-live").addEventListener("click",()=>{
+document.getElementById("nav-live")?.addEventListener("click",()=>{
   if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
 });
 function cssv(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n; }

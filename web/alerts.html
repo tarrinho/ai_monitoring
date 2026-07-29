@@ -153,7 +153,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.12</div>
+      <div id="sidebar-brand-ver">v1.8.13</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -219,7 +219,7 @@
       <span><i class="dash"></i>no data yet</span>
       <span class="status-hint">on / off per service across the window</span>
     </div>
-    <div id="status-wrap"><canvas id="status-chart" height="220"></canvas></div>
+    <div id="status-wrap"><canvas id="status-chart" height="220" role="img" aria-label="Service status over time — per-service up/down timeline"></canvas></div>
     <div id="status-empty" class="unavail" style="display:none">no services enabled</div>
   </section>
 
@@ -401,14 +401,14 @@ function updateRangeUI(){
   const m=Math.round((now-TIMEEND)/60);
   lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
 }
-document.getElementById("nav-left").addEventListener("click",()=>{
+document.getElementById("nav-left")?.addEventListener("click",()=>{
   const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-_swSecs(); updateRangeUI(); loadStatus();
 });
-document.getElementById("nav-right").addEventListener("click",()=>{
+document.getElementById("nav-right")?.addEventListener("click",()=>{
   if(!TIMEEND) return; TIMEEND+=_swSecs();
   if(TIMEEND>=Date.now()/1000) TIMEEND=null; updateRangeUI(); loadStatus();
 });
-document.getElementById("nav-live").addEventListener("click",()=>{
+document.getElementById("nav-live")?.addEventListener("click",()=>{
   if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); loadStatus();
 });
 const _UP = 0.72, _DN = 0.20, _MID = 0.46;   // within-lane levels (0..1 above the lane base)

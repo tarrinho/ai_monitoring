@@ -601,7 +601,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.12"
+    assert config.VERSION == "AI-Monitoring_1.8.13"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -2186,6 +2186,21 @@ def test_alerts_status_timeline_pan_wired():
     assert '"&end=" + TIMEEND.toFixed(0)' in html, "alerts: loadStatus must append the pan cursor"
     assert '#status-wins button[data-w]' in html                     # nav arrows excluded
     assert "statusWin = b.dataset.w; TIMEEND = null;" in html        # size change → live
+
+
+def test_usertokens_stacked_svg_supports_drag_select():
+    """The '/litellm Usage by user over time' stacked view is a hand-rolled <svg> (not a
+    Chart.js canvas), so the shared aimon-core drag-zoom can't hook it. It carries its OWN
+    drag-to-select-a-range that sets a custom window + pan cursor and reloads — so a range can
+    be defined ON this graph like the canvas over-time charts."""
+    html = _page("litellm")
+    assert 'id="ut-stack"' in html
+    for h in ("svg.onpointerdown", "svg.onpointermove", "svg.onpointerup"):
+        assert h in html, f"ut-stack missing {h}"
+    assert "const utPxT=" in html, "drag must map pixels → epoch via bucket timestamps"
+    # drag outcome mirrors aimon-core: custom window + TIMEEND cursor + mark + reload
+    assert 'WIN="custom:"' in html and "TIMEEND=t2" in html
+    assert "_winMark(true)" in html and "rangedReload();" in html
 
 
 def test_spend_cost_handlers_honour_end_cursor():
@@ -4289,7 +4304,9 @@ def test_litellm_user_tokens_chart_fills_width_no_flicker_true_filter():
     # 2. owner map preserved on an empty/blip payload (early return, no unconditional reset)
     assert "function buildKeyUser(budgets){\n  const ks" in html, \
         "buildKeyUser must not reset _keyUser before checking the payload"
-    assert "if(!ks.length) return;" in html, "buildKeyUser must keep the last map on a blip"
+    # blip guard keeps the last map only when BOTH live keys and the persisted store are empty
+    assert "if(!ks.length && !Object.keys(store).length) return;" in html, \
+        "buildKeyUser must keep the last map on a total blip"
     # 3. no 'Other' catch-all band in utBands — unselected users are dropped
     m = re.search(r"function utBands\(\)\{.*?\n\}", html, re.S)
     assert m and "Other (" not in m.group(0), "utBands must not fold unselected users into 'Other'"
@@ -4317,3 +4334,35 @@ def test_litellm_user_tokens_follows_page_window():
     # stale copy removed
     assert '<span class="badge">all-time</span>' not in html
     assert "fold into a grey <b>Other</b>" not in html
+
+
+def test_litellm_by_user_charts_seed_owner_map_from_store():
+    """buildKeyUser seeds _keyUser from the persisted store (budgets.owner_names) BEFORE the
+    live budgets emails, so every by-user chart (userOf) is warm + covers historical keys, and
+    a blip keeps the last map only when BOTH live keys and the store are empty."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "const store = (budgets && budgets.owner_names)" in html
+    i_store = html.find("for(const lbl in store){ const u = usernameOf(store[lbl])")
+    i_live = html.find("ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email)")
+    assert i_store != -1 and i_live != -1 and i_store < i_live, "store must seed before live"
+    assert "if(!ks.length && !Object.keys(store).length) return;" in html
+
+
+def test_litellm_cards_show_loading_overlay_on_first_paint():
+    """Slow graphs must read as 'Loading…' on first paint, not empty 'no data'. Every chart
+    card gets a .card-loading overlay at startup; a data-backed card keeps it until it HAS
+    data (_cardTry / _cardHasData), bounded so a genuinely-empty window doesn't spin forever;
+    cards where empty is valid+fast (KPIs, failures, anomalies) reveal at once (_cardShow)."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert ".card-loading{" in html, "overlay style missing"
+    assert 'ov.className="card-loading"' in html, "overlay not injected at startup"
+    assert "function _cardHasData(" in html and "function _cardTry(" in html \
+        and "function _cardShow(" in html
+    assert "_EMPTY_MAX" in html, "bounded fallback missing (would spin forever)"
+    assert "Chart.getChart" in html, "canvas data-check missing"
+    # slow LiteLLM /spend-backed cards use _cardTry (stay until data); fast/local cards use _cardShow
+    for cid in ('"card-models"', '"card-usertokens"', '"card-keydelta"'):
+        assert f"_cardTry({cid}" in html or f',{cid}' in html, f"{cid} not held for data"
+    assert '_cardShow("card-kpi"' in html and '_cardShow("card-anomalies")' in html
+    # fast /api/data cards reveal right away (regression: they used to hold + show blank)
+    assert '_cardShow("card-kpi","card-failures","card-keys","card-userkeys")' in html

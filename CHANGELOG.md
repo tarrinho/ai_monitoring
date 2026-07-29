@@ -4,6 +4,26 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.13] — 2026-07-29
+
+_In progress._
+
+### Added
+- **Alerts:** "Service status over time" — a stepped up/down timeline per service
+  (LiteLLM, Ollama, llama.cpp, vLLM, GPU, and the monitoring site itself), gated by the
+  Settings service toggles, with a 1h/24h/1mo/1y window selector. Backed by
+  `/api/status-timeline` (`db.status_segments` + `db.self_uptime_segments`).
+
+### Fixed
+- **LiteLLM · Usage by user over time:** now follows the page time-window (was hard-coded
+  all-time); resolves key owners server-side from the persisted store, so users appear
+  immediately instead of after the live `/user/list` poll and historical keys are no longer
+  stuck "Unassigned"; the SVG fills the card width; the user picker is a true filter
+  (unselected users are removed, not folded into a grey "Other" band).
+- **Alerts:** stepped-line colour now matches the line height (up = green, down = red — the
+  y-axis was reversed); defined the page-local `paintUpdated()` that was throwing on every
+  successful poll.
+
 ## [1.8.12] — 2026-07-28
 
 Third architecture/design review (5-agent) — Tier-1 (correctness/availability/security) through

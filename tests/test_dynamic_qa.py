@@ -3383,7 +3383,11 @@ def test_bucket_model_series_windows_and_other():
         {"model": "gpt-5-mini", "kind": "real", "daily": {"2026-07-15": 10.0, "2026-07-16": 20.0}},
         {"model": "local-llama", "kind": "reference", "daily": {"2026-07-14": 1.0, "2026-07-16": 2.0}},
     ]}
-    now = _t.mktime(_t.strptime("2026-07-16", "%Y-%m-%d"))
+    import calendar
+    # UTC epoch (timegm), NOT mktime: bucket_model_series now clamps its right edge to
+    # gmtime(now), and the real handler passes a UTC epoch (time.time()/_q_end). mktime (local)
+    # would skew the anchor date by the TZ offset and drop the boundary label in UTC+ zones.
+    now = calendar.timegm(_t.strptime("2026-07-16", "%Y-%m-%d"))
     out = appmod.bucket_model_series(series, "30d", now)
     assert out["available"] is True and out["labels"] == series["dates"]
     top = out["models"][0]
@@ -10618,6 +10622,111 @@ async def test_userreqs_follows_window_and_end(monkeypatch):
     assert seen["days_back"] == 30 and seen["end"] is None  # window widens the span; live = no cursor
 
 
+def test_window_and_years_clamps_both_edges_to_anchor():
+    """Pan correctness: window_and_years must bound the chart points to [anchor-span, anchor]
+    for 30d/month/12mo — a past pan cursor SHIFTS the window, never widening it to today and
+    never (for 12mo) ignoring the cursor. Guards the review's B1/B3."""
+    import time as _t
+    now = _t.time()
+
+    def day(d):
+        return _t.strftime("%Y-%m-%d", _t.gmtime(now - d * 86400))
+    # rows every 5 days from 400d ago to today
+    daily = [{"date": day(d), "spend": 1.0, "real": 1.0, "reference": 0.0,
+              "requests": 1, "tokens": 10} for d in range(0, 400, 5)]
+    anchor = now - 90 * 86400                     # pan back ~3 months
+    anchor_day = _t.strftime("%Y-%m-%d", _t.gmtime(anchor))
+    for win, span_days in (("30d", 30), ("12mo", 365)):
+        out = appmod.window_and_years(daily, win, anchor)
+        dates = [_t.strftime("%Y-%m-%d", _t.gmtime(p["t"])) for p in out["points"]]
+        assert dates, f"{win}: no points"
+        assert max(dates) <= anchor_day, f"{win}: point past the anchor (window widened to today)"
+        lo = _t.strftime("%Y-%m-%d", _t.gmtime(anchor - span_days * 86400))
+        assert min(dates) >= lo, f"{win}: point before the window start"
+    # 12mo pan is NOT a no-op: anchored payload differs from the live one
+    live = appmod.window_and_years(daily, "12mo", now)
+    panned = appmod.window_and_years(daily, "12mo", anchor)
+    assert [p["t"] for p in live["points"]] != [p["t"] for p in panned["points"]]
+
+
+def test_bucket_model_series_clamps_right_edge_to_anchor():
+    """Pan correctness: bucket_model_series (30d/month) must not emit labels past the anchor —
+    the full-year series it receives contains dates after a past cursor. Guards review B2."""
+    import time as _t
+    now = _t.time()
+    anchor = now - 60 * 86400
+    anchor_day = _t.strftime("%Y-%m-%d", _t.gmtime(anchor))
+    dates = [_t.strftime("%Y-%m-%d", _t.gmtime(now - d * 86400)) for d in range(0, 200, 3)]
+    series = {"dates": dates, "models": [
+        {"model": "m", "kind": "real", "total": 1.0, "daily": {d: 1.0 for d in dates}}]}
+    out = appmod.bucket_model_series(series, "30d", anchor)
+    assert out["labels"], "no labels"
+    assert max(out["labels"]) <= anchor_day, "label past the anchor (right edge not clamped)"
+    lo = _t.strftime("%Y-%m-%d", _t.gmtime(anchor - 30 * 86400))
+    assert min(out["labels"]) >= lo, "label before the window start"
+
+
+async def test_q_end_rejects_non_finite():
+    """_q_end must reject inf/-inf/nan/overflow (they slip past float() and 500 the pan
+    handlers via gmtime/json). Guards review B4."""
+    from aiohttp.test_utils import make_mocked_request
+    for bad in ("nan", "inf", "-inf", "1e999", "Infinity", "NaN"):
+        req = make_mocked_request("GET", f"/api/x?end={bad}")
+        assert appmod._q_end(req) is None, f"{bad!r} not rejected"
+    for good, exp in (("1700000000", 1700000000.0), ("0", 0.0), ("-5", -5.0)):
+        req = make_mocked_request("GET", f"/api/x?end={good}")
+        assert appmod._q_end(req) == exp
+    assert appmod._q_end(make_mocked_request("GET", "/api/x")) is None   # absent → live
+
+
+async def test_spend_series_cache_bypassed_and_not_poisoned_by_pan(monkeypatch):
+    """The short-TTL spend/series cache must (a) serve a live repeat from cache, (b) be BYPASSED
+    on a panned request (recompute, not the stale live payload), and (c) NOT be poisoned by the
+    panned response (a following live call still gets the live data). Guards review T2 — the
+    only behavioral coverage of the end_q-is-None cache guards (the source-hook test skips them)."""
+    import time as _t
+    monkeypatch.setattr(appmod, "_spend_series_source", None)   # force the real cache path
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    appmod._SPEND_SERIES_CACHE.clear()
+    calls = {"n": 0}
+    today = _t.strftime("%Y-%m-%d", _t.gmtime(_t.time()))
+
+    async def fake_activity(session, start, end):
+        calls["n"] += 1
+        return [{"date": today, "spend": 1.0, "requests": 5, "tokens": 100}]
+
+    async def _empty(*a, **k):
+        return {}
+
+    async def _emptylist(*a, **k):
+        return []
+
+    monkeypatch.setattr(appmod.litellm, "spend_activity", fake_activity)
+    monkeypatch.setattr(appmod.litellm, "model_prices", _empty)
+    monkeypatch.setattr(appmod.litellm, "per_model_range", _emptylist)
+    monkeypatch.setattr(appmod.litellm, "per_model_daily_cost", _empty)
+    monkeypatch.setattr(appmod.litellm, "per_model_daily_tokens", _empty)
+    monkeypatch.setattr(db, "spend_daily_range", lambda *a, **k: [])
+    monkeypatch.setattr(db, "spend_daily_upsert", lambda *a, **k: None)
+    monkeypatch.setattr(db, "model_kind_overrides", lambda *a, **k: {})
+    c = await _client()
+    try:
+        live1 = await (await c.get("/api/spend/series?window=30d")).json()
+        assert calls["n"] == 1 and live1.get("points")          # computed + cached
+        await (await c.get("/api/spend/series?window=30d")).json()
+        assert calls["n"] == 1                                   # live repeat served FROM cache
+        past = _t.time() - 100 * 86400
+        await (await c.get(f"/api/spend/series?window=30d&end={past:.0f}")).json()
+        assert calls["n"] == 2                                   # panned BYPASSED the cache read
+        live2 = await (await c.get("/api/spend/series?window=30d")).json()
+        assert calls["n"] == 2                                   # live still cached...
+        assert live2.get("points") == live1.get("points")       # ...and NOT poisoned by the pan
+    finally:
+        await c.close()
+        appmod._SPEND_SERIES_CACHE.clear()
+
+
 def test_status_segments_currently_down(tmp_path, monkeypatch):
     """A backend whose last state before the window was DOWN (and never recovered)
     reads down for the whole window: 0% uptime, one down segment, not no_data."""
@@ -10897,3 +11006,25 @@ async def test_userreqs_owners_map_only_covers_returned_labels(tmp_path, monkeyp
     d = json.loads((await appmod.userreqs_handler(make_mocked_request("GET", "/api/userreqs?window=24h"))).text)
     assert set(d.get("owners", {}).keys()) <= set(d.get("labels", [])), "owners must not exceed labels"
     assert "absent-key" not in d.get("owners", {})
+
+
+async def test_budgets_ships_persisted_owner_map_for_by_user_charts(tmp_path, monkeypatch):
+    """/api/budgets includes the persisted owner map (owner_names) so the client can seed its
+    key->user map warm — fixing 'Unassigned' on ALL by-user charts, including historical keys
+    that are no longer in the live budgets list."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "budown.db"))
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "budtok-123456")
+    monkeypatch.setattr(config, "KEY_BUDGETS_JSON", "")
+    db.init()
+    with db._connect() as conn:
+        conn.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                     "VALUES(?,?,?,?,?)", ("hist-key", _t.time(), _t.time(), "u", "hist@x.io"))
+    hdr = {"Authorization": "Bearer budtok-123456"}
+    c = await _client()
+    try:
+        d = await (await c.get("/api/budgets", headers=hdr)).json()
+        assert "owner_names" in d, "budgets must ship the persisted owner map"
+        assert d["owner_names"].get("hist-key") == "hist@x.io"
+    finally:
+        await c.close()

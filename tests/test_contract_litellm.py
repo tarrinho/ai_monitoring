@@ -9,10 +9,21 @@ Refresh the fixtures when LiteLLM changes shape; a diff here is an early warning
 import json
 import pathlib
 
+import pytest
+
 import config
 from collectors import litellm
 
 FIX = pathlib.Path(__file__).parent / "fixtures"
+
+# The recorded fixtures are a DEV-TIME contract reference ("a diff here is an early warning").
+# A clean/public checkout — or a build context that didn't include them — can't run the JOIN
+# contract check, so it skips with a VISIBLE reason instead of hard-failing the in-image QA gate
+# (mirrors the _internal_markers.py public-checkout fallback below). The LEAK check is guarded
+# SEPARATELY (per-test): it scans EVERY fixture that IS present and skips only when none ship,
+# so a PARTIAL fixture set can never slip real data past it.
+_FIXTURE_FILES = ("litellm_key_list.json", "litellm_user_list.json", "litellm_team_list.json")
+_HAVE_ALL_FIXTURES = all((FIX / n).exists() for n in _FIXTURE_FILES)
 
 # Internal-infra names must never be hardcoded (rules.md §7a) — they live in
 # tests/_internal_markers.py, which is NOT in the publish ALLOW-list. A public
@@ -30,6 +41,8 @@ def _load(name):
     return json.loads((FIX / name).read_text(encoding="utf-8"))
 
 
+@pytest.mark.skipif(not _HAVE_ALL_FIXTURES,
+                    reason="LiteLLM contract fixtures absent/partial in this checkout/build context")
 async def test_contract_key_budgets_joins_email_and_resolves_team(monkeypatch):
     kl, ul, tl = (_load("litellm_key_list.json"),
                   _load("litellm_user_list.json"),
@@ -64,10 +77,13 @@ async def test_contract_key_budgets_joins_email_and_resolves_team(monkeypatch):
 
 def test_contract_fixtures_carry_no_real_data():
     """The recorded fixtures must stay synthetic — placeholder emails only, no internal
-    markers (so they never leak into the public repo)."""
-    blob = "".join((FIX / n).read_text(encoding="utf-8")
-                   for n in ("litellm_key_list.json", "litellm_user_list.json",
-                             "litellm_team_list.json")).lower()
+    markers (so they never leak into the public repo). Scans EVERY fixture that is present
+    (not a fixed list), so a partial fixture set can't bypass the check; skips only when none
+    ship."""
+    present = [FIX / n for n in _FIXTURE_FILES if (FIX / n).exists()]
+    if not present:
+        pytest.skip("no LiteLLM contract fixtures in this checkout")
+    blob = "".join(p.read_text(encoding="utf-8") for p in present).lower()
     for marker in tuple(_INTERNAL_MARKERS) + _GENERIC_LEAK_MARKERS:
         assert marker.lower() not in blob, f"fixture leaks {marker!r}"
     assert "@example.com" in blob

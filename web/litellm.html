@@ -52,7 +52,17 @@ function updateSeries(chart,labels,next){
      50-66% width.) minmax(0,1fr) lets wide tables/charts scroll instead of overflow. */
   main{padding:18px;display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:14px 16px}
+    padding:14px 16px;position:relative}
+  /* First-load overlay so a slow graph reads as "loading", not "no data". Sits below the
+     card title; removed per-card as each loader returns (see _cardLoaded). */
+  .card-loading{position:absolute;top:40px;left:0;right:0;bottom:12px;z-index:5;
+    display:flex;align-items:center;justify-content:center;pointer-events:none}
+  .card-loading .cl-box{display:inline-flex;gap:8px;align-items:center;padding:5px 12px;
+    border:1px solid var(--line);border-radius:20px;background:var(--panel2);color:var(--muted);
+    font-size:11.5px;letter-spacing:.03em;box-shadow:0 2px 10px rgba(0,0,0,.2)}
+  .card-loading .cl-spin{width:12px;height:12px;border:2px solid var(--line);
+    border-top-color:var(--accent);border-radius:50%;animation:cl-spin .8s linear infinite}
+  @keyframes cl-spin{to{transform:rotate(360deg)}}
   .card h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;
     letter-spacing:.05em;color:var(--muted);display:flex;align-items:center;
     justify-content:space-between}
@@ -208,7 +218,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.12</div>
+      <div id="sidebar-brand-ver">v1.8.13</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -402,7 +412,7 @@ function updateSeries(chart,labels,next){
       #card-usertokens .ut-wrap{position:relative}
       /* the SVG has a viewBox + fixed height but no width, so it otherwise renders at
          its intrinsic 920px and leaves the card half-empty. Stretch it to the card. */
-      #card-usertokens #ut-stack{display:block;width:100%;height:280px}
+      #card-usertokens #ut-stack{display:block;width:100%;height:280px;touch-action:none}
       #card-usertokens #ut-tip{position:absolute;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:11px;min-width:120px;display:none;z-index:20;box-shadow:0 4px 16px rgba(0,0,0,.4)}
       #card-usertokens #ut-tip .r{display:flex;justify-content:space-between;gap:12px}
       #card-usertokens #ut-tip .sw{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
@@ -730,13 +740,18 @@ let _keyUser = {};
 function usernameOf(email){ email = String(email||""); return email.indexOf("@")>0 ? email.split("@")[0] : email; }
 function buildKeyUser(budgets){
   const ks = (budgets && budgets.keys) || [];
-  // A budgets fetch blip (null) or an empty payload must NOT wipe the owner map —
-  // doing so folded every key to "Unassigned" until the next good poll, so the
-  // "by user" charts flickered to one grey Unassigned band each time /api/budgets
-  // hiccuped. Keep the last-known mapping and only rebuild from real data.
-  if(!ks.length) return;
+  // owner_names = the PERSISTED store ({label: email}) that /api/budgets now ships. Seeding
+  // _keyUser from it makes EVERY "by user" chart (userOf() below) warm on the first paint and
+  // able to name historical keys — not just those in the current live budgets list. Without it
+  // the by-user charts showed "Unassigned" until LiteLLM's ~60s /user/list poll warmed up.
+  const store = (budgets && budgets.owner_names) || {};
+  // A budgets fetch blip (null) or a fully-empty payload must NOT wipe the owner map —
+  // doing so folded every key to "Unassigned" until the next good poll. Keep the last-known
+  // mapping and only rebuild when there's real data (live keys OR a stored map).
+  if(!ks.length && !Object.keys(store).length) return;
   const next = {};
-  ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) next[k.key] = u; } });
+  for(const lbl in store){ const u = usernameOf(store[lbl]); if(u) next[lbl] = u; }   // persisted first
+  ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) next[k.key] = u; } });  // live wins
   _keyUser = next;
 }
 // Resolve a key label to its OWNER for the "by user" charts. A key whose owner LiteLLM
@@ -1449,6 +1464,56 @@ document.getElementById("export-btn").addEventListener("click",()=>{
     +(AUTH?("&token="+encodeURIComponent(AUTH)):""),"_blank");
 });
 
+// ---- first-load "Loading…" overlays -----------------------------------------
+// Every chart card gets an overlay at startup; each loader removes its own as it returns,
+// so a slow graph shows "Loading…" instead of an empty "no data" state on the first paint.
+const _CARD_IDS=["card-kpi","card-models","card-failures","card-anomalies",
+  "card-keys-winspend","card-userkeys-winspend","card-keytime-win","card-userdelta",
+  "card-keydelta","card-conc-by-key","card-conc-by-model","card-backlog-by-key",
+  "card-corr","card-impact","card-svc-cpu","card-svc-ram","card-charts","card-keytime",
+  "card-userkeys","card-keys","card-usertokens"];
+(function _initLoading(){
+  _CARD_IDS.forEach(id=>{ const el=document.getElementById(id);
+    if(!el || el.querySelector(".card-loading")) return;
+    const ov=document.createElement("div"); ov.className="card-loading";
+    // build with DOM nodes (not innerHTML) to keep setHtml() the ONLY innerHTML sink.
+    // A compact centred pill (not a full-card opaque box) so it reads the same on a small
+    // card and on the big full-width "metrics over time" grid.
+    const box=document.createElement("div"); box.className="cl-box";
+    const sp=document.createElement("span"); sp.className="cl-spin";
+    const tx=document.createElement("span"); tx.textContent="Loading…";
+    box.appendChild(sp); box.appendChild(tx); ov.appendChild(box);
+    el.appendChild(ov); });
+})();
+// Does a card actually have rendered data yet? (so the overlay stays up while a card is
+// still warming, instead of clearing the moment its fetch returns empty). Canvas cards ask
+// their Chart.js instance; the two non-canvas cards use their own state.
+function _cardHasData(id){
+  const el=document.getElementById(id); if(!el) return true;   // unknown card → don't hold it
+  const cv=el.querySelector("canvas");
+  if(cv){
+    const ch=(window.Chart && Chart.getChart) ? Chart.getChart(cv) : null;
+    if(!ch) return false;
+    return (ch.data.datasets||[]).some(ds=>(ds.data||[]).some(v=>{
+      const n=(v && typeof v==="object") ? (v.y!=null?v.y:v.x) : v;   // {x,y} points or plain numbers
+      return n!=null && n!==0; }));
+  }
+  if(id==="card-models")     return !!el.querySelector("table");         // Per-model table
+  if(id==="card-usertokens") return typeof utHas!=="undefined" && utHas; // Usage-by-user SVG
+  return true;
+}
+// Reveal a card immediately (for cards where "empty" is a valid, fast state: KPIs, failures, anomalies).
+function _cardShow(){ for(let i=0;i<arguments.length;i++){
+  const el=document.getElementById(arguments[i]); if(!el) continue;
+  const ov=el.querySelector(".card-loading"); if(ov) ov.remove(); } }
+// Keep the overlay until the card HAS DATA; bounded so a genuinely-empty window doesn't spin
+// forever — after _EMPTY_MAX polls with no data it reveals the card's real "no data" state.
+const _emptyTries={}, _EMPTY_MAX=4;
+function _cardTry(){ for(let i=0;i<arguments.length;i++){ const id=arguments[i];
+  const el=document.getElementById(id); if(!el) continue;
+  const ov=el.querySelector(".card-loading"); if(!ov) continue;        // already revealed
+  if(_cardHasData(id) || (_emptyTries[id]=(_emptyTries[id]||0)+1) >= _EMPTY_MAX) ov.remove(); } }
+
 async function tick(){
   const budgets = await api("/api/budgets");   // owner map only — the budget card lives on /spend
   buildKeyUser(budgets);
@@ -1466,20 +1531,26 @@ async function tick(){
     const t=(d.latest||{}).ts?new Date(d.latest.ts*1000).toLocaleTimeString():"—";
     document.getElementById("updated").textContent="updated "+t;
   }
-  await loadSeries();
-  await loadKeyTime();
-  await loadKeyTimeWin();
-  await loadKeyDelta();
-  await loadUserDelta();
-  await loadWinSpend();
-  await loadConcByKey();
-  await loadConcByModel();
-  await loadBacklogByKey();
-  await loadCorr();
-  await loadImpact();
-  await loadAnomalies();
-  await loadModels();     // cheap pre-aggregated endpoint (NOT /spend/logs)
-  await loadUserTokens();
+  // KPIs/failures reveal at once ("empty" is valid + fast); data-backed charts stay on
+  // "Loading…" until they actually have data (see _cardTry).
+  // Fast/local cards reveal as soon as their loader returns (their data is already in the
+  // snapshot/rollup, so info shows right away). "Stay until data" (_cardTry) is reserved for
+  // the genuinely slow, warm-up-prone LiteLLM /spend-backed cards.
+  _cardShow("card-kpi","card-failures","card-keys","card-userkeys");
+  await loadSeries();        _cardShow("card-charts");
+  await loadKeyTime();       _cardShow("card-keytime");
+  await loadKeyTimeWin();    _cardShow("card-keytime-win");
+  await loadKeyDelta();      _cardTry("card-keydelta");
+  await loadUserDelta();     _cardTry("card-userdelta");
+  await loadWinSpend();      _cardTry("card-keys-winspend","card-userkeys-winspend");
+  await loadConcByKey();     _cardShow("card-conc-by-key");
+  await loadConcByModel();   _cardShow("card-conc-by-model");
+  await loadBacklogByKey();  _cardShow("card-backlog-by-key");
+  await loadCorr();          _cardShow("card-corr");
+  await loadImpact();        _cardShow("card-impact","card-svc-cpu","card-svc-ram");
+  await loadAnomalies();     _cardShow("card-anomalies");     // no anomalies is a valid, good state
+  await loadModels();        _cardTry("card-models");         // slow: LiteLLM-derived
+  await loadUserTokens();    _cardTry("card-usertokens");
 }
 
 /* ===== Token volume by user over time — day-granular, keys folded to owner, picker + Other ===== */
@@ -1534,8 +1605,10 @@ function utBands(){
   // nothing — the volume just restacked in grey). Show only what's selected.
   return utData.list.filter(o=>utSel.has(o.name)).slice();
 }
+let utDrag=null;   // drag-select-a-range state for the stacked SVG (the shared canvas drag-zoom can't hook an <svg>)
 function utDrawStack(){
   const svg=document.getElementById("ut-stack"); while(svg.firstChild)svg.removeChild(svg.firstChild);
+  svg.style.cursor="crosshair";
   const days=utData.days, B=days.length, bands=utBands();
   const W=920,H=280,PADL=54,PADR=12,PADT=10,PADB=22,iw=W-PADL-PADR,ih=H-PADT-PADB;
   const totals=Array.from({length:B},(_,b)=>bands.reduce((s,o)=>s+(o.series[b]||0),0));
@@ -1553,8 +1626,17 @@ function utDrawStack(){
     svg.appendChild(utEl("path",{d,fill:o.color,"fill-opacity":o.isOther?0.32:0.7,stroke:o.color,"stroke-opacity":o.isOther?0.5:0.9,"stroke-width":0.8}));
     for(let b=0;b<B;b++)base[b]=top[b]; });
   const guide=utEl("line",{x1:0,x2:0,y1:PADT,y2:PADT+ih,stroke:"var(--fg)","stroke-opacity":0.25,"stroke-width":1,style:"display:none"});svg.appendChild(guide);
+  // drag-to-select-a-range band (Kibana-style, like the Chart.js charts): the shared
+  // aimon-core drag-zoom only hooks canvas elements in a .chart-wrap, so this SVG needs its own.
+  const dragRect=utEl("rect",{x:PADL,y:PADT,width:0,height:ih,fill:"var(--accent)","fill-opacity":0.18,stroke:"var(--accent)","stroke-opacity":0.9,"stroke-width":1,style:"display:none"});svg.appendChild(dragRect);
   const tip=document.getElementById("ut-tip");
-  svg.onmousemove=ev=>{ const r=svg.getBoundingClientRect(); const px=(ev.clientX-r.left)/r.width*W;
+  // pixel (clientX) -> epoch seconds, interpolating between bucket timestamps for a smooth edge
+  const utPxT=cx=>{ const r=svg.getBoundingClientRect(); const px=(cx-r.left)/r.width*W;
+    let b=(px-PADL)/iw*(B<=1?0:(B-1)); b=Math.max(0,Math.min(B-1,b));
+    const lo=Math.floor(b), hi=Math.ceil(b), f=b-lo;
+    return (days[lo].getTime()+(days[hi].getTime()-days[lo].getTime())*f)/1000; };
+  svg.onmousemove=ev=>{ if(utDrag&&utDrag.moved){ tip.style.display="none"; guide.style.display="none"; return; }
+    const r=svg.getBoundingClientRect(); const px=(ev.clientX-r.left)/r.width*W;
     let b=Math.round((px-PADL)/iw*(B<=1?1:(B-1))); b=Math.max(0,Math.min(B-1,b));
     guide.style.display=""; guide.setAttribute("x1",X(b)); guide.setAttribute("x2",X(b));
     const rws=bands.map(o=>({n:o.name,c:o.color,v:o.series[b]||0})).filter(x=>x.v>0).sort((a,c)=>c.v-a.v).slice(0,8);
@@ -1562,6 +1644,32 @@ function utDrawStack(){
     tip.style.display="block"; const tw=tip.offsetWidth, lx=ev.clientX-r.left;
     tip.style.left=Math.min(r.width-tw-4,Math.max(0,lx+14))+"px"; tip.style.top=Math.max(0,ev.clientY-r.top-10)+"px"; };
   svg.onmouseleave=()=>{tip.style.display="none";guide.style.display="none";};
+  // --- drag to define a custom start→end window (only meaningful with ≥2 buckets) ---
+  svg.onpointerdown=ev=>{ if(ev.button||B<2) return; const r=svg.getBoundingClientRect(); const px=(ev.clientX-r.left)/r.width*W;
+    if(px<PADL||px>W-PADR) return; utDrag={x0:ev.clientX,moved:false}; try{svg.setPointerCapture(ev.pointerId);}catch(e){} };
+  svg.onpointermove=ev=>{ if(!utDrag) return;
+    // button released outside the SVG (Alt-Tab / lost pointerup) → no ghost band tracking the
+    // bare cursor. Mirrors aimon-core's blur-abort. touch-action:none + preventDefault keep a
+    // touch drag from being stolen by the browser as a page scroll (pointercancel).
+    if(!ev.buttons){ utDrag=null; dragRect.style.display="none"; return; }
+    ev.preventDefault();
+    if(!utDrag.moved){ if(Math.abs(ev.clientX-utDrag.x0)<5) return; utDrag.moved=true; }
+    const r=svg.getBoundingClientRect();
+    let a=(Math.min(utDrag.x0,ev.clientX)-r.left)/r.width*W, b2=(Math.max(utDrag.x0,ev.clientX)-r.left)/r.width*W;
+    a=Math.max(PADL,a); b2=Math.min(W-PADR,b2);
+    dragRect.setAttribute("x",a); dragRect.setAttribute("width",Math.max(0,b2-a)); dragRect.style.display="";
+    tip.style.display="none"; guide.style.display="none"; };
+  svg.onpointerup=ev=>{ const dg=utDrag; utDrag=null; dragRect.style.display="none";
+    if(!dg||!dg.moved) return;
+    const t1=utPxT(Math.min(dg.x0,ev.clientX)), t2=utPxT(Math.max(dg.x0,ev.clientX));
+    if(!(t2-t1>=30)) return;                    // ignore <30s selections
+    WIN="custom:"+Math.round(t2-t1); TIMEEND=t2; _winSave(WIN,TIMEEND);
+    document.querySelectorAll("#windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    document.querySelectorAll('#win-label,[id$="-win"]').forEach(el=>{el.textContent="custom";});
+    _winMark(true);
+    if(typeof updateRangeUI==="function") updateRangeUI();
+    rangedReload(); };
+  svg.onpointercancel=()=>{ utDrag=null; dragRect.style.display="none"; };
   const lg=document.getElementById("ut-legend");
   setHtml(lg, bands.map(o=>"<span><span class='sw' style='background:"+o.color+(o.isOther?";opacity:.55":"")+"'></span>"+escapeHtml(o.name)+" · "+utFmt(o.total)+"</span>").join(""));
 }
