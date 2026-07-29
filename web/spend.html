@@ -227,7 +227,7 @@ function updateSeries(chart,labels,next){
             if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
           }).catch(function(){});
       }
-      _alertDot(); setInterval(_alertDot, 10000);
+      _alertDot(); _timers.push(setInterval(_alertDot, 10000));
     }catch(e){}
   });
 })();
@@ -261,7 +261,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.10</div>
+      <div id="sidebar-brand-ver">v1.8.12</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -285,10 +285,15 @@ function updateSeries(chart,labels,next){
     <h1>Spend &amp; Quota</h1>
     <div class="sub">LLM cost &amp; usage · per-key budgets</div>
   </div>
-  <div class="windows" id="sp-windows" role="group" aria-label="time window" title="time window — applies to every chart on this page">
+  <div class="windows" id="sp-windows" role="group" aria-label="time window and range" title="time window — applies to every chart on this page">
+    <button id="nav-left" title="shift earlier" aria-label="shift window earlier">◀</button>
     <button data-w="30d" class="active" aria-pressed="true">30d</button>
     <button data-w="12mo" aria-pressed="false">12mo</button>
     <button data-w="month" aria-pressed="false">MTD</button>
+    <button id="nav-right" title="shift later" disabled aria-label="shift window later">▶</button>
+    <span class="wsep" aria-hidden="true"></span><button id="nav-live" title="jump to now (live)" disabled aria-label="jump to now, live">● Live</button>
+    <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
+    <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
   </div>
   <span id="updated">connecting…</span>
   <button id="theme-btn" class="badge" title="toggle day / night"
@@ -407,6 +412,39 @@ function _spWinRestore(sel, def, labelId){
   return w;
 }
 let SPWIN=_spWinRestore("#sp-windows", "30d", null);
+// ◀▶ pan cursor (epoch, end-anchor) — shared api() in aimon-core.js appends `&end=` to any
+// `window=` request while this is set, so every Spend chart follows the panned window. null =
+// live/now. WSECS feeds the shared wsecs() (drag-zoom is intentionally OFF on this page — the
+// data is day-granular — so charts are never stampTs'd; only ◀▶/Live pan the window).
+let TIMEEND=null;
+const WSECS={"30d":2592000,"12mo":31536000};
+function fmtRange(ts){
+  const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
+  return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
+}
+function updateRangeUI(){
+  const now=Date.now()/1000;
+  const nr=document.getElementById("nav-right"); if(nr) nr.disabled=!TIMEEND;
+  const lv=document.getElementById("nav-live");
+  if(lv){ lv.disabled=!TIMEEND; lv.style.color=TIMEEND?"var(--accent)":""; lv.style.borderColor=TIMEEND?"var(--accent)":""; }
+  const _end=TIMEEND||now, _start=_end-wsecs(SPWIN);
+  const _dt=document.getElementById("range-dates"); if(_dt) _dt.textContent=fmtRange(_start)+"  →  "+fmtRange(_end);
+  const lbl=document.getElementById("range-lbl"); if(!lbl) return;
+  if(!TIMEEND){ lbl.textContent="live"; return; }
+  const m=Math.round((now-TIMEEND)/60);
+  lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
+}
+function rangedReload(){ loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost(); }
+document.getElementById("nav-left").addEventListener("click",()=>{
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-wsecs(SPWIN); updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-right").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND+=wsecs(SPWIN);
+  if(TIMEEND>=Date.now()/1000) TIMEEND=null; updateRangeUI(); rangedReload();
+});
+document.getElementById("nav-live").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); rangedReload();
+});
 function cssv(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||n; }
 function axisSp(t,gran){
   const d=new Date(t*1000);
@@ -812,9 +850,9 @@ async function loadSpendSeries(){
 }
 document.querySelectorAll("#sp-windows button[data-w]").forEach(b=>{
   b.addEventListener("click",()=>{
-    document.querySelectorAll("#sp-windows button").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
+    document.querySelectorAll("#sp-windows button[data-w]").forEach(x=>{x.classList.remove("active");x.setAttribute("aria-pressed","false");});
     b.classList.add("active"); b.setAttribute("aria-pressed","true"); SPWIN=b.dataset.w; _spWinSave(SPWIN);
-    loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost();   // one window, all charts
+    TIMEEND=null; updateRangeUI(); rangedReload();   // one window, all charts; size change → back to live
   });
 });
 
@@ -1017,10 +1055,12 @@ function renderKeys(keys){
   });
 }
 
+let _spendLastOk=0;
 async function tick(){
   const d=await api("/api/budgets");
+  if(d) _spendLastOk=Date.now();
+  paintUpdated("updated", _spendLastOk);   // ages green→amber→red so a stale/failing poll shows
   if(!d) return;
-  document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString();
   if(!d.available || !(d.keys&&d.keys.length)){
     setHtml(document.getElementById("summary"),
       `<div class="unavail" style="grid-column:1/-1">No per-key spend yet — point `
@@ -1040,6 +1080,7 @@ async function tick(){
   renderCostChart(_lastKeys);
   loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost();
 }
+updateRangeUI();
 tick();
 _timers.push(setInterval(tick, 5000));
 </script>

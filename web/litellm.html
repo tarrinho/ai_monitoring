@@ -65,6 +65,11 @@ function updateSeries(chart,labels,next){
   th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
   th{color:var(--muted);font-weight:500}
   td.num{text-align:right;font-variant-numeric:tabular-nums}
+  /* Per-model table: vertical column dividers. Its five right-aligned numeric columns
+     (params · reqs · tokens · svc CPU · svc RAM) blur together without them, so a value
+     couldn't be told apart from its neighbour's — the dividers tie each value to its header. */
+  #ll-models table th,#ll-models table td{border-left:1px solid var(--line)}
+  #ll-models table th:first-child,#ll-models table td:first-child{border-left:none}
   .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
   .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
   .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
@@ -169,7 +174,7 @@ function updateSeries(chart,labels,next){
             if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
           }).catch(function(){});
       }
-      _alertDot(); setInterval(_alertDot, 10000);
+      _alertDot(); _timers.push(setInterval(_alertDot, 10000));
     }catch(e){}
   });
 })();
@@ -203,7 +208,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.10</div>
+      <div id="sidebar-brand-ver">v1.8.12</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -328,13 +333,13 @@ function updateSeries(chart,labels,next){
 
   <section class="card span-2" id="card-svc-cpu">
     <h2>LLM serving CPU over time — <span id="svc-cpu-win">24h</span>
-      <span class="info" title="Per-process CPU % of the LLM serving processes (llama-server, ollama) over the window.">ⓘ</span></h2>
+      <span class="info" title="Per-process CPU % of the LLM serving processes (llama-server, ollama, vLLM, SGLang, TGI) over the window.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:170px"><canvas id="svc-cpu-chart" role="img" aria-label="LLM serving CPU over time"></canvas></div>
   </section>
 
   <section class="card span-2" id="card-svc-ram">
     <h2>LLM serving RAM over time — <span id="svc-ram-win">24h</span>
-      <span class="info" title="Resident memory (RSS) of the LLM serving processes over the window.">ⓘ</span></h2>
+      <span class="info" title="Resident memory (RSS) of the LLM serving processes (llama-server, ollama, vLLM, SGLang, TGI) over the window.">ⓘ</span></h2>
     <div class="chart-wrap" style="height:170px"><canvas id="svc-ram-chart" role="img" aria-label="LLM serving RAM over time"></canvas></div>
   </section>
 
@@ -367,6 +372,67 @@ function updateSeries(chart,labels,next){
     <div class="chart-wrap" style="height:240px"><canvas id="keys-chart" role="img" aria-label="Requests by API key"></canvas></div>
   </section>
 
+  <section class="card span-full" id="card-usertokens">
+    <style>
+      #card-usertokens .ut-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 10px}
+      #card-usertokens .ut-seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+      #card-usertokens .ut-seg button{background:var(--panel);color:var(--muted);border:0;padding:5px 11px;font-size:12px;cursor:pointer;border-right:1px solid var(--line)}
+      #card-usertokens .ut-seg button:last-child{border-right:0}
+      #card-usertokens .ut-seg button[aria-pressed="true"]{background:var(--accent);color:#fff}
+      #card-usertokens .ut-combo{position:relative}
+      #card-usertokens .ut-combo>button{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:5px 11px;font-size:12px;cursor:pointer}
+      #card-usertokens .ut-pop{position:absolute;z-index:30;top:calc(100% + 6px);left:0;width:280px;max-height:320px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px;box-shadow:0 8px 26px rgba(0,0,0,.45);display:none}
+      #card-usertokens .ut-pop.open{display:block}
+      #card-usertokens .ut-pop .r{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;cursor:pointer;font-size:12.5px}
+      #card-usertokens .ut-pop .r:hover{background:var(--panel2)}
+      #card-usertokens .ut-pop .sw{width:9px;height:9px;border-radius:2px;flex:0 0 auto}
+      #card-usertokens .ut-pop .nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #card-usertokens .ut-pop .tot{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+      #card-usertokens .ut-pop input[type=search]{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:12px;margin-bottom:6px}
+      #card-usertokens .ut-quick{display:flex;gap:6px;margin:0 0 8px}
+      #card-usertokens .ut-quick button{flex:1;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px;font-size:11px;cursor:pointer}
+      #card-usertokens .ut-legend{display:flex;flex-wrap:wrap;gap:3px 14px;margin-top:8px;font-size:11px;color:var(--muted)}
+      #card-usertokens .ut-legend span{display:inline-flex;align-items:center;gap:5px}
+      #card-usertokens .ut-legend .sw{width:10px;height:10px;border-radius:2px}
+      #card-usertokens .ut-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px}
+      #card-usertokens .ut-sm{border:1px solid var(--line);border-radius:8px;padding:6px 8px 4px}
+      #card-usertokens .ut-sm .t{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
+      #card-usertokens .ut-sm .t b{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #card-usertokens .ut-sm .t i{font-style:normal;color:var(--muted);font-size:10px;font-variant-numeric:tabular-nums}
+      #card-usertokens .ut-wrap{position:relative}
+      /* the SVG has a viewBox + fixed height but no width, so it otherwise renders at
+         its intrinsic 920px and leaves the card half-empty. Stretch it to the card. */
+      #card-usertokens #ut-stack{display:block;width:100%;height:280px}
+      #card-usertokens #ut-tip{position:absolute;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:11px;min-width:120px;display:none;z-index:20;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+      #card-usertokens #ut-tip .r{display:flex;justify-content:space-between;gap:12px}
+      #card-usertokens #ut-tip .sw{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+      #card-usertokens #ut-tip b{display:block;margin-bottom:4px;font-size:10.5px;color:var(--muted)}
+    </style>
+    <h2>Usage by user over time <span class="badge" id="ut-metric">requests</span> <span class="badge" id="ut-win">24h</span></h2>
+    <div class="sub" style="color:var(--muted);font-size:11px;margin:-4px 0 8px">Per-user cumulative usage over the selected time window, keys grouped by owner (same source as "Top 10 keys over time"). Shows <b>requests</b> when the proxy tracks them, else cumulative <b>spend</b> (lite/off mode). Pick users below — unselected users are removed from the graph. The rollup is day-granular, so sub-day windows (15m/1h) show the current day.</div>
+    <div class="ut-controls">
+      <div class="ut-seg" id="ut-view">
+        <button type="button" data-v="stack" aria-pressed="true">Stacked area</button>
+        <button type="button" data-v="small" aria-pressed="false">Small multiples</button>
+      </div>
+      <div class="ut-combo" id="ut-combo">
+        <button type="button" id="ut-combo-btn">👥 Users: <b id="ut-count">0</b> ▾</button>
+        <div class="ut-pop" id="ut-pop">
+          <input type="search" id="ut-search" placeholder="Filter users…" aria-label="Filter users">
+          <div class="ut-quick"><button type="button" data-q="top">Top 12</button><button type="button" data-q="all">All</button><button type="button" data-q="none">None</button></div>
+          <div id="ut-rows"></div>
+        </div>
+      </div>
+    </div>
+    <div id="ut-stack-box" class="ut-wrap">
+      <svg id="ut-stack" viewBox="0 0 920 280" preserveAspectRatio="none" height="280" role="img" aria-label="Token volume by user over time (stacked area)"></svg>
+      <div id="ut-tip"></div>
+    </div>
+    <div class="ut-legend" id="ut-legend"></div>
+    <div id="ut-small-box" style="display:none"><div class="ut-grid" id="ut-grid"></div></div>
+    <div class="unavail" id="ut-empty" style="display:none">no per-user request data in this window yet</div>
+  </section>
+
 </main>
 
 <script>
@@ -392,8 +458,15 @@ let _spendMode = "full"; // lite mode has no per-key requests → key charts sho
 let _spendWinMin = null;  // LITELLM_SPEND_WINDOW_MIN, for the key-chart sub-line
 function svcProc(backend){
   const p=_procs||{}, cpu=p.top_cpu||[], ram=p.top_ram||[];
+  // Map a model's backend to the process name(s) the procs collector reports. vLLM / SGLang /
+  // TGI run under a generic `python`, so the collector relabels them to vllm/sglang/tgi (see
+  // collectors/procs.py) — match those here so self-hosted models get their svc CPU/RAM too.
   const names = backend==="llama.cpp" ? ["llama-server","llama-cpp","llama_cpp"]
-              : backend==="ollama" ? ["ollama"] : [];
+              : backend==="ollama" ? ["ollama"]
+              : backend==="vllm" ? ["vllm"]
+              : backend==="sglang" ? ["sglang"]
+              : (backend==="tgi"||backend==="text-generation-inference") ? ["tgi"]
+              : [];
   if(!names.length) return {cpu:null, ram:null};
   const hit=x=>names.some(n=>String(x.app||"").toLowerCase().includes(n));
   const c=cpu.find(hit), r=ram.find(hit);
@@ -539,19 +612,38 @@ function paramSize(name){
 // Per-model requests+tokens for the SELECTED window (follows 15m/1h/24h/30d/12mo).
 // Backed by /api/litellm/models -> LiteLLM /global/activity/model (day-granular,
 // cheap aggregate), so 24h shows yesterday+today and 30d/12mo show prior months.
+let _pmSig="", _pmHas=false;   // last table STRUCTURE signature + whether a table is shown
 async function loadModels(){
   const winEl=document.getElementById("ll-models-win"); if(winEl) winEl.textContent=wlabel(WIN);
   const d=await api("/api/litellm/models?window="+WIN);
   const el=document.getElementById("ll-models");
-  if(!d){ return; }
+  if(!d){ return; }   // fetch blip → keep whatever is shown
+  // Anti-blink: a backend flapping down (e.g. vLLM restarting) makes this endpoint toggle
+  // available/rows ↔ unavailable/empty every poll. Do NOT wipe an already-populated table on a
+  // transient miss — that swap of table↔message every 5s is the "whole thing blinks". Only show
+  // the placeholder on the FIRST load (nothing shown yet). (Mirrors loadModels-in-settings.)
   if(!d.available){
-    setHtml(el,`<div class="unavail">LiteLLM not configured</div>`); return; }
+    if(!_pmHas) setHtml(el,`<div class="unavail">LiteLLM not configured</div>`); return; }
   const pm=d.per_model||[];
-  if(!pm.length){ setHtml(el,`<div class="unavail">no requests in this window</div>`); return; }
+  if(!pm.length){
+    if(!_pmHas) setHtml(el,`<div class="unavail">no requests in this window</div>`);
+    else { _pmSig=""; }   // real empty but keep last table; force a rebuild once data returns
+    return; }
   // internal / external / unattributed tag per model
   const kind=m=>m.internal===true?["self-hosted","var(--ok)"]
     :m.internal===false?["external","var(--accent)"]:["unattributed","var(--muted)"];
-  const rows=pm.map(m=>{
+  // Rebuild the DOM only when the STRUCTURE changes (model set / params / kind / usage mix — all
+  // slow, day-granular). When only the live numbers move (reqs/tokens tick up, svc CPU/RAM), update
+  // the cells IN PLACE — no setHtml, so the table never blinks on the 5s poll.
+  const _cells=(m,i)=>{ const sb=servedBy(m.model), svc=svcProc(sb);
+    const q=(id,v)=>{const e=document.getElementById(id); if(e) e.textContent=v;};
+    q("pmreq"+i,(m.reqs||0).toLocaleString()); q("pmtok"+i,(m.tokens||0).toLocaleString());
+    q("pmscpu"+i,svc.cpu!=null?svc.cpu+'%':'—'); q("pmsram"+i,svc.ram!=null?bytes(svc.ram):'—'); };
+  const sig=JSON.stringify(pm.map(m=>[m.model,m.internal,paramSize(m.model)]))
+    +"|"+JSON.stringify(d.usage||{});
+  if(sig===_pmSig && _pmHas){ pm.forEach(_cells); return; }   // structure same → live cells only
+  _pmSig=sig;
+  const rows=pm.map((m,i)=>{
     const sb=servedBy(m.model);
     const svc=svcProc(sb);   // serving-process CPU%/RSS (from procs collector) — live
     const [kl,kc]=kind(m);
@@ -560,10 +652,10 @@ async function loadModels(){
       +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")
       +` <span class="srv" style="color:${kc};border-color:${kc}">${kl}</span></td>`
       +`<td class="num">${ps?escapeHtml(ps):'—'}</td>`
-      +`<td class="num">${(m.reqs||0).toLocaleString()}</td>`
-      +`<td class="num">${(m.tokens||0).toLocaleString()}</td>`
-      +`<td class="num">${svc.cpu!=null?svc.cpu+'%':'—'}</td>`
-      +`<td class="num">${svc.ram!=null?bytes(svc.ram):'—'}</td></tr>`;}).join("");
+      +`<td class="num" id="pmreq${i}">${(m.reqs||0).toLocaleString()}</td>`
+      +`<td class="num" id="pmtok${i}">${(m.tokens||0).toLocaleString()}</td>`
+      +`<td class="num" id="pmscpu${i}">${svc.cpu!=null?svc.cpu+'%':'—'}</td>`
+      +`<td class="num" id="pmsram${i}">${svc.ram!=null?bytes(svc.ram):'—'}</td></tr>`;}).join("");
   // usage mix (works in lite mode: split by tokens/requests, cost not needed)
   const u=d.usage||{}; let mix="";
   if(u.tokens_total){
@@ -587,8 +679,10 @@ async function loadModels(){
     +`<table><tr><th>Model</th>`
     +`<th class="num" title="Parameter count inferred from the model name (LiteLLM does not report it); — when the name has no size token">params</th>`
     +`<th class="num">reqs</th><th class="num">tokens</th>`
-    +`<th class="num">svc CPU</th><th class="num">svc RAM</th>`
+    +`<th class="num" title="Serving-process CPU — live CPU% (share of one core) of the LOCAL process serving this model (llama-server / ollama / vLLM / SGLang / TGI), read from /proc. '—' for external providers (no local process to measure) or when the monitor can't see host processes (run it with pid:host).">svc CPU</th>`
+    +`<th class="num" title="Serving-process RAM — resident memory (RSS) of that same local serving process. '—' for external providers or when the process isn't visible (needs pid:host).">svc RAM</th>`
     +`</tr>${rows}</table>`);
+  _pmHas=true;   // a real table is now shown → later transient misses keep it (no blink)
 }
 
 // Top-10 API keys — horizontal bar chart (categorical, updates each tick).
@@ -635,9 +729,15 @@ function renderKeys(l){
 let _keyUser = {};
 function usernameOf(email){ email = String(email||""); return email.indexOf("@")>0 ? email.split("@")[0] : email; }
 function buildKeyUser(budgets){
-  _keyUser = {};
   const ks = (budgets && budgets.keys) || [];
-  ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) _keyUser[k.key] = u; } });
+  // A budgets fetch blip (null) or an empty payload must NOT wipe the owner map —
+  // doing so folded every key to "Unassigned" until the next good poll, so the
+  // "by user" charts flickered to one grey Unassigned band each time /api/budgets
+  // hiccuped. Keep the last-known mapping and only rebuild from real data.
+  if(!ks.length) return;
+  const next = {};
+  ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) next[k.key] = u; } });
+  _keyUser = next;
 }
 // Resolve a key label to its OWNER for the "by user" charts. A key whose owner LiteLLM
 // never resolved must NOT be charted as its own key-id (a "by user" graph should only ever
@@ -1166,7 +1266,7 @@ const svcRamChart = mkSvcChart("svc-ram-chart", true);
 const _SVC_COLORS = ["#7ee787","#f0883e","#58a6ff","#bc8cff","#f778ba"];
 function _svcDatasets(feed){
   if(!(feed && feed.points && feed.apps)) return {labels:[],datasets:[]};
-  const apps=(feed.apps||[]).filter(a=>/llama|ollama|vllm/i.test(a));   // LLM servers only
+  const apps=(feed.apps||[]).filter(a=>/llama|ollama|vllm|sglang|tgi/i.test(a));   // LLM servers only
   return {labels:feed.points.map(axisT(feed.points)),
     datasets:apps.map((a,i)=>({_k:a, label:a,
       data:feed.points.map(p=>p[a]==null?null:p[a]),
@@ -1195,7 +1295,7 @@ async function loadImpact(){
   // matched to the series timestamps by nearest second.
   const align=(feed,conv)=>{
     if(!(feed && feed.points && feed.apps)) return pts.map(()=>null);
-    const app=(feed.apps||[]).find(a=>/llama|ollama|vllm/i.test(a));
+    const app=(feed.apps||[]).find(a=>/llama|ollama|vllm|sglang|tgi/i.test(a));
     if(!app) return pts.map(()=>null);
     const byT={}; feed.points.forEach(p=>{ byT[Math.round(p.t)]=p[app]; });
     return pts.map(p=>{ const v=byT[Math.round(p.t)]; return v==null?null:conv(v); });
@@ -1300,7 +1400,7 @@ async function loadSeries(){
     if(card) card.style.display=pts.some(p=>p[cfg.key]!=null)?"":"none";
   }
 }
-function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyTimeWin(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadConcByModel(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); }
+function rangedReload(){ loadSeries(); loadKeyTime(); loadKeyTimeWin(); loadKeyDelta(); loadUserDelta(); loadWinSpend(); loadConcByKey(); loadConcByModel(); loadBacklogByKey(); loadCorr(); loadImpact(); loadModels(); loadUserTokens(); }
 function fmtRange(ts){
   const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
   return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes());
@@ -1379,7 +1479,128 @@ async function tick(){
   await loadImpact();
   await loadAnomalies();
   await loadModels();     // cheap pre-aggregated endpoint (NOT /spend/logs)
+  await loadUserTokens();
 }
+
+/* ===== Token volume by user over time — day-granular, keys folded to owner, picker + Other ===== */
+const UT_PAL=["#58a6ff","#3fb950","#db6d28","#bc8cff","#39c5cf","#f778ba","#d29922","#f85149","#6e7bf2","#57cf8a","#e3826b","#a5a2ff"];
+let utSel=new Set(), utColor={}, utData={days:[],list:[]}, utView="stack", utInit=false, utHas=false;
+const utFmt=n=>{n=+n; if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+"M"; if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1)+"k"; return String(Math.round(n||0));};
+const UTNS="http://www.w3.org/2000/svg";
+function utEl(t,a){const e=document.createElementNS(UTNS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function utShowEmpty(on){ const e=document.getElementById("ut-empty"); if(e)e.style.display=on?"":"none";
+  ["ut-stack-box","ut-small-box","ut-legend"].forEach(id=>{const x=document.getElementById(id); if(x&&on)x.style.display="none";}); }
+function utDayLbl(dt){ if(!(dt instanceof Date)||isNaN(dt)) return "";
+  return utData._span>2 ? (dt.getMonth()+1)+"/"+dt.getDate()
+    : dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+async function loadUserTokens(){
+  // follow the page time-window (+ pan cursor) so the chart matches the 15m/1h/24h/30d/12mo
+  // selector instead of always showing all-time; rangedReload() re-fires this on window change.
+  const uw=document.getElementById("ut-win"); if(uw) uw.textContent=wlabel(WIN);
+  const d=await api("/api/userreqs?window="+encodeURIComponent(WIN)+(TIMEEND?("&end="+Math.round(TIMEEND)):""));
+  if(!d) return;                                    // fetch blip → keep last render (no blink)
+  const mb=document.getElementById("ut-metric"); if(mb&&d.metric) mb.textContent=d.metric;
+  const labels=d.labels||[], pts=d.points||[];
+  if(!labels.length||!pts.length){ if(!utHas) utShowEmpty(true); return; }
+  // Owner resolution prefers the SERVER's persisted owner map (d.owners, keyed by the
+  // same label): it's warm on the first load and covers historical keys, so keys no
+  // longer resolve to "Unassigned" until the live /user/list poll catches up. Falls back
+  // to the budgets-derived _keyUser, then "Unassigned".
+  const omap=d.owners||{};
+  const resolveOwner=k=>{ const e=omap[k]; return e ? usernameOf(e) : userOf(k); };
+  const days=pts.map(p=>new Date((p.t||0)*1000)), owners={};
+  pts.forEach((p,bi)=>{ labels.forEach(k=>{ const u=resolveOwner(k), v=p[k]||0;
+    let o=owners[u]; if(!o) o=owners[u]=new Array(pts.length).fill(0); o[bi]+=v; }); });
+  let list=Object.keys(owners).map(n=>({name:n,series:owners[n],total:owners[n][owners[n].length-1]||0}))
+    .filter(o=>o.total>0).sort((a,b)=>b.total-a.total);   // cumulative → total = last bucket
+  if(!list.length){ if(!utHas) utShowEmpty(true); return; }
+  utShowEmpty(false);
+  list.forEach(o=>{ if(!utColor[o.name]) utColor[o.name]=UT_PAL[Object.keys(utColor).length%UT_PAL.length]; o.color=utColor[o.name]; });
+  if(!utInit){ utInit=true; list.slice(0,12).forEach(o=>utSel.add(o.name)); }
+  utData={days,list,_span:(days.length>1)?((days[days.length-1]-days[0])/86400000):0}; utHas=true;
+  const s=document.getElementById("ut-search"); utRows(s?s.value:""); utRender();
+}
+function utRender(){
+  document.getElementById("ut-count").textContent=utSel.size;
+  const stackOn=utView==="stack";
+  document.getElementById("ut-stack-box").style.display=stackOn?"":"none";
+  document.getElementById("ut-legend").style.display=stackOn?"":"none";
+  document.getElementById("ut-small-box").style.display=stackOn?"none":"";
+  stackOn?utDrawStack():utDrawSmall();
+}
+function utBands(){
+  // The user picker is a TRUE filter: unselected users are removed from the graph,
+  // not rolled into a grey "Other" band (which made unselecting look like it did
+  // nothing — the volume just restacked in grey). Show only what's selected.
+  return utData.list.filter(o=>utSel.has(o.name)).slice();
+}
+function utDrawStack(){
+  const svg=document.getElementById("ut-stack"); while(svg.firstChild)svg.removeChild(svg.firstChild);
+  const days=utData.days, B=days.length, bands=utBands();
+  const W=920,H=280,PADL=54,PADR=12,PADT=10,PADB=22,iw=W-PADL-PADR,ih=H-PADT-PADB;
+  const totals=Array.from({length:B},(_,b)=>bands.reduce((s,o)=>s+(o.series[b]||0),0));
+  const ymax=Math.max(1,...totals);
+  const X=b=>PADL+(B<=1?iw/2:(b/(B-1))*iw), Y=v=>PADT+ih-(v/ymax)*ih;
+  for(let g=0;g<=4;g++){const v=ymax*g/4,y=Y(v);
+    svg.appendChild(utEl("line",{x1:PADL,x2:W-PADR,y1:y,y2:y,stroke:"var(--line)","stroke-opacity":0.4,"stroke-width":1}));
+    const t=utEl("text",{x:PADL-7,y:y+3,"text-anchor":"end",fill:"var(--muted)","font-size":10});t.textContent=utFmt(v);svg.appendChild(t);}
+  const step=Math.max(1,Math.ceil(B/7));
+  for(let b=0;b<B;b+=step){const t=utEl("text",{x:X(b),y:H-6,"text-anchor":"middle",fill:"var(--muted)","font-size":9.5});t.textContent=utDayLbl(days[b]);svg.appendChild(t);}
+  const base=new Array(B).fill(0);
+  bands.forEach(o=>{ const top=base.map((v,b)=>v+(o.series[b]||0));
+    let d="M"+X(0)+","+Y(base[0]); for(let b=0;b<B;b++)d+=" L"+X(b)+","+Y(top[b]);
+    for(let b=B-1;b>=0;b--)d+=" L"+X(b)+","+Y(base[b]); d+="Z";
+    svg.appendChild(utEl("path",{d,fill:o.color,"fill-opacity":o.isOther?0.32:0.7,stroke:o.color,"stroke-opacity":o.isOther?0.5:0.9,"stroke-width":0.8}));
+    for(let b=0;b<B;b++)base[b]=top[b]; });
+  const guide=utEl("line",{x1:0,x2:0,y1:PADT,y2:PADT+ih,stroke:"var(--fg)","stroke-opacity":0.25,"stroke-width":1,style:"display:none"});svg.appendChild(guide);
+  const tip=document.getElementById("ut-tip");
+  svg.onmousemove=ev=>{ const r=svg.getBoundingClientRect(); const px=(ev.clientX-r.left)/r.width*W;
+    let b=Math.round((px-PADL)/iw*(B<=1?1:(B-1))); b=Math.max(0,Math.min(B-1,b));
+    guide.style.display=""; guide.setAttribute("x1",X(b)); guide.setAttribute("x2",X(b));
+    const rws=bands.map(o=>({n:o.name,c:o.color,v:o.series[b]||0})).filter(x=>x.v>0).sort((a,c)=>c.v-a.v).slice(0,8);
+    setHtml(tip, "<b>"+escapeHtml(utDayLbl(days[b]))+" — "+utFmt(totals[b])+"</b>"+rws.map(x=>"<div class='r'><span><span class='sw' style='background:"+x.c+"'></span>"+escapeHtml(x.n)+"</span><span>"+utFmt(x.v)+"</span></div>").join(""));
+    tip.style.display="block"; const tw=tip.offsetWidth, lx=ev.clientX-r.left;
+    tip.style.left=Math.min(r.width-tw-4,Math.max(0,lx+14))+"px"; tip.style.top=Math.max(0,ev.clientY-r.top-10)+"px"; };
+  svg.onmouseleave=()=>{tip.style.display="none";guide.style.display="none";};
+  const lg=document.getElementById("ut-legend");
+  setHtml(lg, bands.map(o=>"<span><span class='sw' style='background:"+o.color+(o.isOther?";opacity:.55":"")+"'></span>"+escapeHtml(o.name)+" · "+utFmt(o.total)+"</span>").join(""));
+}
+function utDrawSmall(){
+  const grid=document.getElementById("ut-grid"); setHtml(grid,"");
+  const days=utData.days,B=days.length, shown=utData.list.filter(o=>utSel.has(o.name));
+  if(!shown.length){ setHtml(grid,"<div class='sub'>No users selected — pick some in the Users menu.</div>"); return; }
+  const ymax=Math.max(1,...shown.map(o=>Math.max(...o.series,0)));
+  const w=148,h=38,pad=2;
+  shown.forEach(o=>{ const X=b=>pad+(B<=1?(w-2*pad)/2:(b/(B-1))*(w-2*pad)), Y=v=>h-pad-(v/ymax)*(h-2*pad);
+    let d="M"+X(0)+","+(h-pad); for(let b=0;b<B;b++)d+=" L"+X(b)+","+Y(o.series[b]||0); d+=" L"+X(B-1)+","+(h-pad)+"Z";
+    const card=document.createElement("div");card.className="ut-sm";
+    setHtml(card, "<div class='t'><b title='"+escapeHtml(o.name)+"'>"+escapeHtml(o.name)+"</b><i>"+utFmt(o.total)+"</i></div>"+
+      "<svg viewBox='0 0 "+w+" "+h+"' height='"+h+"' style='width:100%'><path d='"+d+"' fill='"+o.color+"' fill-opacity='0.26' stroke='"+o.color+"' stroke-width='1.2'/><circle cx='"+X(B-1)+"' cy='"+Y(o.series[B-1]||0)+"' r='2' fill='"+o.color+"'/></svg>");
+    grid.appendChild(card); });
+}
+function utRows(filter){ const q=String(filter||"").toLowerCase(), rows=document.getElementById("ut-rows"); if(!rows)return;
+  setHtml(rows, utData.list.filter(o=>o.name.toLowerCase().includes(q)).map(o=>
+    "<label class='r'><input type='checkbox' data-u='"+encodeURIComponent(o.name)+"' "+(utSel.has(o.name)?"checked":"")+">"+
+    "<span class='sw' style='background:"+o.color+"'></span><span class='nm'>"+escapeHtml(o.name)+"</span><span class='tot'>"+utFmt(o.total)+"</span></label>").join("")
+    || "<div class='sub'>no users</div>"); }
+(function(){
+  const view=document.getElementById("ut-view");
+  if(view) view.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;utView=b.dataset.v;
+    [...view.children].forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));utRender();});
+  const pop=document.getElementById("ut-pop"),cbtn=document.getElementById("ut-combo-btn"),combo=document.getElementById("ut-combo");
+  if(cbtn) cbtn.addEventListener("click",()=>pop.classList.toggle("open"));
+  document.addEventListener("click",e=>{if(combo&&!combo.contains(e.target))pop.classList.remove("open");});
+  const rows=document.getElementById("ut-rows");
+  if(rows) rows.addEventListener("change",e=>{const c=e.target.closest("input");if(!c)return;
+    const u=decodeURIComponent(c.dataset.u); c.checked?utSel.add(u):utSel.delete(u); utRender();});
+  const s=document.getElementById("ut-search"); if(s) s.addEventListener("input",e=>utRows(e.target.value));
+  const q=document.querySelector("#card-usertokens .ut-quick");
+  if(q) q.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;utSel.clear();
+    if(b.dataset.q==="top")utData.list.slice(0,12).forEach(o=>utSel.add(o.name));
+    else if(b.dataset.q==="all")utData.list.forEach(o=>utSel.add(o.name));
+    utRows(s?s.value:""); utRender();});
+})();
+
 updateRangeUI();
 tick();
 _timers.push(setInterval(tick,5000));

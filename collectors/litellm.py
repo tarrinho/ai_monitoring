@@ -866,13 +866,14 @@ async def model_price_detail(session: aiohttp.ClientSession) -> dict:
     cached-read) in currency per 1M tokens, from LiteLLM `/model/info`. For DISPLAY: the
     Settings model-costs card shows the breakdown instead of the summed blend (which reads
     double). Empty on error / unconfigured. Zeros are kept so an all-unset model still lists."""
+    global _DETAIL_CACHE
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
         return {}
     d, err = await fetch_json(session, f"{base.rstrip('/')}/model/info",
                               headers=_headers(), timeout_s=config.HTTP_TIMEOUT)
     if err is not None:
-        return {}
+        return dict(_DETAIL_CACHE)        # transient error → reuse last-good detail
     rows = (d.get("data") or d.get("model_list")) if isinstance(d, dict) else d
     out: dict = {}
     for m in rows if isinstance(rows, list) else []:
@@ -887,10 +888,17 @@ async def model_price_detail(session: aiohttp.ClientSession) -> dict:
         oc = _fnum(lp.get("output_cost_per_token") or info.get("output_cost_per_token") or 0)
         cc = _fnum(lp.get("cache_read_input_token_cost")
                    or info.get("cache_read_input_token_cost") or 0)
-        if ic or oc or cc:
-            out[name] = {"in": round(ic * 1e6, 4), "out": round(oc * 1e6, 4),
-                         "cache": round(cc * 1e6, 4)}
-    return out
+        # Keep EVERY model /model/info names — including an all-unset (self-hosted, $0) one, as
+        # the docstring promises. This is the RELIABLE model-name source for the Settings card:
+        # it comes straight from /model/info on each request, so the board no longer depends on
+        # the sampler's volatile /v1/models snapshot (which is absent whenever the latest sample
+        # hit a transient error — the "costs only show after a manual Refresh + reload" bug).
+        out[name] = {"in": round(ic * 1e6, 4), "out": round(oc * 1e6, 4),
+                     "cache": round(cc * 1e6, 4)}
+    if out:
+        _DETAIL_CACHE = dict(out)         # cache a non-empty result as last-good
+        return out
+    return dict(_DETAIL_CACHE)            # answered but priced nothing → last-good
 
 
 def _match_model(model: str, mapping: dict):
@@ -1223,9 +1231,13 @@ async def spend_activity(session: aiohttp.ClientSession,
 
 _KEY_LIST_ERR: str | None = None
 _KEY_BUDGETS_CACHE: dict | None = None  # last good /key/list result
+_KEY_BUDGETS_TS = 0.0                    # when the last good walk completed (short-TTL coalesce)
+_KEY_BUDGETS_TTL = 30.0                  # serve the cached walk to concurrent callers within this
 # last good (by_team_id→alias, by_user_id→team_alias, by_user_id→user_name) maps
 _TEAM_DIR_CACHE: tuple[dict, dict, dict] = ({}, {}, {})
 _PRICES_CACHE: dict = {}  # last good /model/info {model: $/token} — prices are stable
+_DETAIL_CACHE: dict = {}  # last good /model/info {model: {in,out,cache}} — the Settings card's
+#                           reliable model-name + per-type source (see model_price_detail)
                           # config, so reuse them when the endpoint blips empty (else
                           # cost=0 → the Spend "Cost over time" card flickers off)
 # Last good per-model daily series (the Spend "Cost per model over time" chart). The
@@ -1373,12 +1385,18 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
     budget is 0 when the key has no `max_budget`. The team is resolved key →
     team_id → USER (LiteLLM often puts the team on the user, not the key). None when
     LiteLLM is unconfigured or the endpoint is unavailable, so the caller can fall back."""
-    global _KEY_LIST_ERR, _KEY_BUDGETS_CACHE
+    global _KEY_LIST_ERR, _KEY_BUDGETS_CACHE, _KEY_BUDGETS_TS
     base = config.LITELLM_BASE_URL
     if not base or not config.LITELLM_MASTER_KEY:
         _KEY_LIST_ERR = "LiteLLM base URL or master key not set"
         return None
     base = base.rstrip("/")
+    # Single-flight-ish coalesce: this ~100-page management walk is invoked by the sampler AND
+    # concurrently by 3 dashboard handlers (budgets/teams/keys). Without this, N dashboard
+    # refreshes each re-walk /key/list+/team/list+/user/list at once and can clobber the shared
+    # cache mid-flight. Serve the last good result to any caller within _KEY_BUDGETS_TTL of it.
+    if _KEY_BUDGETS_CACHE is not None and time.time() - _KEY_BUDGETS_TS < _KEY_BUDGETS_TTL:
+        return _KEY_BUDGETS_CACHE
     # /key/list?return_full_object=true is a HEAVY management call — give it the
     # spend timeout, not the 4s per-collector one, or a busy LiteLLM (why
     # spend_mode=lite is common) times it out and every key silently loses its
@@ -1414,6 +1432,12 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
                         if _auth_err(err) else ""
                     _dbg(f"/key/list err={err} -> reuse cached{scope}" if _KEY_BUDGETS_CACHE
                          else f"/key/list err={err} -> budgets use MONITOR_KEY_BUDGETS{scope}")
+                # Feed the private key_list breaker the LIVE outcome (a fast scope-limit 403 is
+                # NOT the struggling/slow API the breaker guards, so only a real transport/5xx
+                # failure trips it). Recorded HERE, not from the caller's memoized return value —
+                # a cache-fallback return would otherwise read as "success" and never open it.
+                if not _auth_err(err):
+                    _cb_record("key_list", False, time.time())
                 return _KEY_BUDGETS_CACHE
             truncated = True                    # page>1 failed → we have only a partial set
             break
@@ -1510,6 +1534,8 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         return cache
     if out and not (incomplete and len(out) < len(cache)):
         _KEY_BUDGETS_CACHE = out
+        _KEY_BUDGETS_TS = time.time()     # start the coalesce window from this good walk
+        _cb_record("key_list", True, _KEY_BUDGETS_TS)   # live walk succeeded → reset the breaker
     return out or _KEY_BUDGETS_CACHE
 
 
@@ -1726,16 +1752,27 @@ async def _heavy_sample(session: aiohttp.ClientSession, base: str,
     # no cache yet) on a transient /key/list error, so this never regresses a chart
     # over a blip — it only ever grows the known-keys set (db.known_keys_upsert
     # never deletes, so a later-rotated key still shows in HISTORY).
-    try:
-        kb = await key_budgets(session)
-        if kb:
-            # {alias: owner-user-id}, not just the alias list — the owner is what tells an
-            # UNASSIGNED key (LiteLLM reports no user) from an owned one, and it is already
-            # resolved here, so persisting it costs nothing and saves the read paths from
-            # re-querying LiteLLM. '' means "LiteLLM names no owner for this key".
-            hv["known_keys"] = {a: str(v.get("user") or "") for a, v in kb.items()}
-    except Exception as e:
-        _dbg(f"/key/list known-keys refresh error: {type(e).__name__}")
+    # This /key/list + /team/list + /user/list walk is a HEAVY management-API pull (up to ~100
+    # sequential paginated requests) — no cheaper than /spend/logs — so it MUST honour the same
+    # freeze gates: skip in 'off' mode (the operator disabled heavy pulls), under load-shed, or
+    # when a breaker is open. It reads the shared 'spend' breaker (respect a genuinely-down
+    # endpoint) and records its OWN failures into a private 'key_list' breaker, so a struggling
+    # management API can't degrade the always-on spend poll (mirrors the token_types pattern).
+    if (_spend_mode() != "off" and not _load_shed()
+            and not _cb_open("spend", now) and not _cb_open("key_list", now)):
+        try:
+            kb = await key_budgets(session)   # feeds the key_list breaker its OWN live outcome
+            if kb:
+                # {alias: owner-user-id}, not just the alias list — the owner is what tells an
+                # UNASSIGNED key (LiteLLM reports no user) from an owned one, and it is already
+                # resolved here, so persisting it costs nothing and saves the read paths from
+                # re-querying LiteLLM. '' means "LiteLLM names no owner for this key".
+                hv["known_keys"] = {a: str(v.get("user") or "") for a, v in kb.items()}
+        except Exception as e:
+            _cb_record("key_list", False, time.time())
+            _dbg(f"/key/list known-keys refresh error: {type(e).__name__}")
+    else:
+        _dbg("/key/list known-keys refresh skipped — freeze gate (off/load-shed/breaker)")
     return hv
 
 
@@ -1855,7 +1892,13 @@ async def per_model_token_types(session: aiohttp.ClientSession, start_date: str,
     if _load_shed():
         return {"per_model": {}, "days_ok": 0, "days_failed": [], "total_days": 0,
                 "aborted": "load_shed"}
-    if _cb_open("spend", started):
+    # Respect a genuinely-down /spend/logs (the always-on sampler opens the shared "spend"
+    # breaker) AND our OWN recent-failure breaker — but this on-demand pull must NOT feed the
+    # shared one: its heavy multi-day fan-out fails on modes specific to it (byte cap, time
+    # budget on a big window) that don't mean the light sampler poll is down, so coupling them
+    # would let a user-initiated pull degrade the always-on spend collection. Read the shared
+    # breaker (protective); record failures to a private "token_types" breaker only.
+    if _cb_open("spend", started) or _cb_open("token_types", started):
         return {"per_model": {}, "days_ok": 0, "days_failed": [], "total_days": 0,
                 "aborted": "circuit_open"}
     aborted = None
@@ -1869,10 +1912,10 @@ async def per_model_token_types(session: aiohttp.ClientSession, start_date: str,
         raw, err = await _fetch_spend_raw(
             session, f"{base}/spend/logs?start_date={ds}&end_date={ds}", _headers(),
             config.LITELLM_SPEND_TIMEOUT, config.LITELLM_SPEND_MAX_BYTES)
-        _cb_record("spend", err is None, time.time())      # feed the shared spend breaker
+        _cb_record("token_types", err is None, time.time())  # private breaker — never the shared spend one
         if err is not None or not raw:
             days_failed.append({"day": ds, "err": err or "empty"})
-            if _cb_open("spend", time.time()):             # breaker just tripped → stop hammering
+            if _cb_open("token_types", time.time()):        # our own breaker tripped → stop hammering
                 aborted = "circuit_open"
                 break
         else:

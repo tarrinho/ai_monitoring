@@ -512,6 +512,43 @@ async def test_litellm_heavy_sample_surfaces_known_keys(monkeypatch):
         await srv.close()
 
 
+async def test_heavy_sample_skips_key_list_walk_under_freeze_gates(monkeypatch):
+    """Review-fix: the /key/list (+/team/list +/user/list) management walk in key_budgets is a
+    HEAVY pull (~100 sequential requests) — no cheaper than /spend/logs — so it must honour the
+    SAME freeze gates: skipped when the circuit breaker is open, under load-shed, or in 'off'
+    mode. Guards against the ungated-walk regression that hammered a proxy the operator had
+    explicitly configured (off/load-shed) to protect."""
+    hits = {"keylist": 0}
+    async def _live(_r): return web.json_response({"status": "healthy"})
+    async def _models(_r): return web.json_response({"data": []})
+    async def _backlog(_r): return web.json_response({"in_flight_requests": 0})
+    async def _spend(_r): return web.json_response([])
+    async def _keylist(r):
+        hits["keylist"] += 1
+        return web.json_response({"keys": [{"key_alias": "k", "spend": 0}], "total_pages": 1})
+    app = web.Application()
+    for _p, _h in (("/health/liveliness", _live), ("/v1/models", _models),
+                   ("/health/backlog", _backlog), ("/spend/logs", _spend), ("/key/list", _keylist)):
+        app.router.add_get(_p, _h)
+    srv = TestServer(app)
+    await srv.start_server()
+    try:
+        monkeypatch.setattr(config, "LITELLM_BASE_URL", str(srv.make_url("")).rstrip("/"))
+        monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-test")
+        monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 9999)
+        monkeypatch.setattr(config, "LITELLM_BACKLOG_PROBE_SELFCOUNT", False)
+        litellm._KEY_BUDGETS_CACHE = None
+        litellm._CB.pop("key_list", None)
+        litellm._CB["spend"] = {"fails": 99, "until": 9e18}   # breaker OPEN
+        async with aiohttp.ClientSession() as s:
+            out = await litellm.sample(s)
+        assert hits["keylist"] == 0, "key_budgets walk ran despite an OPEN circuit breaker"
+        assert not out.get("known_keys")
+    finally:
+        litellm._CB.pop("spend", None)
+        await srv.close()
+
+
 async def test_litellm_heavy_sample_key_list_failure_is_non_fatal(monkeypatch):
     """A /key/list failure (e.g. scope-limited master key) must not crash the sample or
     drop already-derived heavy fields — key_budgets() degrades to its own cache/None and
@@ -1263,6 +1300,7 @@ def test_concurrency_by_key_attribution_sums_to_aggregate(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk.db"))
     db.init()
     now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)   # align wall-clock so age-aware _pick_tier reads raw
     for i in range(10):
         t = now - 600 + i * 60
         with db._connect() as c:
@@ -1285,6 +1323,7 @@ def test_concurrency_by_key_unattributed_goes_to_other(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk2.db"))
     db.init()
     now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)   # align wall-clock so age-aware _pick_tier reads raw
     for i in range(5):                       # metrics only, no key_series activity
         with db._connect() as c:
             c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 300 + i * 60, 7.0))
@@ -1387,6 +1426,26 @@ def test_procs_collector_shape():
     assert out["top_ram"] and "app" in out["top_ram"][0] and "ram" in out["top_ram"][0]
     for c in out["top_cpu"]:
         assert "app" in c and "cpu" in c
+
+
+def test_procs_relabels_llm_servers_from_cmdline(monkeypatch):
+    """vLLM / SGLang run under a generic `python`, and TGI's rust router comm truncates to
+    'text-generation' — so `comm` alone can't attribute their CPU/RAM to the served model.
+    _app_of peeks at the cmdline of interpreter-like comms and relabels them to the server
+    (vllm / sglang / tgi) so the /litellm Per-model svc CPU/RAM + serving charts pick them up.
+    A generic python (no LLM marker) and a non-interpreter comm are left untouched."""
+    cmds = {
+        1: "/usr/bin/python3 -m vllm.entrypoints.openai.api_server --model MiniMax-M2",
+        2: "/venv/bin/python -m sglang.launch_server --model-path X",
+        3: "text-generation-router --model-id bigscience/bloom",
+        4: "/usr/bin/python3 /app/other_service.py",
+    }
+    monkeypatch.setattr(procs, "_cmdline", lambda pid: cmds.get(pid, ""))
+    assert procs._app_of(1, "python3") == "vllm"
+    assert procs._app_of(2, "python") == "sglang"
+    assert procs._app_of(3, "text-generation") == "tgi"      # comm-truncated rust router
+    assert procs._app_of(4, "python3") == "python3"          # generic python — unchanged
+    assert procs._app_of(5, "postgres") == "postgres"        # non-interpreter — no cmdline read
 
 
 def test_db_proc_series_multiline(tmp_path, monkeypatch):
@@ -3848,6 +3907,43 @@ async def test_per_model_series_survives_a_transient_failure(monkeypatch):
     assert empty is not None and empty["models"], "answered-empty must keep last-good too"
 
 
+async def test_model_price_detail_lists_zero_rate_models_and_serves_last_good(monkeypatch):
+    """The Settings model-costs card takes its model NAME list from /model/info via
+    model_price_detail() — so it must list EVERY configured model, INCLUDING an all-unset
+    ($0 self-hosted) one (as the docstring promises), and must serve the LAST-GOOD detail
+    across a transient blip instead of returning empty. This is what stops the card from going
+    blank whenever the sampler's /v1/models snapshot is momentarily absent — the reported
+    'model costs only appear after a manual Refresh + browser reload' bug."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-CHANGE_ME")
+    monkeypatch.setattr(litellm, "_DETAIL_CACHE", {})          # cold start
+    good = {"data": [
+        {"model_name": "azure_ai/gpt-5-mini",
+         "litellm_params": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}},
+        {"model_name": "vllm/self-hosted", "litellm_params": {}},   # all-unset → $0, still lists
+    ]}
+
+    async def _ok(session, url, headers=None, timeout_s=None):
+        return good, None
+    monkeypatch.setattr(litellm, "fetch_json", _ok)
+    d = await litellm.model_price_detail(None)
+    assert set(d) == {"azure_ai/gpt-5-mini", "vllm/self-hosted"}, "every model listed, incl. $0"
+    assert d["vllm/self-hosted"] == {"in": 0.0, "out": 0.0, "cache": 0.0}
+    assert d["azure_ai/gpt-5-mini"]["in"] == 1.0 and d["azure_ai/gpt-5-mini"]["out"] == 2.0
+
+    async def _fail(session, url, headers=None, timeout_s=None):   # transient blip
+        return None, "timeout"
+    monkeypatch.setattr(litellm, "fetch_json", _fail)
+    during = await litellm.model_price_detail(None)
+    assert set(during) == {"azure_ai/gpt-5-mini", "vllm/self-hosted"}, "blip must serve last-good"
+
+    async def _empty(session, url, headers=None, timeout_s=None):  # answered but empty
+        return {"data": []}, None
+    monkeypatch.setattr(litellm, "fetch_json", _empty)
+    empty = await litellm.model_price_detail(None)
+    assert set(empty) == {"azure_ai/gpt-5-mini", "vllm/self-hosted"}, "answered-empty keeps last-good"
+
+
 async def test_per_model_series_blank_before_first_success_still_hides(monkeypatch):
     """The persistence must not resurrect a card that never had data: with an empty
     cache (fresh deploy) a failing poll still returns None so the card stays hidden."""
@@ -4449,12 +4545,20 @@ async def test_containers_sample_concurrent_under_loop_bound(monkeypatch):
             await asyncio.sleep(0.3)                  # each inspect is "slow"
             return {"State": {"Running": True, "Status": "Up 1 min"}}
 
+    import json as _json
+    class _Content:               # the list read accumulates via r.content.iter_chunked()
+        def iter_chunked(self, n):
+            body = _json.dumps([{"Names": [f"/c{i}"]} for i in range(N)]).encode()
+            async def _gen():      # yield in SEVERAL chunks so a single-read (bug) would truncate
+                for i in range(0, len(body), 40):
+                    yield body[i:i+40]
+            return _gen()
+
     class _FakeSess:
         def get(self, url, **kw):
             if "containers/json?all=1" in url:
                 class _L(_FakeResp):
-                    async def json(self):
-                        return [{"Names": [f"/c{i}"]} for i in range(N)]
+                    content = _Content()
                 return _L()
             return _FakeResp()
 
@@ -4471,6 +4575,142 @@ async def test_containers_sample_concurrent_under_loop_bound(monkeypatch):
     assert elapsed < 1.5, f"inspects not concurrent: {elapsed:.2f}s for {N} containers"
 
 
+async def test_containers_auto_discover_flags_truncation_over_50(monkeypatch):
+    """Review-fix (C7): auto-discover inspects at most 50 containers; when the host has more,
+    the collector SURFACES the truncation (`truncated` + `total`) instead of silently dropping
+    the rest, so the UI can say 'showing 50 of N'."""
+    import collectors.containers as cont
+    import json as _json
+    M = 63
+
+    class _Resp:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def json(self): return {"State": {"Running": True, "Status": "Up"}}
+
+    class _Content:
+        def iter_chunked(self, n):
+            body = _json.dumps([{"Names": [f"/c{i}"]} for i in range(M)]).encode()
+            async def _gen():      # multi-chunk: a single-read regression would truncate + 404
+                for i in range(0, len(body), 40):
+                    yield body[i:i+40]
+            return _gen()
+
+    class _Sess:
+        def get(self, url, **kw):
+            if "containers/json?all=1" in url:
+                class _L(_Resp):
+                    content = _Content()
+                return _L()
+            return _Resp()
+
+    async def _mk(): return _Sess()
+    monkeypatch.setattr(cont, "_sess", lambda: _mk())
+    monkeypatch.setattr(config, "MONITOR_CONTAINERS", [])
+    out = await cont.sample(None)
+    assert out["available"] is True
+    assert len(out["containers"]) == 50               # capped
+    assert out.get("truncated") is True and out.get("total") == M
+
+
+async def test_key_budgets_serves_memo_within_ttl(monkeypatch):
+    """Review-fix (C6): the ~100-page /key/list+/team/list+/user/list walk is invoked by the
+    sampler AND 3 dashboard handlers. A short-TTL memo serves the last good walk to any caller
+    within the window so concurrent refreshes don't each re-walk the management API."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    sentinel = {"alice": {"budget": 1.0, "spend": 0.5}}
+    litellm._KEY_BUDGETS_CACHE = sentinel
+    litellm._KEY_BUDGETS_TS = time.time()             # fresh → within TTL
+    called = {"n": 0}
+
+    async def _boom(*a, **k):
+        called["n"] += 1
+        return {}, None
+    monkeypatch.setattr(litellm, "fetch_json", _boom)
+    out = await litellm.key_budgets(None)
+    assert out is sentinel and called["n"] == 0, "a fresh memo must be served with NO fetch"
+    litellm._KEY_BUDGETS_TS = time.time() - litellm._KEY_BUDGETS_TTL - 1   # expire it
+    await litellm.key_budgets(None)
+    assert called["n"] > 0, "an expired memo must re-walk /key/list"
+
+
+async def test_key_list_breaker_records_live_failure_not_cache_fallback(monkeypatch):
+    """Review-fix: the private key_list breaker must reflect the LIVE /key/list walk, not the
+    memoized cache-fallback RETURN (which is non-None whenever a warm cache exists, so it always
+    read as 'success' and the breaker never opened). A real transport/5xx failure records a failure
+    even with a warm cache; a fast auth/scope 403 must NOT trip it."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def _fail(session, url, headers=None, timeout_s=None):
+        return None, "timeout"
+    monkeypatch.setattr(litellm, "fetch_json", _fail)
+
+    # (1) real transport failure WITH a warm cache → the live outcome is recorded as a failure
+    monkeypatch.setattr(litellm, "_auth_err", lambda e: False)
+    litellm._CB.pop("key_list", None)
+    litellm._KEY_BUDGETS_CACHE = {"alice": {"spend": 0}}
+    litellm._KEY_BUDGETS_TS = 0.0                       # memo expired → a live walk happens
+    out = await litellm.key_budgets(None)
+    assert out == {"alice": {"spend": 0}}              # still served the cache (return unchanged)
+    assert litellm._CB.get("key_list", {}).get("fails", 0) >= 1, "live failure was not recorded"
+
+    # (2) a scope-limit 403 (auth error) is fast, not a struggling API → must NOT trip the breaker
+    monkeypatch.setattr(litellm, "_auth_err", lambda e: True)
+    litellm._CB.pop("key_list", None)
+    litellm._KEY_BUDGETS_TS = 0.0
+    await litellm.key_budgets(None)
+    assert litellm._CB.get("key_list", {}).get("fails", 0) == 0, "a fast 403 must not trip the breaker"
+
+
+def test_userreqs_endpoint_gated_and_wired():
+    """The users-over-time card (/litellm 'Request volume by user over time'): /api/userreqs
+    carries per-user request attribution, so it's in the SPEND_REQUIRE_ADMIN-gated set; and the
+    page reuses the existing key→owner fold + both views + the anti-blink keep-last."""
+    import app as a
+    import pathlib
+    assert "/api/userreqs" in a._SPEND_SENSITIVE_API
+    html = (pathlib.Path(a.__file__).parent / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert 'id="card-usertokens"' in html and "loadUserTokens" in html
+    assert '/api/userreqs' in html and "userOf(" in html            # owner-fold reused
+    assert "Usage by user over time" in html and 'id="ut-metric"' in html
+    assert 'id="ut-stack"' in html and 'id="ut-grid"' in html       # both views present
+    assert "utHas" in html and "if(!utHas)" in html                 # anti-blink keep-last
+    assert 'data-q="top"' in html and 'data-q="all"' in html and 'data-q="none"' in html
+    # dynamic writes route through the sanitized sink (single-innerHTML-sink invariant guarded
+    # by test_litellm_page_exists_and_secure); confirm reuse here.
+    assert "setHtml(rows," in html and "setHtml(lg," in html and "setHtml(grid," in html
+
+
+async def test_userreqs_endpoint_mirrors_keytime_and_falls_back_in_lite(tmp_path, monkeypatch):
+    """GET /api/userreqs returns per-key CUMULATIVE usage over time, un-capped (top_n=200) for
+    owner-folding — exactly the 'Top 10 keys over time' path. In lite/off mode (no per-key request
+    counts) it falls back to cumulative SPEND from key_series, so the card is never empty when the
+    keys-over-time chart has data. Returns {metric, labels, points}."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ureq.db"))
+    db.init()
+    now = time.time()
+    # key_series only (no spend_model_user_daily rollup) → key_cumulative empty → SPEND fallback,
+    # mirroring a lite-mode live box where keytime shows via the same fallback.
+    for i in range(6):
+        t = now - 3600 + i * 300
+        db.insert_key_series(t, [{"key": "hA", "alias": "aliceKey", "reqs": 10 + i * 5},
+                                 {"key": "hB", "alias": "bobKey", "reqs": 2 + i}])
+    db.rollup()                       # 12mo reads the _1h tier — live has rollups; the test must too
+    c = await _client()
+    try:
+        r = await c.get("/api/userreqs")
+        assert r.status == 200
+        j = await r.json()
+        assert "labels" in j and "points" in j and j["metric"] in ("requests", "spend")
+        assert {"aliceKey", "bobKey"} <= set(j["labels"])     # both keys ranked in
+        assert j["points"], "must return series data via the spend fallback (lite mode)"
+    finally:
+        await c.close()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Extra QA — security · functional · unit · regression · performance
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4483,6 +4723,9 @@ async def test_csp_locks_down_script_and_object_src():
         assert "default-src 'self'" in csp
         assert "object-src 'none'" in csp
         assert "base-uri" in csp
+        # AU4: form-action does NOT inherit from default-src, so it must be set explicitly to
+        # stop an injected <form action="//evil"> exfiltrating on submit.
+        assert "form-action 'self'" in csp
     finally:
         await c.close()
 
@@ -5180,6 +5423,40 @@ async def test_per_model_token_types_honors_freeze_gates(monkeypatch):
     assert r["aborted"] == "load_shed" and called["n"] == 0
 
 
+async def test_token_types_failures_use_private_breaker_not_shared_spend(monkeypatch):
+    """Regression (review #12): the on-demand token-types fan-out must NOT feed the shared
+    'spend' breaker — its heavy multi-day pull fails on modes specific to it (byte cap, time
+    budget on a big window) that don't mean the always-on sampler's light /spend/logs poll is
+    down. Failing days must trip its PRIVATE 'token_types' breaker only, leaving 'spend' intact."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    litellm._CB.pop("spend", None)
+    litellm._CB.pop("token_types", None)
+    monkeypatch.setattr(litellm, "_AUTH_BAD", False)
+    monkeypatch.setattr(litellm, "_LOAD_PER_CORE", 0.0)
+    monkeypatch.setattr(config, "LITELLM_CB_THRESHOLD", 2)
+
+    async def _all_fail(session, url, headers, timeout_s, max_bytes):
+        return None, "too_big:>67108864"
+    monkeypatch.setattr(litellm, "_fetch_spend_raw", _all_fail)
+    r = await litellm.per_model_token_types(None, "2026-07-15", "2026-07-20")
+    assert r["aborted"] == "circuit_open"                      # its own breaker stopped the fan-out
+    assert litellm._CB.get("token_types", {}).get("fails", 0) >= 2   # private breaker took the hits
+    assert not litellm._cb_open("spend", time.time()), "shared spend breaker must stay closed"
+    litellm._CB.pop("token_types", None)
+
+
+def test_tt_cache_store_is_bounded():
+    """Regression (review #6): _TT_CACHE must not grow without bound — a run of distinct ?start=
+    windows (one entry each) is capped, evicting expired-then-oldest."""
+    appmod._TT_CACHE.clear()
+    now = 1_000_000.0
+    for i in range(appmod._TT_MAX * 3):
+        appmod._tt_cache_store((f"2026-01-{i:04d}", ""), now, {"available": True, "models": []})
+    assert len(appmod._TT_CACHE) <= appmod._TT_MAX
+    appmod._TT_CACHE.clear()
+
+
 def test_model_cost_overrides_db_beats_env(monkeypatch):
     """The Settings-page (DB) cost override wins over the MONITOR_MODEL_COSTS env value."""
     db.init()
@@ -5337,6 +5614,35 @@ async def test_last_admin_cannot_be_demoted(monkeypatch):
                          headers={"X-CSRF-Token": csrf})
         assert r.status == 400                      # can't demote the last admin
         assert db.user_get("solo2")["role"] == "admin"
+    finally:
+        await c.close()
+
+
+async def test_user_update_drops_sessions_only_on_role_change(monkeypatch):
+    """Review-fix: the admin `update` action must drop the target's sessions ONLY when their role
+    actually changes (a demotion needs the fresh role) — an email-only edit must NOT log them out,
+    and it uses sessions_drop_user_except so an admin editing their OWN profile isn't self-locked."""
+    c, csrf = await _admin_client(monkeypatch, user="acting", pw="actingpw1")
+    try:
+        # a second admin as the target, so demoting them isn't blocked by the last-admin guard
+        db.user_create("tgt", "tgt@x.io", auth.hash_password("tgtpw123"), "admin", time.time())
+        sid1, _ = auth.session_new("tgt", "admin")
+        assert auth.session_get(sid1) is not None
+        # (1) email-only edit, role unchanged → session SURVIVES (no forced logout)
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "tgt", "action": "update",
+                               "email": "tgt2@x.io", "role": "admin"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        assert auth.session_get(sid1) is not None, "email-only edit must NOT drop the user's session"
+        # (2) role change → the target's sessions are DROPPED (fresh role applies at once)
+        sid2, _ = auth.session_new("tgt", "admin")
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "tgt", "action": "update",
+                               "email": "tgt2@x.io", "role": "viewer"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        assert auth.session_get(sid2) is None, "role change must drop the target's sessions"
     finally:
         await c.close()
 
@@ -7735,6 +8041,68 @@ def test_user_delete_cascades_api_tokens():
     assert db.api_token_count("cdel") == 0
 
 
+def test_api_token_role_capped_at_current_user_role(tmp_path, monkeypatch):
+    """Review-fix (privilege persistence): a PAT carries its OWN stored role, so a user who
+    minted an admin PAT and is later DEMOTED to viewer must not keep admin via that token.
+    api_token_lookup returns the LOWER of the token role and the owner's CURRENT role, capping
+    the token at read time without having to mutate every PAT on a role change."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "patcap.db"))
+    db.init()
+    # two admins so demoting one doesn't trip the last-admin guard
+    db.user_create("adm1", "a1@example.com", auth.hash_password("pw-abcdef12"), "admin", 1.0)
+    db.user_create("adm2", "a2@example.com", auth.hash_password("pw-abcdef34"), "admin", 1.0)
+    h = "tokhash-" + "a" * 24
+    db.api_token_create("tidP", "adm1", "admin", "lbl", h, "pfx", 1.0)
+    assert db.api_token_lookup(h)["role"] == "admin"          # admin owner → admin PAT
+    assert db.user_update_guarded("adm1", "a1@example.com", "viewer")   # demote
+    assert db.api_token_lookup(h)["role"] == "viewer"         # PAT capped to current role
+    # re-promote → the same token regains admin (role is derived live, not frozen)
+    assert db.user_update_guarded("adm1", "a1@example.com", "admin")
+    assert db.api_token_lookup(h)["role"] == "admin"
+
+
+async def test_gpu_sample_skips_when_probe_threads_wedged(monkeypatch):
+    """Review-fix: a wedged nvidia-smi (D-state, unkillable) must not starve the SHARED thread
+    pool. The GPU probe runs on a dedicated 2-thread executor gated by a BoundedSemaphore; when
+    both permits are held (two threads already stuck), _gpu_sample returns a 'wedged' sentinel
+    WITHOUT submitting a third probe — so the executor queue can't grow and the shared pool
+    (host/procs/persist/rollup) is never touched."""
+    import app as a
+    called = {"n": 0}
+    monkeypatch.setattr(a.gpu, "sample", lambda: called.__setitem__("n", called["n"] + 1) or {})
+    assert a._GPU_SEM.acquire(blocking=False)      # simulate two wedged probe threads
+    assert a._GPU_SEM.acquire(blocking=False)
+    try:
+        out = await a._gpu_sample(None)
+        assert out == {"available": False, "error": "gpu probe wedged"}
+        assert called["n"] == 0, "submitted a 3rd GPU probe while 2 were wedged"
+    finally:
+        a._GPU_SEM.release()
+        a._GPU_SEM.release()
+
+
+async def test_gpu_sample_releases_permit_if_submit_fails(monkeypatch):
+    """Review-fix: if _GPU_EXECUTOR.submit raises (only reachable at executor shutdown), the
+    permit acquired just before it must be RELEASED, not leaked — else every later GPU probe would
+    read as permanently 'wedged'. Uses a fresh semaphore so the check is isolated from other tests."""
+    import app as a
+    import threading as _t
+
+    class _BoomExec:
+        def submit(self, *args):
+            raise RuntimeError("executor shut down")
+
+    monkeypatch.setattr(a, "_GPU_EXECUTOR", _BoomExec())
+    monkeypatch.setattr(a, "_GPU_SEM", _t.BoundedSemaphore(2))    # isolated 2-permit semaphore
+    with pytest.raises(RuntimeError):
+        await a._gpu_sample(None)
+    # both permits must still be free (the failed submit released the one it took)
+    assert a._GPU_SEM.acquire(blocking=False)
+    assert a._GPU_SEM.acquire(blocking=False), "submit-failure leaked a GPU permit"
+    a._GPU_SEM.release()
+    a._GPU_SEM.release()
+
+
 # ── Top-10 keys "requests in window" delta chart (1.3.2) ──────────────────────
 def _clear_key_series():
     """Isolate per-key delta tests from cross-run pollution (the shared test DB is
@@ -7922,6 +8290,7 @@ def test_concurrency_by_key_hides_excluded_label(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EXCLUDE_KEYS", {"monitor-key"})
     db.init()
     now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)   # align wall-clock so age-aware _pick_tier reads raw
     for i in range(10):
         t = now - 600 + i * 60
         with db._connect() as c:
@@ -8141,13 +8510,15 @@ def test_litellm_persistence_not_nested_under_vllm_guard():
     """T0-1: the LiteLLM spend rollup + known-keys upserts must persist independently of vLLM.
     They were mis-nested under the single-model-vLLM guard, so on a LiteLLM-only or
     multi-model-vLLM stack they never ran from live samples (silent data loss)."""
-    import pathlib
-    loop = pathlib.Path(appmod.__file__).read_text(encoding="utf-8") \
-        .split("async def _sampling_loop", 1)[1].split("\nasync def ", 1)[0]
-    # both upserts sit at loop-body indent (12 spaces), NOT inside the 16-space vLLM `if`
-    assert "\n            if _mu_rows:\n                db.spend_model_user_upsert(" in loop
-    assert '\n            if _ll.get("known_keys"):' in loop
-    assert "\n                if _mu_rows:" not in loop, "spend upsert must NOT be nested under vLLM"
+    import inspect
+    import app as a
+    # Per-tick writes were extracted into the sync _persist_tick helper (run off-loop via
+    # asyncio.to_thread); the mis-nesting invariant now lives THERE. Both upserts must sit at
+    # helper-body indent (4 spaces), NOT inside the 8-space single-model-vLLM `if`.
+    persist = inspect.getsource(a._persist_tick)
+    assert "\n    if mu_rows:\n        db.spend_model_user_upsert(" in persist
+    assert '\n    if _ll.get("known_keys"):' in persist
+    assert "\n        if mu_rows:" not in persist, "spend upsert must NOT be nested under vLLM"
 
 
 def test_heavy_fetchers_refuse_redirects():
@@ -8374,6 +8745,49 @@ def test_vllm_parse_prom_sums_and_skips_junk():
     assert m["b"] == 5.0
     assert "broken" not in m
     assert vllm.parse_prom("") == {}
+
+
+def test_vllm_parse_prom_skips_non_finite():
+    """Review-fix (C5): Prometheus legitimately emits NaN / +Inf for un-observed gauges/summaries
+    on some builds. float() accepts them, but they'd flow into the KPIs and then json.dumps emits
+    bare `NaN`/`Infinity` tokens the browser's JSON.parse REJECTS — killing the whole vLLM panel.
+    parse_prom must drop non-finite values (and still keep the finite ones)."""
+    m = vllm.parse_prom('kv{} NaN\nwait{} +Inf\nneg{} -Inf\nrun{} 3.5\n')
+    assert m.get("run") == 3.5
+    assert "kv" not in m and "wait" not in m and "neg" not in m
+    import math
+    assert all(math.isfinite(v) for v in m.values())
+
+
+def test_prune_uses_short_samples_retention_window(tmp_path, monkeypatch):
+    """Review-fix (S1): `samples` is read only by db.recent() at startup, so it prunes on the
+    short SAMPLES_RETENTION_HOURS window (capped by DB_RETENTION_HOURS) instead of keeping ~518k
+    blobs at the full 720h — a row older than the samples window is dropped even though the raw
+    metrics retention is far longer."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "prune.db"))
+    monkeypatch.setattr(config, "DB_RETENTION_HOURS", 720)
+    monkeypatch.setattr(config, "SAMPLES_RETENTION_HOURS", 6)
+    db.init()
+    now = time.time()
+    with db._connect() as c:
+        c.execute("INSERT INTO samples(ts, payload) VALUES (?, ?)", (now - 3 * 3600, "{}"))    # 3h — kept
+        c.execute("INSERT INTO samples(ts, payload) VALUES (?, ?)", (now - 10 * 3600, "{}"))   # 10h — pruned
+    removed = db.prune()
+    assert removed == 1
+    with db._connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+
+
+def test_config_apply_refuses_non_scalar_tunable():
+    """Review-fix (A6): config._apply must REFUSE (return without rebinding) a non-scalar
+    tunable rather than just warn — a compound global mutated in place across the to_thread
+    boundary is exactly the torn-read race the scalar-only invariant exists to prevent."""
+    import inspect
+    src = inspect.getsource(config._apply)
+    i_check = src.index("isinstance(v, (int, float, bool, str))")
+    i_bind = src.index("globals()[name] = v")
+    assert "return" in src[i_check:i_bind], \
+        "a non-scalar tunable must be refused (return) BEFORE the globals() rebind"
 
 
 def test_vllm_avg_and_pick_helpers():
@@ -9036,10 +9450,16 @@ def test_sampling_loop_feeds_vllm_realtime_into_model_conc_series():
     model name would be wrong, not merely imprecise)."""
     import inspect
     import app as a
+    # The per-tick DB writes (incl. the vLLM real-time feed) were extracted into
+    # _persist_tick so the sampling loop can run them off-loop via asyncio.to_thread;
+    # the loop must still call it, and the feed must still live in that path.
     samp = inspect.getsource(a._sampling_loop)
-    assert "insert_model_conc_series" in samp
-    assert 'snap["collectors"].get("vllm"' in samp
-    assert "multi_model" in samp, "must skip when the reading is summed across models"
+    assert "_persist_tick" in samp, "sampling loop must delegate per-tick writes to _persist_tick"
+    persist = inspect.getsource(a._persist_tick)
+    assert "insert_model_conc_series" in persist
+    assert '.get("vllm"' in persist and 'coll = snap["collectors"]' in persist
+    assert 'get("running")' in persist and 'get("waiting")' in persist, "must feed vLLM's own gauges"
+    assert "multi_model" in persist, "must skip when the reading is summed across models"
 
 
 async def test_service_toggle_disables_backend_everywhere(monkeypatch):
@@ -9911,6 +10331,24 @@ def test_model_cost_price_per_type_derives_blend_and_reads_back(tmp_path, monkey
     assert "gpt-4o" not in db.model_cost_prices() and "gpt-4o" not in db.model_cost_details()
 
 
+def test_model_cost_partial_override_fills_blank_types_from_litellm_rate(tmp_path, monkeypatch):
+    """Review #13: a partial per-type override (only one type pinned) must NOT count the blank
+    types as $0 and zero-deflate the derived blend. The blanks fill from LiteLLM's live rate
+    (fill_*), while the stored per-type detail still holds only the operator's explicit override."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mcfill.db"))
+    db.init()
+    # only OUTPUT overridden (20); input/cache blank → fill from LiteLLM live (in=5, cache=1).
+    db.model_cost_price_set("m", 0.0, 1.0, out_1m="20",
+                            vol_in="100", vol_out="10", vol_cache="0",
+                            fill_in="5", fill_cache="1")
+    assert db.model_cost_prices()["m"] == pytest.approx((5*100 + 20*10 + 1*0) / 110)
+    assert db.model_cost_details()["m"] == {"out": 20.0}      # only the explicit override is stored
+    # WITHOUT the fill the same partial override zero-deflates input to $0 (the bug this fixes).
+    db.model_cost_price_set("m2", 0.0, 1.0, out_1m="20",
+                            vol_in="100", vol_out="10", vol_cache="0")
+    assert db.model_cost_prices()["m2"] == pytest.approx((0*100 + 20*10) / 110)
+
+
 async def test_model_kinds_post_accepts_per_type_cost(monkeypatch):
     """The /api/admin/model-kinds handler accepts action=cost with in/out/cache and persists
     a per-type override (deriving usd_1m); the blended usd_1m path still works too."""
@@ -9926,3 +10364,536 @@ async def test_model_kinds_post_accepts_per_type_cost(monkeypatch):
     finally:
         db.model_cost_price_delete("gpt-4o")
         await c.close()
+
+
+# --- Service status timeline (Alerts page) -----------------------------------
+# Backend for the "Service status over time" stepped-line graph: per-service
+# up/down segments from the events table, the monitoring site derived from
+# metrics-row cadence, and the endpoint that omits Settings-disabled services.
+
+def test_status_segments_reconstructs_up_down_runs(tmp_path, monkeypatch):
+    """A backend up before the window with a mid-window outage yields three
+    ordered segments (up / down / up) and the matching uptime%."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "seg.db"))
+    db.init()
+    now = _t.time()
+    db.record_event(now - 2 * 86400, "ollama", True)     # up long before window
+    db.record_event(now - 12 * 3600, "ollama", False)    # down at -12h
+    db.record_event(now - 11 * 3600, "ollama", True)     # back up at -11h
+    out = db.status_segments("24h", ["ollama"], end=now)["ollama"]
+    segs = out["segments"]
+    assert [s["up"] for s in segs] == [True, False, True]
+    assert out["no_data"] is False
+    # exactly one hour of downtime in a 24h window
+    assert abs(out["uptime_pct"] - (23 / 24 * 100)) < 0.1
+    # segments are contiguous and cover the whole window
+    assert abs(segs[0]["from"] - (now - 86400)) < 1
+    assert abs(segs[-1]["to"] - now) < 1
+    for a, b in zip(segs, segs[1:]):
+        assert abs(a["to"] - b["from"]) < 1e-6
+
+
+def test_status_segments_no_data_for_backend_without_events(tmp_path, monkeypatch):
+    """An enabled backend that has never produced a state event is flagged
+    no_data (frontend draws a dashed 'no data yet' lane, never a fake green)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "nd.db"))
+    db.init()
+    out = db.status_segments("24h", ["vllm"], end=1_000_000.0)["vllm"]
+    assert out["no_data"] is True
+
+
+def test_self_uptime_segments_flags_a_metrics_gap(tmp_path, monkeypatch):
+    """The monitoring-site lane is inferred from metrics cadence: a gap larger
+    than 3x the sample interval becomes a 'down' segment."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "site.db"))
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    db.init()
+    now = _t.time()
+    gap_lo, gap_hi = now - 6 * 3600 - 600, now - 6 * 3600   # a 10-min blackout at -6h
+    with db._connect() as c:
+        t = now - 86400
+        while t < now:
+            if not (gap_lo < t < gap_hi):
+                c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (t, 10.0))
+            t += 5
+    out = db.self_uptime_segments("24h", end=now)
+    assert out["no_data"] is False
+    downs = [s for s in out["segments"] if not s["up"]]
+    assert len(downs) == 1
+    # the down segment matches the injected blackout (~10 min), not the whole window
+    assert 540 < (downs[0]["to"] - downs[0]["from"]) < 660
+    assert out["uptime_pct"] < 100 and out["uptime_pct"] > 99
+
+
+async def test_status_timeline_endpoint_omits_services_disabled_in_settings(tmp_path, monkeypatch):
+    """A service switched OFF in Settings -> Services is absent from the graph
+    entirely (same gate as the sidebar link); the monitoring site is always
+    present and always last."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ep.db"))
+    db.init()
+    monkeypatch.setattr(appmod, "_latest", {"ts": 0, "collectors": {}})
+    # ollama enabled + configured; vllm/litellm/llamacpp disabled; gpu unconfigured
+    monkeypatch.setattr(config, "OLLAMA_ENABLED", True)
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://ollama:11434")
+    monkeypatch.setattr(config, "VLLM_ENABLED", False)
+    monkeypatch.setattr(config, "VLLM_BASE_URL", "http://vllm:8000")
+    monkeypatch.setattr(config, "LITELLM_ENABLED", False)
+    monkeypatch.setattr(config, "LLAMACPP_ENABLED", False)
+    for attr in ("GPU_SSH", "GPU_METRICS_URL", "GPU_METRICS_FILE"):
+        monkeypatch.setattr(config, attr, "", raising=False)
+    now = _t.time()
+    with db._connect() as c:
+        for k in range(30):
+            c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (now - 150 + k * 5, 10.0))
+    req = make_mocked_request("GET", "/api/status-timeline?window=24h")
+    resp = await appmod.status_timeline_handler(req)
+    data = json.loads(resp.text)
+    keys = [s["key"] for s in data["services"]]
+    assert "ollama" in keys                     # enabled -> present
+    assert "vllm" not in keys                    # disabled in Settings -> omitted
+    assert "litellm" not in keys and "llamacpp" not in keys
+    assert "gpu" not in keys                      # unconfigured -> omitted
+    assert keys[-1] == "site"                     # site always last, always present
+    site = data["services"][-1]
+    assert site["configured"] is True and site["no_data"] is False
+
+
+def test_status_segments_full_uptime_when_up_since_before_window(tmp_path, monkeypatch):
+    """A backend that came up before the window and never fell over shows a single
+    up segment spanning the whole window at 100% (no events inside the window)."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "up.db"))
+    db.init()
+    now = _t.time()
+    db.record_event(now - 3 * 86400, "llamacpp", True)     # up well before the window
+    out = db.status_segments("24h", ["llamacpp"], end=now)["llamacpp"]
+    assert out["no_data"] is False
+    assert [s["up"] for s in out["segments"]] == [True]
+    assert out["uptime_pct"] == 100.0
+
+
+async def test_status_timeline_honours_end_pan_cursor(tmp_path, monkeypatch):
+    """Alerts pan: /api/status-timeline?end=<past> anchors the window END at that cursor
+    (now==end, start==end-secs) instead of 'now' — this is what the ◀▶ arrows send."""
+    import time as _t
+    import json
+    from aiohttp.test_utils import make_mocked_request
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "pan.db"))
+    db.init()
+    end = _t.time() - 3 * 86400            # three days back
+    req = make_mocked_request("GET", f"/api/status-timeline?window=24h&end={end:.0f}")
+    resp = await appmod.status_timeline_handler(req)
+    data = json.loads(resp.text)
+    assert data["window"] == "24h"
+    assert abs(data["now"] - end) < 1.0                 # window END pinned to the cursor
+    assert abs(data["start"] - (end - 86400)) < 1.0     # start = end - 24h, not now - 24h
+
+
+async def test_spend_series_forwards_end_pan_to_anchor(monkeypatch):
+    """Spend pan: /api/spend/series?end=<past> forwards that cursor as the window anchor
+    (the day-granular charts then end there); a param-less call anchors at ~now."""
+    from aiohttp.test_utils import make_mocked_request
+    seen = {}
+
+    def _src(anchor, window):
+        seen["anchor"] = anchor
+        seen["window"] = window
+        return {"window": window, "available": True, "points": [], "years": []}
+
+    monkeypatch.setattr(appmod, "_spend_series_source", _src)
+    end = 1_700_000_000.0
+    req = make_mocked_request("GET", f"/api/spend/series?window=30d&end={end:.0f}")
+    resp = await appmod.spend_series_handler(req)
+    assert resp.status == 200
+    assert seen["anchor"] == end and seen["window"] == "30d"   # pan cursor → anchor
+    req2 = make_mocked_request("GET", "/api/spend/series?window=30d")
+    await appmod.spend_series_handler(req2)
+    assert seen["anchor"] > end                                # live: anchor ~= now (future of cursor)
+
+
+async def test_spend_model_series_forwards_end_pan(monkeypatch):
+    """/api/spend/model-series honours the ?end= pan cursor: the per-model bucketing anchors
+    at the cursor, not 'now'. A param-less call anchors at ~now."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+
+    async def fake_prices(session):
+        return {"m": 2.25e-06}
+
+    async def fake_series(session, start, end, prices, ov):
+        return {"dates": ["2026-07-15"], "models": [
+            {"model": "m", "kind": "real", "total": 1.0, "daily": {"2026-07-15": 1.0}}]}
+
+    monkeypatch.setattr(litellm, "model_prices", fake_prices)
+    monkeypatch.setattr(litellm, "per_model_daily_series", fake_series)
+    seen = {}
+
+    def cap(series, window, anchor, **kw):
+        seen["anchor"] = anchor
+        return {"window": window, "available": True, "labels": ["x"], "models": []}
+
+    monkeypatch.setattr(appmod, "bucket_model_series", cap)
+    end = 1_700_000_000.0
+    c = await _client()
+    try:
+        await (await c.get(f"/api/spend/model-series?window=30d&end={end:.0f}")).json()
+        assert seen["anchor"] == end                # pan cursor → bucket anchor
+        seen.clear()
+        await (await c.get("/api/spend/model-series?window=30d")).json()
+        assert seen["anchor"] > end                 # live ~ now
+    finally:
+        await c.close()
+
+
+async def test_spend_model_user_series_forwards_end_and_serves_fresh(monkeypatch):
+    """/api/spend/model-user-series forwards ?end= to BOTH the rollup read (day span anchored
+    at the cursor) and the bucketing; a panned view is served fresh (never from the window-keyed
+    cache), so a following live call still anchors at ~now."""
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
+    rows_seen = {}
+
+    def fake_rows(days_back, end=None):
+        rows_seen["days"] = days_back
+        rows_seen["end"] = end
+        return [{"date": "2026-07-15", "model": "m", "key": "k", "cost": 1.0}]
+
+    async def fake_owner(session):
+        return {"ovr": {}, "live": {}}
+
+    async def fake_prices(session):
+        return {}
+
+    monkeypatch.setattr(db, "spend_model_user_rows", fake_rows)
+    monkeypatch.setattr(appmod, "_key_owner_map", fake_owner)
+    monkeypatch.setattr(litellm, "model_prices", fake_prices)
+    bseen = {}
+
+    def cap(rows, omap, prices, kind_ov, window, anchor):
+        bseen["anchor"] = anchor
+        return {"window": window, "available": True, "labels": [], "series": []}
+
+    monkeypatch.setattr(appmod, "bucket_model_user_series", cap)
+    end = 1_700_000_000.0
+    c = await _client()
+    try:
+        await (await c.get(f"/api/spend/model-user-series?window=30d&end={end:.0f}")).json()
+        assert rows_seen["end"] == end and bseen["anchor"] == end   # cursor → rollup read + bucket
+        rows_seen.clear()
+        bseen.clear()
+        await (await c.get("/api/spend/model-user-series?window=30d")).json()
+        assert bseen["anchor"] > end        # live served fresh (panned view was not cached)
+    finally:
+        await c.close()
+
+
+async def test_userreqs_follows_window_and_end(monkeypatch):
+    """The /litellm 'Usage by user over time' card follows the window (→ day span) AND the
+    ?end= pan cursor: the handler maps window→days_back and forwards end to key_cumulative."""
+    import json as _j
+    from aiohttp.test_utils import make_mocked_request
+    seen = {}
+
+    def fake_cum(metric="reqs", days_back=366, top_n=10, end=None):
+        seen["days_back"] = days_back
+        seen["end"] = end
+        return {"labels": ["k1"], "points": [{"t": 1, "k1": 5}]}
+
+    monkeypatch.setattr(db, "key_cumulative", fake_cum)
+    monkeypatch.setattr(db, "known_owner_names", lambda: {})
+    monkeypatch.setattr(db, "key_user_overrides", lambda: {})
+    end = 1_700_000_000.0
+    req = make_mocked_request("GET", f"/api/userreqs?window=24h&end={end:.0f}")
+    d = _j.loads((await appmod.userreqs_handler(req)).text)
+    assert seen["end"] == end and seen["days_back"] == 1    # 24h → 1 day (day-granular)
+    assert d["metric"] == "requests"
+    seen.clear()
+    req2 = make_mocked_request("GET", "/api/userreqs?window=30d")
+    await appmod.userreqs_handler(req2)
+    assert seen["days_back"] == 30 and seen["end"] is None  # window widens the span; live = no cursor
+
+
+def test_status_segments_currently_down(tmp_path, monkeypatch):
+    """A backend whose last state before the window was DOWN (and never recovered)
+    reads down for the whole window: 0% uptime, one down segment, not no_data."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "down.db"))
+    db.init()
+    now = _t.time()
+    db.record_event(now - 2 * 86400, "vllm", False)
+    out = db.status_segments("24h", ["vllm"], end=now)["vllm"]
+    assert out["no_data"] is False
+    assert [s["up"] for s in out["segments"]] == [False]
+    assert out["uptime_pct"] == 0.0
+
+
+def test_status_segments_ignores_model_kind_events(tmp_path, monkeypatch):
+    """Only kind='state' events drive the timeline. A backend with ONLY model
+    load/unload events (kind='model') has no state history → no_data, never a
+    phantom up/down flip from a model swap."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mk.db"))
+    db.init()
+    now = _t.time()
+    db.record_event(now - 3600, "ollama", True, "loaded m", kind="model")
+    db.record_event(now - 1800, "ollama", False, "unloaded m", kind="model")
+    out = db.status_segments("24h", ["ollama"], end=now)["ollama"]
+    assert out["no_data"] is True
+
+
+def test_status_segments_honours_end_cursor(tmp_path, monkeypatch):
+    """Passing `end` pans the window: an outage sits at the right offset from the
+    cursor, and events after the cursor are excluded."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "pan.db"))
+    db.init()
+    now = _t.time()
+    cursor = now - 48 * 3600                       # view a window ending 2 days ago
+    db.record_event(cursor - 5 * 86400, "ollama", True)
+    db.record_event(cursor - 3 * 3600, "ollama", False)   # down 3h before the cursor
+    db.record_event(cursor - 2 * 3600, "ollama", True)    # back up 2h before
+    db.record_event(now - 60, "ollama", False)            # AFTER the cursor → ignored
+    out = db.status_segments("24h", ["ollama"], end=cursor)["ollama"]
+    assert [s["up"] for s in out["segments"]] == [True, False, True]
+    assert abs(out["segments"][-1]["to"] - cursor) < 1     # window ends AT the cursor
+    assert abs(out["uptime_pct"] - (23 / 24 * 100)) < 0.1  # exactly 1h down
+
+
+def test_status_segments_handles_multiple_backends_in_one_call(tmp_path, monkeypatch):
+    """One query returns an independent entry per requested backend."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "multi.db"))
+    db.init()
+    now = _t.time()
+    db.record_event(now - 2 * 86400, "ollama", True)
+    db.record_event(now - 2 * 86400, "vllm", False)
+    out = db.status_segments("24h", ["ollama", "vllm"], end=now)
+    assert out["ollama"]["uptime_pct"] == 100.0
+    assert out["vllm"]["uptime_pct"] == 0.0
+
+
+def test_self_uptime_segments_no_metrics_is_no_data(tmp_path, monkeypatch):
+    """No metrics rows at all → no_data (the site lane draws 'no data yet', never
+    a fabricated up)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "nosite.db"))
+    db.init()
+    out = db.self_uptime_segments("24h", end=1_000_000.0)
+    assert out["no_data"] is True and out["segments"] == []
+
+
+def test_self_uptime_segments_continuous_is_fully_up(tmp_path, monkeypatch):
+    """Unbroken sample cadence across the window → 100% up, no down segment."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cont.db"))
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    db.init()
+    now = _t.time()
+    with db._connect() as c:
+        t = now - 86400
+        while t <= now:
+            c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (t, 10.0))
+            t += 5
+    out = db.self_uptime_segments("24h", end=now)
+    assert out["no_data"] is False
+    assert all(s["up"] for s in out["segments"])
+    assert out["uptime_pct"] == 100.0
+
+
+def test_self_uptime_segments_current_down_when_no_recent_sample(tmp_path, monkeypatch):
+    """Samples stop an hour before now (site currently down/host off) → the lane
+    ends in a down segment and uptime is below 100%."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "tail.db"))
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    db.init()
+    now = _t.time()
+    with db._connect() as c:
+        t = now - 86400
+        while t <= now - 3600:                      # nothing in the last hour
+            c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (t, 10.0))
+            t += 5
+    out = db.self_uptime_segments("24h", end=now)
+    assert out["segments"][-1]["up"] is False
+    assert 95 < out["uptime_pct"] < 96              # ~23/24
+
+
+async def test_status_timeline_endpoint_shape_and_lane_order(tmp_path, monkeypatch):
+    """The endpoint returns window/start/now plus one service object per enabled
+    lane in fixed order (litellm, ollama, llamacpp, vllm, then site), each with
+    segments/uptime_pct/no_data/configured. A bogus window normalises to 24h."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "shape.db"))
+    db.init()
+    monkeypatch.setattr(appmod, "_latest", {"ts": 0, "collectors": {}})
+    for name, url in (("LITELLM", "http://litellm:4000"), ("OLLAMA", "http://ollama:11434"),
+                      ("LLAMACPP", "http://llamacpp:8080"), ("VLLM", "http://vllm:8000")):
+        monkeypatch.setattr(config, f"{name}_ENABLED", True)
+        monkeypatch.setattr(config, f"{name}_BASE_URL", url)
+    for attr in ("GPU_SSH", "GPU_METRICS_URL", "GPU_METRICS_FILE"):
+        monkeypatch.setattr(config, attr, "", raising=False)
+    now = _t.time()
+    db.record_event(now - 2 * 86400, "ollama", True)
+    with db._connect() as c:
+        for k in range(40):
+            c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (now - 200 + k * 5, 10.0))
+    req = make_mocked_request("GET", "/api/status-timeline?window=bogus")
+    resp = await appmod.status_timeline_handler(req)
+    data = json.loads(resp.text)
+    assert data["window"] == "24h"                       # bogus normalised
+    assert data["now"] >= data["start"]
+    assert abs((data["now"] - data["start"]) - 86400) < 2
+    keys = [s["key"] for s in data["services"]]
+    assert keys == ["litellm", "ollama", "llamacpp", "vllm", "site"]
+    for s in data["services"]:
+        assert set(("key", "label", "configured", "segments", "uptime_pct", "no_data")) <= set(s)
+    ol = next(s for s in data["services"] if s["key"] == "ollama")
+    assert ol["uptime_pct"] == 100.0 and ol["no_data"] is False
+
+
+async def test_userreqs_resolves_owners_from_persisted_store_not_live(tmp_path, monkeypatch):
+    """/api/userreqs must attach an owner map resolved from the PERSISTED store
+    (known_keys.owner_name), so the by-user chart names keys immediately — without
+    waiting for LiteLLM's ~60s live /user/list poll — and covers historical keys
+    that are no longer in the current budgets list. No live LiteLLM call is made."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ur.db"))
+    db.init()
+    now = _t.time()
+    day = _t.strftime("%Y-%m-%d", _t.gmtime(now))
+    with db._connect() as c:
+        c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                  "VALUES(?,?,?,?,?,?,?)", (day, "m", "k_alice", "alice-key", 0.0, 100.0, 50.0))
+        # persisted owner for that key — the store, NOT a live poll
+        c.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                  "VALUES(?,?,?,?,?)", ("alice-key", now, now, "u_alice", "alice@example.com"))
+    req = make_mocked_request("GET", "/api/userreqs")
+    resp = await appmod.userreqs_handler(req)
+    d = json.loads(resp.text)
+    assert "alice-key" in d.get("labels", [])
+    assert "owners" in d, "userreqs must return an owners map"
+    assert d["owners"].get("alice-key") == "alice@example.com"
+
+
+async def test_userreqs_owner_override_beats_stored_name(tmp_path, monkeypatch):
+    """An admin per-key user reassignment (key_user_overrides) wins over the stored
+    last-known name in the userreqs owner map — same precedence as the budgets path."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "urov.db"))
+    db.init()
+    now = _t.time()
+    day = _t.strftime("%Y-%m-%d", _t.gmtime(now))
+    with db._connect() as c:
+        c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                  "VALUES(?,?,?,?,?,?,?)", (day, "m", "k_bob", "bob-key", 0.0, 100.0, 40.0))
+        c.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                  "VALUES(?,?,?,?,?)", ("bob-key", now, now, "u_bob", "stored@example.com"))
+    db.key_user_set("bob-key", "reassigned@example.com", now)
+    req = make_mocked_request("GET", "/api/userreqs")
+    resp = await appmod.userreqs_handler(req)
+    d = json.loads(resp.text)
+    assert d["owners"].get("bob-key") == "reassigned@example.com"
+
+
+async def test_userreqs_follows_the_page_time_window(tmp_path, monkeypatch):
+    """The 'Usage by user over time' chart must honour the page window (?window=):
+    a 24h window excludes a key whose usage was 60 days ago, while 12mo (all-time)
+    includes it. Day-granular, so the window maps to a day span."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "urw.db"))
+    db.init()
+    now = _t.time()
+    for off, alias in ((60, "old-key"), (0, "new-key")):
+        day = _t.strftime("%Y-%m-%d", _t.gmtime(now - off * 86400))
+        with db._connect() as c:
+            c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                      "VALUES(?,?,?,?,?,?,?)", (day, "m", "k_" + alias, alias, 0.0, 10.0, 5.0))
+            c.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                      "VALUES(?,?,?,?,?)", (alias, now, now, "u", alias + "@x.io"))
+
+    async def labels_for(win):
+        r = await appmod.userreqs_handler(make_mocked_request("GET", "/api/userreqs?window=" + win))
+        return set(json.loads(r.text).get("labels", []))
+
+    day_labels = await labels_for("24h")
+    all_labels = await labels_for("12mo")
+    assert "old-key" not in day_labels, "24h window must exclude 60-day-old usage"
+    assert "new-key" in day_labels
+    assert {"old-key", "new-key"} <= all_labels, "12mo must include all-time"
+
+
+async def test_userreqs_default_window_is_all_time(tmp_path, monkeypatch):
+    """Back-compat guard: with NO ?window= the endpoint defaults to all-time (12mo),
+    so an older caller / the first paint still sees the full history."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "urdef.db"))
+    db.init()
+    now = _t.time()
+    day_old = _t.strftime("%Y-%m-%d", _t.gmtime(now - 60 * 86400))
+    with db._connect() as c:
+        c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                  "VALUES(?,?,?,?,?,?,?)", (day_old, "m", "k_old", "old-key", 0.0, 10.0, 5.0))
+    resp = await appmod.userreqs_handler(make_mocked_request("GET", "/api/userreqs"))
+    d = json.loads(resp.text)
+    assert "old-key" in d.get("labels", []), "no window param must default to all-time"
+
+
+async def test_userreqs_end_cursor_pans_the_window(tmp_path, monkeypatch):
+    """?end= pans the window back in time: a 24h window anchored 40 days ago shows the
+    usage from THEN, not today's."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "urpan.db"))
+    db.init()
+    now = _t.time()
+    past = now - 40 * 86400
+    with db._connect() as c:
+        c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                  "VALUES(?,?,?,?,?,?,?)",
+                  (_t.strftime("%Y-%m-%d", _t.gmtime(past)), "m", "k_then", "then-key", 0.0, 10.0, 5.0))
+        c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                  "VALUES(?,?,?,?,?,?,?)",
+                  (_t.strftime("%Y-%m-%d", _t.gmtime(now)), "m", "k_now", "now-key", 0.0, 10.0, 5.0))
+    url = "/api/userreqs?window=24h&end=" + str(int(past))
+    d = json.loads((await appmod.userreqs_handler(make_mocked_request("GET", url))).text)
+    labels = set(d.get("labels", []))
+    assert "then-key" in labels, "panned window must show the past usage"
+    assert "now-key" not in labels, "panned 24h window must exclude today"
+
+
+async def test_userreqs_owners_map_only_covers_returned_labels(tmp_path, monkeypatch):
+    """The owners map is scoped to the labels actually returned — no stray owners for
+    keys that fell outside the window / top-N."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "urscope.db"))
+    db.init()
+    now = _t.time()
+    today = _t.strftime("%Y-%m-%d", _t.gmtime(now))
+    with db._connect() as c:
+        c.execute("INSERT INTO spend_model_user_daily(day,model,key,alias,cost,tokens,reqs) "
+                  "VALUES(?,?,?,?,?,?,?)", (today, "m", "k_in", "in-key", 0.0, 10.0, 5.0))
+        # owner stored for a key that has NO usage in the window → must NOT leak into owners
+        c.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                  "VALUES(?,?,?,?,?)", ("in-key", now, now, "u", "in@x.io"))
+        c.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                  "VALUES(?,?,?,?,?)", ("absent-key", now, now, "u", "absent@x.io"))
+    d = json.loads((await appmod.userreqs_handler(make_mocked_request("GET", "/api/userreqs?window=24h"))).text)
+    assert set(d.get("owners", {}).keys()) <= set(d.get("labels", [])), "owners must not exceed labels"
+    assert "absent-key" not in d.get("owners", {})

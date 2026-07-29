@@ -177,7 +177,7 @@ function updateSeries(chart,labels,next){
             if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
           }).catch(function(){});
       }
-      _alertDot(); setInterval(_alertDot, 10000);
+      _alertDot(); _timers.push(setInterval(_alertDot, 10000));
     }catch(e){}
   });
 })();
@@ -211,7 +211,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.10</div>
+      <div id="sidebar-brand-ver">v1.8.12</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>

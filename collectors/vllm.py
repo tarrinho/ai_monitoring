@@ -13,6 +13,8 @@
 # endpoints (status + model list) if that trade is preferred.
 from __future__ import annotations
 
+import asyncio
+import math
 import time
 
 import aiohttp
@@ -78,6 +80,12 @@ def parse_prom(text: str, labels_out: set | None = None) -> dict[str, float]:
                 continue
             name = left.split("{", 1)[0]
             val = float(rest.split()[0])
+            # Prometheus legitimately emits NaN / +Inf for an un-observed gauge or summary on
+            # some builds. float() accepts them, but they'd flow into the KPIs and then
+            # json.dumps emits bare `NaN`/`Infinity` tokens that the browser's JSON.parse
+            # REJECTS — killing the whole vLLM panel over one metric line. Skip them.
+            if not math.isfinite(val):
+                continue
             # Record which models the series belong to. Summing across label sets is
             # right for one model but silently merges two — the caller needs to know
             # so the UI can say so rather than present a blended number as one model's.
@@ -145,10 +153,14 @@ async def sample(session: aiohttp.ClientSession) -> dict:
         "series_count": None,
     }
 
-    # Liveness. /health returns an empty 200, so a JSON decode failure here is NOT a
-    # failure — only a transport error is.
-    _, herr = await fetch_json(session, f"{base}/health", headers=h)
-    models, merr = await fetch_json(session, f"{base}/v1/models", headers=h)
+    # Liveness. /health returns an empty 200, so a JSON decode failure here is NOT a failure —
+    # only a transport error is. /health and /v1/models are independent, so fetch them
+    # CONCURRENTLY: sequentially each is bounded by HTTP_TIMEOUT (4s) and, with /metrics below,
+    # would sum past this backend's 9s wait_for bound and misreport a slow-but-alive vLLM DOWN.
+    (_, herr), (models, merr) = await asyncio.gather(
+        fetch_json(session, f"{base}/health", headers=h),
+        fetch_json(session, f"{base}/v1/models", headers=h),
+    )
     if herr is not None and merr is not None:
         return {"available": False, "error": herr}
 

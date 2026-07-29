@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.10"
+VERSION = "AI-Monitoring_1.8.12"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -44,7 +44,13 @@ DB_PATH      = _str("MONITOR_DB_PATH", "/data/ai-monitoring.db")
 # --- sampling / retention ----------------------------------------------------
 SAMPLE_INTERVAL   = _float("MONITOR_SAMPLE_INTERVAL", 5.0)     # seconds
 RETENTION_SAMPLES = _int("MONITOR_RETENTION_SAMPLES", 8640)    # in-mem ring
-DB_RETENTION_HOURS = _int("MONITOR_DB_RETENTION_HOURS", 720)   # on-disk prune
+DB_RETENTION_HOURS = _int("MONITOR_DB_RETENTION_HOURS", 720)   # on-disk prune (upper bound)
+# The full-snapshot `samples` blob table is written every tick but read ONLY at startup
+# (db.recent(180) warms the in-memory ring) — the charted numerics live in the flat `metrics`
+# table + rollups. Keeping 720h of it (~518k JSON blobs at 5s cadence) is the single largest
+# redundant table, so it prunes on its OWN short window, capped by DB_RETENTION_HOURS so an
+# operator who deliberately lowered that still wins.
+SAMPLES_RETENTION_HOURS = _int("MONITOR_SAMPLES_RETENTION_HOURS", 12)
 HTTP_TIMEOUT      = _float("MONITOR_HTTP_TIMEOUT", 4.0)        # per collector call
 # Hard cap on a single collector response body (defends against a compromised /
 # MITM'd backend returning a multi-GB body and OOM-ing the monitor). Generous —
@@ -500,9 +506,13 @@ def _apply(name: str) -> None:
     try:
         v = tunable(name)
         if not (v is None or isinstance(v, (int, float, bool, str))):
+            # REFUSE to rebind (not merely warn): a compound object mutated in place across the
+            # to_thread boundary is exactly the torn-read the scalar-only invariant exists to
+            # prevent, so keep the (scalar) default instead of racing. Structural, not advisory.
             import sys
             sys.stderr.write(f"[config] tunable {name!r} is not a scalar ({type(v).__name__}) "
-                             f"— unsafe for lock-free cross-thread reads (F-1)\n")
+                             f"— REFUSED for lock-free cross-thread reads (F-1); kept default\n")
+            return
         globals()[name] = v
     except Exception:
         pass

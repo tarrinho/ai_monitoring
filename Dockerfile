@@ -36,6 +36,12 @@ RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev \
 # --- test stage: run the QA suite; build aborts here on any failure ----------
 FROM base AS test
 ARG RUN_TESTS=1
+# BuildKit injects these automatically. When they differ the build is EMULATED (QEMU),
+# where launching chromium is slow/fragile — so chromium is installed (and the headless
+# smoke runs) ONLY on a native build; emulated builds leave it absent and the smoke
+# self-skips (`skipif(not CHROME)`). The native arch already gates the browser coverage.
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
 COPY requirements-dev.txt .
 COPY . .
 # Dev deps are installed AND the suite runs only when RUN_TESTS=1 (native builds).
@@ -43,8 +49,18 @@ COPY . .
 # already gated on the native arch, and some dev deps have no musl wheel for
 # arm/v7, so a source build would need a Rust toolchain that isn't there. The
 # /qa-passed marker is still produced so the runtime stage can depend on it.
+#
+# chromium (+ swiftshader software-GL + fonts) is installed ONLY in this test stage,
+# ONLY on RUN_TESTS=1, and ONLY on a NATIVE build (BUILDPLATFORM==TARGETPLATFORM), so
+# tests/test_headless_smoke.py loads each real dashboard in a real browser (catching
+# runtime JS bugs the static gate can't — e.g. the Chart.js legend-hang). It never reaches
+# the lean runtime stage. On an emulated build chromium is left absent and the smoke
+# self-skips — running it under QEMU is slow/fragile and the native arch already covered it.
 RUN if [ "$RUN_TESTS" = "1" ]; then \
-        pip install --no-cache-dir -r requirements-dev.txt \
+        if [ "$BUILDPLATFORM" = "$TARGETPLATFORM" ]; then \
+            apk add --no-cache chromium chromium-swiftshader nss freetype harfbuzz ttf-freefont; \
+        fi \
+        && pip install --no-cache-dir -r requirements-dev.txt \
         && MONITOR_DB_PATH=/tmp/build-test.db python -m pytest tests/ -q; \
     fi && touch /qa-passed
 

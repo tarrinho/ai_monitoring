@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI-Monitoring · Alerts</title>
 <link rel="icon" href="/assets/favicon.svg">
+<script src="/assets/chart.umd.min.js"></script>
 <script src="/assets/purify.min.js"></script>
 <style>
   :root{
@@ -79,6 +80,19 @@
     body:not(.sb-collapsed) #sidebar{transform:none}
     #sidebar-reopen{display:flex!important;align-items:center;justify-content:center}
   }
+  /* Service status timeline (Alerts) */
+  .win-mini{display:inline-flex;gap:4px}
+  .win-mini button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;line-height:1.4}
+  .win-mini button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+  .status-legend{display:flex;gap:16px;align-items:center;flex-wrap:wrap;
+    font-size:11.5px;color:var(--muted);margin:2px 0 8px}
+  .status-legend i{display:inline-block;width:20px;height:3px;border-radius:2px;
+    vertical-align:middle;margin-right:5px}
+  .status-legend i.dash{background:repeating-linear-gradient(90deg,var(--muted) 0 5px,transparent 5px 9px)}
+  .status-hint{margin-left:auto}
+  #status-wrap{position:relative;overflow-x:auto}
+  #status-wrap canvas{min-width:520px}
 </style>
 <script>
 /* day/night — applied on every page; choice shared via localStorage */
@@ -116,7 +130,7 @@
             if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
           }).catch(function(){});
       }
-      _alertDot(); setInterval(_alertDot, 10000);
+      _alertDot(); _timers.push(setInterval(_alertDot, 10000));
     }catch(e){}
   });
 })();
@@ -139,7 +153,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.10</div>
+      <div id="sidebar-brand-ver">v1.8.12</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -185,6 +199,30 @@
     <div id="thresh"></div>
   </section>
 
+  <section class="card" id="card-status" style="grid-column:1/-1">
+    <h2>Service status over time
+      <span class="win-mini" id="status-wins" role="group" aria-label="status time window and range">
+        <button id="nav-left" title="shift earlier" aria-label="shift window earlier">◀</button>
+        <button data-w="1h" aria-pressed="false">1h</button>
+        <button data-w="24h" class="active" aria-pressed="true">24h</button>
+        <button data-w="30d" aria-pressed="false">1mo</button>
+        <button data-w="12mo" aria-pressed="false">1y</button>
+        <button id="nav-right" title="shift later" disabled aria-label="shift window later">▶</button>
+        <button id="nav-live" title="jump to now (live)" disabled aria-label="jump to now, live">● Live</button>
+        <span id="range-lbl" style="color:var(--muted);font-size:11px;margin-left:6px">live</span>
+        <span id="range-dates" style="color:var(--muted);font-size:11px;margin-left:8px" title="window start → end"></span>
+      </span>
+    </h2>
+    <div class="status-legend">
+      <span><i style="background:var(--ok)"></i>up</span>
+      <span><i style="background:var(--bad)"></i>down</span>
+      <span><i class="dash"></i>no data yet</span>
+      <span class="status-hint">on / off per service across the window</span>
+    </div>
+    <div id="status-wrap"><canvas id="status-chart" height="220"></canvas></div>
+    <div id="status-empty" class="unavail" style="display:none">no services enabled</div>
+  </section>
+
   <section class="card" id="card-history" style="grid-column:1/-1">
     <h2>Alert history</h2>
     <div id="history-body"><div class="unavail">no alerts yet</div></div>
@@ -199,6 +237,16 @@ function escapeHtml(s){
     {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 function setHtml(el,html){ el.innerHTML = DOMPurify.sanitize(html); }
+// Freshness stamp for #updated. alerts.html does not load aimon-core.js (it would
+// clash with this page's own api()/setHtml), so the shared paintUpdated() isn't
+// available here — define it locally. Without it tick() threw ReferenceError on
+// every successful poll and the stamp never refreshed.
+function paintUpdated(elId, lastOkMs){
+  var el=document.getElementById(elId); if(!el||!lastOkMs) return;
+  var age=Math.max(0,(Date.now()-lastOkMs)/1000);
+  el.textContent="updated "+new Date(lastOkMs).toLocaleTimeString()+(age>=15?" ("+Math.round(age)+"s ago)":"");
+  el.style.color = age>=60?"var(--bad)":age>=15?"var(--warn)":"var(--muted)";
+}
 const _timers = [];
 window.addEventListener("beforeunload", ()=>{ _timers.forEach(clearInterval); });
 
@@ -277,8 +325,10 @@ async function tick(){
   if(d){
     _lastAlertCheck = Date.now();
     render(d);
-    document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString();
     paintRecheck();
+    // only refresh the freshness stamp on SUCCESS — on a failed poll api() has already written
+    // the explicit "disconnected"/"auth-error N" status to #updated, which must NOT be masked.
+    paintUpdated("updated", _lastAlertCheck);
   }
 }
 
@@ -323,6 +373,152 @@ document.getElementById("test-btn").addEventListener("click", async ()=>{
 tick();
 _timers.push(setInterval(tick, ALERT_POLL_MS));
 _timers.push(setInterval(paintRecheck, 1000));   // countdown only — no extra requests
+
+/* ---- Service status over time (stepped on/off line per service) --------------
+   Backed by /api/status-timeline. Linear x-axis (seconds-from-window-start) so we
+   need no Chart.js date adapter. y-axis stacks one lane per service; within a lane
+   the line steps between an "up" level and a "down" level, coloured green/red per
+   segment. Services turned OFF in Settings are omitted server-side, so we simply
+   draw whatever lanes arrive (0..6). */
+const SWIN = {"1h":3600,"24h":86400,"30d":2592000,"12mo":31536000};
+let statusWin = "24h";
+let statusChart = null;
+// ◀▶ pan cursor (epoch, end-anchor) — loadStatus() appends `&end=` while set, and the
+// timeline handler already honours it (db.status_segments/self_uptime take `end`). null = live.
+let TIMEEND = null;
+function _swSecs(){ return SWIN[statusWin] || 86400; }
+function _swFmt(ts){ const d=new Date(ts*1000), p=n=>String(n).padStart(2,"0");
+  return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes()); }
+function updateRangeUI(){
+  const now=Date.now()/1000;
+  const nr=document.getElementById("nav-right"); if(nr) nr.disabled=!TIMEEND;
+  const lv=document.getElementById("nav-live");
+  if(lv){ lv.disabled=!TIMEEND; lv.style.color=TIMEEND?"var(--accent)":""; lv.style.borderColor=TIMEEND?"var(--accent)":""; }
+  const _end=TIMEEND||now, _start=_end-_swSecs();
+  const _dt=document.getElementById("range-dates"); if(_dt) _dt.textContent=_swFmt(_start)+"  →  "+_swFmt(_end);
+  const lbl=document.getElementById("range-lbl"); if(!lbl) return;
+  if(!TIMEEND){ lbl.textContent="live"; return; }
+  const m=Math.round((now-TIMEEND)/60);
+  lbl.textContent = m>=1440?("-"+Math.round(m/1440)+"d"):m>=60?("-"+Math.round(m/60)+"h"):("-"+m+"m");
+}
+document.getElementById("nav-left").addEventListener("click",()=>{
+  const now=Date.now()/1000; TIMEEND=(TIMEEND||now)-_swSecs(); updateRangeUI(); loadStatus();
+});
+document.getElementById("nav-right").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND+=_swSecs();
+  if(TIMEEND>=Date.now()/1000) TIMEEND=null; updateRangeUI(); loadStatus();
+});
+document.getElementById("nav-live").addEventListener("click",()=>{
+  if(!TIMEEND) return; TIMEEND=null; updateRangeUI(); loadStatus();
+});
+const _UP = 0.72, _DN = 0.20, _MID = 0.46;   // within-lane levels (0..1 above the lane base)
+function _cssv(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "#888"; }
+function _fmtPct(p){ return (p>=100 ? "100" : (Math.round(p*10)/10).toFixed(1)) + "%"; }
+function _fmtX(v, start, secs){
+  const d = new Date((start + v) * 1000);
+  const p2 = n => String(n).padStart(2, "0");
+  if(secs <= 86400)   return p2(d.getHours()) + ":" + p2(d.getMinutes());
+  if(secs <= 2592000) return (d.getMonth()+1) + "/" + d.getDate();
+  return (d.getMonth()+1) + "/" + String(d.getFullYear()).slice(2);
+}
+// lane separators drawn at each integer y boundary
+const _laneLines = {
+  id: "laneLines",
+  beforeDatasetsDraw(c){
+    const y = c.scales.y; if(!y) return;
+    const {ctx, chartArea:{left, right}} = c;
+    const n = c.$laneCount || 0;
+    ctx.save(); ctx.strokeStyle = _cssv("--line"); ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    for(let i=0;i<=n;i++){ const yy = y.getPixelForValue(i);
+      ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(right, yy); ctx.stroke(); }
+    ctx.restore();
+  }
+};
+function buildStatusChart(resp){
+  if(typeof Chart === "undefined") return;      // chart lib unavailable → no-op
+  const wrap = document.getElementById("status-wrap");
+  const empty = document.getElementById("status-empty");
+  const svcs = (resp && resp.services) || [];
+  const n = svcs.length;
+  if(!n){ if(statusChart){ statusChart.destroy(); statusChart = null; }
+    wrap.style.display = "none"; empty.style.display = ""; return; }
+  wrap.style.display = ""; empty.style.display = "none";
+  const secs = SWIN[statusWin] || 86400;
+  const start = resp.start;
+  const OK = _cssv("--ok"), BAD = _cssv("--bad"), MUT = _cssv("--muted");
+  const labels = svcs.map(s => s.no_data ? (s.label + "  —")
+                                         : (s.label + "  " + _fmtPct(s.uptime_pct)));
+  const datasets = svcs.map((s, i) => {
+    // lane base grows DOWN the list: first service (litellm) gets the highest base
+    // so it sits at the top, while within each lane "up" is the higher level and
+    // "down" the lower one — a natural (non-reversed) y-axis, so line height and
+    // colour agree (up = high = green, down = low = red).
+    const base = n - 1 - i;
+    if(s.no_data){
+      return {label:s.label, borderColor:MUT, borderDash:[5,4], borderWidth:1.5,
+        pointRadius:0, stepped:"after", tension:0, fill:false,
+        data:[{x:0, y:base+_MID, up:null}, {x:secs, y:base+_MID, up:null}]};
+    }
+    const segs = s.segments || [];
+    const pts = segs.map(g => ({x: Math.max(0, g.from - start), y: base + (g.up?_UP:_DN), up: g.up}));
+    if(segs.length){ const last = segs[segs.length-1];
+      pts.push({x: secs, y: base + (last.up?_UP:_DN), up: last.up}); }
+    else { pts.push({x:0, y:base+_MID, up:null}, {x:secs, y:base+_MID, up:null}); }
+    return {label:s.label, borderWidth:2.5, pointRadius:0, stepped:"after", tension:0,
+      fill:false, borderColor:OK, data:pts,
+      // colour each drawn stroke by the level it sits at (the fractional part of y):
+      // the "up" level is _UP (~0.72), the "down" level _DN (~0.20). Deriving from the
+      // rendered height guarantees green always marks the high (up) run and red the low
+      // (down) run — they can never disagree with what the eye sees.
+      segment:{ borderColor: ctx => {
+        const y0 = ctx.p0.parsed.y;
+        return (y0 - Math.floor(y0)) > (_UP + _DN) / 2 ? OK : BAD; }}};
+  });
+  wrap.style.height = (n*40 + 44) + "px";
+  if(statusChart) statusChart.destroy();
+  statusChart = new Chart(document.getElementById("status-chart").getContext("2d"), {
+    type:"line", data:{datasets}, plugins:[_laneLines],
+    options:{ responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
+      interaction:{mode:"nearest", intersect:false, axis:"x"},
+      scales:{
+        x:{type:"linear", min:0, max:secs, border:{display:false},
+           ticks:{color:MUT, font:{size:10}, maxRotation:0, autoSkipPadding:18,
+                  callback:v => _fmtX(v, start, secs)},
+           grid:{color:_cssv("--line"), drawTicks:false}},
+        y:{type:"linear", min:0, max:n, border:{display:false},
+           grid:{display:false},
+           ticks:{color:_cssv("--fg"), font:{size:11}, autoSkip:false,
+                  callback:v => { const base = Math.round(v - _MID); const i = n - 1 - base;
+                    return (i>=0 && i<labels.length && Math.abs(v-(base+_MID))<0.02) ? labels[i] : ""; }},
+           afterBuildTicks:ax => { ax.ticks = labels.map((_l,i)=>({value:(n-1-i)+_MID})); }}},
+      plugins:{ legend:{display:false},
+        tooltip:{ displayColors:false,
+          callbacks:{
+            title:items => (items[0] ? items[0].dataset.label : ""),
+            label:it => { const dd = it.raw || {};
+              const st = dd.up===true ? "● up" : dd.up===false ? "● down" : "no data yet";
+              const d = new Date((start + it.parsed.x) * 1000);
+              return st + "  ·  " + d.toLocaleString(); }}}}}
+  });
+  statusChart.$laneCount = n;
+}
+async function loadStatus(){
+  let p = "/api/status-timeline?window=" + encodeURIComponent(statusWin);
+  if(TIMEEND) p += "&end=" + TIMEEND.toFixed(0);      // ◀▶ pan cursor
+  const d = await api(p);
+  if(d) buildStatusChart(d);
+}
+document.querySelectorAll("#status-wins button[data-w]").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll("#status-wins button[data-w]").forEach(x => {
+      x.classList.remove("active"); x.setAttribute("aria-pressed", "false"); });
+    b.classList.add("active"); b.setAttribute("aria-pressed", "true");
+    statusWin = b.dataset.w; TIMEEND = null; updateRangeUI(); loadStatus();   // size change → live
+  });
+});
+updateRangeUI();
+loadStatus();
+_timers.push(setInterval(loadStatus, 30000));   // status shifts slowly — 30s is plenty
 </script>
 </div>
 <script>

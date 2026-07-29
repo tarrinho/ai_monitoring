@@ -295,7 +295,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.10</div>
+      <div id="sidebar-brand-ver">v1.8.12</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -1070,18 +1070,40 @@
       save.title=txt||"Save"; if(txt)setTimeout(function(){save.classList.remove("ok","bad");save.title="Confirm — save kind + rates";},1600); }
     var reset=document.createElement("button"); reset.className="ib reset"; reset.type="button"; reset.textContent="↺";
     reset.title="Reset to LiteLLM — drop this model's rate + kind overrides";
+    // Best-effort real token MIX for this model, so a per-type override derives a VOLUME-WEIGHTED
+    // usd_1m (total-cost ÷ total-tokens) instead of a naive (in+out)/2 that over-weights the
+    // expensive-but-low-volume output rate. Pulled from /api/admin/model-token-types (server-side
+    // cached + single-flighted); a miss/slow pull just omits volumes → the naive blend, unchanged.
+    function modelVolumes(model){
+      return fetch("/api/admin/model-token-types").then(function(r){
+        return r.ok?r.json():null;
+      }).then(function(d){
+        var ms=(d&&d.available&&d.models)||[]; var bare=String(model).split("/").pop();
+        for(var i=0;i<ms.length;i++){ var mm=ms[i].model||"";
+          if(mm===model||String(mm).split("/").pop()===bare){
+            return {vol_in:ms[i].input, vol_out:ms[i].output, vol_cache:ms[i].cached}; } }
+        return null;
+      }).catch(function(){ return null; });
+    }
     save.addEventListener("click",function(){
       var vi=inC.value.trim(), vo=outC.value.trim(), vc=cacheC.value.trim();
-      var jobs=[postModel({action:"set",model:m.model,kind:sel.value})];
-      if(vi!==""||vo!==""||vc!==""){
-        jobs.push(postModel({action:"cost",model:m.model,in_1m:vi,out_1m:vo,cache_1m:vc}));
-      }else if(m.in_pinned||m.out_pinned||m.cache_pinned||m.cost_1m!=null){
-        jobs.push(postModel({action:"cost_reset",model:m.model})); // all cleared → drop override
+      var perType=(vi!==""||vo!==""||vc!=="");
+      function finish(vols){
+        var jobs=[postModel({action:"set",model:m.model,kind:sel.value})];
+        if(perType){
+          var body={action:"cost",model:m.model,in_1m:vi,out_1m:vo,cache_1m:vc};
+          if(vols){ body.vol_in=vols.vol_in; body.vol_out=vols.vol_out; body.vol_cache=vols.vol_cache; }
+          jobs.push(postModel(body));
+        }else if(m.in_pinned||m.out_pinned||m.cache_pinned||m.cost_1m!=null){
+          jobs.push(postModel({action:"cost_reset",model:m.model})); // all cleared → drop override
+        }
+        Promise.all(jobs).then(function(rs){
+          if(rs.some(function(r){return !r.ok;})){say((rs.find(function(r){return !r.ok;}).j||{}).error||"save failed",false);return;}
+          say("saved",true); setTimeout(loadModels,900);
+        }).catch(function(){say("save failed",false);});
       }
-      Promise.all(jobs).then(function(rs){
-        if(rs.some(function(r){return !r.ok;})){say((rs.find(function(r){return !r.ok;}).j||{}).error||"save failed",false);return;}
-        say("saved",true); setTimeout(loadModels,900);
-      }).catch(function(){say("save failed",false);});
+      if(perType){ say("weighting…",true); modelVolumes(m.model).then(finish); }
+      else { finish(null); }
     });
     reset.addEventListener("click",function(){
       Promise.all([postModel({action:"reset",model:m.model}),

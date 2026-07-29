@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -89,8 +90,17 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
                              timeout=aiohttp.ClientTimeout(total=4)) as r:
                 if r.status != 200:
                     return {"available": False, "error": f"list HTTP {r.status}"}
+                # Byte-cap the list read (even a local docker can report a huge container set).
+                # Read to the cap with iter_chunked — a single StreamReader.read(n) returns only
+                # the first buffered chunk, NOT n bytes, so on a multi-chunk body it would parse
+                # truncated JSON; accumulate like litellm._fetch_spend_raw does.
+                buf = bytearray()
+                async for chunk in r.content.iter_chunked(65536):
+                    buf += chunk
+                    if len(buf) > config.HTTP_MAX_BYTES:
+                        return {"available": False, "error": "container list too large"}
                 names = [(c.get("Names") or ["/?"])[0].lstrip("/")
-                         for c in (await r.json())]
+                         for c in json.loads(bytes(buf) or b"[]")]
         except Exception as e:
             return {"available": False, "error": f"docker list: {type(e).__name__}"}
 
@@ -132,6 +142,7 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
     # would sum per-container timeouts and blow past the backend loop's wait_for
     # bound on a busy host, cancelling the whole sample every tick → permanent
     # stale panel. Concurrent → wall-time ≈ one timeout regardless of count.
+    total = len(names)
     out = list(await asyncio.gather(*(_inspect(n) for n in names[:50])))
     # running first, then alphabetical — stable, readable ordering
     out.sort(key=lambda x: (not x["running"], x["name"]))
@@ -141,4 +152,10 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
         cutoff = now - 7 * 24 * 3600
         for stale in [k for k, t in _last_seen.items() if t < cutoff]:
             del _last_seen[stale]
-    return {"available": True, "containers": out}
+    # Surface auto-discover truncation so the UI can say "showing 50 of N" instead of
+    # silently dropping the rest (a busy host with >50 containers).
+    res = {"available": True, "containers": out}
+    if total > 50:
+        res["truncated"] = True
+        res["total"] = total
+    return res

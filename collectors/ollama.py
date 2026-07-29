@@ -7,6 +7,8 @@
 # Ollama exposes no request-latency; that comes from LiteLLM.
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 
 import config
@@ -26,7 +28,15 @@ async def sample(session: aiohttp.ClientSession) -> dict:
         return unconfigured()
     base = base.rstrip("/")
 
-    ps, err = await fetch_json(session, f"{base}/api/ps")
+    # These three endpoints are independent, so fetch them CONCURRENTLY: sampled sequentially
+    # each is bounded by HTTP_TIMEOUT (4s), summing to 12s — past this backend's 9s wait_for
+    # bound, which would cancel the whole tick and misreport a slow-but-alive Ollama as DOWN.
+    # In parallel the wall-time is ~one timeout. /api/ps still gates availability.
+    (ps, err), (tags, terr), (ver, verr) = await asyncio.gather(
+        fetch_json(session, f"{base}/api/ps"),
+        fetch_json(session, f"{base}/api/tags"),
+        fetch_json(session, f"{base}/api/version"),
+    )
     if err is not None:
         return {"available": False, "error": err}
 
@@ -49,15 +59,8 @@ async def sample(session: aiohttp.ClientSession) -> dict:
             "expires_at": m.get("expires_at"),
         })
 
-    installed = 0
-    tags, terr = await fetch_json(session, f"{base}/api/tags")
-    if terr is None and tags:
-        installed = len(tags.get("models", []) or [])
-
-    version = None
-    ver, verr = await fetch_json(session, f"{base}/api/version")
-    if verr is None and ver:
-        version = ver.get("version")
+    installed = len(tags.get("models", []) or []) if (terr is None and tags) else 0
+    version = ver.get("version") if (verr is None and ver) else None
 
     # overall GPU-resident share across all running models
     gpu_pct = round(vram_total / ram_total * 100, 1) if ram_total else 0.0

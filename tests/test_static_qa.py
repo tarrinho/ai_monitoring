@@ -217,8 +217,9 @@ def test_per_characteristic_charts_defined():
 
 
 def test_windowed_pages_have_time_nav_arrows():
-    # every dashboard with a time-window selector also has ◀ / ▶ pan arrows
-    for name in ("index", "litellm", "gpu", "ollama", "llamacpp"):
+    # every dashboard with a time-window selector also has ◀ / ▶ pan arrows.
+    # spend joined the set: it loads aimon-core and pans via the shared api() `end=` append.
+    for name in ("index", "litellm", "gpu", "ollama", "llamacpp", "spend"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert 'id="nav-left"' in html and 'id="nav-right"' in html, name
         assert "TIMEEND" in html and "/assets/aimon-core.js" in html, name   # panned query via shared api()
@@ -402,6 +403,36 @@ def test_litellm_keytime_is_cumulative_requests_not_rolling():
     assert "rolling window" not in m.group(0), "the falling rolling-window note must be gone"
 
 
+def test_per_model_table_has_vertical_column_dividers():
+    """The Per-model table (#ll-models) has five right-aligned numeric columns (params · reqs ·
+    tokens · svc CPU · svc RAM) that blur together with only horizontal row lines — a value
+    couldn't be tied to its header. Scoped vertical column dividers fix the association."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert re.search(r"#ll-models table th,\s*#ll-models table td\{[^}]*border-left:", html), \
+        "Per-model table must have vertical column dividers (border-left on its cells)"
+    # the first column is exempt so there's no dangling divider on the left edge
+    assert re.search(r"#ll-models table th:first-child,\s*#ll-models table td:first-child\{"
+                     r"[^}]*border-left:\s*none", html)
+
+
+def test_per_model_svc_cpu_ram_covers_vllm_sglang_tgi():
+    """svc CPU/RAM on the Per-model table maps a model's backend to its serving process. vLLM /
+    SGLang / TGI (relabelled by the procs collector) must be covered — previously only llama.cpp
+    + ollama were, so a vLLM-served model always showed '—'. The 'LLM serving …' over-time
+    charts filter the same server set."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    m = re.search(r"function svcProc\(backend\)\{.*?\n\}", html, re.S)
+    assert m, "svcProc not found"
+    body = m.group(0)
+    for b in ("vllm", "sglang", "tgi"):
+        assert f'backend==="{b}"' in body, f"svcProc must map the {b} backend to a process name"
+    # the two 'LLM serving …' charts filter the same expanded server set
+    assert html.count("/llama|ollama|vllm|sglang|tgi/i") == 2
+    # both svc columns carry a hover tooltip explaining what they are (they used to be bare)
+    assert '<th class="num" title="Serving-process CPU' in html, "svc CPU header needs a tooltip"
+    assert '<th class="num" title="Serving-process RAM' in html, "svc RAM header needs a tooltip"
+
+
 def test_litellm_has_per_user_usage_charts():
     """The keys usage charts (bar 'by requests' + delta 'requests in window') each
     have a per-USER sibling that aggregates keys by owner client-side, using the
@@ -570,7 +601,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.10"
+    assert config.VERSION == "AI-Monitoring_1.8.12"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -736,6 +767,51 @@ def test_container_monitoring_wired():
     assert "MONITOR_CONTAINERS" in env_ex
 
 
+def test_freshness_indicator_shared_and_not_client_clock():
+    """Review-fix (F2): the /spend and /alerts 'updated' indicators used the CLIENT wall-clock
+    (`new Date().toLocaleTimeString()`), which advances every poll even when the data is stale —
+    an actively misleading 'fresh' signal on the cost page. They now use the shared aimon-core
+    `paintUpdated(elId, lastOkMs)` helper, which ages green→amber→red from the last SUCCESSFUL
+    update so a frozen/erroring page visibly goes stale."""
+    core = (ROOT / "web" / "assets" / "aimon-core.js").read_text(encoding="utf-8")
+    assert "function paintUpdated(" in core, "shared paintUpdated helper missing"
+    for page in ("spend.html", "alerts.html"):
+        html = (ROOT / "web" / page).read_text(encoding="utf-8")
+        assert 'paintUpdated("updated"' in html, f"{page} must use the shared freshness helper"
+        assert '"updated "+new Date().toLocaleTimeString()' not in html, \
+            f"{page} still shows the misleading client-clock 'updated' time"
+    # alerts: the freshness stamp must be GATED on a successful poll (`_lastAlertCheck`, inside
+    # the if(d) block) — the earlier unconditional `_lastAlertCheck || 0` form masked api()'s
+    # explicit "disconnected"/"auth-error" status on a failed poll. Guard against that regression.
+    alerts = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert 'paintUpdated("updated", _lastAlertCheck)' in alerts
+    assert 'paintUpdated("updated", _lastAlertCheck || 0)' not in alerts, \
+        "alerts freshness must be gated on success, not overwrite the error status"
+
+
+def test_collapsible_section_headers_are_keyboard_accessible():
+    """Review-fix (F3): the collapsible chart-section headers were plain <div>s with only a click
+    handler — not focusable, no Enter/Space. index.html now wires them through the shared
+    aimon-core `a11yToggle` (role=button + tabindex + keydown) and keeps aria-expanded in sync."""
+    core = (ROOT / "web" / "assets" / "aimon-core.js").read_text(encoding="utf-8")
+    assert "function a11yToggle(" in core and 'setAttribute("role","button")' in core
+    assert 'ev.key!=="Enter"' in core and 'ev.key!==" "' in core, "a11yToggle must handle Enter/Space"
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert "a11yToggle(hd" in html, "index.html collapse header must use a11yToggle"
+    assert 'aria-expanded' in html
+
+
+def test_index_sse_has_data_starvation_watchdog():
+    """Review-fix: index.html's SSE path must not suppress the /api/data poll FOREVER on a
+    half-open stream that stays connected but stops delivering (no es.onerror fires). A watchdog
+    stamps each message time (`_lastSse`) and resumes polling when no message arrived recently,
+    so the page can't silently freeze while still looking 'connected'."""
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert "_lastSse" in html, "SSE data-starvation watchdog (_lastSse) missing"
+    assert "es.onmessage" in html and "_lastSse=Date.now()" in html, "onmessage must stamp _lastSse"
+    assert "Date.now()-_lastSse" in html, "tick() must gate SSE-covers-poll on message freshness"
+
+
 def test_app_uses_typed_appkeys():
     """App state uses typed web.AppKey (aiohttp-recommended), not deprecated string
     keys — avoids NotAppKeyWarning + gives type safety."""
@@ -809,6 +885,21 @@ def test_alerts_module_webhook_only():
     assert "recovered" in src and "_due" in src
 
 
+def test_per_model_table_does_not_blink_on_transient_miss():
+    """Regression: the /litellm Per-model table blinked (whole table blanked + redrawn every 5s)
+    because loadModels() full-`setHtml`-rebuilt it each poll AND wiped it to an 'unavailable'
+    placeholder whenever a backend flapped down (e.g. vLLM restarting). It must (a) keep the
+    last-good table on a transient miss — only show the placeholder before the FIRST load — and
+    (b) rebuild the DOM only when the STRUCTURE changes, updating live number cells in place."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "_pmHas" in html and "_pmSig" in html, "per-model anti-blink state missing"
+    # the unavailable / empty branches must be gated on _pmHas (don't wipe a shown table)
+    assert "if(!_pmHas) setHtml(el,`<div class=\"unavail\">LiteLLM not configured" in html
+    assert "if(sig===_pmSig && _pmHas)" in html, "must skip rebuild when structure is unchanged"
+    # live number cells are updated in place (ids), not via a full setHtml each tick
+    assert 'id="pmscpu' in html and 'id="pmsram' in html and 'id="pmreq' in html
+
+
 def test_litellm_page_exists_and_secure():
     page = ROOT / "web" / "litellm.html"
     assert page.exists(), "second LiteLLM dashboard missing"
@@ -833,12 +924,17 @@ def test_litellm_page_exists_and_secure():
     # The serving-process filter must recognize vLLM (process names "vllm" /
     # "VLLM::EngineCor"), not just llama.cpp/Ollama — a GB10 box running vLLM
     # as its local backend previously left both over-time charts permanently
-    # empty because the filter regex only matched llama|ollama.
-    assert "/llama/i.test(a)" not in html, "serving-process filter regressed to llama-only"
-    assert "/llama|ollama/i.test(a)" not in html, "serving-process filter missing vllm"
-    assert html.count("/llama|ollama|vllm/i.test(a)") == 2, (
-        "expected both serving-process filters (_svcDatasets + loadImpact's align) "
-        "to include vllm")
+    # empty because the filter regex only matched llama|ollama (bug-registry #7).
+    # Intent-based (not an exact-string count) so extending the alternation with
+    # further self-hosted servers — e.g. sglang/tgi — can't regress this guard: both
+    # filter sites (_svcDatasets + loadImpact's align) must still include vllm.
+    svc_filters = re.findall(r'/([a-z|]+)/i\.test\(a\)', html)
+    assert len(svc_filters) == 2, (
+        f"expected two serving-process filter sites, found {len(svc_filters)}: {svc_filters}")
+    for pat in svc_filters:
+        parts = pat.split("|")
+        assert {"llama", "ollama", "vllm"} <= set(parts), (
+            f"serving-process filter {pat!r} must include llama+ollama+vllm (not regress to llama-only)")
     # per-model resource cost columns sourced from the procs collector
     assert "svcProc" in html and "svc CPU" in html and "svc RAM" in html
     assert 'type:"bar"' in html
@@ -1659,7 +1755,7 @@ def test_window_controls_are_grouped_and_labelled():
     """a11y/UX: the header time-window control is a labelled group (role=group), the
     icon-only pan buttons carry aria-labels (not title alone), and a visual divider
     (.wsep) separates the window selector from the live/pan cluster."""
-    for name in ("gpu", "index", "litellm", "llamacpp", "ollama", "vllm"):
+    for name in ("gpu", "index", "litellm", "llamacpp", "ollama", "vllm", "spend"):
         html = (ROOT / "web" / f"{name}.html").read_text(encoding="utf-8")
         assert 'role="group"' in html, f"{name}: window control not a role=group"
         for btn in ("nav-left", "nav-right", "nav-live"):
@@ -1667,8 +1763,6 @@ def test_window_controls_are_grouped_and_labelled():
             assert m and "aria-label=" in m.group(0), f"{name}: {btn} missing aria-label"
         assert 'class="wsep"' in html and ".windows .wsep{" in html, \
             f"{name}: missing window/pan divider"
-    # spend has no pan controls but its window group is still labelled
-    assert 'role="group"' in (ROOT / "web" / "spend.html").read_text(encoding="utf-8")
 
 
 def test_usage_over_time_tokens_split_external_internal():
@@ -1751,7 +1845,7 @@ def test_config_tunables_exclude_secrets_and_switches():
 # Extra QA — 1.0.5 UI + packaging regressions
 # ══════════════════════════════════════════════════════════════════════════════
 _PAGES = ["index", "gpu", "litellm", "ollama", "llamacpp", "vllm", "alerts"]
-_WINDOWED = ["index", "gpu", "litellm", "llamacpp", "ollama", "vllm"]   # have the window nav
+_WINDOWED = ["index", "gpu", "litellm", "llamacpp", "ollama", "vllm", "spend"]   # have the window nav + range
 _LLM_PAGES = ["litellm", "ollama", "llamacpp", "vllm"]                  # default window = 24h
 
 
@@ -2060,6 +2154,54 @@ def test_window_date_range_wired_on_windowed_pages():
         assert 'id="range-dates"' in html, f"{name}: range-dates span missing"
         assert "function fmtRange(" in html, f"{name}: fmtRange helper missing"
         assert "_dt.textContent" in html, f"{name}: range dates must use textContent"
+
+
+def test_spend_page_pans_every_chart():
+    """Spend pan: ◀▶/● Live drive a single TIMEEND cursor that rangedReload() applies to
+    ALL four Spend charts (usage, cost-by-key, cost-per-model, model×user); a window-size
+    change resets to live. Data is day-granular, so drag-to-zoom is intentionally OFF here
+    (Spend charts are never stampTs'd) — only ◀▶ pan."""
+    html = _page("spend")
+    for btn in ("nav-left", "nav-right", "nav-live"):
+        assert f'id="{btn}"' in html, f"spend: {btn} missing"
+    assert "let TIMEEND=null;" in html
+    m = re.search(r"function rangedReload\(\)\{([^}]*)\}", html)
+    assert m, "spend: rangedReload missing"
+    for fn in ("loadSpendSeries()", "loadModelCostSeries()",
+               "loadModelUserCostSeries()", "loadKeyCost()"):
+        assert fn in m.group(1), f"spend: rangedReload must fan out to {fn}"
+    assert "TIMEEND=null; updateRangeUI(); rangedReload();" in html   # size change → live
+    assert "stampTs(" not in html, "spend: charts must not be stampTs'd (drag-zoom stays off)"
+
+
+def test_alerts_status_timeline_pan_wired():
+    """Alerts full parity: the status-timeline card gains ◀▶ pan + ● Live + start→end range.
+    Alerts carries its OWN api() (no aimon-core), so loadStatus() appends the `end=` cursor
+    itself; window buttons are scoped to [data-w] so the nav arrows don't clobber the size."""
+    html = _page("alerts")
+    for btn in ("nav-left", "nav-right", "nav-live"):
+        assert f'id="{btn}"' in html, f"alerts: {btn} missing"
+    assert 'id="range-dates"' in html and "let TIMEEND = null;" in html
+    assert "function updateRangeUI(" in html and "_dt.textContent" in html
+    assert '"&end=" + TIMEEND.toFixed(0)' in html, "alerts: loadStatus must append the pan cursor"
+    assert '#status-wins button[data-w]' in html                     # nav arrows excluded
+    assert "statusWin = b.dataset.w; TIMEEND = null;" in html        # size change → live
+
+
+def test_spend_cost_handlers_honour_end_cursor():
+    """Every Spend series endpoint reads the ?end= pan cursor and anchors its window there
+    (not hard-pinned to now); the two cached handlers never serve/store a panned response."""
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    for fn in ("spend_series_handler", "spend_model_series_handler",
+               "spend_model_user_series_handler"):
+        i = src.index(f"async def {fn}")
+        body = src[i:src.index("\nasync def ", i + 1)]
+        assert "_q_end(request)" in body, f"{fn}: must read the ?end= cursor"
+        assert "anchor" in body, f"{fn}: must anchor the window on the cursor"
+    for fn in ("spend_series_handler", "spend_model_user_series_handler"):
+        i = src.index(f"async def {fn}")
+        assert "end_q is None" in src[i:src.index("\nasync def ", i + 1)], \
+            f"{fn}: panned view must bypass the cache"
 
 
 def test_license_apache2_present_and_wired():
@@ -2386,6 +2528,35 @@ def test_regression_env_and_publisher_excluded_from_public_repo():
     pub = (ROOT / "deploy" / "publish-github.sh").read_text(encoding="utf-8")
     pm = re.search(r'PRIVATE_FILES=\((.*?)\n\)', pub, re.S)
     assert pm and "publish-github.sh" in pm.group(1) and "rules.md" in pm.group(1)
+
+
+def test_regression_all_test_files_are_allow_listed():
+    """Every tests/test_*.py must ship in the publish ALLOW-list — otherwise the PUBLIC repo's
+    CI + the Dockerfile in-image gate run a SMALLER suite than the dev box (a new/renamed test
+    file is silently dropped from the shipped product's quality gate). Was the case for 7 files
+    (~69 tests). `_internal_markers.py` is deliberately private (guarded try/except everywhere)."""
+    allow = _publish_allow_list()
+    if allow is None:
+        return
+    on_disk = sorted(p.name for p in (ROOT / "tests").glob("test_*.py"))
+    for name in on_disk:
+        assert ("tests/" + name) in allow, \
+            f"tests/{name} exists but is NOT in the publish ALLOW-list — it won't ship / won't gate"
+
+
+def test_regression_all_helm_templates_are_allow_listed():
+    """Every Helm chart template must ship in the publish ALLOW-list — a template left out is
+    silently dropped from `helm install` in the PUBLIC repo. This bit networkpolicy.yaml (a
+    security control: without it the pod has no NetworkPolicy at all), so a new template can't
+    be added to the chart without also shipping it."""
+    allow = _publish_allow_list()
+    if allow is None:
+        return
+    tdir = ROOT / "deploy" / "helm" / "ai-monitoring" / "templates"
+    for p in sorted(tdir.glob("*")):
+        if p.is_file():
+            rel = str(p.relative_to(ROOT))
+            assert rel in allow, f"{rel} exists but is NOT in the publish ALLOW-list — helm install would drop it"
 
 
 def test_regression_readme_images_are_all_allow_listed():
@@ -3725,9 +3896,11 @@ def test_litellm_windowed_keys_over_time_card():
     assert 'id="card-keytime"' in html and 'id="keytime-chart"' in html
     # the windowed one is placed BEFORE the all-time one in the DOM (it took the old slot)
     assert html.index('id="card-keytime-win"') < html.index('id="card-keytime"')
-    # the all-time card is 3rd from the last card
+    # the all-time card sits near the end (4th from last since the users-over-time card was
+    # appended after it) — position anchor, not a hard 3rd-from-last, so a new trailing card
+    # doesn't falsely fail this.
     order = re.findall(r'<section class="card[^"]*" id="(card-[a-z0-9-]+)"', html)
-    assert order[-3] == "card-keytime", f"keytime must be 3rd from end, order tail={order[-3:]}"
+    assert order[-4] == "card-keytime", f"keytime must sit near the end, order tail={order[-4:]}"
     # windowed loader follows the selector (WIN) via the per-window key series endpoint,
     # and is TDZ-safe (its metric var declared before its chart)
     assert 'api("/api/keyseries?window="+WIN)' in html, "windowed card must follow WIN"
@@ -4050,3 +4223,97 @@ def test_legend_hover_shows_full_name_only_when_truncated_runtime():
     assert seen["stackedHover"]["shown"] == "block" and seen["stackedHover"]["text"] == "vllm/A-Very-Long-Model-Name-Here", (
         "mkStackByKey-built charts (conc-by-key/model, backlog-by-key) must get the same hover wiring"
     )
+
+
+# ---------------------------------------------- alerts status timeline --------
+def test_alerts_status_card_before_history_and_wired():
+    """The 'Service status over time' card exists on /alerts, sits BEFORE the
+    Alert history card, loads Chart.js, exposes the 1h/24h/1mo/1y window chips,
+    and its poll is tracked in _timers (cleared on beforeunload with the rest)."""
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert '<script src="/assets/chart.umd.min.js">' in html
+    i_status = html.find('id="card-status"')
+    i_hist = html.find('id="card-history"')
+    assert i_status != -1 and i_hist != -1
+    assert i_status < i_hist, "status card must render before Alert history"
+    # window chips: labels 1mo/1y map to the real window tokens 30d/12mo
+    for tok in ('data-w="1h"', 'data-w="24h"', 'data-w="30d"', 'data-w="12mo"'):
+        assert tok in html
+    # the graph is fed by the dedicated endpoint and polled on a tracked timer
+    assert "/api/status-timeline?window=" in html
+    assert "_timers.push(setInterval(loadStatus" in html
+    # server-driven omission (no client fake): the card just draws whatever lanes arrive
+    assert "no_data" in html and "buildStatusChart" in html
+
+
+def test_alerts_status_card_legend_canvas_and_a11y():
+    """The status card carries a self-explaining legend (up / down / no data yet),
+    a canvas to mount the chart, accessible window chips (aria-pressed on the active
+    one), and still escapes all dynamic strings elsewhere on the page."""
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert 'id="status-chart"' in html and "<canvas" in html
+    for word in (">up<", ">down<", "no data yet"):
+        assert word in html, f"legend missing {word!r}"
+    # exactly the four windows, active one marked pressed for assistive tech
+    assert 'class="active" aria-pressed="true"' in html
+    assert html.count('class="win-mini"') == 1
+    # the pre-existing paintUpdated ReferenceError (missing on this non-core page)
+    # is fixed by a local definition, not by pulling in aimon-core (which would clash)
+    assert "function paintUpdated(" in html
+    assert 'src="/assets/aimon-core.js"' not in html   # not loaded (would clash); mentioned in a comment only
+    # page still sanitises + escapes (no regression from the new card)
+    assert "DOMPurify.sanitize" in html and "function escapeHtml(" in html
+
+
+def test_alerts_status_chart_colour_matches_height_not_reversed():
+    """Regression: the status lane y-axis must NOT be reversed. reverse:true flips
+    the within-lane up/down levels, so a service that's UP draws LOW while its line
+    stays green — height then contradicts colour. Colour is derived from the drawn
+    y-level (ctx.p0.parsed.y) precisely so height and colour can never disagree."""
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert "reverse:true" not in html, "reversed y-axis inverts up/down vs green/red"
+    assert "ctx.p0.parsed.y" in html, "segment colour must come from the drawn level"
+
+
+def test_litellm_user_tokens_chart_fills_width_no_flicker_true_filter():
+    """Three fixes to the 'volume by user over time' chart on /litellm:
+      1. the SVG stretches to the card width (it has a viewBox but no width attr,
+         so without an explicit CSS width it renders at its intrinsic ~920px);
+      2. buildKeyUser() must NOT wipe the owner map on a budgets blip (that folded
+         everyone to 'Unassigned' and made the bands flicker);
+      3. the user picker is a true filter — unselected users are removed, not rolled
+         into a grey 'Other' band."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # 1. explicit width on the stacked-area SVG
+    assert re.search(r"#ut-stack\{[^}]*width:100%", html), "ut-stack must be width:100%"
+    # 2. owner map preserved on an empty/blip payload (early return, no unconditional reset)
+    assert "function buildKeyUser(budgets){\n  const ks" in html, \
+        "buildKeyUser must not reset _keyUser before checking the payload"
+    assert "if(!ks.length) return;" in html, "buildKeyUser must keep the last map on a blip"
+    # 3. no 'Other' catch-all band in utBands — unselected users are dropped
+    m = re.search(r"function utBands\(\)\{.*?\n\}", html, re.S)
+    assert m and "Other (" not in m.group(0), "utBands must not fold unselected users into 'Other'"
+
+
+def test_litellm_user_tokens_prefers_server_owner_map():
+    """The by-user chart must fold using the server's persisted owner map (d.owners)
+    first, so keys resolve immediately + historical keys aren't stuck 'Unassigned';
+    _keyUser (budgets/live) stays as the fallback."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "const omap=d.owners||{}" in html
+    assert "resolveOwner" in html and "usernameOf(e)" in html
+    # the fold uses the resolver, not the raw budgets-only userOf
+    m = re.search(r"pts\.forEach\(\(p,bi\)=>\{ labels\.forEach\(k=>\{ const u=(\w+)\(k\)", html)
+    assert m and m.group(1) == "resolveOwner", "fold must use resolveOwner"
+
+
+def test_litellm_user_tokens_follows_page_window():
+    """The by-user chart must request its data for the selected window (+ pan cursor),
+    show the window badge, and no longer advertise 'all-time' or the removed Other band."""
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert '/api/userreqs?window="+encodeURIComponent(WIN)' in html, "must pass the window"
+    assert '&end="+Math.round(TIMEEND)' in html, "must pass the pan cursor"
+    assert 'id="ut-win"' in html and 'uw.textContent=wlabel(WIN)' in html, "window badge must track WIN"
+    # stale copy removed
+    assert '<span class="badge">all-time</span>' not in html
+    assert "fold into a grey <b>Other</b>" not in html

@@ -67,7 +67,37 @@ function _winMark(on){
 
 function wlabel(w){ return (typeof w==="string" && w.indexOf("custom:")===0) ? "custom" : w; }
 
+// Shared freshness indicator for the #updated span. `lastOkMs` = Date.now() at the last
+// SUCCESSFUL data update; call this every tick (success or failure) so the age keeps growing
+// while a poll is failing — a frozen/erroring page then visibly goes green(<15s)→amber(<60s)→
+// red instead of showing a static timestamp that looks fresh forever. The age is a pure
+// client-clock delta (Date.now()-lastOkMs), so it's immune to client/server clock skew.
+function paintUpdated(elId, lastOkMs){
+  var el=document.getElementById(elId); if(!el||!lastOkMs) return;
+  var age=Math.max(0,(Date.now()-lastOkMs)/1000);
+  el.textContent="updated "+new Date(lastOkMs).toLocaleTimeString()+(age>=15?" ("+Math.round(age)+"s ago)":"");
+  el.style.color = age>=60?"var(--bad)":age>=15?"var(--warn)":"var(--muted)";
+}
+
 function stampTs(ch, pts){ try{ if(ch) ch.$ts=(pts||[]).map(function(p){ return p && p.t; }); }catch(e){} }
+
+// Make a click-to-toggle control keyboard + assistive-tech accessible: a plain <div> with a
+// click handler is mouse-only (not focusable, no Enter/Space). This sets role=button + tabindex
+// and activates onToggle on click AND Enter/Space, so the collapsible section headers work
+// without a mouse. Keep aria-expanded in sync in the caller's apply() (see index.html).
+function a11yToggle(el, onToggle){
+  el.setAttribute("role","button");
+  el.setAttribute("tabindex","0");
+  function fire(ev){
+    if(ev.type==="keydown"){
+      if(ev.key!=="Enter"&&ev.key!==" "&&ev.key!=="Spacebar") return;
+      ev.preventDefault();
+    }
+    onToggle();
+  }
+  el.addEventListener("click", fire);
+  el.addEventListener("keydown", fire);
+}
 
 // ---- drag-to-zoom: drag across ANY chart to set a custom time window (Kibana-style) ----
 (function(){

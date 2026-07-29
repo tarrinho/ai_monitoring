@@ -35,8 +35,14 @@ _NVIDIA_QUERY = [
 
 
 def _run(cmd: list[str], timeout: float = 6.0) -> str | None:
+    # start_new_session=True detaches the child into its own session/process-group, so it can't
+    # take signals aimed at the monitor and a manual cleanup COULD kill the whole group. NB:
+    # subprocess.run's own timeout path kills only the direct child (Popen.kill(), single PID) —
+    # a spawned grandchild (e.g. an SSH transport) is not group-reaped here; the real wedge bound
+    # is the dedicated GPU executor in app.py, which caps a stuck probe to that thread.
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                             start_new_session=True)
         if out.returncode == 0:
             return out.stdout
     except Exception:
@@ -170,7 +176,13 @@ def _http() -> dict | None:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect())
         with opener.open(url, timeout=4) as r:  # noqa: S310 (scheme-checked)
-            data = json.loads(r.read().decode())
+            # Byte-cap the read like every other external fetch (fetch_json / _fetch_spend_raw
+            # / vllm.fetch_text): timeout=4 bounds a STALL but not a fast, huge body, so a
+            # misconfigured/hostile GPU agent streaming multi-GB would otherwise OOM the monitor.
+            raw = r.read(config.HTTP_MAX_BYTES + 1)
+            if len(raw) > config.HTTP_MAX_BYTES:
+                return None
+            data = json.loads(raw.decode())
     except Exception:
         return None
     gpus_in = data.get("gpus") if isinstance(data, dict) else None

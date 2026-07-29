@@ -7,6 +7,8 @@
 # tokens/s derived from slot timings when present.
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 
 import config
@@ -69,7 +71,15 @@ async def sample(session: aiohttp.ClientSession) -> dict:
     base = base.rstrip("/")
     h = _headers()
 
-    health, err = await fetch_json(session, f"{base}/health", headers=h)
+    # /health, /props and /slots are independent, so fetch them CONCURRENTLY: sampled
+    # sequentially each is bounded by HTTP_TIMEOUT (4s), summing to 12s — past this backend's 9s
+    # wait_for bound, which cancels the whole tick and misreports a slow-but-alive llama.cpp DOWN.
+    # /health still gates availability.
+    (health, err), (props, perr), (slots, serr) = await asyncio.gather(
+        fetch_json(session, f"{base}/health", headers=h),
+        fetch_json(session, f"{base}/props", headers=h),
+        fetch_json(session, f"{base}/slots", headers=h),
+    )
     if err is not None:
         return {"available": False, "error": err}
 
@@ -91,7 +101,6 @@ async def sample(session: aiohttp.ClientSession) -> dict:
         "n_threads_batch": None,
     }
 
-    props, perr = await fetch_json(session, f"{base}/props", headers=h)
     if perr is None and props:
         dm = props.get("default_generation_settings", {}) or {}
         pr = props.get("params") or {}          # some builds nest the run params here
@@ -110,7 +119,6 @@ async def sample(session: aiohttp.ClientSession) -> dict:
             pr.get("n_threads_batch"), dp.get("n_threads_batch")
         ) or _deep_num(props, "n_threads_batch")
 
-    slots, serr = await fetch_json(session, f"{base}/slots", headers=h)
     if serr is None and isinstance(slots, list):
         active = 0
         pps_vals = []       # generation (decode) tok/s

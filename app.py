@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import hashlib
 import hmac
 import json
 import re
 import secrets
 import sys
+import threading
 import time
 import traceback
 from html import escape as _html_escape
@@ -74,11 +76,30 @@ _backend_latest: dict = {
 }
 
 
+# The GPU probe runs a subprocess (nvidia-smi/rocm-smi) that can wedge in uninterruptible
+# (D-state) sleep on a hung driver — where even SIGKILL can't reap it, so the worker thread
+# is lost FOREVER. `asyncio.wait_for` cancels the awaiting coroutine but NOT that thread, so
+# using the shared default ThreadPoolExecutor would leak a thread per wedged probe until the
+# pool starves and host/procs/_persist_tick/rollup/handler DB-reads (all on the default pool)
+# freeze too — a whole-monitor outage from one stuck GPU call. A DEDICATED 2-thread executor
+# caps the blast radius to the GPU path; a BoundedSemaphore (released only when the thread
+# ACTUALLY finishes, via the future's done-callback — not when the await is cancelled) stops
+# us submitting a 3rd probe while 2 are wedged, so the executor queue can't grow unbounded.
+_GPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="gpu")
+_GPU_SEM = threading.BoundedSemaphore(2)
+
+
 async def _gpu_sample(_session) -> dict:
-    # gpu.sample runs a subprocess (nvidia-smi/rocm-smi). Under GPU overload that
-    # can wedge in uninterruptible-sleep and hang past its own timeout — so it
-    # lives in its OWN bounded loop, never in the main sampler's critical path.
-    return await asyncio.to_thread(gpu.sample)
+    if not _GPU_SEM.acquire(blocking=False):
+        # both probe threads are still stuck on a hung subprocess — don't pile on.
+        return {"available": False, "error": "gpu probe wedged"}
+    try:
+        fut = _GPU_EXECUTOR.submit(gpu.sample)
+    except Exception:
+        _GPU_SEM.release()      # submit can only fail at executor shutdown — don't leak the permit
+        raise
+    fut.add_done_callback(lambda _f: _GPU_SEM.release())   # release when the THREAD finishes
+    return await asyncio.wrap_future(fut)
 
 
 async def _backend_loop(name: str, sample_fn, session, bound: float) -> None:
@@ -284,10 +305,12 @@ def _track_events(snap: dict) -> None:
     ts = snap["ts"]
     for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
         b = c.get(name, {})
-        # only track backends that are actually configured (not the "unconfigured"
-        # note); a configured backend is either up or down-with-a-real-error.
+        # only track backends that are actually configured (not the "unconfigured" note,
+        # and not the boot "starting" sentinel — its own decoupled loop simply hasn't
+        # produced a real sample yet, so recording a down→up here would stamp a phantom
+        # downtime blip in the uptime history at every restart).
         configured = b and not (b.get("available") is False
-                                and b.get("error") in (None, "unconfigured"))
+                                and b.get("error") in (None, "unconfigured", "starting"))
         if not configured:
             continue
         up = bool(b.get("available"))
@@ -326,6 +349,41 @@ def _track_model_events(snap: dict) -> None:
             _llamacpp_model_seen = True
 
 
+def _persist_tick(snap: dict, mu_rows) -> None:
+    """All per-tick SQLite writes for one sample — run OFF the event loop via asyncio.to_thread
+    (see caller). Pure/sync; each db.* call is individually best-effort (swallows + counts its
+    own error), so a single failing table never aborts the rest of the batch."""
+    coll = snap["collectors"]
+    _ll = coll.get("litellm", {})
+    db.insert(snap["ts"], coll)
+    db.insert_metrics(snap["ts"], _metrics_row(snap))
+    if _ll.get("available"):
+        db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])
+        db.insert_model_series(snap["ts"], _ll.get("per_model") or [])
+    _vl = coll.get("vllm", {})
+    # Real-time in-flight count for the "Concurrent LLM work — by model" split: model_series
+    # infers activity from completed-request deltas (blind to a slow still-running request); a
+    # single-model vLLM's running/waiting gauges have no such lag. Skipped when multi_model
+    # (figures are summed across models, so attributing them to the first model name is wrong).
+    if (_vl.get("available") and _vl.get("model") and not _vl.get("multi_model")
+            and (_vl.get("running") is not None or _vl.get("waiting") is not None)):
+        db.insert_model_conc_series(snap["ts"], f"vllm/{_vl['model']}",
+                                    _vl.get("running"), _vl.get("waiting"))
+    # LiteLLM per-(day,model,key) spend rollup + /key/list-confirmed key labels — pure LiteLLM
+    # concerns, persisted independently of vLLM; both only carry data on a HEAVY tick.
+    if mu_rows:
+        db.spend_model_user_upsert(mu_rows, snap["ts"])
+    if _ll.get("known_keys"):
+        db.known_keys_upsert(_ll["known_keys"], snap["ts"])
+    _pr = coll.get("procs", {})
+    if _pr.get("available"):
+        db.insert_proc_series(snap["ts"], "cpu", _pr.get("top_cpu") or [], "cpu")
+        db.insert_proc_series(snap["ts"], "ram", _pr.get("top_ram") or [], "ram")
+    _ho = coll.get("host", {})
+    if _ho.get("available"):
+        db.insert_cpu_core_series(snap["ts"], _ho.get("cpu_per_core"))   # per-core CPU% for pan
+
+
 async def _sampling_loop(app: web.Application) -> None:
     global _latest
     session: aiohttp.ClientSession = app[_SESSION]
@@ -346,41 +404,15 @@ async def _sampling_loop(app: web.Application) -> None:
             # table, not the full-snapshot `samples` blob — pop BEFORE db.insert so they
             # don't bloat every sample row.
             _mu_rows = _ll.pop("mu_rows", None) if isinstance(_ll, dict) else None
-            db.insert(snap["ts"], snap["collectors"])
-            db.insert_metrics(snap["ts"], _metrics_row(snap))
-            if _ll.get("available"):
-                db.insert_key_series(snap["ts"], _ll.get("top_keys") or [])
-                db.insert_model_series(snap["ts"], _ll.get("per_model") or [])
-            _vl = snap["collectors"].get("vllm", {})
-            # Real-time in-flight count for the "Concurrent LLM work — by model" split (see
-            # model_conc_series schema comment): model_series infers a model's activity from
-            # completed-request deltas, which is blind to a slow, still-running request — a
-            # single-model vLLM instance's own running/waiting gauges have no such lag.
-            # Skipped when multi_model (the figures are summed across models there, so
-            # attributing them to just the first model name would be wrong).
-            if (_vl.get("available") and _vl.get("model") and not _vl.get("multi_model")
-                    and (_vl.get("running") is not None or _vl.get("waiting") is not None)):
-                db.insert_model_conc_series(snap["ts"], f"vllm/{_vl['model']}",
-                                            _vl.get("running"), _vl.get("waiting"))
-            # LiteLLM per-(day,model,key) spend rollup + /key/list-confirmed key labels.
-            # These are pure LiteLLM concerns and MUST persist independently of vLLM — they
-            # were previously mis-nested under the vLLM guard above, so on a LiteLLM-only or
-            # multi-model-vLLM stack the "cost per model & user over time" forward-store and
-            # the by-key 'Other'-folding baseline (db.known_keys_set()/config.key_known())
-            # never updated from live samples (only the one-time backfill). Both only carry
-            # data on a HEAVY tick.
-            if _mu_rows:
-                db.spend_model_user_upsert(_mu_rows, snap["ts"])
-            if _ll.get("known_keys"):
-                db.known_keys_upsert(_ll["known_keys"], snap["ts"])
-            _pr = snap["collectors"].get("procs", {})
-            if _pr.get("available"):
-                db.insert_proc_series(snap["ts"], "cpu", _pr.get("top_cpu") or [], "cpu")
-                db.insert_proc_series(snap["ts"], "ram", _pr.get("top_ram") or [], "ram")
-            _ho = snap["collectors"].get("host", {})
-            if _ho.get("available"):
-                # per-core CPU% — persisted so the GPU/CPU grid honours window + pan
-                db.insert_cpu_core_series(snap["ts"], _ho.get("cpu_per_core"))
+            # The ~10 per-tick SQLite writes are the HIGHEST-frequency DB path (every
+            # SAMPLE_INTERVAL) — run the whole batch OFF the event loop so it can't block
+            # concurrent HTTP handlers (§6 observer-effect; the 1.8.10 fix offloaded only the
+            # 60s rollup / hourly prune, leaving this hotter path on-loop).
+            await asyncio.to_thread(_persist_tick, snap, _mu_rows)
+            # Warm the visibility-gate label sets off-loop too, so the hot serving path
+            # (_visible_gate_inputs, hit on every /api/data poll + SSE tick) reads a fresh cache
+            # instead of ever issuing its two sqlite reads on the event loop (§6 observer-effect).
+            await asyncio.to_thread(_warm_vis_gate)
             _track_events(snap)
             _track_model_events(snap)
             anoms = _detect_anomalies(snap)
@@ -431,7 +463,9 @@ def _csp(nonce: str | None = None) -> str:
     return (f"default-src 'self'; script-src {script_src}; "
             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
             "connect-src 'self'; object-src 'none'; base-uri 'none'; "
-            "frame-ancestors 'none'")
+            # form-action does NOT inherit from default-src, so without it an injected
+            # <form action="//evil"> could exfiltrate on submit — pin it to 'self'.
+            "form-action 'self'; frame-ancestors 'none'")
 
 
 def _apply_sec_headers(resp, secure: bool = False) -> None:
@@ -657,7 +691,7 @@ _ADMIN_API_PREFIX = "/api/admin/"
 # readable by any viewer (/api/budgets carries emails; keyseries/keydelta/keyrequests carry
 # cumulative per-key spend; litellm/models + concurrency-by-key carry per-model cost/attribution).
 _SPEND_SENSITIVE_API = frozenset({
-    "/api/budgets", "/api/keyrequests", "/api/keyseries", "/api/keydelta",
+    "/api/budgets", "/api/keyrequests", "/api/keyseries", "/api/keydelta", "/api/userreqs",
     "/api/litellm/models", "/api/litellm/concurrency-by-key",
 })
 # The only surfaces a must-change-password session may reach before resetting.
@@ -1201,8 +1235,13 @@ async def api_account_tokens_create(request: web.Request) -> web.Response:
     data = await request.post()
     label = str(data.get("label") or "").strip()[:64]
     want = str(data.get("role") or "viewer").strip()
-    # Privilege guard: only an admin can mint an admin-scoped token.
-    role = (want if want in auth.ROLES else "viewer") if sess["role"] == "admin" \
+    # Privilege guard: only an admin can mint an admin-scoped token. Derive the ceiling from the
+    # user's CURRENT DB role, not the in-memory `sess["role"]` (which is set once at login and
+    # never refreshed) — otherwise a just-demoted admin whose session wasn't dropped could still
+    # mint a fresh admin PAT before their next request re-evaluates the role.
+    _cur = db.user_get(sess["user"]) or {}
+    cur_role = _cur.get("role", "viewer")
+    role = (want if want in auth.ROLES else "viewer") if cur_role == "admin" \
         else "viewer"
     raw, tid, prefix = _new_pat()
     if not db.api_token_create(tid, sess["user"], role, label,
@@ -1283,8 +1322,17 @@ def _require_csrf(request: web.Request, sess: dict | None) -> bool:
     (bearer, not a browser-auto-sent cookie) is exempt."""
     if sess is None:
         return True
-    return hmac.compare_digest(
+    ok = hmac.compare_digest(
         request.headers.get("X-CSRF-Token", "") or "", sess.get("csrf", "") or "")
+    if not ok:
+        # A rejected CSRF on a state-changing route is attempted-abuse the security UI should
+        # see — the audit trail previously logged only SUCCESSES. One central hook covers every
+        # handler's `_require_csrf` call. Best-effort (never blocks the deny it accompanies).
+        try:
+            _audit(request, sess.get("user"), "csrf.deny", target=request.path)
+        except Exception:
+            pass
+    return ok
 
 
 async def admin_users_page_handler(request: web.Request) -> web.Response:
@@ -1376,16 +1424,23 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
         db.user_set_must_change(name, False)
         auth.sessions_drop_user(name)
     elif action == "update":
-        # edit a user's profile (email + role). Role is revalidated per request in
-        # _auth_ctx, so a change takes effect on the target's next request.
+        # edit a user's profile (email + role). The middleware revalidates role per request, but
+        # a stale session still carries the OLD role for token-minting and a previously-issued PAT
+        # keeps its own stored role — so on a ROLE CHANGE drop the target's sessions to force a
+        # fresh role. Only on an ACTUAL role change (an email-only edit must not log the user out),
+        # and via _except so an admin editing their OWN email isn't self-locked-out. The PAT side
+        # is capped at read time in db.api_token_lookup (effective = min(token, user)).
         email = str(data.get("email") or "").strip()
         role = str(data.get("role") or "").strip()
         if not auth.valid_email(email):
             return web.json_response({"error": "invalid email"}, status=400)
         if role not in auth.ROLES:
             return web.json_response({"error": "invalid role"}, status=400)
+        _prev = db.user_get(name)
         if not db.user_update_guarded(name, email, role):   # atomic last-admin guard
             return web.json_response({"error": "cannot demote the last admin"}, status=400)
+        if _prev and _prev.get("role") != role:             # role actually changed → refresh sessions
+            auth.sessions_drop_user_except(name, request.cookies.get(_USER_COOKIE))
     else:
         return web.json_response({"error": "unknown action"}, status=400)
     _audit(request, actor, "user." + action, target=name)
@@ -1549,6 +1604,53 @@ async def keyseries_handler(request: web.Request) -> web.Response:
     return web.json_response({"window": window, **data})
 
 
+async def userreqs_handler(request: web.Request) -> web.Response:
+    """Per-USER usage over time — the 'Usage by user over time' chart. Per-key CUMULATIVE
+    running total (up to the rollup's 1-year retention), folded to owner client-side, and in
+    lite/off spend mode — where per-key REQUEST counts don't exist — it falls back to per-key
+    cumulative SPEND. UN-CAPPED (top_n=200) so the client can fold key → owner + top/Other
+    without dropping a user whose keys each rank low.
+
+    FOLLOWS the page time-window (?window=15m|1h|24h|30d|12mo|month, default 12mo=all-time):
+    the range is limited to that many days so the chart matches the selector like the other
+    over-time cards. The rollup is DAY-granular, so a sub-day window (15m/1h/24h) collapses to
+    the current day — the finest this data supports. `?end=` pans the window back.
+
+    Returns {labels, points, metric, owners} — metric is 'requests' or 'spend' depending on
+    what the proxy actually tracks (so the card can label it honestly)."""
+    end = _q_end(request)
+    window = db.norm_window(request.query.get("window", "12mo"), "12mo")
+    # window duration -> day span for the day-granular rollup (ceil, min 1 day)
+    days_back = max(1, int((db.window_secs(window) + 86399) // 86400))
+    metric = "requests"
+    data = await asyncio.to_thread(db.key_cumulative, metric="reqs",
+                                   days_back=days_back, top_n=200, end=end)
+    if not data.get("points"):     # lite/off: no per-key request counts → cumulative SPEND instead
+        ks = await asyncio.to_thread(db.key_delta_series, window, 400, 200, end)
+        if ks.get("points"):
+            data = {"labels": ks.get("labels", []), "points": ks["points"]}
+            metric = "spend"
+    # Resolve each returned key label to its owner SERVER-SIDE, from the PERSISTED store
+    # (known_keys.owner_name) plus the admin per-key override — the same authority the
+    # Settings board uses. The client used to fold owners only via /api/budgets, which:
+    #   (a) names keys from LiteLLM's LIVE /user/list heavy poll (~60s), so on first load
+    #       everyone showed as "Unassigned" until that poll landed ("resolves after a few
+    #       minutes"), and
+    #   (b) only covers keys in the CURRENT budgets list — a historical key no longer there
+    #       stayed "Unassigned" forever.
+    # The persisted store is warm immediately and covers every key ever resolved, so it fixes
+    # both. Precedence: admin override > stored last-known name.
+    labels = data.get("labels") or []
+    stored = await asyncio.to_thread(db.known_owner_names)   # {label: owner email/alias}
+    uov = db.key_user_overrides()                            # {label: name}  admin reassignment
+    owners = {}
+    for lbl in labels:
+        name = uov.get(lbl) or stored.get(lbl)
+        if name:
+            owners[lbl] = name
+    return web.json_response({**data, "metric": metric, "owners": owners})
+
+
 async def keyrequests_handler(request: web.Request) -> web.Response:
     """CUMULATIVE requests per key over time (the 'Top 10 API keys over time' chart). Reads
     the local per-(day,model,key) rollup — no /spend/logs pull — so each line is an
@@ -1635,16 +1737,25 @@ _VIS_GATE_TTL = 5.0
 _vis_gate: dict = {"mono": -1e9, "db": None, "known": frozenset(), "unassigned": frozenset()}
 
 
+def _warm_vis_gate() -> None:
+    """Refresh the visibility-gate label sets from SQLite (two reads). Pure/sync — called from
+    the sampling loop via asyncio.to_thread so the reads happen OFF the event loop; the hot
+    serving path then only reads the memoized frozensets and never opens sqlite on-loop."""
+    _vis_gate["known"] = db.known_keys_set()
+    _vis_gate["unassigned"] = db.unassigned_labels()
+    _vis_gate["mono"] = time.monotonic()
+    _vis_gate["db"] = config.DB_PATH
+
+
 def _visible_gate_inputs() -> tuple:
-    """(known_keys, hidden_unassigned_labels) for the per-request visibility filter,
-    cached for _VIS_GATE_TTL. The config toggle is read LIVE (not cached) so Show/Hide
-    still takes effect on the next poll; only the underlying label SETS are memoized."""
+    """(known_keys, hidden_unassigned_labels) for the per-request visibility filter. The sampler
+    warms the sets off-loop every tick (`_warm_vis_gate`), so this normally just reads the cache.
+    The TTL/db-path check here is a FALLBACK that only fires (and reads on-loop) when the sampler
+    hasn't warmed them — a cold start before the first tick, a swapped MONITOR_DB_PATH in a test,
+    or a dead sampler loop. The config toggle is read LIVE so Show/Hide still takes effect at once."""
     now = time.monotonic()
     if now - _vis_gate["mono"] >= _VIS_GATE_TTL or _vis_gate["db"] != config.DB_PATH:
-        _vis_gate["known"] = db.known_keys_set()
-        _vis_gate["unassigned"] = db.unassigned_labels()
-        _vis_gate["mono"] = now
-        _vis_gate["db"] = config.DB_PATH
+        _warm_vis_gate()
     hidden = (_vis_gate["unassigned"]
               if getattr(config, "HIDE_UNASSIGNED_KEYS", False) else frozenset())
     return _vis_gate["known"], hidden
@@ -2459,6 +2570,11 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
     # per-model activity, and any model that already carries an override. This keeps
     # the board populated even when the master key can't reach the spend endpoints.
     names: set[str] = set(prices.keys())
+    # /model/info's FULL model set (via detail) — the reliable name source: it comes straight
+    # from LiteLLM on this request, independent of the sampler's /v1/models snapshot (which is
+    # absent whenever the latest sample errored → the card was empty until a manual Refresh +
+    # browser reload happened to land on a good sample).
+    names.update(k for k in detail if k)
     for mid in (_backend_latest.get("litellm", {}) or {}).get("models", []) or []:
         if mid:
             names.add(mid)
@@ -2526,6 +2642,55 @@ async def api_admin_model_kinds_get(request: web.Request) -> web.Response:
 # dashboards/tabs poll it. At most a handful of window entries.
 _TT_CACHE: dict[tuple, tuple[float, dict]] = {}
 _TT_TTL = 60.0
+_TT_MAX = 64                                   # bound the cache — never grow unboundedly per distinct window
+_TT_INFLIGHT: dict[tuple, "asyncio.Future"] = {}   # single-flight: coalesce concurrent identical heavy pulls
+
+
+def _tt_cache_store(ck: tuple, now_c: float, payload: dict) -> None:
+    """Store a token-types payload, evicting expired entries first and, if still at the cap,
+    the oldest — so a run of distinct ?start= windows can't grow _TT_CACHE without bound."""
+    _TT_CACHE[ck] = (now_c, payload)
+    if len(_TT_CACHE) <= _TT_MAX:
+        return
+    for k in [k for k, (ts, _) in _TT_CACHE.items() if now_c - ts >= _TT_TTL]:
+        _TT_CACHE.pop(k, None)
+    while len(_TT_CACHE) > _TT_MAX:
+        _TT_CACHE.pop(min(_TT_CACHE, key=lambda k: _TT_CACHE[k][0]), None)
+
+
+async def _compute_token_types(request: web.Request, window: str, start: str,
+                               end: str | None) -> dict:
+    """The HEAVY per-model token-types pull + payload assembly, factored out of the handler so
+    the single-flight wrapper can run it exactly once per (start,end) even under concurrent tabs."""
+    try:
+        # Hard ceiling on the whole fan-out so a slow proxy can never wedge this aiohttp worker
+        # for minutes; the collector self-bounds at TOKEN_TYPES_MAX_SECONDS, this is the backstop.
+        tt = await asyncio.wait_for(
+            litellm.per_model_token_types(request.app[_SESSION], start, end),
+            timeout=litellm.TOKEN_TYPES_MAX_SECONDS + 20)
+    except asyncio.TimeoutError:
+        return {"window": window, "start_date": start, "end_date": end,
+                "available": False, "models": [],
+                "diag": {"days_ok": 0, "aborted": "timeout"}}
+    except Exception as e:      # heavy pull is best-effort — never 500 the settings page
+        print(f"[warn] /api/admin/model-token-types {type(e).__name__}: {e}", file=sys.stderr)
+        tt = None
+    if tt is None:
+        return {"window": window, "start_date": start, "end_date": end,
+                "available": False, "models": [], "diag": None}
+    per = tt.get("per_model") or {}
+    models = [{"model": m, "input": v["input"], "cached": v["cached"],
+               "output": v["output"], "total": v["total"]}
+              for m, v in sorted(per.items(), key=lambda kv: -kv[1]["total"])]
+    # available only if at least one day's logs actually came back; diag surfaces which days
+    # failed and why (byte cap / timeout / HTTP / circuit-open / load-shed) so the operator
+    # sees the real reason instead of a bare false.
+    diag = {"days_ok": tt.get("days_ok", 0), "total_days": tt.get("total_days", 0),
+            "days_failed": tt.get("days_failed", [])}
+    if tt.get("aborted"):
+        diag["aborted"] = tt["aborted"]
+    return {"window": window, "start_date": start, "end_date": end,
+            "available": bool(tt.get("days_ok")), "models": models, "diag": diag}
 
 
 async def api_admin_model_token_types_handler(request: web.Request) -> web.Response:
@@ -2560,38 +2725,32 @@ async def api_admin_model_token_types_handler(request: web.Request) -> web.Respo
     hit = _TT_CACHE.get(ck)
     if hit and now_c - hit[0] < _TT_TTL:
         return web.json_response(hit[1])
+    # Single-flight: a fresh dashboard load can open several admin tabs that all miss the cache
+    # at once; without coalescing each fires its OWN heavy multi-day /spend/logs fan-out at the
+    # proxy simultaneously (the exact thundering-herd the cache exists to prevent). Followers on
+    # the same (start,end) await the leader's one pull instead.
+    inflight = _TT_INFLIGHT.get(ck)
+    if inflight is not None:
+        try:
+            return web.json_response(await inflight)
+        except Exception:       # leader failed — fall through and try once ourselves
+            pass
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _TT_INFLIGHT[ck] = fut
     try:
-        # Hard ceiling on the whole fan-out so a slow proxy can never wedge this aiohttp worker
-        # for minutes; the collector self-bounds at TOKEN_TYPES_MAX_SECONDS, this is the backstop.
-        tt = await asyncio.wait_for(
-            litellm.per_model_token_types(request.app[_SESSION], start, end),
-            timeout=litellm.TOKEN_TYPES_MAX_SECONDS + 20)
-    except asyncio.TimeoutError:
-        return web.json_response({"window": window, "start_date": start, "end_date": end,
-                                  "available": False, "models": [],
-                                  "diag": {"days_ok": 0, "aborted": "timeout"}})
-    except Exception as e:      # heavy pull is best-effort — never 500 the settings page
-        print(f"[warn] /api/admin/model-token-types {type(e).__name__}: {e}", file=sys.stderr)
-        tt = None
-    if tt is None:
-        return web.json_response({"window": window, "start_date": start, "end_date": end,
-                                  "available": False, "models": [], "diag": None})
-    per = tt.get("per_model") or {}
-    models = [{"model": m, "input": v["input"], "cached": v["cached"],
-               "output": v["output"], "total": v["total"]}
-              for m, v in sorted(per.items(), key=lambda kv: -kv[1]["total"])]
-    # available only if at least one day's logs actually came back; diag surfaces which days
-    # failed and why (byte cap / timeout / HTTP / circuit-open / load-shed) so the operator
-    # sees the real reason instead of a bare false.
-    diag = {"days_ok": tt.get("days_ok", 0), "total_days": tt.get("total_days", 0),
-            "days_failed": tt.get("days_failed", [])}
-    if tt.get("aborted"):
-        diag["aborted"] = tt["aborted"]
-    payload = {"window": window, "start_date": start, "end_date": end,
-               "available": bool(tt.get("days_ok")), "models": models, "diag": diag}
-    if payload["available"]:            # only cache real, useful results — never a transient abort
-        _TT_CACHE[ck] = (now_c, payload)
-    return web.json_response(payload)
+        payload = await _compute_token_types(request, window, start, end)
+        if not fut.done():
+            fut.set_result(payload)
+        if payload["available"]:        # only cache real, useful results — never a transient abort
+            _tt_cache_store(ck, now_c, payload)
+        return web.json_response(payload)
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        _TT_INFLIGHT.pop(ck, None)
 
 
 async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
@@ -2633,9 +2792,22 @@ async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
         vcache = str(data.get("vol_cache") or "").strip()
         per_type = any((pin, pout, pcache))
         if per_type:
+            # Partial override (not all three types set): fill the blank types from LiteLLM's own
+            # live rate for this model so the derived blend doesn't count a blank type as $0. Only
+            # then does a lone out_1m override leave input/cache priced instead of zeroing them.
+            fin = fout = fcache = None
+            if not (pin and pout and pcache):
+                try:
+                    _lit = litellm.detail_for(
+                        model, await litellm.model_price_detail(request.app[_SESSION])) or {}
+                    fin, fout, fcache = _lit.get("in"), _lit.get("out"), _lit.get("cache")
+                except Exception as e:      # best-effort — a lookup miss just falls back to $0 blanks
+                    print(f"[warn] model_cost fill-rate lookup {type(e).__name__}: {e}",
+                          file=sys.stderr)
             if not db.model_cost_price_set(model, 0.0, time.time(),
                                            in_1m=pin, out_1m=pout, cache_1m=pcache,
-                                           vol_in=vin, vol_out=vout, vol_cache=vcache):
+                                           vol_in=vin, vol_out=vout, vol_cache=vcache,
+                                           fill_in=fin, fill_out=fout, fill_cache=fcache):
                 return web.json_response(
                     {"error": "rates must be numbers ≥ 0 (per 1M tokens)"}, status=400)
             _audit(request, actor, "model_cost.set", target=model,
@@ -3127,7 +3299,8 @@ async def _capture_spend_daily(session: aiohttp.ClientSession, now: float) -> No
         daily_tok = await litellm.per_model_daily_tokens(session, start, end, overrides)
     except Exception as e:      # cost is best-effort; still persist usage
         print(f"[spend] capture cost estimate: {type(e).__name__}: {e}", file=sys.stderr)
-    db.spend_daily_upsert(_spend_daily_records(daily, daily_cost, daily_tok), now)
+    await asyncio.to_thread(
+        db.spend_daily_upsert, _spend_daily_records(daily, daily_cost, daily_tok), now)
 
 
 async def spend_series_handler(request: web.Request) -> web.Response:
@@ -3137,14 +3310,16 @@ async def spend_series_handler(request: web.Request) -> web.Response:
     if window not in ("30d", "12mo", "month"):
         window = "30d"
     now = time.time()
+    end_q = _q_end(request)          # ◀▶ pan cursor (epoch); None = live/now
+    anchor = end_q or now            # the window ENDS here — slice + labels align to it
     if _spend_series_source is not None:
-        return web.json_response(_spend_series_source(now, window))
+        return web.json_response(_spend_series_source(anchor, window))
     # Short-TTL cache: this handler fans out to several LiteLLM round-trips (spend_activity,
     # model_prices, per_model_range, per_model_daily_cost/tokens) per call, and every open Spend
     # tab polls it — a viewer could otherwise amplify load onto the monitored proxy. Serve a
     # cached payload for _SPEND_SERIES_TTL (the write-through is redundant with the hourly
     # sampler). `?diag=1` bypasses the cache so the diagnostic view is always live.
-    if not request.query.get("diag"):
+    if not request.query.get("diag") and end_q is None:   # never cache a panned (past) view
         _hit = _SPEND_SERIES_CACHE.get(window)
         if _hit and now - _hit[0] < _SPEND_SERIES_TTL:
             return web.json_response(_hit[1])
@@ -3175,7 +3350,7 @@ async def spend_series_handler(request: web.Request) -> web.Response:
             return web.json_response({"window": window, "available": False,
                                       "points": [], "years": []})
         out = {"window": window, "available": True,
-               **window_and_years(daily, window, now)}
+               **window_and_years(daily, window, anchor)}
         # Estimated cost over time: free-tier LiteLLM has no per-day $, so multiply each
         # day's tokens by per-model prices (real external vs reference self-hosted rates).
         try:
@@ -3236,7 +3411,8 @@ async def spend_series_handler(request: web.Request) -> web.Response:
             # the live dates — older days already came from the store. Idempotent REPLACE.
             # The background sampler (_capture_spend_daily) does the same on an hourly
             # cadence so capture never depends on the page being open.
-            db.spend_daily_upsert(_spend_daily_records(daily_live, daily_cost, daily_tok), now)
+            await asyncio.to_thread(
+                db.spend_daily_upsert, _spend_daily_records(daily_live, daily_cost, daily_tok), now)
         except Exception as ce:     # cost is best-effort; usage chart must still render
             print(f"[warn] spend/series cost estimate: {type(ce).__name__}: {ce}",
                   file=sys.stderr)
@@ -3256,7 +3432,7 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                            "points_built": len(out.get("points", []))}
         else:
             # cache only the plain (non-diag) successful payload
-            if out.get("available"):
+            if out.get("available") and end_q is None:
                 _SPEND_SERIES_CACHE[window] = (now, out)
         return web.json_response(out)
     except Exception as e:      # a bad LiteLLM shape must degrade, never 500 the page
@@ -3302,6 +3478,7 @@ async def spend_model_series_handler(request: web.Request) -> web.Response:
     if window not in ("30d", "12mo", "month"):
         window = "30d"
     now = time.time()
+    anchor = _q_end(request) or now          # ◀▶ pan cursor: bucket window ends here
     start = time.strftime("%Y-%m-%d", time.gmtime(now - 31536000))   # full year
     end = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
     series = None
@@ -3315,7 +3492,7 @@ async def spend_model_series_handler(request: web.Request) -> web.Response:
     if not series:
         return web.json_response({"window": window, "available": False,
                                   "labels": [], "models": []})
-    return web.json_response(bucket_model_series(series, window, now))
+    return web.json_response(bucket_model_series(series, window, anchor))
 
 
 async def _key_owner_map(session: aiohttp.ClientSession) -> dict:
@@ -3357,12 +3534,14 @@ async def spend_model_user_series_handler(request: web.Request) -> web.Response:
     if window not in ("14d", "30d", "12mo", "month"):
         window = "30d"
     now = time.time()
+    end_q = _q_end(request)                   # ◀▶ pan cursor; None = live/now
+    anchor = end_q or now
     hit = _MU_SERIES_CACHE.get(window)
-    if hit and now - hit[0] < _MU_SERIES_TTL:
+    if hit and now - hit[0] < _MU_SERIES_TTL and end_q is None:   # panned view is never cached
         return web.json_response(hit[1])
-    days = (int((now - db.month_start(now)) / 86400) + 1 if window == "month"
+    days = (int((anchor - db.month_start(anchor)) / 86400) + 1 if window == "month"
             else 366 if window == "12mo" else (30 if window == "30d" else 14))
-    rows = await asyncio.to_thread(db.spend_model_user_rows, days, now)
+    rows = await asyncio.to_thread(db.spend_model_user_rows, days, anchor)
     if not rows:
         payload = {"window": window, "available": False, "labels": [], "series": []}
     else:
@@ -3374,8 +3553,9 @@ async def spend_model_user_series_handler(request: web.Request) -> web.Response:
         prices = await litellm.model_prices(request.app[_SESSION])
         _apply_cost_overrides(prices)
         kind_ov = db.model_kind_overrides()
-        payload = bucket_model_user_series(rows, omap, prices, kind_ov, window, now)
-    _MU_SERIES_CACHE[window] = (now, payload)
+        payload = bucket_model_user_series(rows, omap, prices, kind_ov, window, anchor)
+    if end_q is None:                          # cache only the live view (keyed by window)
+        _MU_SERIES_CACHE[window] = (now, payload)
     return web.json_response(payload)
 
 
@@ -3474,6 +3654,59 @@ async def events_handler(request: web.Request) -> web.Response:
         "kind": kind,
         "events": db.recent_events(limit, kind=None if kind == "all" else kind),
     })
+
+
+# Services shown on the Alerts status timeline, in lane order. The monitoring
+# site is appended by the handler (it has no backend row / no Settings toggle).
+_STATUS_SERVICES = [
+    ("litellm", "LiteLLM"),
+    ("ollama", "Ollama"),
+    ("llamacpp", "llama.cpp"),
+    ("vllm", "vLLM"),
+    ("gpu", "GPU"),
+]
+
+
+def _status_env_ok(name: str) -> bool:
+    """Deployment-fact fallback for _configured() when there is no live sample yet."""
+    if name == "litellm":
+        return bool(config.LITELLM_BASE_URL)
+    if name == "ollama":
+        return bool(config.OLLAMA_BASE_URL)
+    if name == "llamacpp":
+        return bool(config.LLAMACPP_BASE_URL)
+    if name == "vllm":
+        return bool(config.VLLM_BASE_URL)
+    if name == "gpu":
+        return bool(config.GPU_SSH or config.GPU_METRICS_URL or config.GPU_METRICS_FILE)
+    return False
+
+
+async def status_timeline_handler(request: web.Request) -> web.Response:
+    """Per-service up/down segments for the Alerts status timeline.
+
+    A service OFF in Settings -> Services (or an unconfigured backend) is omitted
+    entirely — same gate as the sidebar link — so the graph never shows a service
+    the operator has disabled. The monitoring site is always included, derived
+    from sample cadence (it cannot record its own downtime while down).
+    """
+    window = db.norm_window(request.query.get("window", "24h"), "24h")
+    end = _q_end(request)
+    enabled = [(k, label) for (k, label) in _STATUS_SERVICES
+               if _configured(k, _status_env_ok(k))]
+    keys = [k for (k, _label) in enabled]
+    seg = await asyncio.to_thread(db.status_segments, window, keys, end)
+    site = await asyncio.to_thread(db.self_uptime_segments, window, end)
+    secs = db.window_secs(window)
+    now = end or time.time()
+    services = []
+    for k, label in enabled:
+        d = seg.get(k) or {"segments": [], "uptime_pct": 0.0, "no_data": True}
+        services.append({"key": k, "label": label, "configured": True, **d})
+    services.append({"key": "site", "label": "Monitoring site",
+                     "configured": True, **site})
+    return web.json_response(
+        {"window": window, "start": now - secs, "now": now, "services": services})
 
 
 async def export_handler(request: web.Request) -> web.Response:
@@ -3724,9 +3957,11 @@ def build_app() -> web.Application:
     app.router.add_get("/api/series", series_handler)
     app.router.add_get("/api/uptime", uptime_handler)
     app.router.add_get("/api/events", events_handler)
+    app.router.add_get("/api/status-timeline", status_timeline_handler)
     app.router.add_get("/api/stream", stream_handler)
     app.router.add_get("/api/keyseries", keyseries_handler)
     app.router.add_get("/api/keyrequests", keyrequests_handler)
+    app.router.add_get("/api/userreqs", userreqs_handler)
     app.router.add_get("/api/litellm/concurrency-by-key", concurrency_by_key_handler)
     app.router.add_get("/api/keydelta", keydelta_handler)
     app.router.add_get("/api/procseries", procseries_handler)

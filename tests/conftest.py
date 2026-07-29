@@ -59,6 +59,8 @@ def _reset_litellm_heavy_cache():
     _litellm._HEAVY_TS = 0.0
     _litellm._CB = {}
     _litellm._PRICES_CACHE = {}   # last-good /model/info prices — isolate per test
+    _litellm._KEY_BUDGETS_CACHE = None   # key_budgets coalesce memo — isolate per test
+    _litellm._KEY_BUDGETS_TS = 0.0
     yield
 
 
@@ -96,6 +98,7 @@ def _reset_auth_state():
     _app._users_seen["any"] = False
     _app._MU_SERIES_CACHE.clear()          # module-level series cache — isolate per test
     _app._TT_CACHE.clear()                 # token-types window cache — isolate per test
+    _app._TT_INFLIGHT.clear()              # token-types single-flight futures — no leak across tests
     _app._SPEND_SERIES_CACHE.clear()       # spend/series window cache — isolate per test
     _db._ROLLUP_HWM = 0.0                  # incremental-rollup HWM — a fresh test rolls up in full
     _auth._sessions.clear()

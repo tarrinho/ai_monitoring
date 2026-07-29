@@ -539,6 +539,23 @@ def insert_metrics(ts: float, row: dict[str, Any]) -> None:
         pass
 
 
+def _pick_tier(secs: float, end: float, now: float,
+               raw_tbl: str, m1_tbl: str, h1_tbl: str) -> tuple[str, str]:
+    """Pick the storage tier for a windowed read from BOTH the window LENGTH (resolution) AND how
+    far back the window START (end-secs) reaches vs each tier's retention. A short window that is
+    panned / drag-zoomed deep into history must NOT read the RAW table (pruned at
+    ROLLUP_RAW_HOURS): it holds only the last 24h, so the read came back empty — a blank chart —
+    even though the coarser _1m (ROLLUP_MIN_DAYS, default 30d but operator-configurable — the
+    live box runs 730) / _1h (ROLLUP_HOUR_DAYS, default 365d) tiers still hold that range.
+    Returns (table, ts_column)."""
+    oldest_age = now - (end - secs)
+    if secs <= WINDOWS["1h"] and oldest_age <= config.ROLLUP_RAW_HOURS * 3600:
+        return raw_tbl, "ts"
+    if secs <= WINDOWS["24h"] and oldest_age <= config.ROLLUP_MIN_DAYS * 86400:
+        return m1_tbl, "bucket"
+    return h1_tbl, "bucket"
+
+
 def series(window: str, max_points: int = 300,
            end: float | None = None) -> list[dict[str, Any]]:
     """Downsampled metric series for a named window (SQL time-bucket average).
@@ -553,13 +570,7 @@ def series(window: str, max_points: int = 300,
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
-    # pick source table by window length
-    if secs <= WINDOWS["1h"]:
-        table, tcol = "metrics", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tcol = "metrics_1m", "bucket"
-    else:
-        table, tcol = "metrics_1h", "bucket"
+    table, tcol = _pick_tier(secs, end, time.time(), "metrics", "metrics_1m", "metrics_1h")
     avg = ", ".join(f"AVG({c})" for c in _METRIC_COLS)
     try:
         with _connect() as conn:
@@ -823,12 +834,7 @@ def key_series(window: str, max_points: int = 300,
     start = end - secs
     bsize = max(1.0, secs / max_points)
     # tier by window: raw ≤1h, 1-min ≤24h, 1-hour beyond (1-year history)
-    if secs <= WINDOWS["1h"]:
-        table, tc = "key_series", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tc = "key_series_1m", "bucket"
-    else:
-        table, tc = "key_series_1h", "bucket"
+    table, tc = _pick_tier(secs, end, time.time(), "key_series", "key_series_1m", "key_series_1h")
     try:
         known = known_keys_set()
         hidden = hidden_unassigned()
@@ -934,12 +940,7 @@ def key_series_window_delta(window: str, top_n: int = 10,
     secs = window_secs(window)
     end = end or time.time()
     start = end - secs
-    if secs <= WINDOWS["1h"]:
-        table, tc = "key_series", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tc = "key_series_1m", "bucket"
-    else:
-        table, tc = "key_series_1h", "bucket"
+    table, tc = _pick_tier(secs, end, time.time(), "key_series", "key_series_1m", "key_series_1h")
     try:
         known = known_keys_set()
         hidden = hidden_unassigned()
@@ -989,12 +990,7 @@ def key_delta_series(window: str, max_points: int = 300, top_n: int = 10,
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
-    if secs <= WINDOWS["1h"]:
-        table, tc = "key_series", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tc = "key_series_1m", "bucket"
-    else:
-        table, tc = "key_series_1h", "bucket"
+    table, tc = _pick_tier(secs, end, time.time(), "key_series", "key_series_1m", "key_series_1h")
     try:
         ranked = key_series_window_delta(window, top_n, end)["labels"]
         if not ranked:
@@ -1135,17 +1131,15 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
     start = end - secs
     bsize = max(1.0, secs / max_points)
     stab = "model_series" if source == "model" else "key_series"
-    if secs <= WINDOWS["1h"]:
-        mtab, ktab, tc = "metrics", stab, "ts"
-    elif secs <= WINDOWS["24h"]:
-        mtab, ktab, tc = "metrics_1m", f"{stab}_1m", "bucket"
-    else:
-        mtab, ktab, tc = "metrics_1h", f"{stab}_1h", "bucket"
+    # both the aggregate (metrics) and the per-key (stab) source must come from the SAME tier;
+    # _pick_tier also steps down when the window is panned/zoomed past a tier's retention.
+    mtab, tc = _pick_tier(secs, end, time.time(), "metrics", "metrics_1m", "metrics_1h")
+    ktab = stab + ("" if tc == "ts" else ("_1m" if mtab.endswith("_1m") else "_1h"))
     # Real-time override source (model_conc_series): raw tier only — see the schema
     # comment for why the completion-delta weight above can be misleadingly zero for a
-    # slow, still-running request, and why this is scoped to the ≤1h window.
+    # slow, still-running request, and why this is scoped to the raw (≤1h, unpanned) window.
     rt_col = "running" if metric == "conc" else "waiting"
-    fetch_rt = source == "model" and secs <= WINDOWS["1h"]
+    fetch_rt = source == "model" and tc == "ts"
     try:
         with _connect() as conn:
             agg = conn.execute(
@@ -1335,12 +1329,7 @@ def proc_series(kind: str, window: str, max_points: int = 200,
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
-    if secs <= WINDOWS["1h"]:
-        table, tc = "proc_series", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tc = "proc_series_1m", "bucket"
-    else:
-        table, tc = "proc_series_1h", "bucket"
+    table, tc = _pick_tier(secs, end, time.time(), "proc_series", "proc_series_1m", "proc_series_1h")
     try:
         with _connect() as conn:
             top = [r[0] for r in conn.execute(
@@ -1402,12 +1391,8 @@ def cpu_core_series(window: str, max_points: int = 200,
     end = end or time.time()
     start = end - secs
     bsize = max(1.0, secs / max_points)
-    if secs <= WINDOWS["1h"]:
-        table, tc = "cpu_core_series", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tc = "cpu_core_series_1m", "bucket"
-    else:
-        table, tc = "cpu_core_series_1h", "bucket"
+    table, tc = _pick_tier(secs, end, time.time(),
+                           "cpu_core_series", "cpu_core_series_1m", "cpu_core_series_1h")
     try:
         with _connect() as conn:
             cores = [int(r[0]) for r in conn.execute(
@@ -1438,12 +1423,8 @@ def ncpu(window: str = "1h", end: float | None = None) -> int:
     secs = window_secs(window)
     end = end or time.time()
     start = end - secs
-    if secs <= WINDOWS["1h"]:
-        table, tc = "cpu_core_series", "ts"
-    elif secs <= WINDOWS["24h"]:
-        table, tc = "cpu_core_series_1m", "bucket"
-    else:
-        table, tc = "cpu_core_series_1h", "bucket"
+    table, tc = _pick_tier(secs, end, time.time(),
+                           "cpu_core_series", "cpu_core_series_1m", "cpu_core_series_1h")
     try:
         with _connect() as conn:
             r = conn.execute(
@@ -1540,7 +1521,7 @@ def uptime(window: str) -> dict[str, dict]:
     Integrates time-up between transitions. A backend with no events in the
     window inherits its last-known state before the window (assumed up if none).
     """
-    secs = WINDOWS.get(window, WINDOWS["24h"])
+    secs = window_secs(window)   # handles month/custom:<secs>, not just the fixed named windows
     now = time.time()
     start = now - secs
     try:
@@ -1582,6 +1563,116 @@ def uptime(window: str) -> dict[str, dict]:
         return {}
 
 
+def status_segments(window: str, backends: list[str],
+                    end: float | None = None) -> dict[str, dict]:
+    """Per-backend up/down SEGMENTS over a window, for the status timeline.
+
+    Same step reconstruction as uptime() (state at window start = last 'state'
+    event before the window, default up), but emits the actual [from,to,up] runs
+    so the frontend can draw a stepped line per service. Honours `end` (pan
+    cursor). `no_data` = the backend has no 'state' event at all before or within
+    the window (enabled-but-never-sampled → draw a dashed "no data yet" lane).
+    """
+    secs = window_secs(window)
+    now = end or time.time()
+    start = now - secs
+    out: dict[str, dict] = {}
+    try:
+        with _connect() as conn:
+            for b in backends:
+                pre = conn.execute(
+                    "SELECT up FROM events WHERE backend=? AND ts<? "
+                    "AND (kind='state' OR kind IS NULL) "
+                    "ORDER BY ts DESC LIMIT 1", (b, start)).fetchone()
+                evs = conn.execute(
+                    "SELECT ts,up FROM events WHERE backend=? AND ts>=? AND ts<=? "
+                    "AND (kind='state' OR kind IS NULL) "
+                    "ORDER BY ts", (b, start, now)).fetchall()
+                state = pre[0] if pre else 1
+                segs: list[dict] = []
+                up_time = 0.0
+                cursor = start
+                for ts, up in evs:
+                    if ts > cursor:
+                        segs.append({"from": cursor, "to": ts, "up": bool(state)})
+                        if state:
+                            up_time += ts - cursor
+                    state = up
+                    cursor = ts
+                if now > cursor:
+                    segs.append({"from": cursor, "to": now, "up": bool(state)})
+                    if state:
+                        up_time += now - cursor
+                out[b] = {
+                    "segments": segs,
+                    "uptime_pct": round(up_time / secs * 100, 2) if secs else 0.0,
+                    "no_data": pre is None and not evs,
+                }
+        return out
+    except Exception as _e:
+        _dberr(_e)
+        return {}
+
+
+def self_uptime_segments(window: str, end: float | None = None,
+                         gap_factor: float = 3.0) -> dict:
+    """Monitoring-site up/down segments, derived from metrics-row cadence.
+
+    The site cannot record its own downtime while down, so infer it: a gap
+    between consecutive metrics rows larger than gap_factor x the sample interval
+    means the site (or its host) was down for that gap. Returns the same shape as
+    one status_segments() entry. Reads a hair before `start` so a run straddling
+    the window boundary isn't misread as a fresh start-of-window outage.
+    """
+    import config as _cfg
+    secs = window_secs(window)
+    now = end or time.time()
+    start = now - secs
+    thresh = max(15.0, gap_factor * getattr(_cfg, "SAMPLE_INTERVAL", 5.0))
+    try:
+        with _connect() as conn:
+            rows = [r[0] for r in conn.execute(
+                "SELECT ts FROM metrics WHERE ts>=? AND ts<=? ORDER BY ts",
+                (start - thresh, now)).fetchall()]
+    except Exception as _e:
+        _dberr(_e)
+        return {}
+    if not rows:
+        return {"segments": [], "uptime_pct": 0.0, "no_data": True}
+    # collapse dense samples into up-runs (consecutive samples within thresh)
+    runs: list[tuple[float, float]] = []
+    run_start = run_end = rows[0]
+    for ts in rows[1:]:
+        if ts - run_end > thresh:
+            runs.append((run_start, run_end))
+            run_start = ts
+        run_end = ts
+    runs.append((run_start, run_end))
+    segs: list[dict] = []
+    up_time = 0.0
+    cursor = start
+    for a, b in runs:
+        a2, b2 = max(a, start), min(b, now)
+        if b2 <= start or a2 >= now:
+            continue
+        if a2 > cursor:                       # down gap before this run
+            segs.append({"from": cursor, "to": a2, "up": False})
+            cursor = a2
+        if b2 > cursor:                       # the up-run itself
+            segs.append({"from": cursor, "to": b2, "up": True})
+            up_time += b2 - cursor
+            cursor = b2
+    if now > cursor:                          # tail: up only if a sample is recent
+        if (now - rows[-1]) > thresh:
+            segs.append({"from": cursor, "to": now, "up": False})
+        else:
+            segs.append({"from": cursor, "to": now, "up": True})
+            up_time += now - cursor
+    return {"segments": segs,
+            "uptime_pct": round(up_time / secs * 100, 2) if secs else 0.0,
+            "no_data": False}
+
+
 # High-water mark for incremental rollup (see rollup()). Module global, reset to 0 on process
 # start: the FIRST rollup after start re-aggregates all retained raw; subsequent ones only
 # re-touch the buckets that could have received new raw since. Advanced only on success.
@@ -1601,7 +1692,11 @@ def rollup() -> None:
     """
     global _ROLLUP_HWM
     now = time.time()
-    look_from = 0.0 if _ROLLUP_HWM <= 0.0 else max(0.0, _ROLLUP_HWM - _ROLLUP_GRACE)
+    # `min(_ROLLUP_HWM, now)` so a BACKWARD wall-clock step (NTP correction / manual set) can't
+    # strand data: without it, samples recorded at the new, earlier time would have ts < the
+    # old high HWM − grace and never fold. Taking the min re-scans from the current clock, so the
+    # jumped-back samples are caught on the next run.
+    look_from = 0.0 if _ROLLUP_HWM <= 0.0 else max(0.0, min(_ROLLUP_HWM, now) - _ROLLUP_GRACE)
     try:
         with _connect() as conn:
             # metrics
@@ -1682,8 +1777,13 @@ def recent(limit: int = 720) -> list[dict[str, Any]]:
 
 
 def prune() -> int:
-    """Delete rows older than retention window. Returns rows removed."""
-    cutoff = time.time() - config.DB_RETENTION_HOURS * 3600
+    """Delete `samples` rows older than the retention window. Returns rows removed.
+
+    `samples` is read only by db.recent() at startup (ring warm-up), so it prunes on the short
+    SAMPLES_RETENTION_HOURS window rather than the full DB_RETENTION_HOURS — capped by the
+    latter so an operator who deliberately set a smaller on-disk window still wins."""
+    hours = min(config.DB_RETENTION_HOURS, config.SAMPLES_RETENTION_HOURS)
+    cutoff = time.time() - hours * 3600
     try:
         with _connect() as conn:
             cur = conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
@@ -1928,11 +2028,12 @@ def spend_model_user_rows(days_back: int, end: float | None = None) -> list[dict
     caller resolves key/alias → owner and buckets into the chart series. Empty on error."""
     end = end or time.time()
     start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
+    end_day = time.strftime("%Y-%m-%d", time.gmtime(end))   # bound the TOP edge too (a panned/historical `end` must not pull days after the window)
     try:
         with _connect() as conn:
             rows = conn.execute(
                 "SELECT day, model, key, alias, cost, tokens FROM spend_model_user_daily "
-                "WHERE day >= ? ORDER BY day", (start_day,)).fetchall()
+                "WHERE day >= ? AND day <= ? ORDER BY day", (start_day, end_day)).fetchall()
         return [{"day": r[0], "model": r[1], "key": r[2], "alias": r[3] or "",
                  "cost": float(r[4] or 0), "tokens": float(r[5] or 0)} for r in rows]
     except Exception as _e:
@@ -1958,12 +2059,13 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
     ndp = 0 if col == "reqs" else 4          # requests are whole numbers; cost keeps cents
     end = end or time.time()
     start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
+    end_day = time.strftime("%Y-%m-%d", time.gmtime(end))   # bound the TOP edge too (a panned/historical `end` must not pull days after the window)
     try:
         with _connect() as conn:
             rows = conn.execute(
                 f"SELECT day, COALESCE(NULLIF(alias,''), key) AS label, SUM({col}) v "
-                "FROM spend_model_user_daily WHERE day >= ? "
-                "GROUP BY day, label ORDER BY day", (start_day,)).fetchall()
+                "FROM spend_model_user_daily WHERE day >= ? AND day <= ? "
+                "GROUP BY day, label ORDER BY day", (start_day, end_day)).fetchall()
         if not rows:
             return {"labels": [], "metric": metric, "points": []}
         # rank keys by total over the span; keep the top-N
@@ -2010,11 +2112,12 @@ def key_cost_window(days_back: int, end: float | None = None) -> dict[str, float
     the page time-window instead of showing LiteLLM's all-time per-key total. Empty on error."""
     end = end or time.time()
     start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
+    end_day = time.strftime("%Y-%m-%d", time.gmtime(end))   # bound the TOP edge too (a panned/historical `end` must not pull days after the window)
     try:
         with _connect() as conn:
             rows = conn.execute(
                 "SELECT COALESCE(NULLIF(alias,''), key) AS label, SUM(cost) c "
-                "FROM spend_model_user_daily WHERE day >= ? GROUP BY label", (start_day,)).fetchall()
+                "FROM spend_model_user_daily WHERE day >= ? AND day <= ? GROUP BY label", (start_day, end_day)).fetchall()
         # Fold excluded / unconfirmed / hidden-unassigned keys into "Other" rather than showing
         # them as named bands (this rollup-backed chart used to skip the filter entirely). Cost
         # is FOLDED, not dropped, so the window's total spend is preserved — a hidden key's
@@ -2072,7 +2175,15 @@ def spend_daily_upsert(rows: list[dict[str, Any]], now: float) -> None:
     if not payload:
         return
     cols = ",".join(_SPEND_DAILY_COLS)
-    setter = ", ".join(f"{c}=excluded.{c}" for c in _SPEND_DAILY_COLS)
+    # The cost/token-split columns come from a BEST-EFFORT pull (`daily_cost`/`daily_tok`) that
+    # can fail independently of the always-present usage pull; on failure the caller emits 0 for
+    # them. Overwriting unconditionally then REPLACEd a previously-good day's cost with zeros —
+    # permanent once the date aged out of LiteLLM's 7-day live window. Keep the existing value
+    # when the incoming one is 0 (cost/tokens are day-cumulative, never legitimately drop to 0).
+    _COST_COLS = ("tokens_ext", "tokens_int", "real_cost", "est_cost")
+    setter = ", ".join(
+        (f"{c}=COALESCE(NULLIF(excluded.{c},0), {c})" if c in _COST_COLS else f"{c}=excluded.{c}")
+        for c in _SPEND_DAILY_COLS)
     try:
         with _connect() as conn:
             conn.executemany(
@@ -2410,7 +2521,9 @@ def model_cost_price_set(model: str, usd_1m: float, now: float,
                          in_1m: object = None, out_1m: object = None,
                          cache_1m: object = None,
                          vol_in: object = None, vol_out: object = None,
-                         vol_cache: object = None) -> bool:
+                         vol_cache: object = None,
+                         fill_in: object = None, fill_out: object = None,
+                         fill_cache: object = None) -> bool:
     """Pin a model's cost. Either a single blended `usd_1m`, or per-type in/out/cache rates
     ($ per 1M tokens) — when any per-type rate is given, `usd_1m` (what the cost pipeline
     reads) is DERIVED from the per-type rates so both stay consistent.
@@ -2418,7 +2531,13 @@ def model_cost_price_set(model: str, usd_1m: float, now: float,
     When per-type token VOLUMES are also supplied (vol_in/vol_out/vol_cache, e.g. from
     /api/admin/model-token-types), the derived usd_1m is VOLUME-WEIGHTED (total-cost ÷
     total-tokens) instead of a naive input/output average — so usd_1m·total_tokens matches the
-    real bill even when output is expensive but low-volume. False on a bad value/DB error."""
+    real bill even when output is expensive but low-volume.
+
+    A PARTIAL per-type override (e.g. only `out_1m`, leaving input/cache blank) would otherwise
+    blend the blank types as $0 and zero-deflate the derived usd_1m. `fill_in/fill_out/fill_cache`
+    (LiteLLM's own live rate for the model, passed by the handler) fill ONLY the blanks for the
+    blend; the stored per-type columns still hold just the operator's explicit overrides, so the
+    card keeps showing which types were pinned. False on a bad value/DB error."""
     model = str(model or "").strip()
     if not model:
         return False
@@ -2426,7 +2545,16 @@ def model_cost_price_set(model: str, usd_1m: float, now: float,
         pin, pout, pcache = _ok_rate(in_1m), _ok_rate(out_1m), _ok_rate(cache_1m)
         wi, wo, wc = _ok_rate(vol_in), _ok_rate(vol_out), _ok_rate(vol_cache)
         per_type = any(x is not None for x in (pin, pout, pcache))
-        v = _blend_1m(pin, pout, pcache, wi, wo, wc) if per_type else float(usd_1m)
+        if per_type:
+            # Blend from EFFECTIVE rates: the explicit override where set, else LiteLLM's live
+            # rate for the un-overridden type — a partial override never counts a blank type as $0.
+            fin, fout, fcache = _ok_rate(fill_in), _ok_rate(fill_out), _ok_rate(fill_cache)
+            ein = pin if pin is not None else fin
+            eout = pout if pout is not None else fout
+            ecache = pcache if pcache is not None else fcache
+            v = _blend_1m(ein, eout, ecache, wi, wo, wc)
+        else:
+            v = float(usd_1m)
         if v < 0 or v != v or v == float("inf"):
             return False
     except (TypeError, ValueError):
@@ -2511,18 +2639,24 @@ def api_token_create(tid: str, owner: str, role: str, label: str,
 
 
 def api_token_lookup(token_hash: str) -> dict[str, Any] | None:
-    """Resolve a presented token (by hash) to its owner + role, but only if the
-    token is enabled AND its owner still exists and is not disabled. None otherwise."""
+    """Resolve a presented token (by hash) to its owner + EFFECTIVE role, but only if the
+    token is enabled AND its owner still exists and is not disabled. None otherwise.
+
+    The effective role is the LOWER of the token's stored role and the owner's CURRENT role:
+    a token carries its own role, so a user who minted an admin PAT and was later demoted to
+    viewer must not keep admin via that token. Capping at read time closes the gap without
+    having to mutate every PAT on a role change."""
     try:
         with _connect() as conn:
             r = conn.execute(
-                "SELECT t.id, t.owner, t.role FROM api_tokens t "
+                "SELECT t.id, t.owner, t.role, u.role FROM api_tokens t "
                 "JOIN users u ON u.name = t.owner "
                 "WHERE t.token_hash = ? AND t.disabled = 0 AND u.disabled = 0",
                 (token_hash,)).fetchone()
         if not r:
             return None
-        return {"id": r[0], "owner": r[1], "role": r[2]}
+        eff_role = "admin" if (r[2] == "admin" and r[3] == "admin") else "viewer"
+        return {"id": r[0], "owner": r[1], "role": eff_role}
     except Exception as _e:
         _dberr(_e)
         return None

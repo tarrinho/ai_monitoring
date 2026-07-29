@@ -201,7 +201,7 @@ function updateSeries(chart,labels,next){
             if(a) a.classList.toggle("has-alert",(d.active||[]).length>0);
           }).catch(function(){});
       }
-      _alertDot(); setInterval(_alertDot, 10000);
+      _alertDot(); _timers.push(setInterval(_alertDot, 10000));
     }catch(e){}
   });
 })();
@@ -235,7 +235,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.10</div>
+      <div id="sidebar-brand-ver">v1.8.12</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -517,12 +517,14 @@ function mkChart(canvas, cfg){
     sec.append(hd, grid);
     container.appendChild(sec);
     const KEY = "aimon_g_" + gname;
-    function apply(c){ sec.classList.toggle("collapsed", c); caret.textContent = c ? "▸" : "▾"; }
-    hd.addEventListener("click", function(){
+    function apply(c){ sec.classList.toggle("collapsed", c); caret.textContent = c ? "▸" : "▾";
+      hd.setAttribute("aria-expanded", c ? "false" : "true"); }
+    a11yToggle(hd, function(){        // keyboard + AT accessible (Enter/Space), not just mouse
       const c = !sec.classList.contains("collapsed");
       apply(c); try{ localStorage.setItem(KEY, c ? "1" : "0"); }catch(e){}
     });
-    try{ if(localStorage.getItem(KEY) === "1") apply(true); }catch(e){}
+    let _gInit=false; try{ _gInit = localStorage.getItem(KEY) === "1"; }catch(e){}
+    apply(_gInit);                     // also seeds aria-expanded on first paint
   }
 })();
 
@@ -1038,7 +1040,7 @@ function renderStrip(c, now){
     +dot("containers",c.containers)+`<span class="sep"></span>`
     +`<span class="s mut">GPU util · LiteLLM backlog · llama.cpp slots</span>`);
 }
-let _sseOk=false, _ver="";
+let _sseOk=false, _lastSse=0, _ver="";
 // render everything that comes from a live snapshot (shared by SSE + poll)
 function applySnapshot(d){
   if(d.version){ _ver=d.version; }
@@ -1059,9 +1061,14 @@ function applySnapshot(d){
   } else { up.textContent="—"; }
 }
 async function tick(){
-  // when SSE is delivering, skip the snapshot poll (SSE covers it); always
-  // refresh the windowed series (not carried over the stream)
-  if(!_sseOk){
+  // SSE covers the snapshot poll ONLY while it's actually delivering. A stream that stays
+  // OPEN but stops sending (half-open TCP, an idle-timeout proxy, a wedged server sampler)
+  // never fires es.onerror, so relying on _sseOk alone would suppress polling forever and the
+  // page would silently freeze while still looking "connected". Watchdog: require a message
+  // within the last ~12s (pure client-clock delta, skew-immune); otherwise fall back to polling
+  // until the stream resumes. Always refresh the windowed series (not carried over the stream).
+  const sseFresh = _sseOk && (Date.now()-_lastSse < 12000);
+  if(!sseFresh){
     const d = await api("/api/data?history=1");
     if(d) applySnapshot(d);
   }
@@ -1076,7 +1083,7 @@ function startSSE(){
   const url="/api/stream"+(AUTH?("?token="+encodeURIComponent(AUTH)):"");
   let es; try{ es=new EventSource(url); }catch(e){ return; }
   es.onmessage=function(ev){
-    try{ applySnapshot({version:_ver, latest:JSON.parse(ev.data), now:Date.now()/1000}); _sseOk=true; }
+    try{ applySnapshot({version:_ver, latest:JSON.parse(ev.data), now:Date.now()/1000}); _sseOk=true; _lastSse=Date.now(); }
     catch(e){}
   };
   es.onerror=function(){ _sseOk=false; };
