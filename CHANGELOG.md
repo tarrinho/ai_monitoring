@@ -17,6 +17,9 @@ opt-ins.
 ### Deployment
 - **Default-deny NetworkPolicy template (T-17)** expanded in `deploy/k8s/ai-monitoring.yaml`: the optional (commented) policy now covers **egress** as well as ingress — a ready starting point to bound the pod to DNS + your LiteLLM/backend endpoints only, shrinking the SSRF/lateral-move blast radius. Stays commented, so zero change to existing clusters.
 
+### Build / CI
+- **Image CVE hygiene: pip is stripped from the runtime image.** `pip install --upgrade pip` now lands pip **26.2**, whose bundled `_vendor` pins `setuptools 70.3.0` (CVE-2025-47273) and `msgpack 1.1.2` (GHSA-6v7p-g79w-8964) — image scanners (Trivy) flag both, though they're only reachable when pip itself runs. The app runs `python app.py` and never installs packages at runtime, so the runtime stage now removes pip entirely: clears the two HIGH findings on every rebuild and shrinks the attack surface. The base + test stages keep pip. (Regression-guarded by `test_runtime_image_strips_pip`.)
+
 ## [1.8.13] — 2026-07-29
 
 _In progress._

@@ -1049,6 +1049,18 @@ def test_dockerfile_gates_build_on_tests():
     assert "COPY --from=test /qa-passed" in df
 
 
+def test_runtime_image_strips_pip():
+    """Image-CVE hygiene: the RUNTIME stage removes pip. The app never installs packages at
+    runtime, and pip's vendored deps otherwise surface as image-scan HIGHs (pip 26.2 vendors
+    setuptools 70.3.0 → CVE-2025-47273 and msgpack 1.1.2 → GHSA-6v7p-g79w-8964). Stripping pip
+    keeps Trivy green on every rebuild regardless of which pip the base image ships."""
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "AS runtime" in df
+    runtime = df[df.index("AS runtime"):]            # only the runtime stage
+    assert "rm -rf" in runtime and "site-packages/pip" in runtime, \
+        "runtime stage must strip pip (unused at runtime; its vendored deps flag as CVEs)"
+
+
 def test_every_metric_column_charted_somewhere():
     # regression guard: any new db metric column must appear as a chart key in
     # at least one dashboard, else it silently never gets graphed.

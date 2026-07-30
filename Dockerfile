@@ -77,6 +77,15 @@ COPY web/ ./web/
 # not exist and the whole build fails here.
 COPY --from=test /qa-passed /qa-passed
 
+# Strip pip from the RUNTIME image: the app runs `python app.py` and NEVER installs packages, so
+# pip — and its VENDORED deps that image scanners flag but which are only reachable when pip
+# itself runs (pip 26.2's _vendor pins setuptools 70.3.0 → CVE-2025-47273 and msgpack 1.1.2 →
+# GHSA-6v7p-g79w-8964) — has no runtime purpose. Removing it clears those non-exploitable findings
+# and shrinks the attack surface. The base + test stages keep pip (they need it to install deps).
+RUN rm -rf /usr/local/lib/python*/site-packages/pip \
+           /usr/local/lib/python*/site-packages/pip-*.dist-info \
+           /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.* 2>/dev/null || true
+
 # non-root (BusyBox adduser: -D no password, -H no home — /app already exists)
 RUN adduser -D -H -u 10001 monitor \
     && mkdir -p /data && chown -R monitor:monitor /app /data
