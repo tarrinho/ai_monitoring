@@ -54,7 +54,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: ai-monitoring
-          image: ghcr.io/tarrinho/ai_monitoring:1.8.13
+          image: ghcr.io/tarrinho/ai_monitoring:1.8.14
           ports:
             - { name: http, containerPort: 9925 }
           securityContext:                    # restricted Pod Security Standard
@@ -117,9 +117,11 @@ spec:
           name: ai-monitoring
           key: MONITOR_METRICS_TOKEN
 ---
-# OPTIONAL NetworkPolicy — uncomment + adjust to restrict who can reach the
-# dashboard/metrics. Default is commented out so cross-namespace Prometheus scraping
-# keeps working out of the box. Set the namespaceSelector to your Prometheus namespace.
+# OPTIONAL NetworkPolicy — uncomment + adjust to restrict who can reach the dashboard/metrics
+# AND, importantly, to bound the pod's EGRESS (default-deny egress shrinks the SSRF/lateral-move
+# blast radius: the pod should only reach DNS + your LiteLLM/backend endpoints, nothing else).
+# Left commented so cross-namespace Prometheus scraping + backend egress keep working out of the
+# box — enable it once you have pinned your Prometheus namespace and backend CIDRs/ports below.
 # apiVersion: networking.k8s.io/v1
 # kind: NetworkPolicy
 # metadata:
@@ -128,7 +130,7 @@ spec:
 # spec:
 #   podSelector:
 #     matchLabels: { app.kubernetes.io/name: ai-monitoring }
-#   policyTypes: ["Ingress"]
+#   policyTypes: ["Ingress", "Egress"]
 #   ingress:
 #     - from:
 #         - namespaceSelector:
@@ -136,3 +138,15 @@ spec:
 #         - podSelector: {}                                              # + same namespace
 #       ports:
 #         - { protocol: TCP, port: 9925 }
+#   egress:
+#     # DNS (kube-dns) — required for resolving backend/LiteLLM hostnames
+#     - to: [ { namespaceSelector: {} } ]
+#       ports: [ { protocol: UDP, port: 53 }, { protocol: TCP, port: 53 } ]
+#     # ONLY your LiteLLM proxy + LLM backends — replace with their pod/namespace selectors
+#     # or ipBlock CIDRs + ports. Everything else (cloud metadata, internal APIs) is denied,
+#     # so a compromised collector or a user-webhook SSRF cannot reach it.
+#     - to:
+#         - podSelector: { matchLabels: { app: litellm } }               # e.g. your LiteLLM
+#       ports: [ { protocol: TCP, port: 4000 } ]
+#     # - to: [ { ipBlock: { cidr: 10.0.0.0/24 } } ]                     # e.g. a vLLM host range
+#     #   ports: [ { protocol: TCP, port: 8000 } ]

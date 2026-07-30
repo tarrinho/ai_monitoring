@@ -16,6 +16,7 @@ import asyncio
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.parse
 
@@ -51,8 +52,13 @@ PAGES = ["/", "/litellm", "/vllm", "/alerts"]
 
 # A console line that means the page's JS aborted mid-run — the exact failure signature of the
 # legend-hang class (infinite recursion → stack overflow) plus any other uncaught exception.
+# Match GENUINE page JS-error phrases. The bare word "Unhandled" must NOT be here: some Chromium
+# builds dump internal telemetry (Histogram: lines whose metric names contain "Unhandled") to
+# stderr under --v=1, and a bare-word match false-positived on that noise (CI flake). The real JS
+# signature is "Unhandled (promise) rejection". "Uncaught" stays broad — it's JS-specific and has
+# never collided with telemetry, and narrowing it would miss "Uncaught (in promise) …" forms.
 _FATAL_JS = re.compile(
-    r"Maximum call stack size exceeded|\bUncaught\b|Unhandled|"
+    r"Maximum call stack size exceeded|\bUncaught\b|Unhandled(?: promise)? rejection|"
     r"is not a function|is not defined|SyntaxError",
     re.IGNORECASE)
 
@@ -78,14 +84,19 @@ def _render(url: str) -> tuple[str, str]:
     errors to stderr. Bounded by a virtual-time budget (so a genuine infinite hang can't wedge
     the build) and a hard subprocess timeout."""
     assert CHROME                                 # guaranteed by the module-level skipif
-    p = subprocess.run(
-        [CHROME, "--headless=new", "--no-sandbox", "--disable-gpu",
-         "--disable-dev-shm-usage", "--enable-logging=stderr", "--v=1",
-         "--no-first-run", "--disable-background-networking", "--disable-component-update",
-         "--disable-sync", "--disable-default-apps",
-         "--virtual-time-budget=8000", "--run-all-compositor-stages-before-draw",
-         "--dump-dom", url],
-        capture_output=True, text=True, timeout=90)
+    # Isolated per-render profile: without --user-data-dir, concurrent/back-to-back Chromium
+    # invocations contend on (and lock) the shared DEFAULT profile dir → the subprocess hangs to
+    # its 90s timeout under load. A throwaway dir per render removes that contention entirely.
+    with tempfile.TemporaryDirectory(prefix="aimon-smoke-") as _profile:
+        p = subprocess.run(
+            [CHROME, "--headless=new", "--no-sandbox", "--disable-gpu",
+             "--disable-dev-shm-usage", f"--user-data-dir={_profile}",
+             "--enable-logging=stderr", "--v=1",
+             "--no-first-run", "--disable-background-networking", "--disable-component-update",
+             "--disable-sync", "--disable-default-apps",
+             "--virtual-time-budget=8000", "--run-all-compositor-stages-before-draw",
+             "--dump-dom", url],
+            capture_output=True, text=True, timeout=90)
     return p.stdout, p.stderr
 
 

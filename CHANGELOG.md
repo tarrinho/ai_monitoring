@@ -4,6 +4,19 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.14] — 2026-07-29
+
+Threat-model hardening. The remaining higher-value config/deployment risks (open-mode refusal,
+forced socket-proxy, rate-limit/hostPID changes) require a behavior change and stay documented
+opt-ins.
+
+### Security
+- **SSRF (T-9): a per-user webhook could reach private/internal addresses when `WEBHOOK_ALLOW_PRIVATE=1`.** That flag's only real effect was on USER-supplied webhooks (the trusted operator-global `ALERT_WEBHOOK_URL` bypasses validation entirely), so on its own it handed any viewer an unconstrained SSRF primitive (POST to cloud-metadata / internal services). A private/reserved target is now permitted **only** when the operator ALSO pins it with an explicit `WEBHOOK_ALLOW_HOSTS` allow-list (`_priv_allowed()`), enforced in both the save-time validator and the connect-time SSRF resolver. **Behavior note:** `WEBHOOK_ALLOW_PRIVATE` alone no longer relaxes the check — pair it with `WEBHOOK_ALLOW_HOSTS`. Public webhooks and the operator-global URL are unaffected.
+- **Exposure signal (T-1): open mode on a non-loopback bind is now surfaced at startup.** `startup_selfcheck()` flags a deployment running with no dashboard token AND no users while bound to a non-loopback interface — every non-admin surface (per-user spend, request attribution, owner emails) is world-readable there. Informational only (boot is never blocked; `MONITOR_ALLOW_OPEN` already governs whether open mode is allowed at all), shown in logs + the settings health panel.
+
+### Deployment
+- **Default-deny NetworkPolicy template (T-17)** expanded in `deploy/k8s/ai-monitoring.yaml`: the optional (commented) policy now covers **egress** as well as ingress — a ready starting point to bound the pod to DNS + your LiteLLM/backend endpoints only, shrinking the SSRF/lateral-move blast radius. Stays commented, so zero change to existing clusters.
+
 ## [1.8.13] — 2026-07-29
 
 _In progress._

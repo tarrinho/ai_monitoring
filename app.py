@@ -4040,6 +4040,17 @@ def startup_selfcheck() -> list[str]:
         problems.append(f"weak dashboard token ({len(config.DASHBOARD_TOKEN)} chars) "
                         "— use ≥16 random chars; rate-limit is on but a short token "
                         "is still guessable")
+    # OPEN MODE (no DASHBOARD_TOKEN and no users) on a non-loopback bind means every
+    # non-admin surface — including per-user spend/attribution + owner emails — is served
+    # to anyone who can reach the port. Surface it loudly at boot + in the settings health
+    # panel. Informational only (we never refuse to start — a deliberate localhost/demo
+    # open-mode deployment stays valid); the operator decides.
+    if not _auth_enabled() and config.MONITOR_HOST not in ("127.0.0.1", "::1", "localhost"):
+        problems.append(
+            f"OPEN MODE bound to {config.MONITOR_HOST} — no dashboard token and no users, so "
+            "every non-admin surface (incl. per-user spend, request attribution and owner "
+            "emails) is world-readable. Set MONITOR_DASHBOARD_TOKEN or create a user, or bind "
+            "to 127.0.0.1.")
     return problems
 
 

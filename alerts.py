@@ -53,6 +53,15 @@ def _host_allowed(host: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in hosts)
 
 
+def _priv_allowed() -> bool:
+    """May a USER webhook resolve to a private/reserved address? Only when the operator has
+    ALSO pinned the targets with an explicit allow-list (WEBHOOK_ALLOW_HOSTS). WEBHOOK_ALLOW_PRIVATE
+    alone is NOT enough — on its own it would hand any viewer an unconstrained SSRF primitive
+    (POST to cloud-metadata / internal services). The trusted operator-global ALERT_WEBHOOK_URL
+    bypasses this whole path, so a LAN operator's own alert URL is unaffected either way."""
+    return config.WEBHOOK_ALLOW_PRIVATE and bool(config.WEBHOOK_ALLOW_HOSTS.strip())
+
+
 def _validate_sync(url: str) -> str | None:
     """None if the user webhook URL is safe to POST to, else a reason string."""
     if not url or len(url) > 2048:
@@ -70,7 +79,7 @@ def _validate_sync(url: str) -> str | None:
         return "URL has no host"
     if not _host_allowed(host):
         return "host is not in the webhook allowlist"
-    if config.WEBHOOK_ALLOW_PRIVATE:
+    if _priv_allowed():        # private targets only when explicitly allow-listed (see _priv_allowed)
         return None
     port = u.port or (443 if u.scheme == "https" else 80)
     try:
@@ -102,7 +111,7 @@ class _SSRFResolver(AbstractResolver):
     async def resolve(self, host: str, port: int = 0,
                       family: socket.AddressFamily = socket.AF_UNSPEC) -> list:
         infos = await self._base.resolve(host, port, family)
-        if config.WEBHOOK_ALLOW_PRIVATE:
+        if _priv_allowed():        # private targets only when explicitly allow-listed
             return infos
         safe = [i for i in infos if not _ip_blocked(str(i["host"]))]
         if not safe:

@@ -601,7 +601,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.13"
+    assert config.VERSION == "AI-Monitoring_1.8.14"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -1033,9 +1033,12 @@ def test_docs_present_and_current():
 
 
 def test_startup_selfcheck_clean():
-    # the per-run boot smoke check must pass in a healthy checkout
+    # the per-run boot smoke check must find no STRUCTURAL problem in a healthy checkout.
+    # The open-mode advisory is a config warning about THIS env (test config runs tokenless
+    # on 0.0.0.0), not a checkout defect — filter it so the structural intent stays exact.
     import app
-    assert app.startup_selfcheck() == []
+    problems = [p for p in app.startup_selfcheck() if "OPEN MODE" not in p]
+    assert problems == []
 
 
 def test_dockerfile_gates_build_on_tests():

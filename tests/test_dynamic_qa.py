@@ -7363,14 +7363,16 @@ def test_webhook_db_crud():
 async def test_webhook_ssrf_validation(monkeypatch):
     # No test relies on real DNS (the in-image gate has no network): private targets
     # are IP LITERALS (getaddrinfo returns them verbatim), and the "public passes"
-    # cases use ALLOW_PRIVATE=True which skips the resolve step.
+    # cases use ALLOW_PRIVATE + an explicit allow-list, which skips the resolve step.
     monkeypatch.setattr(config, "WEBHOOK_HTTPS_ONLY", False)
     monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "")
     monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", False)
     for bad in ("http://169.254.169.254/latest/meta", "http://127.0.0.1:9000/x",
                 "http://10.1.2.3/hook", "http://[::1]/x", "ftp://host/x", "notaurl"):
         assert await alerts.validate_webhook_url(bad) is not None, bad
-    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)   # skip DNS/IP check
+    # ALLOW_PRIVATE now skips the resolve ONLY together with an allow-list (T-9 hardening)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "hooks.slack.com")
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)   # + allow-list → skip DNS/IP check
     assert await alerts.validate_webhook_url("https://hooks.slack.com/services/x") is None
     monkeypatch.setattr(config, "WEBHOOK_HTTPS_ONLY", True)      # rejects http
     assert await alerts.validate_webhook_url("http://hooks.slack.com/x") is not None
@@ -7382,7 +7384,8 @@ async def test_webhook_ssrf_validation(monkeypatch):
 
 async def test_account_webhook_get_set(monkeypatch):
     monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
-    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)      # allow test host
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "hooks.example.test")   # allow-list gates the skip
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)      # + allow-list → allow test host
     db.user_create("wv", "v@x.io", auth.hash_password("wvpw1234"), "viewer", time.time())
     c = await _client()
     try:
@@ -7419,6 +7422,7 @@ async def test_account_webhook_rejects_ssrf_and_needs_csrf(monkeypatch):
 
 
 async def test_notifier_fans_out_to_user_webhooks(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "hooks.example.test")   # allow-list gates the skip
     monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
     monkeypatch.setattr(config, "ALERT_CPU_PCT", 50.0)
     monkeypatch.setattr(config, "ALERT_REPEAT_MIN", 9999)
@@ -7442,6 +7446,7 @@ async def test_notifier_fans_out_to_user_webhooks(monkeypatch):
 
 async def test_webhook_set_is_audited(monkeypatch):
     monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "hooks.example.test")   # allow-list gates the skip
     monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
     db.user_create("wa", "a@x.io", auth.hash_password("wapw1234"), "viewer", time.time())
     c = await _client()
@@ -7496,8 +7501,10 @@ async def test_sec_webhook_resolver_pins_validated_ip(monkeypatch):
 
 
 async def test_sec_webhook_resolver_respects_allow_private(monkeypatch):
-    # the operator opt-in must still reach a LAN host (resolver mustn't over-block)
+    # the operator opt-in (ALLOW_PRIVATE + an explicit allow-list) must still reach a LAN host
+    # (resolver mustn't over-block once the target is allow-list-pinned)
     import alerts
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "lan.internal")
     monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
     r = alerts._SSRFResolver()
 
@@ -10677,6 +10684,47 @@ async def test_q_end_rejects_non_finite():
         req = make_mocked_request("GET", f"/api/x?end={good}")
         assert appmod._q_end(req) == exp
     assert appmod._q_end(make_mocked_request("GET", "/api/x")) is None   # absent → live
+
+
+def test_webhook_private_target_requires_allowlist(monkeypatch):
+    """Threat-model T-9: a per-user webhook may resolve to a private/reserved address ONLY when
+    the operator ALSO pins it with WEBHOOK_ALLOW_HOSTS. WEBHOOK_ALLOW_PRIVATE on its own no
+    longer opens an unconstrained SSRF pivot. Public + allow-listed-private targets still
+    validate (IP literal → getaddrinfo echoes it, offline-safe)."""
+    import alerts
+    priv = "http://169.254.169.254/hook"     # link-local (cloud-metadata) — always _ip_blocked
+    monkeypatch.setattr(alerts.socket, "getaddrinfo",
+                        lambda host, port, **k: [(2, 1, 6, "", (host, port))])
+    monkeypatch.setattr(config, "WEBHOOK_HTTPS_ONLY", False)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", False)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "")
+    assert alerts._validate_sync(priv) is not None            # default: blocked
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", True)
+    assert alerts._priv_allowed() is False                    # ALLOW_PRIVATE alone is NOT enough
+    assert alerts._validate_sync(priv) is not None            # still blocked (the fix)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "169.254.169.254")
+    assert alerts._priv_allowed() is True                     # + allow-list → LAN opt-in preserved
+    assert alerts._validate_sync(priv) is None
+    # a public IP is always fine — no allow-list, no ALLOW_PRIVATE needed (zero impact)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_PRIVATE", False)
+    monkeypatch.setattr(config, "WEBHOOK_ALLOW_HOSTS", "")
+    assert alerts._validate_sync("http://1.1.1.1/hook") is None
+
+
+def test_startup_selfcheck_flags_open_mode_on_nonloopback(monkeypatch, tmp_path):
+    """Threat-model T-1: open mode (no dashboard token AND no users) bound to a non-loopback
+    interface is surfaced as a startup problem (world-readable spend/attribution). Informational
+    — never blocks boot; a loopback bind or any auth suppresses it."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "sc.db"))
+    db.init()                                    # fresh db → 0 users
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    monkeypatch.setattr(config, "MONITOR_HOST", "0.0.0.0")
+    assert any("OPEN MODE" in p for p in appmod.startup_selfcheck())
+    monkeypatch.setattr(config, "MONITOR_HOST", "127.0.0.1")   # loopback → suppressed
+    assert not any("OPEN MODE" in p for p in appmod.startup_selfcheck())
+    monkeypatch.setattr(config, "MONITOR_HOST", "0.0.0.0")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "x" * 20)   # a token → not open mode
+    assert not any("OPEN MODE" in p for p in appmod.startup_selfcheck())
 
 
 async def test_spend_series_cache_bypassed_and_not_poisoned_by_pan(monkeypatch):

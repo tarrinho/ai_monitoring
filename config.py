@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.13"
+VERSION = "AI-Monitoring_1.8.14"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -378,7 +378,10 @@ ALERT_WEBHOOK_URL     = _str("ALERT_WEBHOOK_URL")          # operator-set global
 # Per-user webhooks (each user configures their own at /account) are USER-supplied,
 # so they are SSRF-validated: by default a URL that resolves to a private/loopback/
 # link-local/metadata address is refused (both when saved and before each send —
-# DNS-rebinding aware). Set WEBHOOK_ALLOW_PRIVATE=1 only for trusted LANs.
+# DNS-rebinding aware). WEBHOOK_ALLOW_PRIVATE=1 relaxes this for trusted LANs, but ONLY in
+# combination with WEBHOOK_ALLOW_HOSTS — on its own it no longer lets a user webhook reach a
+# private address (that would be an unconstrained SSRF primitive). The trusted operator-global
+# ALERT_WEBHOOK_URL is exempt from this path and can always point at a LAN host.
 WEBHOOK_ALLOW_PRIVATE = (_str("MONITOR_WEBHOOK_ALLOW_PRIVATE", "0") or "0").lower() in ("1", "true", "yes", "on")
 # Require https for user webhooks (recommended when the monitor is internet-facing).
 WEBHOOK_HTTPS_ONLY    = (_str("MONITOR_WEBHOOK_HTTPS_ONLY", "0") or "0").lower() in ("1", "true", "yes", "on")
