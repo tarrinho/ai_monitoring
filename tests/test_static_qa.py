@@ -601,7 +601,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.14"
+    assert config.VERSION == "AI-Monitoring_1.8.15"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -4381,3 +4381,99 @@ def test_litellm_cards_show_loading_overlay_on_first_paint():
     assert '_cardShow("card-kpi"' in html and '_cardShow("card-anomalies")' in html
     # fast /api/data cards reveal right away (regression: they used to hold + show blank)
     assert '_cardShow("card-kpi","card-failures","card-keys","card-userkeys")' in html
+
+
+# Faithful-enough DOM shim for executing the loading-overlay logic: unlike _PAGE_JS_HARNESS
+# (querySelector always returns a truthy stub, remove() is a no-op), this tracks real children,
+# detaches on remove(), maps className→classList, and returns null-on-no-match for the overlay
+# selectors (.card-loading / canvas / table) while still handing other selectors a stub so the
+# rest of the page loads. Lets us EXECUTE _initLoading/_cardTry/_cardShow/_cardHasData.
+_DOM_HARNESS = r"""
+process.on('unhandledRejection', () => {});
+global.window = global; global.CUR = "€";
+global.addEventListener = () => {}; global.removeEventListener = () => {};
+let _uid = 0; const REG = {};
+function mkEl(tag){
+  const el = { id:"", tagName:String(tag||"div").toUpperCase(), textContent:"", _html:"",
+    _attrs:{}, style:{}, dataset:{}, _children:[], _parent:null, _cls:new Set(),
+    classList:{ add(c){el._cls.add(c);}, remove(c){el._cls.delete(c);}, toggle(){}, contains(c){return el._cls.has(c);} },
+    setAttribute(k,v){el._attrs[k]=v;}, getAttribute(k){return el._attrs[k]||null;},
+    getContext(){ return mkEl(); }, addEventListener(){}, append(){}, prepend(){}, before(){},
+    after(){}, replaceChildren(){}, insertAdjacentHTML(){}, focus(){}, closest(){ return mkEl(); },
+    appendChild(c){ c._parent = el; el._children.push(c); return c; },
+    remove(){ if(el._parent){ const a=el._parent._children, i=a.indexOf(el); if(i>=0)a.splice(i,1); el._parent=null; } },
+    querySelector(sel){
+      const isCls = sel[0]===".", key = isCls ? sel.slice(1) : sel.toUpperCase();
+      const dfs = n => { for(const c of n._children){ const hit = isCls ? c._cls.has(key) : (c.tagName===key);
+        if(hit) return c; const r = dfs(c); if(r) return r; } return null; };
+      const found = dfs(el);
+      if(found) return found;
+      // null-on-no-match ONLY for the overlay-relevant selectors; stub otherwise (page compat)
+      return (sel===".card-loading" || sel==="canvas" || sel==="table") ? null : mkEl();
+    },
+    querySelectorAll(){ return []; } };
+  Object.defineProperty(el, "innerHTML", { get(){ return el._html; }, set(v){ el._html = v; } });
+  Object.defineProperty(el, "className", { get(){ return [...el._cls].join(" "); },
+    set(v){ el._cls = new Set(String(v).split(/\s+/).filter(Boolean)); } });
+  return el;
+}
+global.document = { getElementById: id => (REG[id] || (REG[id] = Object.assign(mkEl("div"), {id}))),
+  querySelector: () => mkEl(), querySelectorAll: () => [], createElement: t => mkEl(t),
+  addEventListener: () => {}, body: mkEl(), documentElement: mkEl(), head: mkEl(), cookie:"", title:"" };
+global.location = { search:"?token=x", pathname:"/litellm", href:"", hostname:"x" };
+global.localStorage = { getItem: () => null, setItem: () => {} };
+global.matchMedia = () => ({ matches:false, addEventListener(){} });
+global.setInterval = () => 0; global.clearInterval = () => {}; global.setTimeout = () => 0;
+global.fetch = () => Promise.resolve({ ok:true, status:200, json:()=>Promise.resolve({}), text:()=>Promise.resolve("") });
+global.getComputedStyle = () => ({ getPropertyValue: () => "" });
+global.Chart = function(_c, cfg){ const data=(cfg&&cfg.data)||{labels:[],datasets:[]};
+  (data.datasets||[]).forEach(ds=>{ if(!ds.data) ds.data=[]; }); const opts=(cfg&&cfg.options)||{};
+  return { data, update(){}, destroy(){}, options:opts, config:{options:opts} }; };
+global.Chart.defaults = {}; global.DOMPurify = { sanitize: s => s };
+"""
+
+
+def test_litellm_loading_overlay_stays_until_data_executed():
+    """Behavioural (code review, Important): EXECUTE the loading-overlay logic under a faithful
+    DOM shim. A data-backed card keeps its overlay while it has no data, reveals once data
+    arrives, and reveals after _EMPTY_MAX empty polls so a genuinely-empty window can't spin
+    forever; _cardShow reveals at once. Uses the non-canvas utHas path (card-usertokens)."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    combined = _core_js() + "\n" + "\n".join(
+        m.group(1) for m in re.finditer(r"<script>([\s\S]*?)</script>", html))
+    probe = r"""
+    function _ovl(id){ const el=document.getElementById(id); return !!(el && el.querySelector(".card-loading")); }
+    const out = {};
+    out.injected = _ovl("card-usertokens");                 // _initLoading ran on load
+    utHas = false;
+    out.staysWhileEmpty = [];
+    for (let i=1;i<_EMPTY_MAX;i++){ _cardTry("card-usertokens"); out.staysWhileEmpty.push(_ovl("card-usertokens")); }
+    _cardTry("card-usertokens");                            // the _EMPTY_MAX-th empty poll
+    out.revealedAtCap = !_ovl("card-usertokens");
+    // fresh overlay + data present -> revealed immediately
+    { const c=document.getElementById("card-usertokens"), ov=document.createElement("div");
+      ov.className="card-loading"; c.appendChild(ov); }
+    utHas = true; _cardTry("card-usertokens");
+    out.revealedOnData = !_ovl("card-usertokens");
+    // _cardShow reveals at once (card-kpi still carries its _initLoading overlay)
+    out.kpiHadOverlay = _ovl("card-kpi");
+    _cardShow("card-kpi");
+    out.showRevealsNow = !_ovl("card-kpi");
+    console.log("PROBE:" + JSON.stringify(out));
+    """
+    script = _DOM_HARNESS + "\ntry {\n" + combined + "\n" + probe + \
+        '\n} catch (e) { console.error("THREW: " + e.message); process.exit(3); }\n'
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, f"litellm.html JS threw:\n{out.stderr.strip()}"
+    line = next((ln for ln in out.stdout.splitlines() if ln.startswith("PROBE:")), None)
+    assert line, f"no probe output:\n{out.stdout}\n{out.stderr}"
+    seen = json.loads(line[len("PROBE:"):])
+    assert seen["injected"] is True, "_initLoading must inject an overlay on card-usertokens"
+    assert all(seen["staysWhileEmpty"]), "overlay must STAY while the card has no data"
+    assert seen["revealedAtCap"] is True, "bounded fallback must reveal after _EMPTY_MAX empty polls"
+    assert seen["revealedOnData"] is True, "overlay must clear once the card has data"
+    assert seen["kpiHadOverlay"] is True, "card-kpi should start with its _initLoading overlay"
+    assert seen["showRevealsNow"] is True, "_cardShow must reveal immediately"

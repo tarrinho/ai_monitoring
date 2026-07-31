@@ -14,6 +14,8 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
+
+import obslog
 from typing import Any, cast
 
 import config
@@ -46,7 +48,7 @@ def _dberr(exc: BaseException) -> None:
         fn = sys._getframe(1).f_code.co_name
         _DB_ERR_COUNT += 1
         _DB_LAST = (fn, f"{type(exc).__name__}: {exc}", time.time())
-        sys.stderr.write(f"[db] {fn}: {type(exc).__name__}: {exc}\n")
+        obslog.get("db").warning(f"{fn}: {type(exc).__name__}: {exc}")
     except Exception:
         pass
 
@@ -1626,13 +1628,38 @@ def self_uptime_segments(window: str, end: float | None = None,
     """
     import config as _cfg
     secs = window_secs(window)
-    now = end or time.time()
+    real_now = time.time()
+    now = end or real_now
     start = now - secs
-    thresh = max(15.0, gap_factor * getattr(_cfg, "SAMPLE_INTERVAL", 5.0))
+    # Tier the cadence source by retention: the raw `metrics` table is pruned to ROLLUP_RAW_HOURS
+    # (~24h), so a 30d / 12mo window read ONLY from raw would see samples for the last day and
+    # fabricate weeks/months of false "down" on the site lane. Pick the tier that covers the
+    # window's oldest point: raw (ts, SAMPLE_INTERVAL cadence, ~24h retention) → metrics_1m (bucket,
+    # 60 s, up to 30 d) → metrics_1h (bucket, 3600 s, ROLLUP_HOUR_DAYS ~365 d). A missing bucket
+    # (gap > gap_factor x the tier's interval) means the monitor wasn't sampling.
+    #
+    # `oldest_age` = age of the window's START from REAL now (live window ⇒ exactly `secs`; a
+    # window PANNED into history is old even if its span is short, so it too skips the pruned raw
+    # table). The raw boundary carries a +60 s tolerance ONLY to absorb the sub-second epsilon of a
+    # live/near-live window landing on the exact 24h edge — a genuinely panned 24h window (minutes
+    # back) exceeds it and correctly tiers to metrics_1m instead of showing a false leading gap.
+    oldest_age = real_now - start
+    if oldest_age <= getattr(_cfg, "ROLLUP_RAW_HOURS", 24) * 3600.0 + 60.0:
+        table, tcol, interval = "metrics", "ts", float(getattr(_cfg, "SAMPLE_INTERVAL", 5.0))
+    # metrics_1m only for windows up to 30 d (like _pick_tier) — never pull ~525k per-minute rows
+    # for a 12mo window just because 1m retention (ROLLUP_MIN_DAYS, 730 on the live box) reaches it.
+    elif oldest_age <= getattr(_cfg, "ROLLUP_MIN_DAYS", 30) * 86400.0 and secs <= 30 * 86400:
+        table, tcol, interval = "metrics_1m", "bucket", 60.0
+    else:
+        # metrics_1h is the floor: a window older than ROLLUP_HOUR_DAYS shows a leading edge gap
+        # (no deeper tier exists) — same as series()/_pick_tier.
+        table, tcol, interval = "metrics_1h", "bucket", 3600.0
+    thresh = max(15.0, gap_factor * interval)
     try:
         with _connect() as conn:
+            # table/tcol are fixed literals assigned just above (never caller input) — SQL-safe.
             rows = [r[0] for r in conn.execute(
-                "SELECT ts FROM metrics WHERE ts>=? AND ts<=? ORDER BY ts",
+                f"SELECT {tcol} FROM {table} WHERE {tcol}>=? AND {tcol}<=? ORDER BY {tcol}",  # noqa: S608
                 (start - thresh, now)).fetchall()]
     except Exception as _e:
         _dberr(_e)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.14"
+VERSION = "AI-Monitoring_1.8.15"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -115,9 +115,26 @@ AUTH_LOCKOUT_S   = _float("MONITOR_AUTH_LOCKOUT_S", 900.0)
 AUTH_USER_MAX_FAILS  = _int("MONITOR_AUTH_USER_MAX_FAILS", 10)
 AUTH_USER_LOCKOUT_S  = _float("MONITOR_AUTH_USER_LOCKOUT_S", 300.0)
 AUTH_TRUSTED_PROXY = (_str("MONITOR_AUTH_TRUSTED_PROXY", "0") or "0").lower() in ("1", "true", "yes", "on")
-# Log each collector's availability + error to stderr (docker logs) on startup
-# and whenever it changes — so you can see WHY a panel is missing (e.g. GPU).
+# --- structured logging (obslog.py) ------------------------------------------
+# One stdlib-`logging` pipeline (obslog.setup()) replaces the ad-hoc print()s. LOG_LEVEL is the
+# global floor (DEBUG/INFO/WARNING/ERROR); LOG_FORMAT is human 'text' (default, for `docker logs`)
+# or 'json' (one object per line for a fleet log aggregator). Per-component floors come from
+# MONITOR_LOG_LEVEL_<logger> env vars (e.g. MONITOR_LOG_LEVEL_aimon.litellm=debug). Identical lines
+# within LOG_DEDUPE_S seconds collapse so a flapping backend can't spam every tick (0 disables).
+LOG_LEVEL    = (_str("MONITOR_LOG_LEVEL", "INFO") or "INFO").upper()
+LOG_FORMAT   = (_str("MONITOR_LOG_FORMAT", "text") or "text").lower()
+LOG_DEDUPE_S = _float("MONITOR_LOG_DEDUPE_S", 60.0)
+# Legacy alias: MONITOR_DEBUG=1 behaves like LOG_LEVEL=DEBUG (kept so existing deployments/tests
+# keep working); it still gates the on-change collector-status lines, which are DEBUG-level.
 MONITOR_DEBUG = (_str("MONITOR_DEBUG", "0") or "0").lower() in ("1", "true", "yes", "on")
+
+
+def log_redaction_values() -> list[str]:
+    """Non-empty secret VALUES the logger scrubs if they ever appear verbatim in a line
+    (defence-in-depth alongside obslog's generic Bearer/sk-/token= patterns). Read at call
+    time so a live-reloaded token is still covered."""
+    return [v for v in (LITELLM_MASTER_KEY, DASHBOARD_TOKEN, METRICS_TOKEN, ADMIN_PASSWORD)
+            if isinstance(v, str) and v]
 
 # --- backends (all optional; a missing backend is reported "unconfigured") ---
 # LiteLLM (JSON endpoints only — NO prometheus).

@@ -4,6 +4,14 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.15] — 2026-07-31
+
+### Changed
+- **Logging is now one structured pipeline (`obslog.py`), replacing the ad-hoc `print()`s.** The ~30 scattered `print(…, file=sys.stderr)` calls (plus db.py's `stderr.write` and litellm's `_dbg`) are gone; every event now goes through stdlib `logging` via a per-component logger hierarchy (`aimon.access`, `aimon.spend`, `aimon.litellm`, `aimon.sampler`, `aimon.auth`, `aimon.collector`, `aimon.db`). Benefits: **real levels** (filter with `MONITOR_LOG_LEVEL`), **structured fields** (`extra={…}`), **automatic secret redaction** (Bearer tokens, `sk-…`, `?token=…`, and the configured master/dashboard/metrics tokens are scrubbed from every line), **duplicate collapsing** (a flapping backend no longer spams every tick — `MONITOR_LOG_DEDUPE_S`, default 60s), and **one system** (aiohttp's own loggers fold into the same handler, kept at WARNING+ so the 200s stay unlogged). Synchronous by design — no background thread — so it costs the same as the `print()`s it replaces. Security-audit events remain in SQLite (`db.audit_*`), unchanged.
+  - New env: `MONITOR_LOG_LEVEL` (default `INFO`), `MONITOR_LOG_FORMAT` (`text` default, human-readable for `docker logs`; `json` for a fleet log aggregator), `MONITOR_LOG_DEDUPE_S`, and per-component `MONITOR_LOG_LEVEL_<logger>` (e.g. `MONITOR_LOG_LEVEL_aimon.litellm=debug`).
+  - **Back-compat:** `MONITOR_DEBUG=1` now means `LOG_LEVEL=DEBUG`; `LITELLM_DEBUG=1` maps to `aimon.litellm=DEBUG`. Both kept working.
+  - Covered by `tests/test_obslog.py` (format, levels, redaction, dedupe, per-component, idempotent setup) + the migrated access/auth/db/collector logging tests.
+
 ## [1.8.14] — 2026-07-29
 
 Threat-model hardening. The remaining higher-value config/deployment risks (open-mode refusal,

@@ -9,7 +9,14 @@ uncaught exception the fuzzer reaches is therefore a real defect, not expected.
 Run locally:  pip install atheris && python fuzz/fuzz_parsers.py -runs=100000
 Built for ClusterFuzzLite via .clusterfuzzlite/ (compile_python_fuzzer).
 """
+import os
 import sys
+
+# Put the repo root on sys.path so `from collectors import ...` resolves whether this harness
+# is run directly (`python fuzz/fuzz_parsers.py` — the script's own dir, not the repo root, is
+# sys.path[0]) or built by ClusterFuzzLite's compile_python_fuzzer. Belt-and-suspenders with the
+# PYTHONPATH export in .clusterfuzzlite/build.sh (which is what lets PyInstaller BUNDLE them).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import atheris
 

@@ -752,30 +752,34 @@ async def test_containers_auto_discovers_all_host_containers(tmp_path, monkeypat
         await runner.cleanup()
 
 
-def test_collector_status_logging(monkeypatch, capsys):
-    """MONITOR_DEBUG logs each collector's availability + error on change, incl. a
-    GPU hint — so 'why is the GPU panel missing?' is visible in docker logs."""
+def test_collector_status_logging(caplog):
+    """At DEBUG level (MONITOR_DEBUG=1 / LOG_LEVEL=debug) the collector logger emits each
+    collector's availability + error on change, incl. a GPU hint — visible in docker logs."""
     import app as appmod
-    monkeypatch.setattr(config, "MONITOR_DEBUG", True)
+    import logging
     appmod._status_prev.clear()
     snap = {"collectors": {
         "host": {"available": True},
         "gpu": {"available": False, "error": "unconfigured"},
         "litellm": {"available": False, "error": "conn: ClientConnectorError"},
     }}
-    appmod._log_collector_status(snap)
-    err = capsys.readouterr().err
-    assert "[collector] host: OK" in err
-    assert "gpu: unavailable — unconfigured" in err and "GPU_SSH" in err
-    assert "litellm: unavailable — conn: ClientConnectorError" in err
+    with caplog.at_level(logging.DEBUG, logger="aimon.collector"):
+        appmod._log_collector_status(snap)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "aimon.collector"]
+    assert any("host: OK" in m for m in msgs)
+    assert any("gpu: unavailable — unconfigured" in m and "GPU_SSH" in m for m in msgs)
+    assert any("litellm: unavailable — conn: ClientConnectorError" in m for m in msgs)
     # unchanged status is NOT re-logged (only on change)
-    appmod._log_collector_status(snap)
-    assert capsys.readouterr().err == ""
-    # disabled => silent
-    monkeypatch.setattr(config, "MONITOR_DEBUG", False)
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="aimon.collector"):
+        appmod._log_collector_status(snap)
+    assert [r for r in caplog.records if r.name == "aimon.collector"] == []
+    # below DEBUG => silent (the function early-returns on !isEnabledFor(DEBUG))
+    caplog.clear()
     appmod._status_prev.clear()
-    appmod._log_collector_status(snap)
-    assert capsys.readouterr().err == ""
+    with caplog.at_level(logging.WARNING, logger="aimon.collector"):
+        appmod._log_collector_status(snap)
+    assert [r for r in caplog.records if r.name == "aimon.collector"] == []
 
 
 def test_gpu_file_mode(tmp_path, monkeypatch):
@@ -6072,10 +6076,11 @@ async def test_team_budget_inherited_by_members(monkeypatch):
         await c.close()
 
 
-async def test_litellm_auth_failure_reported_clearly(monkeypatch, capsys):
+async def test_litellm_auth_failure_reported_clearly(monkeypatch, caplog):
     # A rejected master key (401/403) must be reported CLEARLY in the log ("the
     # token is invalid/expired") and set an auth_error on the collector — not just a
     # bare "HTTP 401", and it must short-circuit the key-gated /spend calls.
+    import logging
     litellm._AUTH_BAD = False
 
     async def fake_fetch(session, url, headers=None, timeout_s=None):
@@ -6085,30 +6090,35 @@ async def test_litellm_auth_failure_reported_clearly(monkeypatch, capsys):
     monkeypatch.setattr(litellm, "fetch_json", fake_fetch)
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-wrong")
-    out = await litellm.sample(None)
+    with caplog.at_level(logging.INFO, logger="aimon.litellm"):
+        out = await litellm.sample(None)
     assert out.get("auth_error") is True
     assert "master key rejected" in (out.get("error") or "")
-    log = capsys.readouterr().err
+    log = " ".join(r.getMessage() for r in caplog.records if r.name == "aimon.litellm")
     assert "AUTH FAILED" in log and ("invalid" in log and "expired" in log)
     litellm._AUTH_BAD = False                  # reset shared state for other tests
 
 
-def test_note_auth_one_shot_and_recovery(capsys):
+def test_note_auth_one_shot_and_recovery(caplog):
     """_note_auth logs the failure ONCE (not every poll), stays quiet while still bad,
     then logs a single AUTH OK on recovery and clears the flag."""
+    import logging
     litellm._AUTH_BAD = False
-    assert litellm._note_auth("http://litellm:4000", "HTTP 401") is True   # bad → log
-    assert litellm._AUTH_BAD is True
-    assert litellm._note_auth("http://litellm:4000", "HTTP 403") is True   # still bad → quiet
-    err1 = capsys.readouterr().err
-    assert err1.count("AUTH FAILED") == 1 and "AUTH OK" not in err1
-    assert litellm._note_auth("http://litellm:4000", None) is False        # recovered
-    assert litellm._AUTH_BAD is False
-    err2 = capsys.readouterr().err
-    assert err2.count("AUTH OK") == 1
-    # a clean tick while already-good logs nothing
-    assert litellm._note_auth("http://litellm:4000", None) is False
-    assert capsys.readouterr().err == ""
+    with caplog.at_level(logging.INFO, logger="aimon.litellm"):
+        assert litellm._note_auth("http://litellm:4000", "HTTP 401") is True   # bad → log
+        assert litellm._AUTH_BAD is True
+        assert litellm._note_auth("http://litellm:4000", "HTTP 403") is True   # still bad → quiet
+        m1 = [r.getMessage() for r in caplog.records if r.name == "aimon.litellm"]
+        assert sum("AUTH FAILED" in m for m in m1) == 1 and not any("AUTH OK" in m for m in m1)
+        caplog.clear()
+        assert litellm._note_auth("http://litellm:4000", None) is False        # recovered
+        assert litellm._AUTH_BAD is False
+        m2 = [r.getMessage() for r in caplog.records if r.name == "aimon.litellm"]
+        assert sum("AUTH OK" in m for m in m2) == 1
+        # a clean tick while already-good logs nothing
+        caplog.clear()
+        assert litellm._note_auth("http://litellm:4000", None) is False
+        assert [r for r in caplog.records if r.name == "aimon.litellm"] == []
     litellm._AUTH_BAD = False
 
 
@@ -7650,50 +7660,52 @@ async def test_metrics_endpoint_enforces_lockout(monkeypatch):
         await c.close()
 
 
-# ── server error logging (1.3.2) ──────────────────────────────────────────────
-async def test_server_logs_failed_login(monkeypatch):
-    logs = []
-    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
+# ── server error logging → obslog access/auth loggers (never the 200s) ─────────
+async def test_server_logs_failed_login(caplog):
+    import logging
     db.user_create("le", "l@x.io", auth.hash_password("lepw1234"), "viewer", time.time())
     c = await _client()
     try:
-        await c.post("/login", data={"username": "le", "password": "WRONG"})
+        with caplog.at_level(logging.WARNING, logger="aimon.auth"):
+            await c.post("/login", data={"username": "le", "password": "WRONG"})
     finally:
         await c.close()
-    assert any("login FAILED" in m and "le" in m for m in logs)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "aimon.auth"]
+    assert any("login FAILED" in m and "le" in m for m in msgs)
 
 
-async def test_server_logs_denied_admin_action(monkeypatch):
+async def test_server_logs_denied_admin_action(monkeypatch, caplog):
+    import logging
     monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
-    logs = []
-    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
     db.user_create("vw", "v@x.io", auth.hash_password("vwpw1234"), "viewer", time.time())
     c = await _client()
     try:
-        await c.post("/login", data={"username": "vw", "password": "vwpw1234"})
-        await c.get("/api/admin/users")           # viewer -> 403
+        with caplog.at_level(logging.WARNING, logger="aimon.access"):
+            await c.post("/login", data={"username": "vw", "password": "vwpw1234"})
+            await c.get("/api/admin/users")           # viewer -> 403
     finally:
         await c.close()
-    assert any("[deny]" in m and "403" in m for m in logs)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "aimon.access"]
+    assert any("denied" in m and "403" in m for m in msgs)
 
 
-async def test_server_does_not_log_normal_200(monkeypatch):
+async def test_server_does_not_log_normal_200(monkeypatch, caplog):
+    import logging
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
     monkeypatch.setattr(config, "ALLOW_OPEN", True)
-    logs = []
-    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
     c = await _client()
     try:
-        assert (await c.get("/healthz")).status == 200
-        assert (await c.get("/gpu")).status == 200
+        with caplog.at_level(logging.INFO, logger="aimon.access"):
+            assert (await c.get("/healthz")).status == 200
+            assert (await c.get("/gpu")).status == 200
     finally:
         await c.close()
-    assert not any("healthz" in m or "/gpu" in m for m in logs)   # no 200 noise
+    msgs = [r.getMessage() for r in caplog.records if r.name == "aimon.access"]
+    assert not any("healthz" in m or "/gpu" in m for m in msgs)   # no 200 noise
 
 
-async def test_log_mw_logs_unhandled_exception_with_traceback(monkeypatch):
-    logs = []
-    monkeypatch.setattr(appmod, "_log", lambda m: logs.append(m))
+async def test_log_mw_logs_unhandled_exception_with_traceback(caplog):
+    import logging
 
     class _Req:
         method = "GET"
@@ -7701,9 +7713,11 @@ async def test_log_mw_logs_unhandled_exception_with_traceback(monkeypatch):
 
     async def boom(_r):
         raise ValueError("kaboom")
-    with pytest.raises(ValueError):
-        await appmod._log_mw(_Req(), boom)
-    assert any("500" in m and "Traceback" in m and "kaboom" in m for m in logs)
+    with caplog.at_level(logging.ERROR, logger="aimon.access"):
+        with pytest.raises(ValueError):
+            await appmod._log_mw(_Req(), boom)
+    # .exception() attaches exc_info → the formatter renders the traceback into caplog.text
+    assert "500" in caplog.text and "Traceback" in caplog.text and "kaboom" in caplog.text
 
 
 # ── forced first-login password change (1.3.2) ────────────────────────────────
@@ -9992,19 +10006,22 @@ async def test_hide_unassigned_saves_through_the_real_settings_endpoint(monkeypa
         await c.close()
 
 
-def test_db_swallowed_errors_are_logged_not_silent_d2(monkeypatch, capsys):
+def test_db_swallowed_errors_are_logged_not_silent_d2(monkeypatch, caplog):
     """REVIEW D-2: a monitoring tool must not fail its own storage silently. Every
-    `except Exception` in db.py logs the failing function + exception type to stderr while
-    still returning its empty default — so a query bug / schema drift / locked DB is
+    `except Exception` in db.py logs (aimon.db, WARNING) the failing function + exception type
+    while still returning its empty default — so a query bug / schema drift / locked DB is
     diagnosable instead of an indistinguishable empty result."""
+    import logging
     # parent "/etc/hostname" is a FILE → os.makedirs in _connect raises → every read fails
     monkeypatch.setattr(config, "DB_PATH", "/etc/hostname/nope.db")
-    assert db.series("1h", 100) == []                 # behaviour unchanged: empty default
-    err = capsys.readouterr().err
-    assert "[db] series:" in err, f"the failing function must be logged, not silent: {err!r}"
+    with caplog.at_level(logging.WARNING, logger="aimon.db"):
+        assert db.series("1h", 100) == []             # behaviour unchanged: empty default
+        assert db.key_series_window_delta("1h") == {"labels": [], "deltas": []}
+    msgs = [r.getMessage() for r in caplog.records if r.name == "aimon.db"]
+    assert any(m.startswith("series:") for m in msgs), \
+        f"the failing function must be logged, not silent: {msgs!r}"
     # a different read logs under ITS own function name (frame-accurate)
-    assert db.key_series_window_delta("1h") == {"labels": [], "deltas": []}
-    assert "[db] key_series_window_delta:" in capsys.readouterr().err
+    assert any(m.startswith("key_series_window_delta:") for m in msgs)
 
 
 def test_key_label_is_the_canonical_join_resolver_d1():
@@ -10419,6 +10436,7 @@ def test_self_uptime_segments_flags_a_metrics_gap(tmp_path, monkeypatch):
     than 3x the sample interval becomes a 'down' segment."""
     import time as _t
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "site.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)   # pin so a 24h window tiers to raw regardless of env
     monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
     db.init()
     now = _t.time()
@@ -10838,6 +10856,7 @@ def test_self_uptime_segments_no_metrics_is_no_data(tmp_path, monkeypatch):
     """No metrics rows at all → no_data (the site lane draws 'no data yet', never
     a fabricated up)."""
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "nosite.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)   # pin so a 24h window tiers to raw regardless of env
     db.init()
     out = db.self_uptime_segments("24h", end=1_000_000.0)
     assert out["no_data"] is True and out["segments"] == []
@@ -10847,6 +10866,7 @@ def test_self_uptime_segments_continuous_is_fully_up(tmp_path, monkeypatch):
     """Unbroken sample cadence across the window → 100% up, no down segment."""
     import time as _t
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cont.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)   # pin so a 24h window tiers to raw regardless of env
     monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
     db.init()
     now = _t.time()
@@ -10866,6 +10886,7 @@ def test_self_uptime_segments_current_down_when_no_recent_sample(tmp_path, monke
     ends in a down segment and uptime is below 100%."""
     import time as _t
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "tail.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)   # pin so a 24h window tiers to raw regardless of env
     monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
     db.init()
     now = _t.time()
@@ -11076,3 +11097,131 @@ async def test_budgets_ships_persisted_owner_map_for_by_user_charts(tmp_path, mo
         assert d["owner_names"].get("hist-key") == "hist@x.io"
     finally:
         await c.close()
+
+
+def test_self_uptime_segments_long_window_uses_rollup_not_fabricated_down(tmp_path, monkeypatch):
+    """Regression (code review, Critical): a 30d/12mo site-uptime read must tier to the
+    metrics_1h rollup (365d+ retention), NOT the raw `metrics` table (pruned to ~24h). Reading
+    raw for a long window fabricated weeks of false 'down'. With hourly buckets present, a 6h
+    outage shows as one ~6h down segment (not a 29-day one); with only 24h of raw and no rollup,
+    the lane is `no_data`, never a giant fabricated outage."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "site30d.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)
+    monkeypatch.setattr(config, "ROLLUP_MIN_DAYS", 1)   # so 30d tiers to metrics_1h deterministically
+    db.init()
+    now = _t.time()
+    # metrics_1h = the 30d tier's heartbeat: seed hourly buckets across 30 days...
+    with db._connect() as c:
+        t = now - 30 * 86400
+        while t < now:
+            c.execute("INSERT OR IGNORE INTO metrics_1h(bucket,cpu) VALUES(?,?)", (t, 10.0))
+            t += 3600
+        # ...with a 6h hole 10 days ago (missing buckets = monitor was down)
+        lo, hi = now - 10 * 86400, now - 10 * 86400 + 6 * 3600
+        c.execute("DELETE FROM metrics_1h WHERE bucket>? AND bucket<?", (lo, hi))
+    out = db.self_uptime_segments("30d", end=now)
+    downs = [s for s in out["segments"] if not s["up"]]
+    assert out["no_data"] is False
+    assert len(downs) == 1, "the 6h outage must be one down segment, not a fabricated month"
+    assert 5 * 3600 < (downs[0]["to"] - downs[0]["from"]) < 7 * 3600  # ~6h, not ~29 days
+    assert out["uptime_pct"] > 99, "≈6h down out of 30d ≈ 99.2% up"
+
+
+def test_self_uptime_segments_long_window_without_rollup_is_no_data(tmp_path, monkeypatch):
+    """The other half: 30d window with ONLY the last 24h of raw metrics and no rollup buckets
+    must return no_data (dashed 'no data yet') — NEVER ~29 days of fabricated down."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "site30d_raw.db"))
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)
+    monkeypatch.setattr(config, "ROLLUP_MIN_DAYS", 1)
+    db.init()
+    now = _t.time()
+    with db._connect() as c:
+        t = now - 24 * 3600
+        while t < now:
+            c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (t, 10.0))
+            t += 5
+    out = db.self_uptime_segments("30d", end=now)
+    assert out["no_data"] is True and out["uptime_pct"] == 0.0
+    assert not any(not s["up"] and (s["to"] - s["from"]) > 2 * 86400 for s in out["segments"])
+
+
+def test_self_uptime_segments_uses_1m_tier_for_mid_range_window(tmp_path, monkeypatch):
+    """The MIDDLE tier: a window past raw retention but within ROLLUP_MIN_DAYS reads metrics_1m
+    (per-minute) with a ~3min gap threshold. A 30-min hole in per-minute buckets = one ~30min
+    down segment; a sub-threshold blip does not."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "site1m.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)
+    monkeypatch.setattr(config, "ROLLUP_MIN_DAYS", 60)   # 30d window (< 60d) tiers to metrics_1m
+    db.init()
+    now = _t.time()
+    with db._connect() as c:
+        t = now - 30 * 86400
+        while t < now:
+            c.execute("INSERT OR IGNORE INTO metrics_1m(bucket,cpu) VALUES(?,?)", (t, 10.0))
+            t += 60
+        # a 30-min outage 5 days ago (missing per-minute buckets)
+        lo, hi = now - 5 * 86400, now - 5 * 86400 + 30 * 60
+        c.execute("DELETE FROM metrics_1m WHERE bucket>? AND bucket<?", (lo, hi))
+    out = db.self_uptime_segments("30d", end=now)
+    downs = [s for s in out["segments"] if not s["up"]]
+    assert out["no_data"] is False
+    assert len(downs) == 1 and 25 * 60 < (downs[0]["to"] - downs[0]["from"]) < 35 * 60  # ~30 min
+    assert out["uptime_pct"] > 99.9
+
+
+def test_self_uptime_segments_panned_short_window_reads_rollup_not_empty_raw(tmp_path, monkeypatch):
+    """Pan-awareness (the whole reason for tiering): a SHORT window dragged deep into history
+    (oldest point older than raw retention) must read the rollup, not the pruned raw table — else
+    the site lane reads empty/no_data even though the monitor was up. A 1h window anchored 10 days
+    ago finds its per-minute buckets and shows up, not no_data."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "sitepan.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)
+    monkeypatch.setattr(config, "ROLLUP_MIN_DAYS", 60)
+    db.init()
+    now = _t.time()
+    cursor = now - 10 * 86400            # view a 1h window ending 10 days ago
+    with db._connect() as c:
+        # per-minute buckets across that historical hour (+ a margin before it)
+        t = cursor - 2 * 3600
+        while t <= cursor:
+            c.execute("INSERT OR IGNORE INTO metrics_1m(bucket,cpu) VALUES(?,?)", (t, 10.0))
+            t += 60
+    out = db.self_uptime_segments("1h", end=cursor)
+    assert out["no_data"] is False, "panned window must read the rollup, not the empty pruned raw table"
+    assert out["uptime_pct"] > 99 and all(s["up"] for s in out["segments"])
+
+
+def test_self_uptime_segments_panned_24h_window_no_leading_fabricated_down(tmp_path, monkeypatch):
+    """Regression (code review #2, Important): a 24h window PANNED back ~30 min must not reopen
+    the fabricated-down bug. Its oldest point is ~24h30m old — past raw retention — so it must
+    tier to metrics_1m and show the real (up) history, NOT a false 'down' band at the leading edge
+    from the pruned raw table. The old `3600s live grace` incorrectly kept it on raw."""
+    import time as _t
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "pan24.db"))
+    monkeypatch.setattr(config, "ROLLUP_RAW_HOURS", 24)
+    monkeypatch.setattr(config, "ROLLUP_MIN_DAYS", 60)   # 1m retention covers the panned span
+    db.init()
+    now = _t.time()
+    end = now - 1800                                     # pan the 24h window back 30 min
+    with db._connect() as c:
+        # raw only for the last 24h (irrelevant to the panned window) — the old-bug bait
+        t = now - 24 * 3600
+        while t < now:
+            c.execute("INSERT INTO metrics(ts,cpu) VALUES(?,?)", (t, 10.0))
+            t += 5
+        # per-minute 1m buckets across the panned window (+margin) = the real heartbeat there
+        t = end - 24 * 3600 - 3600
+        while t <= end:
+            c.execute("INSERT OR IGNORE INTO metrics_1m(bucket,cpu) VALUES(?,?)", (t, 10.0))
+            t += 60
+    out = db.self_uptime_segments("24h", end=end)
+    assert out["no_data"] is False
+    assert out["uptime_pct"] > 99, "panned 24h with continuous 1m buckets ≈ fully up"
+    # the key regression: no big fabricated 'down' band anywhere in the window
+    assert not any(not s["up"] and (s["to"] - s["from"]) > 3600 for s in out["segments"]), \
+        "no leading (or any) >1h fabricated-down band on a panned 24h window"

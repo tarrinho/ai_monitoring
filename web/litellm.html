@@ -218,7 +218,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.14</div>
+      <div id="sidebar-brand-ver">v1.8.15</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -1623,7 +1623,7 @@ function utDrawStack(){
   bands.forEach(o=>{ const top=base.map((v,b)=>v+(o.series[b]||0));
     let d="M"+X(0)+","+Y(base[0]); for(let b=0;b<B;b++)d+=" L"+X(b)+","+Y(top[b]);
     for(let b=B-1;b>=0;b--)d+=" L"+X(b)+","+Y(base[b]); d+="Z";
-    svg.appendChild(utEl("path",{d,fill:o.color,"fill-opacity":o.isOther?0.32:0.7,stroke:o.color,"stroke-opacity":o.isOther?0.5:0.9,"stroke-width":0.8}));
+    svg.appendChild(utEl("path",{d,fill:o.color,"fill-opacity":0.7,stroke:o.color,"stroke-opacity":0.9,"stroke-width":0.8}));
     for(let b=0;b<B;b++)base[b]=top[b]; });
   const guide=utEl("line",{x1:0,x2:0,y1:PADT,y2:PADT+ih,stroke:"var(--fg)","stroke-opacity":0.25,"stroke-width":1,style:"display:none"});svg.appendChild(guide);
   // drag-to-select-a-range band (Kibana-style, like the Chart.js charts): the shared
@@ -1671,7 +1671,7 @@ function utDrawStack(){
     rangedReload(); };
   svg.onpointercancel=()=>{ utDrag=null; dragRect.style.display="none"; };
   const lg=document.getElementById("ut-legend");
-  setHtml(lg, bands.map(o=>"<span><span class='sw' style='background:"+o.color+(o.isOther?";opacity:.55":"")+"'></span>"+escapeHtml(o.name)+" · "+utFmt(o.total)+"</span>").join(""));
+  setHtml(lg, bands.map(o=>"<span><span class='sw' style='background:"+o.color+"'></span>"+escapeHtml(o.name)+" · "+utFmt(o.total)+"</span>").join(""));
 }
 function utDrawSmall(){
   const grid=document.getElementById("ut-grid"); setHtml(grid,"");

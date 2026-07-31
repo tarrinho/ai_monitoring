@@ -14,21 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import re
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
 import config
+import obslog
 from collectors import fetch_json, unconfigured
+
+_LLOG = obslog.get("litellm")
 
 
 def _dbg(msg: str) -> None:
-    """Diagnostic line to stderr (shows in `docker logs`), only when
-    LITELLM_DEBUG is set. Never touches the returned data."""
-    if config.LITELLM_DEBUG:
-        print(f"[litellm-debug] {msg}", file=sys.stderr, flush=True)
+    """Diagnostic line at DEBUG level (shows in `docker logs`). Enable with LITELLM_DEBUG=1 or
+    MONITOR_LOG_LEVEL_aimon.litellm=debug. Never touches the returned data."""
+    _LLOG.debug(msg)
 
 
 def _headers() -> dict[str, str]:
@@ -103,16 +104,15 @@ def _note_auth(base: str, err) -> bool:
     global _AUTH_BAD
     if _auth_err(err):
         if not _AUTH_BAD:
-            print(f"[litellm] AUTH FAILED: LiteLLM rejected the master key ({err}) at "
-                  f"{base} for the admin/spend endpoints — LITELLM_MASTER_KEY is invalid, "
-                  f"expired, or not an admin/master key (proxy calls like /v1/models may "
-                  f"still work). Spend / budgets / teams stay empty until a valid master "
-                  f"key is set.", file=sys.stderr, flush=True)
+            _LLOG.error(f"AUTH FAILED: LiteLLM rejected the master key ({err}) at "
+                        f"{base} for the admin/spend endpoints — LITELLM_MASTER_KEY is invalid, "
+                        f"expired, or not an admin/master key (proxy calls like /v1/models may "
+                        f"still work). Spend / budgets / teams stay empty until a valid master "
+                        f"key is set.")
             _AUTH_BAD = True
         return True
     if _AUTH_BAD and err is None:
-        print(f"[litellm] AUTH OK: LiteLLM accepted the master key again ({base}).",
-              file=sys.stderr, flush=True)
+        _LLOG.info(f"AUTH OK: LiteLLM accepted the master key again ({base}).")
         _AUTH_BAD = False
     return False
 

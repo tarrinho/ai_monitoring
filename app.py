@@ -13,12 +13,11 @@ import concurrent.futures
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
-import sys
 import threading
 import time
-import traceback
 from html import escape as _html_escape
 from pathlib import Path
 from urllib.parse import quote
@@ -32,8 +31,18 @@ import auth
 import alerts
 import anomaly
 import metrics_prom
+import obslog
 from collectors import (host, litellm, ollama, llamacpp, vllm, gpu, procs,
                         containers, network)
+
+# Component loggers (obslog.setup() is called in main()). Using these instead of print()
+# gives leveled, structured, secret-redacted output — one line per event.
+_LOG = obslog.get()                 # aimon (general app)
+_ALOG = obslog.get("access")        # request access/error middleware
+_SLOG = obslog.get("sampler")       # sampling loop
+_SPLOG = obslog.get("spend")        # spend / LiteLLM cost paths
+_AULOG = obslog.get("auth")         # auth / lockout
+_CLOG = obslog.get("collector")     # collector availability
 
 _notifier = alerts.Notifier()
 # last-known up/down state per backend, for transition (event) detection
@@ -113,8 +122,8 @@ async def _backend_loop(name: str, sample_fn, session, bound: float) -> None:
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            print(f"[sample] backend '{name}' exceeded {bound:.0f}s — skipped this tick",
-                  file=sys.stderr)
+            _SLOG.warning(f"backend '{name}' exceeded {bound:.0f}s — skipped this tick",
+                          extra={"backend": name})
         except Exception as e:
             _backend_latest[name] = {"available": False, "error": f"{type(e).__name__}"}
         await asyncio.sleep(config.SAMPLE_INTERVAL)
@@ -280,7 +289,7 @@ def _log_collector_status(snap: dict) -> None:
     """When MONITOR_DEBUG is on, log each collector's availability + error to
     stderr on startup and whenever it changes — makes 'why is panel X missing?'
     (e.g. GPU) obvious in `docker logs`."""
-    if not config.MONITOR_DEBUG:
+    if not _CLOG.isEnabledFor(logging.DEBUG):     # DEBUG level (MONITOR_DEBUG=1 or LOG_LEVEL=debug)
         return
     for name, c in snap.get("collectors", {}).items():
         avail = bool(c.get("available"))
@@ -290,13 +299,12 @@ def _log_collector_status(snap: dict) -> None:
             continue
         _status_prev[name] = cur
         if avail:
-            print(f"[collector] {name}: OK", file=sys.stderr, flush=True)
+            _CLOG.debug(f"{name}: OK", extra={"backend": name})
         else:
             hint = ""
             if name == "gpu" and err == "unconfigured":
                 hint = " — no local nvidia-smi/rocm-smi; set GPU_SSH or GPU_METRICS_URL for a remote GPU"
-            print(f"[collector] {name}: unavailable — {err or '?'}{hint}",
-                  file=sys.stderr, flush=True)
+            _CLOG.debug(f"{name}: unavailable — {err or '?'}{hint}", extra={"backend": name})
 
 
 def _track_events(snap: dict) -> None:
@@ -423,8 +431,7 @@ async def _sampling_loop(app: web.Application) -> None:
                     _notifier.process(session, snap, snap["ts"],
                                       extra_breaches=anoms), 15)
             except asyncio.TimeoutError:
-                print("[alert] notifier exceeded 15s — skipped this tick",
-                      file=sys.stderr)
+                _SLOG.warning("notifier exceeded 15s — skipped this tick")
             # rollup + prune do multi-table INSERT…SELECT / DELETE scans; run them OFF the
             # event loop (like the read paths) so a big aggregation/prune can't stall every
             # concurrent HTTP handler (§6 observer-effect — the write path was still on-loop).
@@ -443,7 +450,7 @@ async def _sampling_loop(app: web.Application) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[sample] error: {type(e).__name__}: {e}", file=sys.stderr)
+            _SLOG.error(f"sample error: {type(e).__name__}: {e}")
         await asyncio.sleep(config.SAMPLE_INTERVAL)
 
 
@@ -495,9 +502,6 @@ async def _sechdr_mw(request: web.Request, handler):
 
 
 # --------------------------------------------------------- server error log ---
-def _log(msg: str) -> None:
-    """Timestamped line to stderr → the server's `docker logs`."""
-    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
 # 4xx codes worth logging as a denial (skip 401 = normal unauth poll, 404 = normal).
@@ -513,19 +517,19 @@ async def _log_mw(request: web.Request, handler):
         resp = await handler(request)
     except web.HTTPException as e:
         if e.status >= 500:
-            _log(f"[error] {request.method} {request.path} -> {e.status}")
+            _ALOG.error(f"{request.method} {request.path} -> {e.status}", extra={"status": e.status})
         elif e.status in _LOG_STATUSES:
-            _log(f"[deny] {request.method} {request.path} -> {e.status} "
-                 f"ip={_client_ip(request)}")
+            _ALOG.warning(f"denied {request.method} {request.path} -> {e.status}",
+                          extra={"status": e.status, "ip": _client_ip(request)})
         raise
     except Exception:                       # unhandled -> aiohttp will 500 it
-        _log(f"[error] {request.method} {request.path} -> 500\n{traceback.format_exc()}")
+        _ALOG.exception(f"{request.method} {request.path} -> 500", extra={"status": 500})
         raise
     if resp.status >= 500:
-        _log(f"[error] {request.method} {request.path} -> {resp.status}")
+        _ALOG.error(f"{request.method} {request.path} -> {resp.status}", extra={"status": resp.status})
     elif resp.status in _LOG_STATUSES:
-        _log(f"[deny] {request.method} {request.path} -> {resp.status} "
-             f"ip={_client_ip(request)}")
+        _ALOG.warning(f"denied {request.method} {request.path} -> {resp.status}",
+                      extra={"status": resp.status, "ip": _client_ip(request)})
     return resp
 
 
@@ -747,9 +751,9 @@ def _client_ip(request: web.Request) -> str:
 
 
 def _record_auth_attack(ip: str) -> None:
-    print(f"[auth] lockout: {ip} hit {config.AUTH_MAX_FAILS} bad tokens in "
-          f"{config.AUTH_WINDOW_S:.0f}s — locked {config.AUTH_LOCKOUT_S:.0f}s",
-          file=sys.stderr)
+    _AULOG.warning(f"lockout: {ip} hit {config.AUTH_MAX_FAILS} bad tokens in "
+                   f"{config.AUTH_WINDOW_S:.0f}s — locked {config.AUTH_LOCKOUT_S:.0f}s",
+                   extra={"ip": ip})
 
 
 def _audit(request: web.Request, actor: str | None, action: str,
@@ -1090,7 +1094,7 @@ async def login_submit_handler(request: web.Request) -> web.Response:
     # regardless of which IP the attempt comes from (survives IP rotation).
     if name and _user_locked_until.get(name, 0.0) > now:
         _audit(request, name, "login.lockout")
-        _log(f"[auth] login LOCKOUT (account) user={name!r} ip={ip}")
+        _AULOG.warning(f"login LOCKOUT (account) user={name!r} ip={ip}", extra={"ip": ip})
         raise web.HTTPFound(_fwd_prefix(request) + "/login?e=locked")
     u = db.user_get(name)
     if u is not None and not u["disabled"]:
@@ -1122,13 +1126,13 @@ async def login_submit_handler(request: web.Request) -> web.Response:
                 _user_locked_until[name] = now + config.AUTH_USER_LOCKOUT_S
                 ufails.clear()
                 user_locked = True
-                _log(f"[auth] account LOCKED user={name!r} for "
-                     f"{config.AUTH_USER_LOCKOUT_S:.0f}s ({config.AUTH_USER_MAX_FAILS} "
-                     f"fails) — last ip={ip}")
+                _AULOG.warning(f"account LOCKED user={name!r} for "
+                               f"{config.AUTH_USER_LOCKOUT_S:.0f}s ({config.AUTH_USER_MAX_FAILS} "
+                               f"fails) — last ip={ip}", extra={"ip": ip})
         any_lock = locked or user_locked
         _audit(request, name or "?", "login.lockout" if any_lock else "login.fail")
-        _log(f"[auth] login {'LOCKOUT' if any_lock else 'FAILED'} "
-             f"user={name or '?'!r} ip={ip}")
+        _AULOG.warning(f"login {'LOCKOUT' if any_lock else 'FAILED'} "
+                       f"user={name or '?'!r} ip={ip}", extra={"ip": ip})
         q = "?e=1" + ("&next=" + quote(nxt, safe="") if nxt != "/" else "")
         raise web.HTTPFound(_fwd_prefix(request) + "/login" + q)
     _auth_fails.pop(ip, None)
@@ -1647,7 +1651,7 @@ async def userreqs_handler(request: web.Request) -> web.Response:
     # both. Precedence: admin override > stored last-known name.
     labels = data.get("labels") or []
     stored = await asyncio.to_thread(db.known_owner_names)   # {label: owner email/alias}
-    uov = db.key_user_overrides()                            # {label: name}  admin reassignment
+    uov = await asyncio.to_thread(db.key_user_overrides)     # {label: name}  admin reassignment (off-loop)
     owners = {}
     for lbl in labels:
         name = uov.get(lbl) or stored.get(lbl)
@@ -2141,14 +2145,16 @@ async def budgets_handler(request: web.Request) -> web.Response:
                              _key_budget_map())
     _apply_team_overrides(keys)          # admin-assigned team wins over LiteLLM's
     _apply_user_overrides(keys)          # admin per-key user reassignment wins (board parity)
-    _apply_stored_owner_names(keys)      # else last-known email, so a /user/list blip ≠ Unassigned
+    # Read the persisted owner store ONCE, off-loop, and reuse it for both the blank-fill and the
+    # payload (was read twice — once on-loop inside _apply_stored_owner_names, once for owner_names).
+    owner_names = await asyncio.to_thread(db.known_owner_names)
+    _apply_stored_owner_names(keys, owner_names)   # else last-known email, so a /user/list blip ≠ Unassigned
     rows = litellm.budget_rows(keys, _resolve_budget_map(keys), lt.tm_mday, mlen)
     # per-key `spend` is LIFETIME, so the monthly figures come from the daily series
     mtd = await _mtd_real_spend(request.app[_SESSION], now)
     # The persisted owner store ({label: email}) rides along so the client can seed its
     # key->user map warm (and for historical keys), fixing "Unassigned" on ALL by-user charts —
     # not just the ones whose keys happen to be in the current live budgets list.
-    owner_names = await asyncio.to_thread(db.known_owner_names)
     return web.json_response({"keys": rows,
                               "summary": _budget_summary(rows, mtd_real=mtd,
                                                          month_day=lt.tm_mday,
@@ -2199,14 +2205,17 @@ def _apply_user_overrides(keys: list) -> None:
             k["user_name"] = name        # budget_rows surfaces this as the row's `email`
 
 
-def _apply_stored_owner_names(keys: list) -> None:
+def _apply_stored_owner_names(keys: list, stored: dict | None = None) -> None:
     """Resilience fallback: for a key whose owner name is STILL empty after the live resolution
     and the admin override, fill it from the persisted last-known owner email (db.known_owner_names).
     LiteLLM's /user/list is flaky, so a key that IS owned can carry a blank `user_name` on a given
     poll; the by-user charts would then drop it to "Unassigned" for that view. This mirrors the
     streak-buffered resilience the by-key path already has for the owner id. Precedence stays
-    override > live > stored: it only ever FILLS a blank, never overrides a resolved name."""
-    stored = db.known_owner_names()
+    override > live > stored: it only ever FILLS a blank, never overrides a resolved name.
+    `stored` may be pre-fetched by the caller (budgets_handler reads it once off-loop and reuses
+    it here + in the response) — otherwise it is read on demand."""
+    if stored is None:
+        stored = db.known_owner_names()
     if not stored:
         return
     for k in keys:
@@ -2683,7 +2692,7 @@ async def _compute_token_types(request: web.Request, window: str, start: str,
                 "available": False, "models": [],
                 "diag": {"days_ok": 0, "aborted": "timeout"}}
     except Exception as e:      # heavy pull is best-effort — never 500 the settings page
-        print(f"[warn] /api/admin/model-token-types {type(e).__name__}: {e}", file=sys.stderr)
+        _SPLOG.warning(f"/api/admin/model-token-types {type(e).__name__}: {e}")
         tt = None
     if tt is None:
         return {"window": window, "start_date": start, "end_date": end,
@@ -2812,8 +2821,7 @@ async def api_admin_model_kinds_set(request: web.Request) -> web.Response:
                         model, await litellm.model_price_detail(request.app[_SESSION])) or {}
                     fin, fout, fcache = _lit.get("in"), _lit.get("out"), _lit.get("cache")
                 except Exception as e:      # best-effort — a lookup miss just falls back to $0 blanks
-                    print(f"[warn] model_cost fill-rate lookup {type(e).__name__}: {e}",
-                          file=sys.stderr)
+                    _SPLOG.warning(f"model_cost fill-rate lookup {type(e).__name__}: {e}")
             if not db.model_cost_price_set(model, 0.0, time.time(),
                                            in_1m=pin, out_1m=pout, cache_1m=pcache,
                                            vol_in=vin, vol_out=vout, vol_cache=vcache,
@@ -3316,7 +3324,7 @@ async def _capture_spend_daily(session: aiohttp.ClientSession, now: float) -> No
         daily_cost = await litellm.per_model_daily_cost(session, start, end, prices, overrides)
         daily_tok = await litellm.per_model_daily_tokens(session, start, end, overrides)
     except Exception as e:      # cost is best-effort; still persist usage
-        print(f"[spend] capture cost estimate: {type(e).__name__}: {e}", file=sys.stderr)
+        _SPLOG.warning(f"capture cost estimate: {type(e).__name__}: {e}")
     await asyncio.to_thread(
         db.spend_daily_upsert, _spend_daily_records(daily, daily_cost, daily_tok), now)
 
@@ -3432,8 +3440,7 @@ async def spend_series_handler(request: web.Request) -> web.Response:
             await asyncio.to_thread(
                 db.spend_daily_upsert, _spend_daily_records(daily_live, daily_cost, daily_tok), now)
         except Exception as ce:     # cost is best-effort; usage chart must still render
-            print(f"[warn] spend/series cost estimate: {type(ce).__name__}: {ce}",
-                  file=sys.stderr)
+            _SPLOG.warning(f"spend/series cost estimate: {type(ce).__name__}: {ce}")
             out["cost_available"] = False
         # ?diag=1: surface what the collector actually got + why rows drop, so an
         # empty chart is diagnosable from the browser (viewer-safe: own spend data).
@@ -3454,7 +3461,7 @@ async def spend_series_handler(request: web.Request) -> web.Response:
                 _SPEND_SERIES_CACHE[window] = (now, out)
         return web.json_response(out)
     except Exception as e:      # a bad LiteLLM shape must degrade, never 500 the page
-        print(f"[error] /api/spend/series {type(e).__name__}: {e}", file=sys.stderr)
+        _SPLOG.error(f"/api/spend/series {type(e).__name__}: {e}")
         return web.json_response({"window": window, "available": False,
                                   "points": [], "years": [], "error": type(e).__name__})
 
@@ -3506,7 +3513,7 @@ async def spend_model_series_handler(request: web.Request) -> web.Response:
         series = await litellm.per_model_daily_series(
             request.app[_SESSION], start, end, prices, db.model_kind_overrides())
     except Exception as e:      # cost is best-effort — never 500 the page
-        print(f"[warn] /api/spend/model-series {type(e).__name__}: {e}", file=sys.stderr)
+        _SPLOG.warning(f"/api/spend/model-series {type(e).__name__}: {e}")
     if not series:
         return web.json_response({"window": window, "available": False,
                                   "labels": [], "models": []})
@@ -3838,9 +3845,9 @@ async def _spend_capture_loop(app: web.Application) -> None:
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            print("[spend] daily capture exceeded 30s — skipped this hour", file=sys.stderr)
+            _SPLOG.warning("daily capture exceeded 30s — skipped this hour")
         except Exception as e:
-            print(f"[spend] daily capture: {type(e).__name__}: {e}", file=sys.stderr)
+            _SPLOG.error(f"daily capture: {type(e).__name__}: {e}")
         await asyncio.sleep(3600)
 
 
@@ -3862,9 +3869,8 @@ async def _spend_mu_backfill_once(session: aiohttp.ClientSession) -> None:
         # (do NOT mark done, so a later switch to full still backfills). This keeps a
         # spend-off box from re-freezing its proxy just to seed history.
         if litellm._spend_mode() != "full":
-            print("[startup] spend model×user backfill skipped — spend mode is not 'full' "
-                  "(/spend/logs disabled); rollup grows forward from live samples",
-                  file=sys.stderr)
+            _SPLOG.info("startup backfill skipped — spend mode is not 'full' "
+                        "(/spend/logs disabled); rollup grows forward from live samples")
             return
         await asyncio.sleep(15)                             # let the dashboard start first
         rows = await litellm.model_user_backfill(session, config.SPEND_MU_BACKFILL_DAYS)
@@ -3872,13 +3878,12 @@ async def _spend_mu_backfill_once(session: aiohttp.ClientSession) -> None:
         if rows:
             db.spend_model_user_upsert(rows, now)
         db.settings_set("spend_mu_backfill", str(int(now)), now)
-        print(f"[startup] spend model×user backfill: seeded {len(rows)} rows "
-              f"({config.SPEND_MU_BACKFILL_DAYS}d window)", file=sys.stderr)
+        _SPLOG.info(f"startup backfill: seeded {len(rows)} rows "
+                    f"({config.SPEND_MU_BACKFILL_DAYS}d window)")
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        print(f"[startup] spend model×user backfill skipped: {type(e).__name__}: {e}",
-              file=sys.stderr)
+        _SPLOG.warning(f"startup backfill skipped: {type(e).__name__}: {e}")
 
 
 async def _on_startup(app: web.Application) -> None:
@@ -4055,28 +4060,28 @@ def startup_selfcheck() -> list[str]:
 
 
 def main() -> int:
+    obslog.setup()                              # configure the logging pipeline FIRST
     db.init()
     created = auth.bootstrap_admin()
     if created:
-        print(f"[auth] bootstrapped initial admin user '{created}' from env",
-              file=sys.stderr)
+        _AULOG.info(f"bootstrapped initial admin user '{created}' from env")
     errs = config.validate(db.user_count())
     if errs:
-        print("FATAL config errors:", file=sys.stderr)
+        _LOG.critical("FATAL config errors:")
         for e in errs:
-            print(f"  - {e}", file=sys.stderr)
+            _LOG.critical(f"  - {e}")
         return 2
     sc = startup_selfcheck()
     if sc:
-        print("[selfcheck] PROBLEMS DETECTED:", file=sys.stderr)
+        _LOG.warning("selfcheck: PROBLEMS DETECTED")
         for p in sc:
-            print(f"  ⚠ {p}", file=sys.stderr)
+            _LOG.warning(f"  ⚠ {p}")
     else:
-        print("[selfcheck] OK — dashboards, assets, metrics, routes all present")
+        _LOG.info("selfcheck OK — dashboards, assets, metrics, routes all present")
     banner = config.redacted_summary()
-    print(f"[AI-Monitoring] {banner['version']} listening on {banner['listen']}")
+    _LOG.info(f"{banner['version']} listening on {banner['listen']}", extra={"component": "startup"})
     for k, v in banner.items():
-        print(f"    {k}: {v}")
+        _LOG.info(f"  {k}: {v}", extra={"component": "startup"})
     web.run_app(build_app(), host=config.MONITOR_HOST, port=config.MONITOR_PORT,
                 print=None)
     return 0
