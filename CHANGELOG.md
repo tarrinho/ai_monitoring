@@ -12,6 +12,14 @@ Versioning: [SemVer](https://semver.org/).
   - **Back-compat:** `MONITOR_DEBUG=1` now means `LOG_LEVEL=DEBUG`; `LITELLM_DEBUG=1` maps to `aimon.litellm=DEBUG`. Both kept working.
   - Covered by `tests/test_obslog.py` (format, levels, redaction, dedupe, per-component, idempotent setup) + the migrated access/auth/db/collector logging tests.
 
+### Fixed
+- **`/litellm` "Other"/"Unassigned" over-attribution cluster** (bug-registry #22–25). The stacked/attribution charts were pushing genuinely-active keys, users, and spend into an oversized "Other"/"Unassigned" band instead of naming them.
+  - **By-key "Concurrent work"/"Backlog"** drew the whole aggregate as "Other": the top-N named lanes were ranked by each key's *total* in-window activity, but conc/backlog is a sparse point-in-time gauge — a key busy while the gauge read 0 won a flat-zero lane while the key actually doing the work fell past the cutoff. Now ranked by **attributable weight** (aggregate × share over the drawn buckets).
+  - **By-model** drew two lanes for one model (`vllm/nvidia/Qwen…` vs `vllm/Qwen…`): the vLLM real-time gauge was stored under the collector's org-prefixed served name instead of LiteLLM's own deployment label. The gauge now reuses LiteLLM's `vllm/` label (basename match, never cross-provider).
+  - **By-user "Concurrent work"/"Backlog"/"user-delta"** stacked owned keys into "Unassigned" on first paint: those handlers shipped no owner map (unlike the "Usage by user" chart). They now attach the same server-resolved owner map (persisted store + admin override), and `buildKeyUser` registers owners under both key hash and alias.
+  - **Cost-by-key/user** folded real spend into "Other" for keys `/key/list` hadn't confirmed (the LiteLLM master key, ephemeral virtual keys): a label present in the billed spend rollup is now treated as a real key (only operator-excluded / hidden keys fold). Ownerless keys now consistently fold to "Unassigned" everywhere (Spend page matched to the `/litellm` charts).
+  - Covered by new tests in `tests/test_dynamic_qa.py` (attributable ranking, model-label merge, server owner-map on both handlers, F2 billed-key attribution, F5 ownerless→Unassigned) + updated static/attribution guards.
+
 ## [1.8.14] — 2026-07-29
 
 Threat-model hardening. The remaining higher-value config/deployment risks (open-mode refusal,

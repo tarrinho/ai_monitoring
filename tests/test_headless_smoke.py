@@ -87,7 +87,10 @@ def _render(url: str) -> tuple[str, str]:
     # Isolated per-render profile: without --user-data-dir, concurrent/back-to-back Chromium
     # invocations contend on (and lock) the shared DEFAULT profile dir → the subprocess hangs to
     # its 90s timeout under load. A throwaway dir per render removes that contention entirely.
-    with tempfile.TemporaryDirectory(prefix="aimon-smoke-") as _profile:
+    # ignore_cleanup_errors: on a timeout Chromium is SIGKILL'd (-9) and may leave the profile dir
+    # non-empty mid-flush; without this, rmtree raises OSError during the TimeoutExpired unwind and
+    # REPLACES it, so _render_or_none's `except TimeoutExpired` never fires and the skip turns red.
+    with tempfile.TemporaryDirectory(prefix="aimon-smoke-", ignore_cleanup_errors=True) as _profile:
         p = subprocess.run(
             [CHROME, "--headless=new", "--no-sandbox", "--disable-gpu",
              "--disable-dev-shm-usage", f"--user-data-dir={_profile}",

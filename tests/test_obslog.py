@@ -61,13 +61,20 @@ def test_redaction_applies_through_the_formatter():
 
 # ---- dedupe ------------------------------------------------------------------
 def test_dedupe_collapses_repeats_within_window(monkeypatch):
-    clock = iter([100.0, 101.0, 102.0, 200.0])          # deterministic time
-    monkeypatch.setattr(obslog.time, "time", lambda: next(clock))
+    # `obslog.time` IS the shared time module, so setattr here patches time.time() PROCESS-WIDE.
+    # Use a settable holder (NOT an exhaustible iterator): a stray time.time() from a leftover
+    # background thread would consume an iter and desync the sequence — the holder just re-reads
+    # the current value, so the test is deterministic regardless of who else calls time.time().
+    now = [100.0]
+    monkeypatch.setattr(obslog.time, "time", lambda: now[0])
     filt = obslog._DedupeFilter(60.0)
     r = _rec(msg="backend flapping")
     assert filt.filter(r) is True      # t=100 first → emit
+    now[0] = 101.0
     assert filt.filter(r) is False     # t=101 within window → drop
+    now[0] = 102.0
     assert filt.filter(r) is False     # t=102 window measured from last EMIT (100) → drop
+    now[0] = 200.0
     assert filt.filter(r) is True      # t=200 (>60 since 100) → emit again
 
 
