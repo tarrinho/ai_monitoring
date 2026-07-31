@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 
 import config
@@ -126,28 +127,42 @@ class JsonFormatter(logging.Formatter):
 
 # ---- dedupe filter -----------------------------------------------------------
 class _DedupeFilter(logging.Filter):
-    """Drop a record identical (name + level + message) to one EMITTED within `window` seconds,
-    so a backend flapping every SAMPLE_INTERVAL can't repeat the same line forever. window<=0 off.
-    The window measures from the last EMISSION (not the last attempt), so it re-surfaces once per
-    window while the condition persists."""
+    """Drop a record identical (name + level + message + extras + exception) to one EMITTED within
+    `window` seconds, so a backend flapping every SAMPLE_INTERVAL can't repeat the same line forever.
+    window<=0 off. The window measures from the last EMISSION (not the last attempt), so it re-surfaces
+    once per window while the condition persists. The key includes the structured `extra` fields and
+    the exception, so per-backend lines that share a message text (extra={"backend": ...}) are NOT
+    collapsed into one — only truly identical lines are."""
 
     def __init__(self, window: float):
         super().__init__()
         self.window = window
         self._seen: dict = {}
+        self._lock = threading.Lock()  # filters run OUTSIDE the handler lock; guard concurrent emits
+
+    def _key(self, record: logging.LogRecord):
+        extras = tuple(sorted((k, str(v)) for k, v in _extras(record).items()))
+        exc = repr(record.exc_info[1]) if record.exc_info else None
+        return (record.name, record.levelno, record.getMessage(), extras, exc)
 
     def filter(self, record: logging.LogRecord) -> bool:
         if self.window <= 0:
             return True
-        key = (record.name, record.levelno, record.getMessage())
-        now = time.time()
-        last = self._seen.get(key)
-        emit = last is None or (now - last) >= self.window
-        if emit:
-            if len(self._seen) > 2048:              # bound the dict on high-cardinality messages
-                self._seen = {k: t for k, t in self._seen.items() if now - t < self.window}
-            self._seen[key] = now
-        return emit
+        # Fail OPEN: a bad %-format or a race must never crash the emitting caller (filters run
+        # outside emit()'s handleError guard) — emit the line rather than raise.
+        try:
+            key = self._key(record)
+            now = time.time()
+            with self._lock:
+                last = self._seen.get(key)
+                emit = last is None or (now - last) >= self.window
+                if emit:
+                    if len(self._seen) > 2048:       # bound the dict on high-cardinality messages
+                        self._seen = {k: t for k, t in self._seen.items() if now - t < self.window}
+                    self._seen[key] = now
+            return emit
+        except Exception:
+            return True
 
 
 # ---- setup -------------------------------------------------------------------

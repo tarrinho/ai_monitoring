@@ -845,6 +845,11 @@ def key_series(window: str, max_points: int = 300,
             # LiteLLM's own /key/list has never confirmed as a real key (an unexpanded
             # '${ENV_VAR}' string, a made-up/revoked hash — a real but INVALID auth attempt)
             # so the historical per-key chart matches the live one, and still show a full top-N.
+            # NOTE (deferred, see UNBUILT/registry): SUM(reqs) ranks correctly in FULL mode
+            # (reqs is a per-bucket count) but by lifetime-magnitude in LITE/OFF mode (reqs is
+            # day-CUMULATIVE spend), where an idle-but-huge key can take a slot. A correct fix
+            # must be mode-aware (window-delta for cumulative, SUM for windowed) — key_series
+            # alone can't tell the two apart, so it is intentionally left as SUM for now.
             ranked = [r[0] for r in conn.execute(
                 f"SELECT label, SUM(reqs) s FROM {table} "
                 f"WHERE {tc} >= ? AND {tc} <= ? "
@@ -1224,34 +1229,28 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
         # string was presented. That activity is genuine backlog/concurrency load —
         # its weight stays in the split denominator below — but it must fold into
         # 'Other' rather than get its own named band, same as an excluded key.
-        # ELIGIBLE labels = those allowed to be NAMED (as a band or in the "why Other?"
-        # popover's list). Model labels are always eligible; key labels drop the ones
-        # excluded/hidden/never-confirmed — their weight still counts in the split
-        # denominator, but they must never be surfaced by name (that's the whole point of
-        # MONITOR_EXCLUDE_KEYS / hide-unassigned / key_known). Computed ONCE so top,
-        # other_labels and labels_total all agree — else the popover would name a hidden
-        # key and inflate the "N beyond the top-N" count.
-        if source == "model":
-            eligible = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])]
-        else:
-            known = known_keys_set()
-            hidden = hidden_unassigned()
-            eligible = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
-                        if not config.key_excluded(lab) and config.key_known(lab, known)
-                        and lab not in hidden]
-        top = eligible[:top_n]
         # The aggregate (fast, ~SAMPLE_INTERVAL) and per-key spend (slow,
         # ~LITELLM_HEAVY_INTERVAL) are polled independently, so a short, isolated
         # request's backlog blip and its matching key_series sample rarely land in
         # the SAME bucket — without bridging, every isolated request washes into
         # "Other" even though the key that made it is known. Borrow the nearest
         # bucket's key-mix within one heavy-poll interval; beyond that the mix is
-        # stale enough that "Other" is still the honest answer.
+        # stale enough that "Other" is still the honest answer. Compute the bridged
+        # per-bucket mix ONCE (`eff`) and reuse it for both ranking and drawing.
         nonempty_bkts = sorted(b for b, bw in weights.items() if sum(bw.values()) > 0)
         max_gap = max(1, math.ceil(config.LITELLM_HEAVY_INTERVAL / bsize)) + 1
         buckets = sorted(aggv)
-        data: dict[str, list] = {lab: [] for lab in top}
-        other: list = []
+        eff: dict[int, tuple] = {}
+        # ATTRIBUTABLE weight per label = its share of the REAL aggregate summed over the
+        # buckets that actually get drawn. Rank the top-N by THIS, not by raw total in-window
+        # activity (`totals`). The aggregate (conc/backlog) is a sparse point-in-time gauge, so
+        # the key that is "biggest" over the whole window and the key doing the work in the few
+        # nonzero-aggregate buckets are routinely different keys: a key busy only while the
+        # gauge read 0 contributes nothing to any drawn band, yet ranking by `totals` gave it a
+        # named top-N slot (a flat-zero lane) and pushed the real contributor past the cutoff
+        # into "Other". That was the live '/litellm shows all-Other with empty named lanes' bug
+        # (aggregate=N, attributed=0, the active keys stranded in the "why Other?" list).
+        attributable: dict[str, float] = {}
         for b in buckets:
             a = aggv[b]
             bw = weights.get(b, {})
@@ -1273,6 +1272,33 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
                             for lab, v in weights[c].items():
                                 bw[lab] = bw.get(lab, 0.0) + v
                         tot = sum(bw.values())
+            eff[b] = (a, bw, tot)
+            if a > 0 and tot > 0:
+                for lab, v in bw.items():
+                    attributable[lab] = attributable.get(lab, 0.0) + a * (v / tot)
+        # ELIGIBLE labels = those allowed to be NAMED (as a band or in the "why Other?"
+        # popover's list), ranked by attributable weight and restricted to labels that
+        # actually contribute (>0) — a zero-contribution label is neither drawn nor "in"
+        # Other, so it must not be named or inflate the "N beyond the top-N" count. Model
+        # labels are always eligible; key labels also drop the ones excluded/hidden/
+        # never-confirmed — their weight still counts in the split denominator, but they
+        # must never be surfaced by name (the whole point of MONITOR_EXCLUDE_KEYS /
+        # hide-unassigned / key_known). Computed ONCE so top, other_labels and labels_total
+        # all agree.
+        ranked = sorted(attributable.items(), key=lambda kv: -kv[1])
+        if source == "model":
+            eligible = [lab for lab, w in ranked if w > 0]
+        else:
+            known = known_keys_set()
+            hidden = hidden_unassigned()
+            eligible = [lab for lab, w in ranked
+                        if w > 0 and not config.key_excluded(lab)
+                        and config.key_known(lab, known) and lab not in hidden]
+        top = eligible[:top_n]
+        data: dict[str, list] = {lab: [] for lab in top}
+        other: list = []
+        for b in buckets:
+            a, bw, tot = eff[b]
             if tot <= 0:                          # aggregate present but nothing to attribute
                 for lab in top:
                     data[lab].append(0.0)
@@ -2110,8 +2136,11 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
         # the filter and surface them as their own lines.
         known = known_keys_set()
         hidden = hidden_unassigned()
+        # require_known=False: a spend-rollup label is self-evidence of a real key (it billed a
+        # completed request), so don't fold real spend into a vanished top-N slot just because
+        # /key/list doesn't currently list it (master key / ephemeral virtual key). See _label_hidden.
         top = [lab for lab, _ in sorted(totals.items(), key=lambda kv: -kv[1])
-               if not _label_hidden(lab, known, hidden)][:top_n]
+               if not _label_hidden(lab, known, hidden, require_known=False)][:top_n]
         if not top:
             return {"labels": [], "metric": metric, "points": []}
         # accumulate each top key's daily value into a running total across the days
@@ -2155,7 +2184,10 @@ def key_cost_window(days_back: int, end: float | None = None) -> dict[str, float
         other = 0.0
         for label, c in rows:
             cost = float(c or 0)
-            if _label_hidden(str(label), known, hidden):
+            # require_known=False: this spend came from a billed, completed request, so attribute
+            # it to the key even if /key/list hasn't confirmed the label (see _label_hidden). Only
+            # an operator-excluded or hidden-unassigned key still folds into 'Other'.
+            if _label_hidden(str(label), known, hidden, require_known=False):
                 other += cost
             else:
                 out[str(label)] = out.get(str(label), 0.0) + cost

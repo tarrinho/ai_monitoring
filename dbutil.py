@@ -87,7 +87,8 @@ def _pos_step(cur: float, prev: float | None) -> float:
     return max(0.0, cur - prev) if prev is not None else 0.0
 
 
-def _label_hidden(label: str, known: set[str], hidden: set[str]) -> bool:
+def _label_hidden(label: str, known: set[str], hidden: set[str],
+                  require_known: bool = True) -> bool:
     """Whether a per-key `label` must be dropped from a NAMED band — folded into 'Other' on
     the aggregate/cost charts, simply omitted from a top-N ranking. True for an operator
     -excluded key (`MONITOR_EXCLUDE_KEYS`), a label LiteLLM's /key/list never confirmed (an
@@ -95,7 +96,16 @@ def _label_hidden(label: str, known: set[str], hidden: set[str]) -> bool:
     exists, so cold start stays permissive), or a hidden 'Unassigned' key. THE one predicate
     every per-key chart applies, so a new chart can't silently skip a class — the two
     spend_model_user_daily-backed charts (`key_cumulative`, `key_cost_window`) did exactly
-    that and surfaced excluded/garbage/ownerless keys the sibling charts already dropped."""
-    return (config.key_excluded(label)
-            or not config.key_known(label, known)
-            or label in hidden)
+    that and surfaced excluded/garbage/ownerless keys the sibling charts already dropped.
+
+    `require_known=False` for the spend-rollup-backed charts: a label that appears in
+    spend_model_user_daily is SELF-EVIDENCE of a real key — a row only lands there after a
+    request actually COMPLETED and was billed, which a garbage/`${...}` or revoked-hash bearer
+    never does. Gating those charts on /key/list too would WRONGLY fold real, attributable spend
+    into 'Other' (or drop it) for a key /key/list doesn't currently list: the LiteLLM master key,
+    an ephemeral virtual key created+used+deleted between heavy polls, or an alias-vs-hash
+    representation mismatch between /spend/logs and /key/list. Exclusion + hide-unassigned still
+    apply (an operator can still MONITOR_EXCLUDE_KEYS the master key)."""
+    if config.key_excluded(label) or label in hidden:
+        return True
+    return require_known and not config.key_known(label, known)

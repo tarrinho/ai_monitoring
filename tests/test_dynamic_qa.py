@@ -1336,6 +1336,53 @@ def test_concurrency_by_key_unattributed_goes_to_other(tmp_path, monkeypatch):
     assert out["series"][0]["data"][-1] == 7.0               # unattributed total preserved
 
 
+def test_concurrency_by_key_ranks_by_attributable_not_total_activity(tmp_path, monkeypatch):
+    """Top-N named lanes must be the keys that actually CONTRIBUTE to the plotted aggregate,
+    not the keys with the most total in-window activity. The aggregate (conc/backlog) is a
+    sparse point-in-time gauge: a key can be very busy in buckets where it read 0 (and so draw
+    a flat-zero lane) while a different key's single request coincides with the one nonzero
+    bucket. Ranking by raw activity names the flat-zero key and folds the real contributor into
+    'Other' — the live '/litellm shows all-Other with empty named lanes' bug. Rank by
+    attributable share (aggregate x share, over drawn buckets) instead."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk_rank.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)   # align wall-clock so _pick_tier reads raw
+    # 'idle_big' is very busy early, when conc==0; 'active' makes one request in the single
+    # bucket where conc==10. With top_n=1 the ranking metric decides which one is named.
+    for i in range(9):
+        t = now - 600 + i * 60
+        with db._connect() as c:
+            c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (t, 0.0))
+        db.insert_key_series(t, [{"key": "hI", "alias": "idle_big", "reqs": 100}])
+    with db._connect() as c:                # the one bucket with real concurrent work
+        c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 30, 10.0))
+    db.insert_key_series(now - 30, [{"key": "hA", "alias": "active", "reqs": 3}])
+    out = db.concurrency_by_key("1h", "conc", top_n=1, end=now)
+    labels = [s["label"] for s in out["series"]]
+    assert "active" in labels, f"active key folded into Other; got {labels}"
+    named = {s["label"]: max(s["data"]) for s in out["series"] if s["label"] != "Other"}
+    assert named.get("active", 0) == 10.0, f"active must carry the full conc=10 band: {named}"
+    other = next((s for s in out["series"] if s["label"] == "Other"), None)
+    assert other is None or max(other["data"]) == 0.0, "nothing real left for Other"
+
+
+def test_model_conc_label_merges_gauge_with_litellm_label():
+    """The vLLM real-time running/waiting gauge must reuse LiteLLM's OWN per_model label for the
+    same model, so the 'Concurrent LLM work — by model' chart draws ONE lane, not two. Live bug:
+    the gauge stored 'vllm/nvidia/Qwen3.6-35B-A3B-NVFP4' (vLLM's org-prefixed served name) while
+    LiteLLM reqs used 'vllm/Qwen3.6-35B-A3B-NVFP4' — two lanes for one model, split into Other."""
+    pm = [{"model": "vllm/Qwen3.6-35B-A3B-NVFP4"}, {"model": "azure_ai/gpt-5-mini"}]
+    # org-prefixed served name maps onto the LiteLLM deployment label
+    assert appmod._model_conc_label("nvidia/Qwen3.6-35B-A3B-NVFP4", pm) == "vllm/Qwen3.6-35B-A3B-NVFP4"
+    # bare served name (no org) resolves to the same lane
+    assert appmod._model_conc_label("Qwen3.6-35B-A3B-NVFP4", pm) == "vllm/Qwen3.6-35B-A3B-NVFP4"
+    # a model LiteLLM has not reported → synthesized fallback, never merged onto another basename
+    assert appmod._model_conc_label("mistral-7b", pm) == "vllm/mistral-7b"
+    # must NOT swallow a same-basename model served under a DIFFERENT provider
+    assert appmod._model_conc_label("gpt-5-mini", [{"model": "azure_ai/gpt-5-mini"}]) == "vllm/gpt-5-mini"
+
+
 @pytest.mark.asyncio
 async def test_concurrency_by_key_endpoint_labels_basis():
     c = await _client()
@@ -8427,10 +8474,22 @@ def test_bucket_model_user_series_share_axis(tmp_path):
         {"day": day, "model": "m", "key": "k2", "alias": "u2", "cost": 0.0, "tokens": 1_000_000},
     ]
     out = appmod.bucket_model_user_series(
-        rows, {"ovr": {}, "live": {}}, {"m": 1e-6}, {"m": "real"}, "14d",
+        rows, {"ovr": {}, "live": {"u1": "u1", "u2": "u2"}},   # owners resolved (F5: ownerless → 'Unassigned')
+        {"m": 1e-6}, {"m": "real"}, "14d",
         time.mktime(time.strptime(day, "%Y-%m-%d")) + 86400)
     costs = {s["user"]: s["costs"][0] for s in out["series"]}
     assert costs["u1"] == 3.0 and costs["u2"] == 1.0        # absolute, not normalized
+
+
+def test_owner_of_folds_ownerless_to_unassigned_not_alias():
+    """F5: a key with no resolved owner folds to 'Unassigned' — never its raw alias or a short
+    key hash — so the Spend model×user chart groups ownerless keys the SAME way the /litellm
+    by-user charts (userOf) do, and per-user totals reconcile across the two pages."""
+    omap = {"ovr": {"k-ovr": "reassigned@example.com"}, "live": {"k-live": "owner@example.com"}}
+    assert appmod._owner_of({"alias": "k-ovr"}, omap) == "reassigned@example.com"   # override wins
+    assert appmod._owner_of({"alias": "k-live"}, omap) == "owner@example.com"       # resolved owner
+    assert appmod._owner_of({"alias": "nameless-key"}, omap) == "Unassigned"        # ownerless → Unassigned
+    assert appmod._owner_of({"alias": "", "key": "sk-abc123"}, omap) == "Unassigned"  # no alias either
 
 
 def test_prune_spend_model_user(tmp_path, monkeypatch):
@@ -9851,9 +9910,12 @@ def _seed_spend_mu(tmp_path, monkeypatch, rows, owners):
 def test_key_cost_window_folds_hidden_keys_into_other(tmp_path, monkeypatch):
     """PHASE-2 gap fix: the Spend 'Cost by key' chart (`key_cost_window`) reads the
     spend_model_user_daily rollup and used to skip EVERY label filter — showing the operator's
-    excluded key, unconfirmed/garbage labels, AND ownerless keys as their own bands. They now
-    fold into 'Other', so the window's total spend is preserved (a hidden key's money stays
-    visible in aggregate) while it loses its named band."""
+    excluded key AND ownerless keys as their own bands. Excluded/hidden keys now fold into
+    'Other', so the window's total spend is preserved while they lose their named band.
+
+    F2: a label PRESENT in the spend rollup is self-evidence of a real key (it billed a
+    completed request), so an unconfirmed-by-/key/list label ('garbage' here) is now ATTRIBUTED,
+    not folded — only operator-excluded and hidden-unassigned keys fold."""
     monkeypatch.setattr(config, "EXCLUDE_KEYS", ["selfkey"])
     monkeypatch.setattr(config, "HIDE_UNASSIGNED_KEYS", True)
     now = _seed_spend_mu(
@@ -9862,15 +9924,17 @@ def test_key_cost_window_folds_hidden_keys_into_other(tmp_path, monkeypatch):
               ("selfkey", 9.0, 90), ("garbage", 4.0, 40)],
         owners={"alice": "u1", "bob": "u2", "orphan": ""})   # orphan = owner empty; garbage unknown
     cw = db.key_cost_window(30, end=now + 86400)
-    assert set(cw) == {"alice", "bob", "Other"}, f"only real keys keep a band: {cw}"
-    assert round(cw["Other"], 2) == 14.0, f"orphan+selfkey+garbage folded: {cw}"
+    assert set(cw) == {"alice", "bob", "garbage", "Other"}, f"billed keys keep a band: {cw}"
+    assert round(cw["garbage"], 2) == 4.0, "unconfirmed but BILLED key keeps its band (F2 self-evidence)"
+    assert round(cw["Other"], 2) == 10.0, f"only orphan(hidden)+selfkey(excluded) fold: {cw}"
     assert round(sum(cw.values()), 2) == 22.0, f"total spend must be preserved: {cw}"
 
 
 def test_key_cumulative_drops_hidden_keys_from_topn(tmp_path, monkeypatch):
     """Same rollup, the 'Top 10 API keys over time' chart in FULL spend mode (`key_cumulative`):
-    excluded / unconfirmed / hidden-unassigned labels are dropped from top-N candidacy, exactly
-    like the sibling `key_series` over-time chart (which this rollup-backed path used to skip)."""
+    excluded and hidden-unassigned labels are dropped from top-N candidacy. F2: an unconfirmed-
+    by-/key/list label that nonetheless BILLED spend (present in the rollup = self-evidence of a
+    real key) is KEPT, not dropped — only operator-excluded (selfkey) and hidden (orphan) fold."""
     monkeypatch.setattr(config, "EXCLUDE_KEYS", ["selfkey"])
     monkeypatch.setattr(config, "HIDE_UNASSIGNED_KEYS", True)
     now = _seed_spend_mu(
@@ -9879,8 +9943,8 @@ def test_key_cumulative_drops_hidden_keys_from_topn(tmp_path, monkeypatch):
               ("selfkey", 9.0, 90), ("garbage", 4.0, 40)],
         owners={"alice": "u1", "bob": "u2", "orphan": ""})
     kc = db.key_cumulative(metric="reqs", top_n=10, end=now + 86400)
-    assert set(kc["labels"]) == {"alice", "bob"}, \
-        f"orphan(hidden)/selfkey(excluded)/garbage(unknown) must not appear: {kc['labels']}"
+    assert set(kc["labels"]) == {"alice", "bob", "garbage"}, \
+        f"orphan(hidden)/selfkey(excluded) dropped; billed-but-unconfirmed garbage kept (F2): {kc['labels']}"
 
 
 def test_label_hidden_predicate_covers_all_three_classes(tmp_path, monkeypatch):
@@ -10981,6 +11045,46 @@ async def test_userreqs_owner_override_beats_stored_name(tmp_path, monkeypatch):
     resp = await appmod.userreqs_handler(req)
     d = json.loads(resp.text)
     assert d["owners"].get("bob-key") == "reassigned@example.com"
+
+
+async def test_conc_by_key_and_keydelta_ship_server_owner_map(tmp_path, monkeypatch):
+    """The 'by user' concurrency/backlog/user-delta charts fold keys → owners CLIENT-side; if the
+    handler ships no owner map, every owned key stacks into one oversized 'Unassigned' band until
+    /api/budgets warms up. Both concurrency-by-key and keydelta must attach the same server-
+    resolved owner map userreqs does (persisted store + admin override), keyed by the series
+    label, so owned keys attribute on the first paint."""
+    from aiohttp.test_utils import make_mocked_request
+    import json
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "own.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    monkeypatch.setattr(appmod, "_backend_latest", {"litellm": {"top_keys": [{"reqs": 1}]}})
+    for i in range(8):
+        t = now - 420 + i * 60
+        with db._connect() as c:
+            c.execute("INSERT INTO metrics(ts,conc,backlog) VALUES (?,?,?)", (t, 4.0, 3.0))
+        db.insert_key_series(t, [{"key": "hA", "alias": "alice-key", "reqs": 5 + i}])
+    with db._connect() as c:
+        c.execute("INSERT INTO known_keys(label,first_seen,last_seen,owner,owner_name) "
+                  "VALUES(?,?,?,?,?)", ("alice-key", now, now, "u_alice", "alice@example.com"))
+
+    async def _cbk(path):
+        r = await appmod.concurrency_by_key_handler(make_mocked_request("GET", path))
+        return json.loads(r.text)
+
+    async def _kd(path):
+        r = await appmod.keydelta_handler(make_mocked_request("GET", path))
+        return json.loads(r.text)
+
+    ck = await _cbk("/api/litellm/concurrency-by-key?window=1h")
+    assert ck.get("owners", {}).get("alice-key") == "alice@example.com", ck.get("owners")
+    kd = await _kd("/api/keydelta?window=1h")
+    assert kd.get("owners", {}).get("alice-key") == "alice@example.com", kd.get("owners")
+    # an admin per-key reassignment must win here too (same precedence as userreqs)
+    db.key_user_set("alice-key", "reassigned@example.com", now)
+    ck2 = await _cbk("/api/litellm/concurrency-by-key?window=1h")
+    assert ck2.get("owners", {}).get("alice-key") == "reassigned@example.com"
 
 
 async def test_userreqs_follows_the_page_time_window(tmp_path, monkeypatch):

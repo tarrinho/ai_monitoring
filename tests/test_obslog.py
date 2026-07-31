@@ -82,6 +82,37 @@ def test_dedupe_disabled_when_window_zero():
     assert filt.filter(r) and filt.filter(r)            # window<=0 → never suppress
 
 
+def test_dedupe_key_includes_extras_so_per_backend_lines_survive():
+    # Same message text, different `extra` → distinct keys → both emit (the 1.8.16 per-backend case:
+    # five backends flapping must NOT collapse to one line just because the text matches).
+    filt = obslog._DedupeFilter(60.0)
+    assert filt.filter(_rec(msg="backend unhealthy", backend="A")) is True
+    assert filt.filter(_rec(msg="backend unhealthy", backend="B")) is True
+    assert filt.filter(_rec(msg="backend unhealthy", backend="A")) is False   # true repeat → drop
+
+
+def test_dedupe_key_includes_exception_so_distinct_tracebacks_survive():
+    filt = obslog._DedupeFilter(60.0)
+    try:
+        raise ValueError("first")
+    except ValueError as e:
+        r1 = _rec(msg="task failed"); r1.exc_info = (type(e), e, e.__traceback__)
+    try:
+        raise KeyError("second")
+    except KeyError as e:
+        r2 = _rec(msg="task failed"); r2.exc_info = (type(e), e, e.__traceback__)
+    assert filt.filter(r1) is True and filt.filter(r2) is True   # different exceptions → both emit
+
+
+def test_dedupe_fails_open_on_bad_format_never_raises():
+    # A %-format mismatch makes getMessage() raise; filters run OUTSIDE emit()'s handleError guard,
+    # so it must NOT propagate to the caller — fail open (emit) instead of crashing the app.
+    filt = obslog._DedupeFilter(60.0)
+    bad = logging.makeLogRecord({"name": "aimon.spend", "levelno": logging.WARNING,
+                                 "levelname": "WARNING", "msg": "rate=%d", "args": ("high",)})
+    assert filt.filter(bad) is True     # would be TypeError inside getMessage() — swallowed
+
+
 # ---- setup / levels ----------------------------------------------------------
 @pytest.fixture
 def restore_logging():

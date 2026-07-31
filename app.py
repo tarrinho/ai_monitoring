@@ -357,6 +357,30 @@ def _track_model_events(snap: dict) -> None:
             _llamacpp_model_seen = True
 
 
+def _model_conc_label(vllm_model: str, per_model: list) -> str:
+    """Canonical model label for the vLLM real-time running/waiting gauge.
+
+    The vLLM collector reports its OWN served-model string, which usually carries the HF org
+    (e.g. 'nvidia/Qwen3.6-35B-A3B-NVFP4'), while LiteLLM's per_model reports the deployment
+    name ('vllm/Qwen3.6-35B-A3B-NVFP4'). Storing the gauge under 'vllm/<served-name>' therefore
+    splits ONE model into TWO lanes on the 'Concurrent LLM work — by model' chart AND lands the
+    real-time count on a label the completion-delta reqs never use — so neither lane is whole and
+    the aggregate split muddies into 'Other'. Reuse LiteLLM's OWN label for the same model
+    (matched by basename = last path segment, preferring a 'vllm/' deployment) so the gauge and
+    the reqs share one lane. Falls back to 'vllm/<served-name>' only when LiteLLM has not reported
+    that model — never merges models LiteLLM itself keeps distinct."""
+    base = str(vllm_model).rsplit("/", 1)[-1].strip().lower()
+    if base:
+        for m in (per_model or []):
+            lab = str((m or {}).get("model") or "")
+            # Only ever adopt a LiteLLM label under the SAME provider (vllm/…) whose basename
+            # matches — never merge onto a different provider that merely shares a model name
+            # (e.g. an 'azure_ai/gpt-5-mini' must not swallow a vLLM-served 'gpt-5-mini').
+            if lab.lower().startswith("vllm/") and lab.rsplit("/", 1)[-1].strip().lower() == base:
+                return lab
+    return f"vllm/{vllm_model}"
+
+
 def _persist_tick(snap: dict, mu_rows) -> None:
     """All per-tick SQLite writes for one sample — run OFF the event loop via asyncio.to_thread
     (see caller). Pure/sync; each db.* call is individually best-effort (swallows + counts its
@@ -375,7 +399,8 @@ def _persist_tick(snap: dict, mu_rows) -> None:
     # (figures are summed across models, so attributing them to the first model name is wrong).
     if (_vl.get("available") and _vl.get("model") and not _vl.get("multi_model")
             and (_vl.get("running") is not None or _vl.get("waiting") is not None)):
-        db.insert_model_conc_series(snap["ts"], f"vllm/{_vl['model']}",
+        db.insert_model_conc_series(snap["ts"],
+                                    _model_conc_label(_vl["model"], _ll.get("per_model")),
                                     _vl.get("running"), _vl.get("waiting"))
     # LiteLLM per-(day,model,key) spend rollup + /key/list-confirmed key labels — pure LiteLLM
     # concerns, persisted independently of vLLM; both only carry data on a HEAVY tick.
@@ -1690,6 +1715,27 @@ async def keyrequests_handler(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+async def _owner_map_for_labels(labels: list) -> dict:
+    """Server-resolved {key-label: owner name} for the 'by user' charts, from the PERSISTED
+    owner store (known_keys.owner_name) plus the admin per-key override — the SAME authority
+    userreqs_handler uses. Warm immediately (never waits on LiteLLM's ~60s /user/list poll), so
+    the by-user concurrency / backlog / user-delta charts attribute owned keys on the FIRST paint
+    instead of stacking every owned key into one oversized 'Unassigned' band (the client-only
+    fold via _keyUser is empty until /api/budgets lands). Precedence: admin override > stored
+    last-known name. Both reads run OFF the event loop."""
+    labels = [lbl for lbl in (labels or []) if lbl and lbl != "Other"]
+    if not labels:
+        return {}
+    stored = await asyncio.to_thread(db.known_owner_names)
+    uov = await asyncio.to_thread(db.key_user_overrides)
+    out = {}
+    for lbl in labels:
+        name = uov.get(lbl) or stored.get(lbl)
+        if name:
+            out[lbl] = name
+    return out
+
+
 async def concurrency_by_key_handler(request: web.Request) -> web.Response:
     """Estimated per-key attribution of a proxy-wide aggregate over time (LiteLLM page's
     'Concurrent work by key' + 'Backlog by key' stacked charts). metric='conc' (default) or
@@ -1716,7 +1762,12 @@ async def concurrency_by_key_handler(request: web.Request) -> web.Response:
                                    end=_q_end(request), cumulative=(basis == "spend"),
                                    source=source)
     data["weight_basis"] = basis
-    return web.json_response({"window": window, **data})
+    # Attach the server-resolved owner map so the client folds keys → owners correctly on the
+    # FIRST paint (see _owner_map_for_labels). Skipped for source='model' (model labels have no
+    # owner, and that chart never folds by user).
+    owners = {} if source == "model" else await _owner_map_for_labels(
+        [s.get("label") for s in data.get("series", [])])
+    return web.json_response({"window": window, "owners": owners, **data})
 
 
 async def keydelta_handler(request: web.Request) -> web.Response:
@@ -1732,7 +1783,10 @@ async def keydelta_handler(request: web.Request) -> web.Response:
         pts = 200
     pts = max(30, min(pts, 1000))
     data = await asyncio.to_thread(db.key_delta_series, window, pts, end=_q_end(request))
-    return web.json_response({"window": window, **data})
+    # Server-resolved owner map so the 'by user' delta chart attributes owned keys on first
+    # paint instead of an oversized 'Unassigned' band (see _owner_map_for_labels).
+    owners = await _owner_map_for_labels(data.get("labels") or [])
+    return web.json_response({"window": window, "owners": owners, **data})
 
 
 # _visible_top_keys runs on EVERY /api/data poll and inside the SSE /api/stream loop
@@ -2951,13 +3005,15 @@ def bucket_model_series(series: dict, window: str, now: float, top_n: int = 10) 
 
 
 def _owner_of(row: dict, omap: dict) -> str:
-    """Resolve a rollup row's (alias/key) to a display owner/user, using the SAME
-    precedence as the by-user board: admin key→user override wins, then LiteLLM's resolved
-    owner email, then the key alias, then a short hash of the key, then 'unassigned'."""
+    """Resolve a rollup row's (alias/key) to a display owner/user: admin key→user override wins,
+    then LiteLLM's resolved owner email. A key with NO resolved owner folds to 'Unassigned' —
+    NOT its raw alias or a short key hash — so the Spend model×user chart groups ownerless keys
+    the SAME way the /litellm by-user charts do (userOf → 'Unassigned', litellm.html). The two
+    pages used to disagree: the same ownerless key showed as an alias band here and under
+    'Unassigned' there, so per-user totals never reconciled across pages (F5)."""
     alias = str(row.get("alias") or "")
     ovr, live = omap.get("ovr", {}), omap.get("live", {})
-    return (ovr.get(alias) or live.get(alias) or alias
-            or litellm._short_key(row.get("key")) or "unassigned")
+    return ovr.get(alias) or live.get(alias) or "Unassigned"
 
 
 def bucket_model_user_series(rows: list, omap: dict, prices: dict, kind_ov: dict,

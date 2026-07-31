@@ -751,7 +751,11 @@ function buildKeyUser(budgets){
   if(!ks.length && !Object.keys(store).length) return;
   const next = {};
   for(const lbl in store){ const u = usernameOf(store[lbl]); if(u) next[lbl] = u; }   // persisted first
-  ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email); if(u) next[k.key] = u; } });  // live wins
+  // Register the owner under BOTH the key hash AND its alias: the server's per-key series label
+  // the "by user" charts fold by is the ALIAS, so a hash-only entry would never be hit and the
+  // key would fold to "Unassigned" even though /api/budgets knew its owner.
+  ks.forEach(k=>{ if(!k) return; const u = usernameOf(k.email); if(!u) return;   // live wins
+    if(k.key) next[k.key] = u; if(k.alias) next[k.alias] = u; });
   _keyUser = next;
 }
 // Resolve a key label to its OWNER for the "by user" charts. A key whose owner LiteLLM
@@ -967,8 +971,10 @@ async function loadUserDelta(){
   const _udCard=document.getElementById("card-userdelta");
   if(_udCard) _udCard.style.display=_udAny?"":"none";
   if(!_udAny) return;
+  const omap=d.owners||{};                            // server-resolved owners (first paint warm)
+  const own=lab=>{ const e=omap[lab]; return e?usernameOf(e):userOf(lab); };
   const byUser={};                                   // username -> [key alias labels]
-  labels.forEach(lab=>{ const u=userOf(lab); (byUser[u]=byUser[u]||[]).push(lab); });
+  labels.forEach(lab=>{ const u=own(lab); (byUser[u]=byUser[u]||[]).push(lab); });
   const last = pts.length ? pts[pts.length-1] : {};
   const _uSum=(u,p)=>{ let s=null; byUser[u].forEach(l=>{ const v=p[l]; if(v!=null) s=(s||0)+v; }); return s; };
   const users = Object.keys(byUser)
@@ -1167,10 +1173,15 @@ function renderStackByKey(d, chart, cardId, basisId){
 // residual "Other" band as-is (last). The measured total still sums exactly — only the
 // grouping of the (already estimated) per-key split changes. Mirrors userOf() used by the
 // other by-user charts.
-function _foldSeriesByUser(series){
+function _foldSeriesByUser(series, owners){
+  // Prefer the SERVER's persisted owner map (keyed by the series label) before the budgets-
+  // derived _keyUser, then "Unassigned" — same precedence as resolveOwner in loadUserTokens.
+  // Without the server map, owned keys folded to "Unassigned" until /api/budgets warmed up.
+  const omap = owners||{};
+  const own = k => { const e=omap[k]; return e ? usernameOf(e) : userOf(k); };
   const byUser={}; const order=[];
   (series||[]).forEach(s=>{
-    const u = (s.label==="Other") ? "Other" : userOf(s.label);
+    const u = (s.label==="Other") ? "Other" : own(s.label);
     if(!byUser[u]){ byUser[u]=[]; order.push(u); }
     const acc=byUser[u], data=s.data||[];
     for(let i=0;i<data.length;i++){
@@ -1186,7 +1197,7 @@ function _foldSeriesByUser(series){
 }
 async function loadConcByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=conc&window="+WIN);
-  if(d && d.series) d.series=_foldSeriesByUser(d.series);   // title is "by user" → show users
+  if(d && d.series) d.series=_foldSeriesByUser(d.series, d.owners);   // title is "by user" → show users
   renderStackByKey(d, concByKeyChart, "card-conc-by-key", "conc-by-key-basis");
 }
 async function loadConcByModel(){
@@ -1196,7 +1207,7 @@ async function loadConcByModel(){
 }
 async function loadBacklogByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=backlog&window="+WIN);
-  if(d && d.series) d.series=_foldSeriesByUser(d.series);   // title is "by user" → show users
+  if(d && d.series) d.series=_foldSeriesByUser(d.series, d.owners);   // title is "by user" → show users
   renderStackByKey(d, backlogByKeyChart, "card-backlog-by-key", "backlog-by-key-basis");
 }
 async function loadAnomalies(){

@@ -369,8 +369,10 @@ def test_litellm_concurrency_backlog_by_key_stacked_and_labeled_estimated():
     assert re.search(r"<h2>LLM Backlog — by user", html), "backlog card must be titled 'by user'"
     for fn in ("loadConcByKey", "loadBacklogByKey"):
         m = re.search(r"async function " + fn + r"\(\)\{.*?\n\}", html, re.S)
-        assert m and "_foldSeriesByUser(d.series)" in m.group(0), \
-            f"{fn} must fold per-key bands to users (else a 'by user' chart shows key ids)"
+        # folds per-key bands to owners, passing the SERVER's owner map so the fold is warm on
+        # the first paint instead of an oversized "Unassigned" band (see _owner_map_for_labels).
+        assert m and "_foldSeriesByUser(d.series, d.owners)" in m.group(0), \
+            f"{fn} must fold per-key bands to users with the server owner map"
     # both reload on window change / tick (search for them in rangedReload)
     assert re.search(r"function rangedReload\(\)\{[^}]*loadConcByKey\(\)[^}]*loadBacklogByKey\(\)", html)
     # stacked area (bands sum to the total) and the "estimated" honesty must be present
@@ -4358,9 +4360,12 @@ def test_litellm_by_user_charts_seed_owner_map_from_store():
     html = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
     assert "const store = (budgets && budgets.owner_names)" in html
     i_store = html.find("for(const lbl in store){ const u = usernameOf(store[lbl])")
-    i_live = html.find("ks.forEach(k=>{ if(k && k.key){ const u = usernameOf(k.email)")
+    i_live = html.find("ks.forEach(k=>{ if(!k) return; const u = usernameOf(k.email)")
     assert i_store != -1 and i_live != -1 and i_store < i_live, "store must seed before live"
     assert "if(!ks.length && !Object.keys(store).length) return;" in html
+    # the live pass must register the owner under BOTH hash and alias — series labels are aliases,
+    # so a hash-only entry would leave the key "Unassigned" on the by-user charts (F4).
+    assert "if(k.key) next[k.key] = u; if(k.alias) next[k.alias] = u;" in html
 
 
 def test_litellm_cards_show_loading_overlay_on_first_paint():
