@@ -51,8 +51,14 @@ _GENERIC = [
 
 
 def _redactor(values):
-    """Return a scrub(text) that removes known secret VALUES + the generic shapes above."""
-    vals = [re.escape(v) for v in values if v]
+    """Return a scrub(text) that removes known secret VALUES + the generic shapes above.
+
+    Only values >=6 chars are used as exact-match secrets: a 1-3 char value (e.g. a mis-set
+    1-char token) would otherwise match as a substring of ordinary words (the `T` in TOKEN /
+    CRITICAL / the ISO-8601 `T` separator) and SHRED every log line. Real tokens/keys/passwords
+    are long; a value this short is not worth redacting and matching it does more harm than good.
+    Longest-first so a value that is a prefix of another can't pre-empt the fuller match."""
+    vals = [re.escape(v) for v in sorted({v for v in values if v and len(v) >= 6}, key=len, reverse=True)]
     exact = re.compile("|".join(vals)) if vals else None
 
     def scrub(text: str) -> str:

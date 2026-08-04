@@ -295,7 +295,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.15</div>
+      <div id="sidebar-brand-ver">v1.8.17</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -728,7 +728,7 @@
     g.keys.forEach(function(k){
       var kr=document.createElement("div"); kr.className="udkey";
       var nm=document.createElement("b"); nm.textContent=k.key; kr.appendChild(nm);
-      var parts=["team "+(k.team||"—")];
+      var parts=[k.team?("team "+k.team):"no team"];   // parity with the Spend "No team" band
       if(k.budget_overridden && k.budget) parts.push("budget "+CUR+k.budget);
       if((Number(k.spent)||0)>0) parts.push("spent $"+Number(k.spent).toFixed(2));
       if(k.overridden) parts.push("overridden");

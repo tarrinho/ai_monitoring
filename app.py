@@ -47,6 +47,8 @@ _CLOG = obslog.get("collector")     # collector availability
 _notifier = alerts.Notifier()
 # last-known up/down state per backend, for transition (event) detection
 _backend_state: dict = {}
+_TRACKED_BACKENDS = ("litellm", "ollama", "llamacpp", "vllm", "gpu")
+_matrix_logged = False              # one-shot: startup backend matrix (logged at first sample)
 # model load/unload tracking (None/False = baseline not yet established, so the
 # models already resident at startup don't spam the timeline as "loaded")
 _ollama_models: set | None = None
@@ -311,7 +313,7 @@ def _track_events(snap: dict) -> None:
     """Record up/down transitions for configured backends (uptime history)."""
     c = snap["collectors"]
     ts = snap["ts"]
-    for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
+    for name in _TRACKED_BACKENDS:
         b = c.get(name, {})
         # only track backends that are actually configured (not the "unconfigured" note,
         # and not the boot "starting" sentinel — its own decoupled loop simply hasn't
@@ -329,6 +331,13 @@ def _track_events(snap: dict) -> None:
         elif prev != up:
             _backend_state[name] = up
             db.record_event(ts, name, up, b.get("error") or "")
+            # Log the EDGE only (never per-poll) — a flap can't spam the log, and the
+            # dedupe filter's extras-aware key keeps each backend on its own line.
+            if up:
+                _SLOG.info("backend recovered", extra={"backend": name})
+            else:
+                _SLOG.warning("backend down", extra={"backend": name,
+                                                     "error": b.get("error") or "?"})
 
 
 def _track_model_events(snap: dict) -> None:
@@ -343,18 +352,48 @@ def _track_model_events(snap: dict) -> None:
         if _ollama_models is not None:            # baseline established → diff it
             for name in cur - _ollama_models:
                 db.record_event(ts, "ollama", True, f"loaded {name}", kind="model")
+                _SLOG.info("model loaded", extra={"backend": "ollama", "model": name})
             for name in _ollama_models - cur:
                 db.record_event(ts, "ollama", False, f"unloaded {name}", kind="model")
+                _SLOG.info("model unloaded", extra={"backend": "ollama", "model": name})
         _ollama_models = cur
     lc = c.get("llamacpp", {})
     if lc.get("available"):
         model = lc.get("model")
         if model and model != _llamacpp_model:
             if _llamacpp_model_seen:              # skip the first-seen baseline
-                db.record_event(ts, "llamacpp", True,
-                                f"loaded {model.rsplit('/', 1)[-1]}", kind="model")
+                short = model.rsplit("/", 1)[-1]
+                db.record_event(ts, "llamacpp", True, f"loaded {short}", kind="model")
+                _SLOG.info("model loaded", extra={"backend": "llamacpp", "model": short})
             _llamacpp_model = model
             _llamacpp_model_seen = True
+
+
+def _backend_up_down(snap: dict) -> tuple[list, list]:
+    """(up, down) lists of CONFIGURED tracked backends — shared by the startup matrix + heartbeat.
+    Uses the same 'configured' gate as _track_events so unconfigured/starting backends are omitted."""
+    c = snap["collectors"]
+    up: list = []
+    down: list = []
+    for name in _TRACKED_BACKENDS:
+        b = c.get(name, {})
+        if not b or (b.get("available") is False
+                     and b.get("error") in (None, "unconfigured", "starting")):
+            continue
+        (up if b.get("available") else down).append(name)
+    return up, down
+
+
+def _log_backend_matrix(snap: dict) -> None:
+    """One-shot INFO line at the first real sample: which backends are up vs down (#5)."""
+    global _matrix_logged
+    if _matrix_logged:
+        return
+    _matrix_logged = True
+    up, down = _backend_up_down(snap)
+    _LOG.info("backends ready", extra={"up": f"{len(up)}/{len(up) + len(down)}",
+                                       "online": " ".join(up) or "-",
+                                       "offline": " ".join(down) or "-"})
 
 
 def _model_conc_label(vllm_model: str, per_model: list) -> str:
@@ -422,6 +461,7 @@ async def _sampling_loop(app: web.Application) -> None:
     session: aiohttp.ClientSession = app[_SESSION]
     last_prune = 0.0
     last_rollup = 0.0
+    last_heartbeat = 0.0
     while True:
         try:
             # Watchdog: host+procs are pure /proc reads (<1s), but if a /proc read
@@ -448,6 +488,7 @@ async def _sampling_loop(app: web.Application) -> None:
             await asyncio.to_thread(_warm_vis_gate)
             _track_events(snap)
             _track_model_events(snap)
+            _log_backend_matrix(snap)               # one-shot startup matrix (#5)
             anoms = _detect_anomalies(snap)
             # Bound the notifier like _sample_once: a user webhook with a slow-
             # resolving/blackholed host must never wedge the sampling loop (§6).
@@ -472,6 +513,15 @@ async def _sampling_loop(app: web.Application) -> None:
                 await asyncio.to_thread(db.audit_prune,
                                         snap["ts"] - config.AUDIT_RETENTION_DAYS * 86400)
                 last_prune = snap["ts"]
+            # Hourly "still alive" line (#6): backends up + active alerts. Skip the FIRST tick —
+            # the one-shot startup matrix already covered boot — so the first heartbeat is ~1h in.
+            if last_heartbeat == 0.0:
+                last_heartbeat = snap["ts"]
+            elif snap["ts"] - last_heartbeat > 3600:
+                up, down = _backend_up_down(snap)
+                _SLOG.info("heartbeat", extra={"backends_up": f"{len(up)}/{len(up) + len(down)}",
+                                               "alerts_active": len(_notifier.active_keys())})
+                last_heartbeat = snap["ts"]
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3012,8 +3062,12 @@ def _owner_of(row: dict, omap: dict) -> str:
     pages used to disagree: the same ownerless key showed as an alias band here and under
     'Unassigned' there, so per-user totals never reconciled across pages (F5)."""
     alias = str(row.get("alias") or "")
-    ovr, live = omap.get("ovr", {}), omap.get("live", {})
-    return ovr.get(alias) or live.get(alias) or "Unassigned"
+    ovr, live, stored = omap.get("ovr", {}), omap.get("live", {}), omap.get("stored", {})
+    # Precedence: admin override > LiteLLM's LIVE owner > the PERSISTED last-known owner > Unassigned.
+    # The stored layer is what keeps this chart warm when the live /key/list+/user/list poll blips
+    # empty (documented-flaky): without it every rollup row collapses to 'Unassigned' on a blip,
+    # while the Cost-by-user chart beside it (which has this fallback) still names the same users.
+    return ovr.get(alias) or live.get(alias) or stored.get(alias) or "Unassigned"
 
 
 def bucket_model_user_series(rows: list, omap: dict, prices: dict, kind_ov: dict,
@@ -3544,7 +3598,13 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
     # empty": in full mode that delta is REQUEST COUNTS, not dollars, and plotting it
     # here would silently mislabel units.
     if not cost and (_backend_latest.get("litellm", {}) or {}).get("spend_mode") != "full":
-        wd = await asyncio.to_thread(db.key_series_window_delta, window, 50, end)
+        # require_known=False: a key with real windowed activity is a real key — keep the
+        # billed-but-unconfirmed key (master / ephemeral virtual) instead of dropping it,
+        # matching the full-mode key_cost_window path so the two spend modes agree.
+        # (Keyword, not positional: a parameter inserted before require_known would silently
+        # rebind a positional False and flip the gate back on with no error.)
+        wd = await asyncio.to_thread(db.key_series_window_delta, window, 50, end,
+                                     require_known=False)
         cost = {lab: d for lab, d in zip(wd["labels"], wd["deltas"]) if d > 0}
     return web.json_response({"window": window, "cost": cost})
 
@@ -3577,18 +3637,27 @@ async def spend_model_series_handler(request: web.Request) -> web.Response:
 
 
 async def _key_owner_map(session: aiohttp.ClientSession) -> dict:
-    """{'ovr': {alias→user}, 'live': {alias→owner-email}} for resolving rollup rows to a
-    user, mirroring the by-user board: admin key→user overrides (local, cheap) layered over
-    LiteLLM's resolved owner (cached /key/list). Either lookup may be empty — the resolver
-    falls back to the alias/short-key."""
-    ovr = db.key_user_overrides()
+    """{'ovr': {alias→user}, 'live': {alias→owner-email}, 'stored': {alias→last-known owner}} for
+    resolving rollup rows to a user, mirroring the by-user board: admin key→user overrides (local,
+    cheap) layered over LiteLLM's resolved owner (cached /key/list), with the PERSISTED last-known
+    owner (`known_owner_names`) beneath so a flaky/empty live poll doesn't drop every row to
+    'Unassigned' (same warm-owner fallback the /api/budgets Cost-by-user path uses). Any layer may
+    be empty; the resolver walks override > live > stored > 'Unassigned'.
+
+    Both SQLite reads run OFF the event loop (§6 observer-effect discipline, same as
+    budgets_handler's read of the same store): the 45s series cache covers the live view, but
+    PANNED views bypass it, so an on-loop read here would open sqlite on every ◀▶ pan and could
+    stall the loop under writer contention (sampler flush / rollup pass)."""
+    def _db_reads() -> tuple:
+        return db.key_user_overrides(), db.known_owner_names()
+    ovr, stored = await asyncio.to_thread(_db_reads)
     live: dict = {}
     try:
         kb = await litellm.key_budgets(session) or {}
         live = {alias: (v.get("user_name") or "") for alias, v in kb.items()}
     except Exception:
         live = {}
-    return {"ovr": ovr, "live": live}
+    return {"ovr": ovr, "live": live, "stored": stored}
 
 
 # Short TTL cache for the model×user series. The rollup is DAILY buckets that only change

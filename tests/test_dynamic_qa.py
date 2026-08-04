@@ -1383,6 +1383,47 @@ def test_model_conc_label_merges_gauge_with_litellm_label():
     assert appmod._model_conc_label("gpt-5-mini", [{"model": "azure_ai/gpt-5-mini"}]) == "vllm/gpt-5-mini"
 
 
+def test_key_series_window_delta_require_known_keeps_billed_unconfirmed(tmp_path, monkeypatch):
+    """`require_known=False` keeps a key with real windowed activity even if /key/list hasn't
+    confirmed it (master key / ephemeral virtual key) — the spend-context lite-mode fallback needs
+    this to match the full-mode key_cost_window path. Default (True) still drops it."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wd.db"))
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    for i in range(6):
+        t = now - 300 + i * 60
+        db.insert_key_series(t, [{"key": "hC", "alias": "confirmed", "reqs": 10 + i},
+                                 {"key": "hU", "alias": "unconfirmed", "reqs": 5 + i}])
+    db.known_keys_upsert({"confirmed": "u1"}, now)          # only 'confirmed' is /key/list-known
+    default = db.key_series_window_delta("1h", 10, now)
+    assert "unconfirmed" not in default["labels"], "default gating must drop the unconfirmed key"
+    relaxed = db.key_series_window_delta("1h", 10, now, False)
+    assert "unconfirmed" in relaxed["labels"] and "confirmed" in relaxed["labels"], \
+        f"require_known=False must keep the billed-but-unconfirmed key: {relaxed['labels']}"
+
+
+def test_concurrency_by_key_bridges_across_poll_jitter(tmp_path, monkeypatch):
+    """The per-key spend poll fires every ~LITELLM_HEAVY_INTERVAL with jitter, so a conc bucket's
+    nearest key sample can sit just past ONE interval. Bridging now spans ~TWO intervals, so that
+    key's work is attributed (using its REAL nearest mix) instead of stranded in 'Other' — the 1h
+    residual. Places a key sample ~1.8 intervals from the conc bucket: bridged, not Other."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "brg.db"))
+    monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 60.0)
+    db.init()
+    now = 9_000_000.0
+    monkeypatch.setattr(db.time, "time", lambda: now)
+    # window=1h, max_points=200 → bsize=18s. gap of ~108s = 6 buckets: >1x (5) but <2x (8) bridge.
+    with db._connect() as c:
+        c.execute("INSERT INTO metrics(ts,conc) VALUES (?,?)", (now - 100, 4.0))   # conc bucket
+    db.insert_key_series(now - 208, [{"key": "hA", "alias": "jitterkey", "reqs": 7}])  # ~108s earlier
+    out = db.concurrency_by_key("1h", "conc", end=now)
+    labels = [s["label"] for s in out["series"]]
+    assert "jitterkey" in labels, f"key ~1.8 poll-intervals away must be bridged, got {labels}"
+    a = out.get("attribution") or {}
+    assert a.get("other", 1) == 0.0, f"nothing should be left to Other after the 2x bridge: {a}"
+
+
 @pytest.mark.asyncio
 async def test_concurrency_by_key_endpoint_labels_basis():
     c = await _client()
@@ -2188,6 +2229,150 @@ def test_track_model_events_detects_load_unload(tmp_path, monkeypatch):
     seen = {(e["backend"], e["up"], e["detail"]) for e in db.recent_events(10, kind="model")}
     assert ("ollama", True, "loaded gemma") in seen
     assert ("ollama", False, "unloaded qwen") in seen
+
+
+# ---- 1.8.16 "interesting logs": backend/model/alert/keylist/matrix/heartbeat -----------------
+def test_backend_transition_logs_edge_only(tmp_path, monkeypatch, caplog):
+    """#1 — _track_events logs the up/down EDGE (WARNING down, INFO recover) with a backend
+    field, and NEVER per-poll: the baseline and steady state stay silent."""
+    import config as cfg
+    import app as a
+    import logging
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "t.db"))
+    db.init()
+    a._backend_state.clear()
+
+    def snap(ts, up, err=""):
+        return {"ts": ts, "collectors": {"litellm": {"available": up, "error": err}}}
+
+    with caplog.at_level(logging.INFO, logger="aimon.sampler"):
+        a._track_events(snap(1.0, True))          # baseline → DB event, but NO log line
+        a._track_events(snap(2.0, True))          # unchanged → silent
+        assert [r for r in caplog.records if r.name == "aimon.sampler"] == []
+        a._track_events(snap(3.0, False, "timeout"))   # down edge → WARNING
+        a._track_events(snap(4.0, True))               # recover edge → INFO
+    recs = [r for r in caplog.records if r.name == "aimon.sampler"]
+    down = [r for r in recs if r.levelno == logging.WARNING]
+    up = [r for r in recs if r.levelno == logging.INFO]
+    assert len(down) == 1 and getattr(down[0], "backend", None) == "litellm"
+    assert getattr(down[0], "error", None) == "timeout"
+    assert len(up) == 1 and "recovered" in up[0].getMessage()
+
+
+def test_model_load_unload_logs_info(tmp_path, monkeypatch, caplog):
+    """#2 — model load/unload emits an INFO with backend+model fields (alongside the DB event)."""
+    import config as cfg
+    import app as a
+    import logging
+    monkeypatch.setattr(cfg, "DB_PATH", str(tmp_path / "t.db"))
+    db.init()
+    a._ollama_models = None
+    a._llamacpp_model = None
+    a._llamacpp_model_seen = False
+
+    def snap(ts, models):
+        return {"ts": ts, "collectors": {
+            "ollama": {"available": True, "models": [{"name": m} for m in models]},
+            "llamacpp": {"available": False}}}
+
+    with caplog.at_level(logging.INFO, logger="aimon.sampler"):
+        a._track_model_events(snap(1.0, ["qwen"]))          # baseline → silent
+        assert [r for r in caplog.records if r.name == "aimon.sampler"] == []
+        a._track_model_events(snap(2.0, ["qwen", "gemma"]))  # gemma loaded
+        a._track_model_events(snap(3.0, ["gemma"]))          # qwen unloaded
+    recs = [r for r in caplog.records if r.name == "aimon.sampler"]
+    loaded = [r for r in recs if "loaded" in r.getMessage() and "unloaded" not in r.getMessage()]
+    unloaded = [r for r in recs if "unloaded" in r.getMessage()]
+    assert any(getattr(r, "model", None) == "gemma" for r in loaded)
+    assert any(getattr(r, "model", None) == "qwen" for r in unloaded)
+
+
+def test_startup_backend_matrix_logs_once(monkeypatch, caplog):
+    """#5 — _log_backend_matrix emits ONE INFO summary of up/down and never repeats."""
+    import app as a
+    import logging
+    a._matrix_logged = False
+    snap = {"ts": 1.0, "collectors": {
+        "litellm": {"available": True}, "ollama": {"available": True},
+        "vllm": {"available": False, "error": "conn refused"},
+        "gpu": {"available": False, "error": "unconfigured"}}}   # unconfigured → omitted
+    with caplog.at_level(logging.INFO, logger="aimon"):
+        a._log_backend_matrix(snap)
+        a._log_backend_matrix(snap)             # second call is a no-op
+    recs = [r for r in caplog.records if r.name == "aimon" and "backends ready" in r.getMessage()]
+    assert len(recs) == 1
+    assert getattr(recs[0], "up", None) == "2/3"          # gpu(unconfigured) excluded from total
+
+
+def test_backend_up_down_gates_unconfigured():
+    """#5/#6 helper — unconfigured/starting backends are excluded from both up and down."""
+    import app as a
+    up, down = a._backend_up_down({"ts": 1.0, "collectors": {
+        "litellm": {"available": True},
+        "ollama": {"available": False, "error": "conn refused"},
+        "vllm": {"available": False, "error": "unconfigured"},
+        "gpu": {"available": False, "error": "starting"}}})
+    assert up == ["litellm"] and down == ["ollama"]        # vllm/gpu gated out
+
+
+async def test_alert_fire_recover_logs(monkeypatch, caplog):
+    """#3 — Notifier logs a WARNING on fire and an INFO on recover, with the alert key."""
+    import alerts
+    import logging
+    n = alerts.Notifier()
+
+    async def _fanout(self, session, text, recipients):    # stub: no real webhook
+        return None
+
+    async def _no_recipients(self):
+        return []
+    monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
+    monkeypatch.setattr(alerts.Notifier, "_recipients", _no_recipients)
+    # evaluate() returns (key, msg) tuples
+    monkeypatch.setattr(alerts, "evaluate", lambda snap: [("cpu", "cpu 95% >= 80%")])
+    with caplog.at_level(logging.INFO, logger="aimon.alerts"):
+        await n.process(None, {"ts": 1.0}, 1.0)            # breach → fire
+        monkeypatch.setattr(alerts, "evaluate", lambda snap: [])
+        await n.process(None, {"ts": 2.0}, 2.0)            # clears → recover
+    recs = [r for r in caplog.records if r.name == "aimon.alerts"]
+    fired = [r for r in recs if r.levelno == logging.WARNING and "fired" in r.getMessage()]
+    recovered = [r for r in recs if r.levelno == logging.INFO and "recovered" in r.getMessage()]
+    assert fired and getattr(fired[0], "key", None) == "cpu"
+    assert recovered and getattr(recovered[0], "key", None) == "cpu"
+
+
+async def test_key_list_degraded_logs_warning_transport_info_scope(monkeypatch, caplog):
+    """#4 — /key/list failure reclassified out of DEBUG: a transport/parse failure (e.g. the
+    JSONDecodeError firehose) is now a deduped WARNING; a 401/403 scope-limit stays INFO
+    (benign — spend/teams/cost keep flowing). Logged once per error-state change, not per poll."""
+    import logging
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-CHANGE_ME")
+    monkeypatch.setattr(litellm, "_KEY_LIST_ERR", None)
+    monkeypatch.setattr(litellm, "_KEY_BUDGETS_CACHE", None)
+    monkeypatch.setattr(litellm, "_KEY_BUDGETS_TS", 0.0)
+
+    async def _transport_fail(session, url, headers=None, timeout_s=None):
+        return None, "JSONDecodeError: Expecting value"       # NOT an auth code
+    monkeypatch.setattr(litellm, "fetch_json", _transport_fail)
+    with caplog.at_level(logging.INFO, logger="aimon.litellm"):
+        await litellm.key_budgets(None)
+    recs = [r for r in caplog.records if r.name == "aimon.litellm"]
+    warns = [r for r in recs if r.levelno == logging.WARNING and "degraded" in r.getMessage()]
+    assert warns and getattr(warns[0], "fallback", None) == "MONITOR_KEY_BUDGETS"
+
+    # A 403 scope-limit is INFO, not WARNING (reset error-state so it re-logs).
+    monkeypatch.setattr(litellm, "_KEY_LIST_ERR", None)
+    caplog.clear()
+
+    async def _scope_fail(session, url, headers=None, timeout_s=None):
+        return None, "403 Forbidden"
+    monkeypatch.setattr(litellm, "fetch_json", _scope_fail)
+    with caplog.at_level(logging.INFO, logger="aimon.litellm"):
+        await litellm.key_budgets(None)
+    recs = [r for r in caplog.records if r.name == "aimon.litellm"]
+    assert any(r.levelno == logging.INFO and "scope-limited" in r.getMessage() for r in recs)
+    assert not [r for r in recs if r.levelno == logging.WARNING]     # 403 is NOT a warning
 
 
 async def test_events_endpoint_kind():
@@ -8490,6 +8675,22 @@ def test_owner_of_folds_ownerless_to_unassigned_not_alias():
     assert appmod._owner_of({"alias": "k-live"}, omap) == "owner@example.com"       # resolved owner
     assert appmod._owner_of({"alias": "nameless-key"}, omap) == "Unassigned"        # ownerless → Unassigned
     assert appmod._owner_of({"alias": "", "key": "sk-abc123"}, omap) == "Unassigned"  # no alias either
+
+
+def test_owner_of_uses_persisted_store_when_live_poll_blips():
+    """The Spend model×user chart must survive a flaky LiteLLM /key/list+/user/list poll: when the
+    LIVE owner map is empty (blip), the PERSISTED last-known owner (`known_owner_names`) keeps the
+    key named instead of collapsing the whole chart to 'Unassigned' — same warm-owner fallback the
+    Cost-by-user chart beside it uses. Precedence: override > live > stored > Unassigned."""
+    # live blipped empty; stored still knows the owner
+    blip = {"ovr": {}, "live": {}, "stored": {"alice-key": "alice@example.com"}}
+    assert appmod._owner_of({"alias": "alice-key"}, blip) == "alice@example.com"
+    # live present wins over stored; override wins over both
+    full = {"ovr": {"k": "boss@example.com"}, "live": {"k": "live@example.com"}, "stored": {"k": "old@example.com"}}
+    assert appmod._owner_of({"alias": "k"}, full) == "boss@example.com"
+    assert appmod._owner_of({"alias": "j"}, {"ovr": {}, "live": {"j": "live@example.com"}, "stored": {"j": "old@example.com"}}) == "live@example.com"
+    # unknown everywhere → Unassigned
+    assert appmod._owner_of({"alias": "ghost"}, blip) == "Unassigned"
 
 
 def test_prune_spend_model_user(tmp_path, monkeypatch):

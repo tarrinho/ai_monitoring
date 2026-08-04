@@ -261,7 +261,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.15</div>
+      <div id="sidebar-brand-ver">v1.8.17</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -635,7 +635,7 @@ function renderCostChart(keys){
   let rows;
   if(COSTBY==="team"){
     const t={};
-    keys.forEach(k=>{ const n=k.team||"—"; (t[n]=t[n]||{spent:0,keys:[]}); t[n].spent+=spentOf(k); t[n].keys.push(k); });
+    keys.forEach(k=>{ const n=k.team||"No team"; (t[n]=t[n]||{spent:0,keys:[]}); t[n].spent+=spentOf(k); t[n].keys.push(k); });  // "No team" (parity with "Unassigned"), not a cryptic "—"
     rows=Object.entries(t).map(([name,v])=>({name,spent:v.spent,keys:v.keys}));
   } else if(COSTBY==="user"){
     const u={};
@@ -994,7 +994,7 @@ function renderKeys(keys){
       +dline("User ID", uid?escapeHtml(uid):"—")
       +dline("Username", email?escapeHtml(email.split("@")[0]):"—")
       +dline("Email", email?escapeHtml(email):"—")
-      +dline("Team", r.team?escapeHtml(r.team):"—")
+      +dline("Team", r.team?escapeHtml(r.team):"No team")   // matches the by-team fold's "No team" band
       +dline("Key", "<b>"+escapeHtml(r.key)+"</b>")
       +`</td></tr>`;
     return `<tr><td>`

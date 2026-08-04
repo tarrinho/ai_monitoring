@@ -4,6 +4,32 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.17] — 2026-08-03
+
+### Added
+- **Chart hover tooltips now show the point's full date + time.** Previously the tooltip header was the abbreviated x-axis label — time-of-day on an intraday window, or just the date on a multi-day one, never both — and on the by-key/user charts it was the series name, not a timestamp at all. A single global Chart tooltip-title default in `aimon-core.js` now reads each time-series chart's per-point epoch (`chart.$ts`, already set by `stampTs` for drag-zoom) and renders it as `DD/MM/YY HH:MM:SS` via a new `fmtDateTime()` helper — so every graph on every page gains it uniformly with no per-page wiring (can't drift). Non-time charts (the by-key/user bars, whose x is a key name) have no `$ts` and fall back to the x label unchanged; the alerts uptime timeline keeps its backend-name header and appends the timestamp. Covered by `test_hover_tooltip_shows_full_date_and_time` (runs the real helper + the real global callback via node).
+
+## [1.8.16] — 2026-07-31
+
+### Added
+- **Operational log events worth watching at `INFO` (the pipeline had levels but little to say at `INFO`).** With `MONITOR_LOG_LEVEL=info` (and `LITELLM_DEBUG=0`), `docker logs` now reads as an operational narrative instead of being silent-or-a-DEBUG-firehose:
+  - **Backend up/down transitions** — a backend going unavailable logs a `WARNING` (`backend down backend=… error=…`), recovery an `INFO`. Logged on the **edge only** (the transition already computed for the uptime history), never per poll, and the dedupe filter keeps each backend on its own line.
+  - **Model load/unload** — Ollama model appearing/disappearing and llama.cpp model swaps log an `INFO` with `backend`/`model` fields.
+  - **Alert fired/recovered** — the notifier logs a `WARNING` on fire (with the alert key + detail) and an `INFO` on recovery, alongside the existing DB record.
+  - **Startup backend matrix** — one `INFO` at the first sample summarising which backends came up (`up=3/4 online=… offline=…`), unconfigured backends omitted.
+  - **Hourly heartbeat** — a once-an-hour `INFO` (`backends_up`, `alerts_active`) so a quiet-but-healthy instance still shows liveness.
+  - **`/key/list` degradation reclassified out of `DEBUG`** — a transport/parse failure (e.g. the `JSONDecodeError` seen in the field) is now a **deduped `WARNING`** (`per-key budgets degraded`, with the fallback source); a `401/403` scope-limit stays `INFO` (benign — spend/teams/cost keep flowing). Still logged once per error-state change, not every poll.
+  - Covered by new tests in `tests/test_dynamic_qa.py` (edge-only transitions, model load/unload, startup matrix one-shot, up/down gating, alert fire/recover, key/list transport-vs-scope classification).
+
+### Fixed
+- **Redaction no longer shreds every log line when a configured secret is very short.** The exact-value scrubber redacted any non-empty configured value — so a mis-set 1-char token (or a short `ADMIN_PASSWORD`) matched as a substring of ordinary words (the `T` in `TOKEN`/`CRITICAL`/the ISO-8601 `T` separator) and replaced it everywhere, mangling the whole log. It now only treats values ≥6 chars as secrets (matching the generic-shape `{6,}` convention; real tokens/keys are long), and matches longest-first. Over-redaction is fail-safe (never a leak) but made logs unreadable; surfaced by the §13 DAST run. Covered by `test_redaction_ignores_too_short_values_no_line_shredding`.
+- **Dedupe filter hardening (found in review of the 1.8.15 pipeline).** `_DedupeFilter` now: keys on the structured `extra` fields + exception too (so five backends flapping with `extra={"backend": …}` no longer collapse into one line — this is what makes the per-backend events above usable), guards `_seen` with a lock (filters run outside the handler lock; concurrent emitters could race), and **fails open** — a bad `%`-format or a race emits the line instead of propagating an exception into the calling code (filters run outside `emit()`'s error guard). Covered by three new `tests/test_obslog.py` cases.
+- **Headless-smoke test no longer red on a CI timeout.** When Chromium is SIGKILL'd on the 90s timeout it can leave the throwaway profile dir non-empty; `TemporaryDirectory` cleanup then raised `OSError` **during** the `TimeoutExpired` unwind, turning the intended graceful skip into a failure. Cleanup errors are now ignored (`ignore_cleanup_errors=True`).
+- **Spend "Cost per model & user" chart no longer collapses to "Unassigned" on a LiteLLM owner-poll blip** (registry #26). It resolved owners from only the admin override + the *live* `/key/list`+`/user/list` fetch, never the persisted `known_owner_names` store — so an empty poll dropped every row to "Unassigned" while the Cost-by-user chart beside it still named the same users. Added the stored fallback (override → live → **stored** → Unassigned), the same warm-owner-map fix already on the `/litellm` by-user charts.
+- **`/litellm` by-key "Concurrent work"/"Backlog" short-window "Other" residual removed** (registry #26b). The per-key spend poll fires with jitter, so a gauge bucket's nearest per-key sample could sit just past the 1× bridge window and strand a small honest "Other" in short (e.g. 1h) views (already ≈0 by 24h). Bridging now spans ~2 poll intervals — still using the *real* nearest key-mix, total preserved — so jitter attributes instead of folding to "Other".
+- **Lite-mode "Cost by key/user/team" no longer silently drops a billed but `/key/list`-unconfirmed key** (registry #26b) — the windowed fallback now keeps it (parity with the full-mode spend path), instead of gating it out on `key_known`.
+- **Spend "by team" chart labels team-less keys "No team"** instead of a cryptic "—" (registry #26b), matching the by-user "Unassigned" band.
+
 ## [1.8.15] — 2026-07-31
 
 ### Changed

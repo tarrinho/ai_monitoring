@@ -153,7 +153,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.15</div>
+      <div id="sidebar-brand-ver">v1.8.17</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -494,7 +494,9 @@ function buildStatusChart(resp){
       plugins:{ legend:{display:false},
         tooltip:{ displayColors:false,
           callbacks:{
-            title:items => (items[0] ? items[0].dataset.label : ""),
+            // backend name + the point's real date+time (x is offset-seconds from `start`)
+            title:items => { const it=items[0]; if(!it) return "";
+              return it.dataset.label + " · " + fmtDateTime(start + it.parsed.x); },
             label:it => { const dd = it.raw || {};
               const st = dd.up===true ? "● up" : dd.up===false ? "● down" : "no data yet";
               const d = new Date((start + it.parsed.x) * 1000);

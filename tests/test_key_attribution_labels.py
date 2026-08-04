@@ -437,8 +437,9 @@ def test_concurrency_by_key_bridges_isolated_request_to_nearest_key_sample(tmp_p
     key_series sample (slow, LITELLM_HEAVY_INTERVAL-polled) almost never land in the exact
     same bucket. Observed live: two one-off test requests billed correctly to a known key,
     yet the by-key chart showed the whole aggregate as 'Other' because no key_series row
-    fell in the aggregate's own bucket. The nearest key_series sample, within one heavy-poll
-    interval, must now be borrowed instead of defaulting straight to 'Other'."""
+    fell in the aggregate's own bucket. The nearest key_series sample, within the bridge bound
+    (~two heavy-poll intervals — 2x to tolerate poll jitter), must now be borrowed instead of
+    defaulting straight to 'Other'."""
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk_bridge.db"))
     monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 60.0)
     db.init()
@@ -449,7 +450,7 @@ def test_concurrency_by_key_bridges_isolated_request_to_nearest_key_sample(tmp_p
     with db._connect() as c:
         c.execute("INSERT INTO metrics(ts,conc,backlog) VALUES (?,?,?)", (now, 5.0, 1.0))
     # the matching key_series sample lands 40s later — a different bucket, but well within
-    # one LITELLM_HEAVY_INTERVAL (60s)
+    # the bridge bound (~2x LITELLM_HEAVY_INTERVAL = ~120s here)
     db.insert_key_series(now + 40, [{"key": "h1", "alias": "pedro", "reqs": 7}])
     out = db.concurrency_by_key("1h", "conc", end=now + 40)
     labels = {s["label"] for s in out["series"]}
@@ -460,9 +461,10 @@ def test_concurrency_by_key_bridges_isolated_request_to_nearest_key_sample(tmp_p
 
 
 def test_concurrency_by_key_does_not_bridge_across_a_stale_gap(tmp_path, monkeypatch):
-    """The bridge is bounded to one LITELLM_HEAVY_INTERVAL — a key_series sample far outside
+    """The bridge is bounded (~two LITELLM_HEAVY_INTERVALs) — a key_series sample far outside
     that window is stale enough that attributing an unrelated blip to it would be a guess,
-    not an inference. Beyond the bound, 'Other' is still the honest answer."""
+    not an inference. Beyond the bound, 'Other' is still the honest answer. (The 600s gap here
+    is far past the ~126s bound, so the 1x→2x widening doesn't change this test.)"""
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "cbk_no_bridge.db"))
     monkeypatch.setattr(config, "LITELLM_HEAVY_INTERVAL", 60.0)
     db.init()

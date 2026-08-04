@@ -305,6 +305,54 @@ console.log(JSON.stringify([
     assert json.loads(out.stdout) == [3600000, 5000, None, None]
 
 
+def test_hover_tooltip_shows_full_date_and_time():
+    """Every time-series chart's hover header shows the point's real DATE + TIME. A single global
+    Chart tooltip-title default in aimon-core.js reads each chart's per-point epoch (`chart.$ts`,
+    set by stampTs) and formats it via `fmtDateTime` (DD/MM/YY HH:MM:SS — both date and time). A
+    non-time chart (no $ts, e.g. the by-key bars) falls back to the x label; the alerts uptime
+    timeline (own title callback) appends the timestamp to its backend name. Runs the REAL helper +
+    the REAL global callback via node so the 'shows date AND time' guarantee can't silently regress."""
+    core = _core_js()
+    assert "function fmtDateTime(" in core, "fmtDateTime helper missing"
+    assert "Chart.defaults.plugins.tooltip.callbacks.title" in core, "global tooltip-title default missing"
+    assert ".$ts" in core, "the global title must read the per-point epoch ($ts)"
+    alerts = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert "fmtDateTime(start + it.parsed.x)" in alerts, \
+        "alerts uptime timeline must append date+time to its title"
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available for JS behavioral test")
+    stub = (
+        "const _el={style:{},setAttribute(){},addEventListener(){},appendChild(){},"
+        "classList:{add(){},remove(){},toggle(){}}};"
+        "const document={addEventListener(){},getElementById(){return null},"
+        "querySelector(){return null},querySelectorAll(){return []},createElement(){return _el},body:_el};"
+        "const window={addEventListener(){}};const localStorage={getItem(){return null},setItem(){}};"
+        "const Chart={defaults:{plugins:{tooltip:{callbacks:{}}}}};\n"
+    )
+    probe = """
+const T=Chart.defaults.plugins.tooltip.callbacks.title;
+console.log(JSON.stringify({
+  fmt: fmtDateTime(1754400000), fmt_null: fmtDateTime(null), fmt_nan: fmtDateTime(NaN),
+  ts_title: T([{chart:{$ts:[1754400000]}, dataIndex:0, label:"14:30"}]),
+  fallback: T([{chart:{}, dataIndex:0, label:"keyname"}]),
+  empty: T([])
+}));"""
+    out = subprocess.run([node, "-e", stub + core + probe], capture_output=True, text=True,
+                         env={**os.environ, "TZ": "UTC"})
+    assert out.returncode == 0, out.stderr
+    r = json.loads(out.stdout)
+    # fmtDateTime shows BOTH a date (dd/mm/yy) and a time (hh:mm:ss)
+    assert re.match(r"^\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$", r["fmt"]), r["fmt"]
+    assert r["fmt"] == "05/08/25 13:20:00"            # epoch 1754400000 in UTC
+    assert r["fmt_null"] == "" and r["fmt_nan"] == ""  # missing/non-finite → empty, never "NaN/.."
+    # a time-series point (has $ts) → the full timestamp, NOT the abbreviated axis label
+    assert r["ts_title"] == "05/08/25 13:20:00" and r["ts_title"] != "14:30"
+    # a non-time chart (no $ts, e.g. a by-key bar) → falls back to the x label unchanged
+    assert r["fallback"] == "keyname"
+    assert r["empty"] == ""
+
+
 def test_network_scope_badge_shows_host_vs_container():
     """The network Live card must surface whether the figures are the HOST's NICs or only
     this container's netns — a `l-scope` badge fed from the collector's `net.scope`, with the
@@ -603,7 +651,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.15"
+    assert config.VERSION == "AI-Monitoring_1.8.17"
 
 
 def test_all_version_surfaces_match_config_version():

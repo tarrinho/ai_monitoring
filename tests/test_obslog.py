@@ -53,6 +53,17 @@ def test_redaction_scrubs_secrets_and_generic_shapes():
     assert "«redacted»" in out and "«redacted-key»" in out
 
 
+def test_redaction_ignores_too_short_values_no_line_shredding():
+    # A 1-char configured secret (e.g. a mis-set token="T") must NOT be redacted — else it
+    # matches the `T` in TOKEN / CRITICAL / the ISO-8601 `T` and shreds every line.
+    scrub = obslog._redactor(["T", "ab"])
+    out = scrub("2026-08-01T15:15:31Z CRITICAL app: MONITOR_DASHBOARD_TOKEN too short")
+    assert out == "2026-08-01T15:15:31Z CRITICAL app: MONITOR_DASHBOARD_TOKEN too short"
+    assert "«redacted»" not in out
+    # a real (>=6) value is still redacted
+    assert "«redacted»" in obslog._redactor(["longsecret"])("x=longsecret")
+
+
 def test_redaction_applies_through_the_formatter():
     f = obslog.TextFormatter(obslog._redactor(["HUNTER2"]))
     line = f.format(_rec(msg="login for HUNTER2 via Bearer tok_abc123def"))

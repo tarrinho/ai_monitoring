@@ -17,6 +17,9 @@ from aiohttp.abc import AbstractResolver
 
 import config
 import db
+import obslog
+
+_LOG = obslog.get("alerts")     # fire/recover edges (INFO recover, WARNING fire)
 
 # ── SSRF guard for USER-supplied webhooks ─────────────────────────────────────
 # Per-user webhooks (set at /account) are attacker-influencable, so the server
@@ -274,11 +277,13 @@ class Notifier:
             self._last[key] = now
             sent.append(msg)
             db.record_alert(now, key, "fire", msg)
+            _LOG.warning("alert fired", extra={"key": key, "detail": msg})
         for key in recoveries:
             await self._fanout(session, f"🟢 recovered: {key}", recipients)
             self._last.pop(key, None)
             sent.append(f"recovered:{key}")
             db.record_alert(now, key, "recover", f"recovered: {key}")
+            _LOG.info("alert recovered", extra={"key": key})
         self._active = firing
         return sent
 

@@ -81,6 +81,37 @@ function paintUpdated(elId, lastOkMs){
 
 function stampTs(ch, pts){ try{ if(ch) ch.$ts=(pts||[]).map(function(p){ return p && p.t; }); }catch(e){} }
 
+// Full date + time from an epoch-SECONDS value, for chart hover tooltips. Explicit DD/MM/YY
+// HH:MM:SS (not toLocaleString, whose order varies by locale) so it always shows BOTH the date
+// and the time and is deterministic to test. Empty string on a missing/non-finite value.
+function fmtDateTime(t){
+  if(t==null || !isFinite(t)) return "";
+  try{
+    var d=new Date(t*1000), p=function(n){ return String(n).padStart(2,"0"); };
+    return p(d.getDate())+"/"+p(d.getMonth()+1)+"/"+String(d.getFullYear()).slice(-2)
+         +" "+p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
+  }catch(e){ return ""; }
+}
+
+// Make EVERY chart's hover tooltip header show the point's real date+time. The value lines were
+// always there; the header used to be the abbreviated x-axis label (time-only intraday, date-only
+// multi-day — never both). Each time-series chart stamps the per-point epoch on `chart.$ts` (via
+// stampTs), so a single global tooltip-title default reads it and formats the full timestamp — no
+// per-page wiring, so it can't drift. Charts with a non-time x (the by-key/user BAR charts, whose x
+// is a key name) have no $ts, so they fall back to the default x label. A chart that sets its OWN
+// tooltip.callbacks.title (e.g. the alerts uptime timeline) still overrides this per chart.
+if(typeof Chart!=="undefined" && Chart.defaults && Chart.defaults.plugins && Chart.defaults.plugins.tooltip){
+  Chart.defaults.plugins.tooltip.callbacks = Chart.defaults.plugins.tooltip.callbacks || {};
+  Chart.defaults.plugins.tooltip.callbacks.title = function(items){
+    try{
+      var it = items && items[0]; if(!it) return "";
+      var ts = it.chart && it.chart.$ts, i = it.dataIndex;
+      if(ts && i!=null && ts[i]!=null) return fmtDateTime(ts[i]);   // time-series → full date+time
+      return it.label!=null ? String(it.label) : "";                // non-time chart → default x label
+    }catch(e){ return ""; }
+  };
+}
+
 // Make a click-to-toggle control keyboard + assistive-tech accessible: a plain <div> with a
 // click handler is mouse-only (not focusable, no Enter/Space). This sets role=button + tabindex
 // and activates onToggle on click AND Enter/Space, so the collapsible section headers work

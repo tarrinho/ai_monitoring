@@ -1428,10 +1428,18 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
                 # Do NOT flag global auth as failed — only per-key budget CAPS fall back
                 # to MONITOR_KEY_BUDGETS. Log once per error-state change, not every poll.
                 if prev != _KEY_LIST_ERR:
-                    scope = " (key lacks key-management scope; spend/teams/cost unaffected)" \
-                        if _auth_err(err) else ""
-                    _dbg(f"/key/list err={err} -> reuse cached{scope}" if _KEY_BUDGETS_CACHE
-                         else f"/key/list err={err} -> budgets use MONITOR_KEY_BUDGETS{scope}")
+                    if _auth_err(err):
+                        # 403/401 = the key lacks key-management scope. Benign: spend/teams/cost
+                        # all keep flowing; only per-key budget CAPS fall back. INFO, not WARNING.
+                        _LLOG.info("/key/list scope-limited — spend/teams/cost unaffected; "
+                                   "per-key budgets use MONITOR_KEY_BUDGETS", extra={"err": str(err)})
+                    else:
+                        # Real transport/parse/5xx failure (e.g. a JSONDecodeError) → budgets are
+                        # degraded. WARNING; deduped so a persistent outage is one line/window.
+                        _LLOG.warning("/key/list failed — per-key budgets degraded",
+                                      extra={"err": str(err),
+                                             "fallback": "cache" if _KEY_BUDGETS_CACHE
+                                             else "MONITOR_KEY_BUDGETS"})
                 # Feed the private key_list breaker the LIVE outcome (a fast scope-limit 403 is
                 # NOT the struggling/slow API the breaker guards, so only a real transport/5xx
                 # failure trips it). Recorded HERE, not from the caller's memoized return value —
@@ -1530,7 +1538,8 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         _KEY_LIST_ERR = (f"/key/list partial: {len(out)} keys"
                          + (f"/{expected}" if expected else "")
                          + f" (page failed mid-walk) — reused {len(cache)}-key cache")
-        _dbg(_KEY_LIST_ERR)
+        _LLOG.warning("/key/list partial — kept fuller cache",
+                      extra={"keys": len(out), "expected": expected or "?", "cached": len(cache)})
         return cache
     if out and not (incomplete and len(out) < len(cache)):
         _KEY_BUDGETS_CACHE = out

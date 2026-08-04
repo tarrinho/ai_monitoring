@@ -927,7 +927,8 @@ def _prewindow_baseline(conn: Any, table: str, tc: str, start: float,
 
 
 def key_series_window_delta(window: str, top_n: int = 10,
-                            end: float | None = None) -> dict[str, Any]:
+                            end: float | None = None,
+                            require_known: bool = True) -> dict[str, Any]:
     """Top-N keys by NET requests made DURING the window — the SUM OF POSITIVE STEPS
     across every sample in the window, per key. A key whose count is unchanged
     (e.g. 1000 → 1000) yields 0: this shows *activity in the window*, not the running
@@ -970,8 +971,13 @@ def key_series_window_delta(window: str, top_n: int = 10,
             prev[label] = v
         out = []
         for label, delta in totals.items():
-            if (config.key_excluded(label) or not config.key_known(label, known)
-                    or label in hidden):
+            # require_known=False for the spend-context caller (spend_keycost lite-mode fallback):
+            # a key with real windowed request activity is self-evidence of a real key, so don't
+            # silently DROP it just because /key/list hasn't confirmed the label (master key /
+            # ephemeral virtual key) — same rationale as the rollup paths' _label_hidden opt-out.
+            # Default True keeps every other caller (ranking, request charts) gating as before.
+            if (config.key_excluded(label) or label in hidden
+                    or (require_known and not config.key_known(label, known))):
                 continue
             out.append({"label": label, "delta": max(0.0, round(delta, 2))})
         out.sort(key=lambda x: cast(float, x["delta"]), reverse=True)
@@ -1125,7 +1131,8 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
     LITELLM_HEAVY_INTERVAL), so a bucket can have an aggregate value with no key_series row
     of its own — most often a single isolated request, whose backlog blip and matching
     spend-delta sample rarely land in the same bucket. Such a bucket borrows the nearest
-    bucket's key-mix within one heavy-poll interval (`max_gap`, below) instead of dumping
+    bucket's key-mix within ~two heavy-poll intervals (`max_gap`, below — 2× tolerates the
+    poll's real-world jitter) instead of dumping
     straight to 'Other'; beyond that distance the mix is stale enough that 'Other' is still
     the honest answer.
 
@@ -1234,11 +1241,19 @@ def concurrency_by_key(window: str, metric: str, max_points: int = 200,
         # request's backlog blip and its matching key_series sample rarely land in
         # the SAME bucket — without bridging, every isolated request washes into
         # "Other" even though the key that made it is known. Borrow the nearest
-        # bucket's key-mix within one heavy-poll interval; beyond that the mix is
-        # stale enough that "Other" is still the honest answer. Compute the bridged
-        # per-bucket mix ONCE (`eff`) and reuse it for both ranking and drawing.
+        # bucket's key-mix; beyond the bridge distance the mix is stale enough that
+        # "Other" is still the honest answer. Compute the bridged per-bucket mix ONCE
+        # (`eff`) and reuse it for both ranking and drawing.
+        #
+        # Bridge up to ~TWO heavy-poll intervals, not one: the per-key spend poll fires every
+        # ~LITELLM_HEAVY_INTERVAL, but with real jitter — a short (e.g. 1h) window regularly has
+        # a conc/backlog bucket whose nearest key-sample sits just past one interval, so a 1×
+        # bridge stranded a small honest-but-avoidable "Other" residual (visible at 1h, ~0 by
+        # 24h once samples align). A 2× bridge still borrows the REAL nearest key-mix (nothing
+        # fabricated, total preserved) — it just tolerates poll jitter — and the mix is stable
+        # across ~2 min of a 60s-cadence signal, so attribution stays correct.
         nonempty_bkts = sorted(b for b, bw in weights.items() if sum(bw.values()) > 0)
-        max_gap = max(1, math.ceil(config.LITELLM_HEAVY_INTERVAL / bsize)) + 1
+        max_gap = max(1, math.ceil(2 * config.LITELLM_HEAVY_INTERVAL / bsize)) + 1
         buckets = sorted(aggv)
         eff: dict[int, tuple] = {}
         # ATTRIBUTABLE weight per label = its share of the REAL aggregate summed over the
