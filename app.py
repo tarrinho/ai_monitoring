@@ -3710,11 +3710,18 @@ async def spend_model_user_series_handler(request: web.Request) -> web.Response:
 
 
 async def alerts_handler(request: web.Request) -> web.Response:
+    # Both SQLite reads in ONE off-loop hop (§6): `history` used to read on-loop, and the
+    # Channels card's delivery list would have doubled that on every poll of every open tab.
+    def _reads() -> tuple:
+        return db.recent_alerts(50), db.recent_webhook_sends(10)
+    history, deliveries = await asyncio.to_thread(_reads)
     return web.json_response({
         "channels": alerts.channels_status(),
         "thresholds": alerts.thresholds_status(),
         "active": _notifier.active_keys(),
-        "history": db.recent_alerts(50),
+        "history": history,
+        # last 10 webhook DELIVERIES (distinct from `history`, which is what was evaluated)
+        "deliveries": deliveries,
     })
 
 

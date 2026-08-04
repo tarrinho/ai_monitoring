@@ -4,6 +4,20 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.19] — 2026-08-04
+
+### Security
+- **Bumped `aiohttp` 3.14.1 → 3.14.3** to clear **CVE-2026-69244** (HIGH), flagged by the CI `trivy fs` dependency scan. Patch release on the same line (no API change); the in-image `RUN_TESTS=1` gate re-runs the full suite against it. `trivy fs .` now reports 0 HIGH/CRITICAL.
+
+### Changed
+- **Alert messages are polished and self-describing.** Every webhook/alert line now leads with the **machine name** and the **tool**, then the event — e.g. `🔴 [gpu-box-01] AI-Monitoring — vLLM is DOWN — connection refused`. Backend up/down reads naturally (`vLLM is DOWN — <reason>` on failure, `vLLM is back UP` on recovery) with human service labels (LiteLLM / Ollama / llama.cpp / vLLM / GPU); threshold alerts (CPU/memory/disk/GPU/VRAM/queue) get the same `[machine] AI-Monitoring — …` prefix and a clean recovery line (`CPU back to normal`) instead of the old `recovered: cpu`. The machine name is the monitored host's own hostname, overridable with `MONITOR_INSTANCE_NAME` (useful when the reported hostname is a container id). The `_LOG` alert lines also carry a `machine=` field. Covered by `test_alert_message_includes_machine_tool_service_and_reason` (+ updated recovery assertion).
+
+## [1.8.18] — 2026-08-04
+
+### Added
+- **Webhook alerts now render in Microsoft Teams with no flow edits.** Teams' stock *"Post to a channel when a webhook request is received"* Workflow (the Power Automate replacement for the retired O365 connector) expects an Adaptive-Card **message envelope**, not a bare `{text}` — so it returned `202 Accepted` (the sender logged *"delivered"*) while the card silently never posted (the classic *delivered-but-nothing-shows*). The notifier now shapes the POST body per destination: an MS Teams URL (`…logic.azure.com/…/workflows/…` or `…webhook.office.com…`) auto-gets the `{"type":"message","attachments":[{contentType: adaptive card…}]}` envelope; a Slack URL gets `{"text":…}`; every other receiver keeps the generic `{"source","text"}` (unchanged). Applies to both the *Send alert test* buttons and real alert fan-out (global + per-user). Controlled by `MONITOR_WEBHOOK_FORMAT` (default `auto` = pick by URL; force with `teams`/`slack`/`generic`). Covered by `test_webhook_payload_teams_url_gets_adaptive_card` + `test_send_test_posts_teams_card_to_a_teams_url`.
+- **Every webhook POST result is now logged** (`aimon.alerts`): delivered → `INFO` with the HTTP status, rejected (non-2xx) or transport error → `WARNING`. Previously the fan-out path swallowed the outcome silently, so a failing webhook was invisible in `docker logs`/journal. The URL is logged **host-only** (its path/query holds the secret — Teams `sig=`, Slack token — which must never reach the log). Note a Teams/Power-Automate URL returns `202` even when the flow later drops the card, so a `202` in the log means *accepted*, not necessarily *rendered*. Covered by `test_webhook_result_is_logged_without_leaking_the_url_secret`.
+
 ## [1.8.17] — 2026-08-03
 
 ### Added

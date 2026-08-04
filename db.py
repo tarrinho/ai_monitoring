@@ -233,6 +233,23 @@ CREATE TABLE IF NOT EXISTS alert_log (
 );
 CREATE INDEX IF NOT EXISTS idx_alert_log_ts ON alert_log(ts);
 
+-- Webhook DELIVERY outcomes (the Channels card's "recent deliveries" list). alert_log above
+-- records what was EVALUATED (fire/recover); this records whether the notification actually
+-- reached the endpoint. Without it, delivery lived only in the logs, so the dashboard could
+-- not answer "did that alert actually arrive?" — the endpoint that 202-accepts and then
+-- silently renders nothing is the exact case this makes visible.
+-- status/ms are NULL when the POST never got a response (timeout / DNS / connection refused);
+-- `ok` is the single truth the UI colours on.
+CREATE TABLE IF NOT EXISTS webhook_log (
+    ts      REAL NOT NULL,
+    channel TEXT NOT NULL,    -- 'webhook' (operator-global) | 'test'
+    akey    TEXT,             -- alert key this send was for ('test' for a test send)
+    status  INTEGER,          -- HTTP status, NULL on transport failure
+    ok      INTEGER NOT NULL, -- 1 delivered (<400), 0 rejected/failed
+    ms      REAL              -- round-trip milliseconds, NULL on transport failure
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_log_ts ON webhook_log(ts);
+
 -- Fired per-key anomalies (spike / budget) for history + dashboard.
 CREATE TABLE IF NOT EXISTS anomalies (
     ts     REAL NOT NULL,
@@ -1066,6 +1083,7 @@ def prune_key_series() -> None:
             # keep alert/anomaly history for the full hour-rollup horizon (1y)
             conn.execute("DELETE FROM anomalies WHERE ts < ?", (hour_cut,))
             conn.execute("DELETE FROM alert_log WHERE ts < ?", (hour_cut,))
+            conn.execute("DELETE FROM webhook_log WHERE ts < ?", (hour_cut,))
     except Exception as _e:
         _dberr(_e)
         pass
@@ -1488,6 +1506,48 @@ def record_alert(ts: float, akey: str, kind: str, msg: str = "") -> None:
     except Exception as _e:
         _dberr(_e)
         pass
+
+
+def record_webhook_send(ts: float, channel: str, akey: str | None,
+                        status: int | None, ok: bool, ms: float | None) -> None:
+    """Record ONE webhook delivery attempt (see the webhook_log schema comment).
+
+    Best-effort, exactly like record_alert: a bookkeeping failure must never propagate into the
+    notifier and stop an alert from being delivered. Values are coerced defensively — `status`
+    and `ms` stay NULL when the POST never got a response (timeout / DNS / refused)."""
+    def _int_or_none(v):
+        try:
+            return None if v is None else int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _float_or_none(v):
+        try:
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            return None
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO webhook_log(ts,channel,akey,status,ok,ms) VALUES (?,?,?,?,?,?)",
+                (float(ts), str(channel)[:24], str(akey or "")[:80],
+                 _int_or_none(status), 1 if ok else 0, _float_or_none(ms)))
+    except Exception as _e:
+        _dberr(_e)
+
+
+def recent_webhook_sends(limit: int = 10) -> list[dict[str, Any]]:
+    """The most recent webhook deliveries, NEWEST FIRST — the Channels card's list."""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT ts,channel,akey,status,ok,ms FROM webhook_log "
+                "ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
+        return [{"ts": t, "channel": c, "akey": k, "status": s,
+                 "ok": bool(o), "ms": m} for t, c, k, s, o, m in rows]
+    except Exception as _e:
+        _dberr(_e)
+        return []
 
 
 def recent_alerts(limit: int = 50) -> list[dict[str, Any]]:

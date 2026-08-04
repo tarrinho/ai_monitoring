@@ -2153,7 +2153,7 @@ async def test_notifier_debounce_and_recovery(monkeypatch):
     monkeypatch.setattr(config, "ALERT_REPEAT_MIN", 9999)  # never repeat
     sent_log = []
 
-    async def fake_fanout(self, session, text, recipients=None):
+    async def fake_fanout(self, session, text, recipients=None, akey=""):
         sent_log.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", fake_fanout)
 
@@ -2168,7 +2168,7 @@ async def test_notifier_debounce_and_recovery(monkeypatch):
         await n.process(s, cool, 1010)     # recovery
     assert any("🔴" in m for m in sent_log)
     assert sum("🔴" in m for m in sent_log) == 1     # only once (debounced)
-    assert any("recovered" in m for m in sent_log)
+    assert any("🟢" in m and "back to normal" in m for m in sent_log)   # polished recovery line
 
 
 # --------------------------------------------------- uptime / events (T2) -----
@@ -2321,7 +2321,7 @@ async def test_alert_fire_recover_logs(monkeypatch, caplog):
     import logging
     n = alerts.Notifier()
 
-    async def _fanout(self, session, text, recipients):    # stub: no real webhook
+    async def _fanout(self, session, text, recipients, akey=""):    # stub: no real webhook
         return None
 
     async def _no_recipients(self):
@@ -7672,7 +7672,7 @@ async def test_notifier_fans_out_to_user_webhooks(monkeypatch):
     db.user_set_webhook("wf", "https://hooks.example.test/mine", True)
     posted = []
 
-    async def fake_post(self, session, url, payload):
+    async def fake_post(self, session, url, payload, akey=""):
         posted.append(url)
     monkeypatch.setattr(alerts.Notifier, "_post_json", fake_post)
     n = alerts.Notifier()
@@ -7684,6 +7684,140 @@ async def test_notifier_fans_out_to_user_webhooks(monkeypatch):
     # a disabled webhook is not a recipient
     db.user_set_webhook("wf", "https://hooks.example.test/mine", False)
     assert "https://hooks.example.test/mine" not in await alerts.Notifier()._recipients()
+
+
+def test_webhook_payload_teams_url_gets_adaptive_card(monkeypatch):
+    """MS Teams (Power Automate / O365) URLs auto-get the Adaptive-Card message envelope the stock
+    'when a webhook request is received' flow renders — so the operator changes nothing on the Teams
+    side. Slack/other URLs keep the generic {source,text}. Overridable via MONITOR_WEBHOOK_FORMAT."""
+    teams = "https://prod-9.westeurope.logic.azure.com:443/workflows/ab/triggers/manual/paths/invoke?sig=x"
+    office = "https://acme.webhook.office.com/webhookb2/xyz"
+    slack = "https://hooks.slack.com/services/T/B/z"
+    generic = "https://example.com/hook"
+    assert alerts._is_teams_url(teams) and alerts._is_teams_url(office)
+    assert not alerts._is_teams_url(slack) and not alerts._is_teams_url(generic)
+    monkeypatch.setattr(config, "WEBHOOK_FORMAT", "auto")
+    card = alerts._webhook_payload("boom", teams)
+    assert card["type"] == "message"
+    att = card["attachments"][0]
+    assert att["contentType"] == "application/vnd.microsoft.card.adaptive"
+    assert att["content"]["body"][0]["text"] == "boom"      # the message text lands inside the card
+    # non-teams under auto → generic {source,text} (unchanged for every existing receiver)
+    assert alerts._webhook_payload("boom", generic) == {"source": "AI-Monitoring", "text": "boom"}
+    # explicit overrides win
+    monkeypatch.setattr(config, "WEBHOOK_FORMAT", "generic")
+    assert alerts._webhook_payload("x", teams) == {"source": "AI-Monitoring", "text": "x"}
+    monkeypatch.setattr(config, "WEBHOOK_FORMAT", "slack")
+    assert alerts._webhook_payload("x", generic) == {"text": "x"}
+    monkeypatch.setattr(config, "WEBHOOK_FORMAT", "teams")
+    assert alerts._webhook_payload("x", generic)["type"] == "message"
+
+
+async def test_send_test_posts_teams_card_to_a_teams_url(monkeypatch):
+    """'Send alert test' (send_test) posts the Adaptive-Card body when ALERT_WEBHOOK_URL is a Teams
+    URL — the fix for 'delivered but nothing shows' (Teams 202s a bare {text} then silently drops it)."""
+    monkeypatch.setattr(config, "WEBHOOK_FORMAT", "auto")
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL",
+                        "https://prod-1.westeurope.logic.azure.com/workflows/x/triggers/manual/paths/invoke?sig=y")
+    captured = {}
+
+    async def fake_try_post(self, session, url, payload):
+        captured["url"] = url
+        captured["payload"] = payload
+        return "ok"
+    monkeypatch.setattr(alerts.Notifier, "_try_post", fake_try_post)
+    res = await alerts.send_test(None)
+    assert res["webhook"] == "ok"
+    assert captured["payload"]["type"] == "message"          # card envelope, not {source,text}
+    assert captured["payload"]["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
+
+
+def _fake_webhook_session(status=None, exc=None):
+    """Minimal aiohttp-session stand-in: `async with session.post(...) as r` yields an object with
+    `.status`, or raises `exc` on enter (transport error)."""
+    class _CM:
+        async def __aenter__(self):
+            if exc:
+                raise exc
+            r = type("R", (), {})()
+            r.status = status
+            return r
+        async def __aexit__(self, *a):
+            return False
+    class _S:
+        def post(self, *a, **k):
+            return _CM()
+    return _S()
+
+
+async def test_webhook_result_is_logged_without_leaking_the_url_secret(caplog):
+    """Every webhook POST result is written to the log (aimon.alerts): delivered→INFO with the HTTP
+    status, rejected/failed→WARNING. The URL is logged HOST-ONLY so the secret in its path/query
+    (Teams `sig=`, Slack token) never reaches the log."""
+    import logging
+    n = alerts.Notifier()
+    url = "https://prod-1.westeurope.logic.azure.com/workflows/x/triggers/manual/paths/invoke?sig=TOPSECRETSIG"
+    with caplog.at_level(logging.INFO, logger="aimon.alerts"):
+        await n._post_json(_fake_webhook_session(202), url, {"x": 1})            # delivered
+        await n._post_json(_fake_webhook_session(403), url, {"x": 1})            # rejected
+        await n._post_json(_fake_webhook_session(exc=RuntimeError("boom")), url, {"x": 1})  # failed
+    recs = [r for r in caplog.records if r.name == "aimon.alerts"]
+    # the secret must appear NOWHERE (message or the structured url field)
+    assert all("TOPSECRETSIG" not in r.getMessage() and "TOPSECRETSIG" not in str(getattr(r, "url", ""))
+               for r in recs), "webhook secret leaked into the log"
+    deliv = [r for r in recs if "delivered" in r.getMessage()]
+    assert deliv and getattr(deliv[0], "status", None) == 202
+    assert getattr(deliv[0], "url", None) == "https://prod-1.westeurope.logic.azure.com"   # host only
+    warns = [r for r in recs if r.levelno == logging.WARNING]
+    assert any(getattr(r, "status", None) == 403 for r in warns)          # non-2xx → WARNING
+    assert any(getattr(r, "error", None) == "RuntimeError" for r in warns)  # transport error → WARNING
+
+
+async def test_alert_message_includes_machine_tool_service_and_reason(monkeypatch):
+    """Every alert line carries the machine name, the tool (AI-Monitoring), and — for a backend —
+    which service is on/off and WHY. A down→up cycle reads naturally ('vLLM is DOWN — …' / 'vLLM
+    is back UP'). Threshold alerts get the same [machine] AI-Monitoring prefix."""
+    monkeypatch.setattr(config, "INSTANCE_NAME", "")            # force hostname path
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_CPU_PCT", 0)            # isolate the backend alert
+    sent = []
+
+    async def fake_fanout(self, session, text, recipients=None, akey=""):
+        sent.append(text)
+    monkeypatch.setattr(alerts.Notifier, "_fanout", fake_fanout)
+    n = alerts.Notifier()
+    down = {"ts": 0, "collectors": {"host": {"available": True, "hostname": "gpu-box-01"},
+                                    "vllm": {"available": False, "error": "connection refused"}}}
+    up = {"ts": 0, "collectors": {"host": {"available": True, "hostname": "gpu-box-01"},
+                                  "vllm": {"available": True}}}
+    async with aiohttp.ClientSession() as s:
+        await n.process(s, down, 1000)     # vLLM down → fire
+        await n.process(s, up, 1010)       # vLLM back → recover
+    fire = next(m for m in sent if "🔴" in m)
+    rec = next(m for m in sent if "🟢" in m)
+    for token in ("gpu-box-01", "AI-Monitoring", "vLLM", "DOWN", "connection refused"):
+        assert token in fire, f"{token!r} missing from {fire!r}"
+    assert "gpu-box-01" in rec and "vLLM is back UP" in rec
+    # the machine-name override wins when set
+    monkeypatch.setattr(config, "INSTANCE_NAME", "prod-eu-1")
+    assert alerts._machine(down) == "prod-eu-1"
+
+
+async def test_real_alert_fanout_posts_teams_card_to_global_url(monkeypatch):
+    """The REAL alert path (`_fanout`, not just the Send-test button) also shapes the global
+    ALERT_WEBHOOK_URL body as a Teams card when that URL is a Teams URL — so live alerts render too."""
+    monkeypatch.setattr(config, "WEBHOOK_FORMAT", "auto")
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL",
+                        "https://prod-2.westeurope.logic.azure.com/workflows/z/triggers/manual/paths/invoke?sig=s")
+    captured = {}
+
+    async def fake_post(self, session, url, payload, akey=""):
+        captured["url"] = url
+        captured["payload"] = payload
+    monkeypatch.setattr(alerts.Notifier, "_post_json", fake_post)
+    await alerts.Notifier()._fanout(None, "🔴 CPU 95%", [])
+    assert captured["payload"]["type"] == "message"                       # card envelope
+    assert captured["payload"]["attachments"][0]["content"]["body"][0]["text"] == "🔴 CPU 95%"
 
 
 async def test_webhook_set_is_audited(monkeypatch):
@@ -11530,3 +11664,79 @@ def test_self_uptime_segments_panned_24h_window_no_leading_fabricated_down(tmp_p
     # the key regression: no big fabricated 'down' band anywhere in the window
     assert not any(not s["up"] and (s["to"] - s["from"]) > 3600 for s in out["segments"]), \
         "no leading (or any) >1h fabricated-down band on a panned 24h window"
+
+
+def test_webhook_log_records_and_reads_recent_deliveries(tmp_path, monkeypatch):
+    """Webhook DELIVERY outcomes are persisted (they used to exist only in logs, so the UI could
+    never answer 'did my alert actually reach Teams/Slack?' — the 202-accepted-but-nothing-rendered
+    class of problem). Newest-first, capped, and every field the Channels card renders."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wl.db"))
+    db.init()
+    now = 9_000_000.0
+    db.record_webhook_send(now - 30, "webhook", "cpu_pct", 204, True, 41.5)
+    db.record_webhook_send(now - 20, "webhook", "gpu_pct", 500, False, 12.0)
+    db.record_webhook_send(now - 10, "webhook", "test", None, False, None)   # transport failure
+    rows = db.recent_webhook_sends(10)
+    assert len(rows) == 3
+    assert [r["akey"] for r in rows] == ["test", "gpu_pct", "cpu_pct"], "newest first"
+    assert rows[2]["status"] == 204 and rows[2]["ok"] is True and rows[2]["ms"] == 41.5
+    assert rows[1]["ok"] is False and rows[1]["status"] == 500
+    assert rows[0]["status"] is None and rows[0]["ok"] is False, "transport failure keeps a row"
+    assert len(db.recent_webhook_sends(2)) == 2, "limit honoured"
+
+
+def test_webhook_log_never_raises_on_bad_input(tmp_path, monkeypatch):
+    """Recording a delivery must never propagate into the notifier — a logging concern must not
+    break alert delivery itself (same best-effort contract as record_alert)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wl2.db"))
+    db.init()
+    db.record_webhook_send(9_000_000.0, "webhook", "x" * 500, "not-an-int", True, "nope")
+    assert isinstance(db.recent_webhook_sends(5), list)
+
+
+async def test_post_json_records_delivery_outcome(tmp_path, monkeypatch):
+    """A real send writes ONE webhook_log row carrying the outcome the Channels card renders:
+    2xx -> ok + status, 5xx -> not ok + status, transport failure -> ok=False with NULL status
+    (that NULL is what distinguishes 'rejected' from 'never arrived')."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wl3.db"))
+    db.init()
+
+    class _Resp:
+        def __init__(self, st): self.status = st
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class _Sess:
+        def __init__(self, st=None, boom=False): self._st, self._boom = st, boom
+        def post(self, *a, **k):
+            if self._boom:
+                raise OSError("connection refused")
+            return _Resp(self._st)
+
+    n = alerts.Notifier()
+    await n._post_json(_Sess(204), "https://hook.example.com/x", {"text": "t"}, "cpu")
+    await n._post_json(_Sess(500), "https://hook.example.com/x", {"text": "t"}, "gpu")
+    await n._post_json(_Sess(boom=True), "https://hook.example.com/x", {"text": "t"}, "disk")
+    rows = db.recent_webhook_sends(10)
+    by = {r["akey"]: r for r in rows}
+    assert len(rows) == 3
+    assert by["cpu"]["ok"] is True and by["cpu"]["status"] == 204 and by["cpu"]["ms"] is not None
+    assert by["gpu"]["ok"] is False and by["gpu"]["status"] == 500
+    assert by["disk"]["ok"] is False and by["disk"]["status"] is None and by["disk"]["ms"] is None
+
+
+async def test_alerts_endpoint_exposes_recent_deliveries(tmp_path, monkeypatch):
+    """/api/alerts ships the last-10 delivery list the Channels card reads, separate from
+    `history` (which is what was EVALUATED, not what was delivered)."""
+    from aiohttp.test_utils import make_mocked_request
+    import json as _json
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wl4.db"))
+    db.init()
+    now = 9_000_000.0
+    for i in range(12):                       # more than the cap, to prove the limit
+        db.record_webhook_send(now + i, "webhook", f"k{i}", 204, True, 10.0)
+    d = _json.loads((await appmod.alerts_handler(make_mocked_request("GET", "/api/alerts"))).text)
+    assert "deliveries" in d, "the endpoint must expose the delivery list"
+    assert len(d["deliveries"]) == 10, "capped at 10"
+    assert d["deliveries"][0]["akey"] == "k11", "newest first"
+    assert "history" in d and isinstance(d["history"], list), "history must remain"

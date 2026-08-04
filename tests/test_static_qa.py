@@ -651,7 +651,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.17"
+    assert config.VERSION == "AI-Monitoring_1.8.19"
 
 
 def test_all_version_surfaces_match_config_version():
@@ -4530,3 +4530,23 @@ def test_litellm_loading_overlay_stays_until_data_executed():
     assert seen["revealedOnData"] is True, "overlay must clear once the card has data"
     assert seen["kpiHadOverlay"] is True, "card-kpi should start with its _initLoading overlay"
     assert seen["showRevealsNow"] is True, "_cardShow must reveal immediately"
+
+
+def test_alerts_channels_card_lists_recent_webhook_deliveries():
+    """The Channels card carries the last-10 webhook DELIVERY list (registry: delivery outcomes
+    used to exist only in logs). It must read /api/alerts' `deliveries`, render through the ONE
+    sanitized sink, escape every server value, and show the status code — an endpoint that
+    2xx-accepts and then renders nothing must still be distinguishable from a real success."""
+    html = (ROOT / "web" / "alerts.html").read_text(encoding="utf-8")
+    assert 'id="deliv-body"' in html, "missing the delivery list container"
+    assert "Recent deliveries" in html, "missing the list heading"
+    assert "d.deliveries" in html, "must read the endpoint's deliveries field"
+    # rendered through the single sanitized sink, never a second innerHTML
+    assert html.count("innerHTML") == 1, "alerts.html must keep exactly one innerHTML sink"
+    assert 'setHtml(document.getElementById("deliv-body")' in html
+    # every interpolated server value escaped
+    body = html[html.find('setHtml(document.getElementById("deliv-body")'):][:900]
+    for field in ("x.akey", "ago(x.ts)"):
+        assert f"escapeHtml({field})" in body or f"escapeHtml({field}||" in body, \
+            f"{field} must be escaped"
+    assert "no reply" in body and "HTTP " in body, "status code (or 'no reply') must be shown"

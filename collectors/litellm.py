@@ -279,7 +279,7 @@ async def sample(session: aiohttp.ClientSession) -> dict:
 
     # Cheap, every tick: queue backlog (saturation signal, single fast call).
     out["backlog"] = await _fetch_backlog(session, base, h)
-    _dbg(f"/health/backlog -> {out['backlog']}")
+    _dbg(f"/health/backlog: in_flight_requests={out['backlog']}")
 
     # The heavy calls (/health probes every deployment; /spend/logs returns the
     # whole day's logs) are throttled to LITELLM_HEAVY_INTERVAL and their derived
@@ -599,7 +599,7 @@ async def _lite_spend(session: aiohttp.ClientSession, base: str,
     out["top_keys"], e3 = await _fetch_top_keys(session, base, h)
     _dbg(f"/spend lite: requests={out.get('requests_window')} "
          f"per_model={len(out.get('per_model', []))} top_keys={len(out.get('top_keys', []))} "
-         f"errs=({e1},{e2},{e3})")
+         f"errs=(activity={e1}, per_model={e2}, top_keys={e3})")
     # If every admin/spend call was rejected, say so CLEARLY (once) — a key that
     # lists models but is refused here is not a valid master/admin key.
     _note_auth(base, next((e for e in (e1, e2, e3) if _auth_err(e)), None))
@@ -1119,18 +1119,26 @@ def _spend_report_variants(base: str, start_date: str,
 
 
 async def _daily_spend_by_date(session: aiohttp.ClientSession, base: str,
-                               start_date: str, end_date: str) -> tuple[dict, str]:
+                               start_date: str, end_date: str
+                               ) -> tuple[dict, str, list[str]]:
     """First spend-report variant that actually yields spend, as {canonical-date:
-    spend}. Returns ({}, "") when none work (e.g. report 400s on this LiteLLM)."""
+    spend}. Returns ({}, "", attempts) when none work (e.g. report 400s on this
+    LiteLLM). `attempts` records the outcome of each variant tried, in order
+    (stops at the first success) — e.g. ["report_capped:err=400", "report_30d:empty",
+    "report_raw:ok"] — so a terminal `via=none` is explainable instead of opaque."""
+    attempts: list[str] = []
     for label, url in _spend_report_variants(base, start_date, end_date):
         d, err = await fetch_json(session, url, headers=_headers(),
                                   timeout_s=config.HTTP_TIMEOUT)
         if err is not None:
+            attempts.append(f"{label}:err={err}")
             continue
         rep, rep_spend = _parse_daily(_rows_of(d) or [])
         if rep_spend:
-            return {r["date"]: r["spend"] for r in rep}, label
-    return {}, ""
+            attempts.append(f"{label}:ok")
+            return {r["date"]: r["spend"] for r in rep}, label, attempts
+        attempts.append(f"{label}:empty")
+    return {}, "", attempts
 
 
 async def spend_report_probe(session: aiohttp.ClientSession,
@@ -1211,8 +1219,8 @@ async def spend_activity(session: aiohttp.ClientSession,
     _dbg(f"/global/activity err={err} rows={len(daily)} has_spend={has_spend}")
 
     if not daily or not has_spend:
-        by_date, src = await _daily_spend_by_date(session, base, start_date, end_date)
-        _dbg(f"daily spend via={src or 'none'} dates={len(by_date)}")
+        by_date, src, attempts = await _daily_spend_by_date(session, base, start_date, end_date)
+        _dbg(f"daily spend via={src or 'none'} dates={len(by_date)} tried={attempts}")
         if by_date and daily:                   # merge report spend into activity rows
             for r in daily:
                 if r["date"] in by_date:
@@ -1375,7 +1383,8 @@ async def _team_directory(session: aiohttp.ClientSession,
     if by_id or by_user or by_user_name:
         _TEAM_DIR_CACHE = (dict(by_id), dict(by_user), dict(by_user_name))
     _dbg(f"/team directory: teams={len(by_id)} users_mapped={len(by_user)} "
-         f"names={len(by_user_name)}")
+         f"(via /team/list) names={len(by_user_name)} (via /user/list, independent "
+         f"paginated walk — can differ from teams/users_mapped even when they're stuck at 0)")
     return by_id, by_user, by_user_name
 
 

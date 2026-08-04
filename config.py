@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "AI-Monitoring_1.8.17"
+VERSION = "AI-Monitoring_1.8.19"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -40,6 +40,9 @@ def _float(name: str, default: float) -> float:
 MONITOR_HOST = _str("MONITOR_HOST", "0.0.0.0")
 MONITOR_PORT = _int("MONITOR_PORT", 9925)
 DB_PATH      = _str("MONITOR_DB_PATH", "/data/ai-monitoring.db")
+# Friendly name for THIS monitored machine, shown in alert messages ("[<name>] …").
+# Empty = use the host's own hostname (os.uname().nodename) from the host collector.
+INSTANCE_NAME = _str("MONITOR_INSTANCE_NAME")
 
 # --- sampling / retention ----------------------------------------------------
 SAMPLE_INTERVAL   = _float("MONITOR_SAMPLE_INTERVAL", 5.0)     # seconds
@@ -409,6 +412,11 @@ WEBHOOK_ALLOW_HOSTS   = _str("MONITOR_WEBHOOK_ALLOW_HOSTS", "") or ""
 # tick, so a large user base (or a user with a slow-resolving host) can't make the
 # fan-out unbounded. Validation + delivery are also run concurrently + time-bounded.
 WEBHOOK_MAX_RECIPIENTS = _int("MONITOR_WEBHOOK_MAX_RECIPIENTS", 50)
+# Webhook body shape per destination. "auto" (default) picks by URL: an MS Teams
+# Power-Automate / O365 URL gets the Adaptive-Card message envelope its stock
+# "when a webhook request is received" flow expects, a Slack hooks URL gets {text},
+# everything else the generic {source,text}. Force one with "teams"/"slack"/"generic".
+WEBHOOK_FORMAT = (_str("MONITOR_WEBHOOK_FORMAT", "auto") or "auto").strip().lower()
 
 # --- retention rollups (Tier 4) ----------------------------------------------
 ROLLUP_RAW_HOURS   = _int("ROLLUP_RAW_HOURS", 24)      # keep raw samples

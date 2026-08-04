@@ -153,7 +153,7 @@
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.17</div>
+      <div id="sidebar-brand-ver">v1.8.19</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -182,6 +182,10 @@
   <section class="card" id="card-channels">
     <h2>Channels</h2>
     <div id="chans"></div>
+    <div id="deliv-wrap" style="margin-top:14px">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Recent deliveries</div>
+      <div id="deliv-body"><div class="unavail">none yet</div></div>
+    </div>
     <div style="margin-top:12px">
       <button id="test-btn">Send test alert</button>
       <span id="test-result" style="margin-left:10px;font-size:12px;color:var(--muted)"></span>
@@ -275,6 +279,23 @@ function render(d){
   setHtml(document.getElementById("chans"),
     (d.channels||[]).map(c=>`<span class="chip ${c.on?'on':'off'}">`
       +`${escapeHtml(c.name)} ${c.on?'●':'○'}</span>`).join(""));
+  // recent webhook DELIVERIES — what actually reached the endpoint, which the alert history
+  // below cannot show (it records what was evaluated). An endpoint that accepts (2xx) and then
+  // renders nothing still reads "ok" here, so the status code itself is shown, not just a tick.
+  const dv=d.deliveries||[];
+  setHtml(document.getElementById("deliv-body"),
+    dv.length ? `<table>`
+      +dv.map(x=>{
+        const st = x.status==null ? "no reply" : ("HTTP "+x.status);
+        const cls = x.ok ? "recover" : "fire";
+        const ms = (x.ms==null) ? "" : (x.ms<1000 ? Math.round(x.ms)+"ms"
+                                                  : (x.ms/1000).toFixed(1)+"s");
+        return `<tr><td>${escapeHtml(ago(x.ts))}</td>`
+          +`<td>${escapeHtml(x.akey||"—")}</td>`
+          +`<td class="${cls}">${escapeHtml(x.ok?"✓ ":"✗ ")}${escapeHtml(st)}</td>`
+          +`<td style="color:var(--muted)">${escapeHtml(ms)}</td></tr>`;
+      }).join("")+`</table>`
+      : `<div class="unavail">no deliveries yet</div>`);
   // active
   const ab=document.getElementById("active-badge");
   const active=d.active||[];

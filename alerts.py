@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import time
 from urllib.parse import urlparse
 
 import aiohttp
@@ -20,6 +21,81 @@ import db
 import obslog
 
 _LOG = obslog.get("alerts")     # fire/recover edges (INFO recover, WARNING fire)
+
+
+def _is_teams_url(url: str) -> bool:
+    """An MS Teams incoming-webhook URL — Power Automate "Workflows" (…logic.azure.com/…/workflows/…)
+    or a legacy O365 connector (…webhook.office.com…). Those need an Adaptive-Card envelope, not a
+    bare {text}: without it Teams returns 202 (so the sender sees 'delivered') but the card never
+    posts — the classic 'delivered but nothing shows' symptom."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return (host.endswith("logic.azure.com") or host.endswith("logic.azure.us")
+            or host.endswith("logic.azure.de") or host.endswith("webhook.office.com")
+            or "/workflows/" in (url or ""))
+
+
+# Human labels for the backends, so a message reads "vLLM is DOWN", not "vllm DOWN".
+_SVC = {"litellm": "LiteLLM", "ollama": "Ollama", "llamacpp": "llama.cpp",
+        "vllm": "vLLM", "gpu": "GPU"}
+# Human labels for the threshold-alert keys, for a clean recovery line.
+_METRIC = {"cpu": "CPU", "mem": "Memory", "disk": "Disk", "gpu": "GPU", "vram": "VRAM",
+           "wait": "LLM wait", "vllm_queue": "vLLM queue", "backlog": "LLM backlog"}
+
+
+def _machine(snap: dict) -> str:
+    """Name of the monitored machine for the alert prefix: the operator override
+    (MONITOR_INSTANCE_NAME) if set, else the host collector's own hostname."""
+    if config.INSTANCE_NAME:
+        return config.INSTANCE_NAME
+    host = (snap.get("collectors", {}) or {}).get("host", {}) or {}
+    return host.get("hostname") or "unknown-host"
+
+
+def _alert_text(snap: dict, body: str, fired: bool) -> str:
+    """One consistent, polished line for every channel: which machine, which tool, then the
+    event — e.g. '🔴 [gpu-box-01] AI-Monitoring — vLLM is DOWN — connection refused'."""
+    return f"{'🔴' if fired else '🟢'} [{_machine(snap)}] AI-Monitoring — {body}"
+
+
+def _recover_msg(key: str) -> str:
+    """Friendly recovery body from an alert key (on recovery only the key is known)."""
+    if key.startswith("down:"):
+        name = key.split(":", 1)[1]
+        return f"{_SVC.get(name, name)} is back UP"
+    return f"{_METRIC.get(key, key)} back to normal"
+
+
+def _log_url(url: str) -> str:
+    """Host (+port) only — the webhook URL's PATH/QUERY carries the secret (Teams `sig=`, Slack
+    token in the path), so the full URL must never reach the log. Host alone identifies the target."""
+    try:
+        p = urlparse(url)
+        return f"{p.scheme}://{p.hostname}" + (f":{p.port}" if p.port else "")
+    except Exception:
+        return "?"
+
+
+def _webhook_payload(text: str, url: str) -> dict:
+    """Shape the POST body for the destination (config.WEBHOOK_FORMAT; "auto" picks by URL):
+      teams   -> Adaptive-Card message envelope the stock Teams flow renders with no flow edits
+      slack   -> {"text": …}  (Slack incoming webhooks)
+      generic -> {"source": "AI-Monitoring", "text": …}  (unchanged default for every other receiver)"""
+    fmt = config.WEBHOOK_FORMAT
+    if fmt == "auto":
+        fmt = "teams" if _is_teams_url(url) else "generic"
+    if fmt == "teams":
+        return {"type": "message", "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {"type": "AdaptiveCard",
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "version": "1.4",
+                        "body": [{"type": "TextBlock", "text": text, "wrap": True}]}}]}
+    if fmt == "slack":
+        return {"text": text}
+    return {"source": "AI-Monitoring", "text": text}
 
 # ── SSRF guard for USER-supplied webhooks ─────────────────────────────────────
 # Per-user webhooks (set at /account) are attacker-influencable, so the server
@@ -158,10 +234,24 @@ async def send_test(session: aiohttp.ClientSession) -> dict:
     if config.ALERT_WEBHOOK_URL:
         res = await n._try_post(
             session, config.ALERT_WEBHOOK_URL,
-            {"source": "AI-Monitoring", "text": text})
+            _webhook_payload(text, config.ALERT_WEBHOOK_URL))
     else:
         res = "not configured"
     return {"webhook": res}
+
+
+async def _record_send(channel: str, akey: str, status: int | None,
+                       ok: bool, ms: float | None) -> None:
+    """Persist ONE delivery outcome for the Channels card's recent-deliveries list.
+
+    Runs OFF the event loop (§6 observer-effect) and swallows everything: this is bookkeeping
+    about a notification, so a failure here must never propagate into the notifier and stop the
+    next alert from being delivered."""
+    try:
+        await asyncio.to_thread(db.record_webhook_send, time.time(), channel,
+                                akey, status, ok, ms)
+    except Exception:
+        pass
 
 
 def channels_status() -> list[dict]:
@@ -237,7 +327,8 @@ def evaluate(snap: dict) -> list[tuple[str, str]]:
             # "configured but down" = available False and not the unconfigured note
             if b and b.get("available") is False and \
                     b.get("error") not in (None, "unconfigured"):
-                out.append((f"down:{name}", f"{name} DOWN: {b.get('error')}"))
+                out.append((f"down:{name}",
+                            f"{_SVC.get(name, name)} is DOWN — {b.get('error')}"))
     return out
 
 
@@ -273,17 +364,20 @@ class Notifier:
         recipients = await self._recipients() if (due or recoveries) else []
 
         for key, msg in due:
-            await self._fanout(session, f"🔴 {msg}", recipients)
+            await self._fanout(session, _alert_text(snap, msg, fired=True), recipients, key)
             self._last[key] = now
             sent.append(msg)
             db.record_alert(now, key, "fire", msg)
-            _LOG.warning("alert fired", extra={"key": key, "detail": msg})
+            _LOG.warning("alert fired", extra={"key": key, "detail": msg,
+                                               "machine": _machine(snap)})
         for key in recoveries:
-            await self._fanout(session, f"🟢 recovered: {key}", recipients)
+            rmsg = _recover_msg(key)
+            await self._fanout(session, _alert_text(snap, rmsg, fired=False), recipients, key)
             self._last.pop(key, None)
             sent.append(f"recovered:{key}")
-            db.record_alert(now, key, "recover", f"recovered: {key}")
-            _LOG.info("alert recovered", extra={"key": key})
+            db.record_alert(now, key, "recover", rmsg)
+            _LOG.info("alert recovered", extra={"key": key, "detail": rmsg,
+                                                "machine": _machine(snap)})
         self._active = firing
         return sent
 
@@ -312,33 +406,54 @@ class Notifier:
         return [u for u in checked if u]
 
     async def _fanout(self, session: aiohttp.ClientSession, text: str,
-                      recipients: list[str]) -> None:
-        payload = {"source": "AI-Monitoring", "text": text}
+                      recipients: list[str], akey: str = "") -> None:
+        # Build the body PER URL: a Teams URL and a Slack URL need different shapes,
+        # and a fan-out can mix destinations (global vs per-user).
         if config.ALERT_WEBHOOK_URL:                  # operator-set global (trusted)
-            await self._post_json(session, config.ALERT_WEBHOOK_URL, payload)
+            await self._post_json(session, config.ALERT_WEBHOOK_URL,
+                                  _webhook_payload(text, config.ALERT_WEBHOOK_URL), akey)
         if recipients:                                 # per-user → SSRF-pinned sender
             wsess = _webhook_sender()                  # concurrent: each POST is
-            await asyncio.gather(*(self._post_json(wsess, url, payload)  # HTTP_TIMEOUT-
+            await asyncio.gather(*(self._post_json(wsess, url, _webhook_payload(text, url), akey)
                                    for url in recipients))               # bounded
 
-    async def _post_json(self, session, url, payload) -> None:
+    async def _post_json(self, session, url, payload, akey: str = "") -> None:
+        # Timed so the Channels card can show round-trip latency; `status`/`ms` stay None when
+        # the POST never got a response, which is what distinguishes "rejected" from "never
+        # arrived" in the delivery list.
+        t0 = time.monotonic()
+        status: int | None = None
+        ok = False
         try:
             # `async with` so the response is released back to the pool immediately
             # (a bare post() leaks the connection/fd until GC).
             async with session.post(
                     url, json=payload, allow_redirects=False,
-                    timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)):
-                pass
-        except Exception:
-            pass
+                    timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)) as r:
+                status, ok = r.status, r.status < 400
+                if ok:
+                    _LOG.info("webhook delivered", extra={"url": _log_url(url), "status": r.status})
+                else:
+                    _LOG.warning("webhook rejected", extra={"url": _log_url(url), "status": r.status})
+        except Exception as e:                        # transport/timeout — was silently swallowed
+            _LOG.warning("webhook failed", extra={"url": _log_url(url), "error": type(e).__name__})
+        await _record_send("webhook", akey, status, ok,
+                           (time.monotonic() - t0) * 1000.0 if status is not None else None)
 
     async def _try_post(self, session, url, payload) -> str:
         try:
             async with session.post(
                     url, json=payload, allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)) as r:
-                return "ok" if r.status < 400 else f"HTTP {r.status}"
+                if r.status < 400:
+                    _LOG.info("webhook test delivered",
+                              extra={"url": _log_url(url), "status": r.status})
+                    return "ok"
+                _LOG.warning("webhook test rejected",
+                             extra={"url": _log_url(url), "status": r.status})
+                return f"HTTP {r.status}"
         except Exception as e:
+            _LOG.warning("webhook test failed", extra={"url": _log_url(url), "error": type(e).__name__})
             return type(e).__name__
 
 
@@ -351,5 +466,5 @@ async def send_test_url(session: aiohttp.ClientSession, url: str) -> dict:
     # between validation and connect can't reach an internal address.
     res = await Notifier()._try_post(
         _webhook_sender(), url,
-        {"source": "AI-Monitoring", "text": "🔔 AI-Monitoring test alert — your webhook is working."})
+        _webhook_payload("🔔 AI-Monitoring test alert — your webhook is working.", url))
     return {"ok": res == "ok", "result": res}
