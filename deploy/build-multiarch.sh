@@ -16,6 +16,15 @@ set -euo pipefail
 
 VERSION="${VERSION:-1.0.6}"
 IMAGE="${IMAGE:-ai-monitoring}"
+# Trivy's DB download defaults to staging in $TMPDIR (/tmp), which on this host is a
+# small tmpfs (~4G) that's often already near-full — the download then dies with a
+# misleading "no space left on device" that looks like a scan failure, not a disk
+# issue. Redirect both the temp staging area and the on-disk vuln-db cache to the
+# project filesystem instead, which has real headroom. Override with TRIVY_TMPDIR=
+# if this host's /tmp is fine.
+TRIVY_TMPDIR="${TRIVY_TMPDIR:-$(pwd)/.trivy-tmp}"
+TRIVY_CACHE="${TRIVY_CACHE:-$(pwd)/.trivy-cache}"
+mkdir -p "$TRIVY_TMPDIR" "$TRIVY_CACHE"
 PROXY_ARGS=()
 [ -n "${http_proxy:-}" ] && PROXY_ARGS+=(--build-arg "http_proxy=$http_proxy"
   --build-arg "https_proxy=${https_proxy:-$http_proxy}"
@@ -30,8 +39,8 @@ build() {   # <platform> <tag-suffix> <run_tests>
 
 scan() {    # <tag-suffix>
   echo "── trivy ${IMAGE}:${VERSION}-$1 ──"
-  trivy image --scanners vuln --severity HIGH,CRITICAL --no-progress \
-    "${IMAGE}:${VERSION}-$1"
+  TMPDIR="$TRIVY_TMPDIR" trivy image --scanners vuln --severity HIGH,CRITICAL --no-progress \
+    --cache-dir "$TRIVY_CACHE" "${IMAGE}:${VERSION}-$1"
 }
 
 # rules.md §14: an offline-loadable image.tar.gz per arch is a MANDATORY build

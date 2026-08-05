@@ -409,8 +409,11 @@ _MAINTENANCE_BACKENDS = ("litellm", "ollama", "llamacpp", "vllm", "gpu")
 def _parse_hhmm(s: str) -> int | None:
     """'HH:MM' -> minutes since midnight, or None if malformed."""
     try:
-        h, m = s.strip().split(":")
-        h, m = int(h), int(m)
+        # separate names for the string parts: rebinding h/m from str to int makes the
+        # later comparison and the return contradict their inferred type (mypy assignment/
+        # operator/return-value errors), even though it runs fine.
+        hs, ms = s.strip().split(":")
+        h, m = int(hs), int(ms)
         if 0 <= h <= 23 and 0 <= m <= 59:
             return h * 60 + m
     except (ValueError, AttributeError):
