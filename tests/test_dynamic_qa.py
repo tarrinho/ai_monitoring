@@ -2134,6 +2134,8 @@ def test_alert_evaluate_thresholds(monkeypatch):
     monkeypatch.setattr(config, "ALERT_CPU_PCT", 80.0)
     monkeypatch.setattr(config, "ALERT_VRAM_PCT", 90.0)
     monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 1)  # this test is about WHICH
+    alerts.reset_down_streaks()                                # backends alarm, not the streak
     snap = {"ts": 0, "collectors": {
         "host": {"available": True, "cpu_pct": 95, "mem_pct": 10,
                  "disk": {"pct": 5}},
@@ -5027,6 +5029,51 @@ def test_config_validate_clean(monkeypatch):
     assert config.validate() == []
 
 
+def test_parse_maintenance_windows_shapes():
+    """'HH:MM-HH:MM,HH:MM-HH:MM' -> [(start_min, end_min), ...]; malformed entries
+    are skipped rather than raising (validate() is what fails loud on those)."""
+    assert config._parse_maintenance_windows("") == []
+    assert config._parse_maintenance_windows("03:00-03:10") == [(180, 190)]
+    assert config._parse_maintenance_windows("03:00-03:10,15:30-15:35") == \
+        [(180, 190), (930, 935)]
+    assert config._parse_maintenance_windows(" 03:00 - 03:10 ") == [(180, 190)], \
+        "whitespace around the range/parts must be tolerated"
+    assert config._parse_maintenance_windows("bogus") == [], "malformed entry dropped"
+    assert config._parse_maintenance_windows("25:00-03:10") == [], "out-of-range hour dropped"
+    assert config._parse_maintenance_windows("03:00-03:10,bogus,15:00-15:05") == \
+        [(180, 190), (900, 905)], "one bad entry must not drop the good ones"
+
+
+def test_in_maintenance_window_boundaries_and_wraparound(monkeypatch):
+    monkeypatch.setitem(config.MAINTENANCE_WINDOWS, "vllm", [(180, 190)])  # 03:00-03:10
+    day = 1785900000 - (1785900000 % 86400)  # any UTC midnight
+    assert not config.in_maintenance_window("vllm", day + 179 * 60), "1 min before: outside"
+    assert config.in_maintenance_window("vllm", day + 180 * 60), "start minute: inside (inclusive)"
+    assert config.in_maintenance_window("vllm", day + 185 * 60), "middle: inside"
+    assert not config.in_maintenance_window("vllm", day + 190 * 60), "end minute: outside (exclusive)"
+    # midnight-crossing window: 23:50-00:10
+    monkeypatch.setitem(config.MAINTENANCE_WINDOWS, "vllm", [(1430, 10)])
+    assert config.in_maintenance_window("vllm", day + 1435 * 60), "23:55: inside the wrap"
+    assert config.in_maintenance_window("vllm", day + 5 * 60), "00:05 next day: inside the wrap"
+    assert not config.in_maintenance_window("vllm", day + 12 * 3600), "noon: outside the wrap"
+    # unconfigured backend never suppresses
+    monkeypatch.setitem(config.MAINTENANCE_WINDOWS, "litellm", [])
+    assert not config.in_maintenance_window("litellm", day + 185 * 60)
+    assert not config.in_maintenance_window("unknown-backend", day + 185 * 60)
+
+
+def test_config_validate_rejects_malformed_maintenance_window(monkeypatch):
+    monkeypatch.setattr(config, "MONITOR_PORT", 9925)
+    monkeypatch.setattr(config, "SAMPLE_INTERVAL", 5.0)
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "tok1234567890abcd")
+    monkeypatch.setitem(config.MAINTENANCE_RAW, "vllm", "not-a-window")
+    errs = config.validate()
+    assert any("MONITOR_MAINTENANCE_VLLM" in e and "not-a-window" in e for e in errs), errs
+    monkeypatch.setitem(config.MAINTENANCE_RAW, "vllm", "03:00-03:10")
+    assert config.validate() == [], "a well-formed window must not fail validation"
+
+
 def test_redacted_summary_hides_key(monkeypatch):
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-supersecretvalue")
     monkeypatch.setattr(config, "DASHBOARD_TOKEN", "sometoken1234567")
@@ -7249,6 +7296,8 @@ def test_unit_alerts_evaluate_fires_host_thresholds(monkeypatch):
 
 def test_unit_alerts_backend_down_but_not_unconfigured(monkeypatch):
     monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 1)  # this test is about WHICH
+    alerts.reset_down_streaks()                                # backends alarm, not the streak
     snap = {"collectors": {
         "litellm": {"available": False, "error": "conn refused"},   # real outage
         "ollama":  {"available": False, "error": "unconfigured"},   # never alerts
@@ -7780,6 +7829,9 @@ async def test_alert_message_includes_machine_tool_service_and_reason(monkeypatc
     monkeypatch.setattr(config, "INSTANCE_NAME", "")            # force hostname path
     monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
     monkeypatch.setattr(config, "ALERT_CPU_PCT", 0)            # isolate the backend alert
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 1)  # this test is about WHICH
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 1)    # backends alarm + the message text,
+    alerts.reset_down_streaks()                                # not the flap hysteresis
     sent = []
 
     async def fake_fanout(self, session, text, recipients=None, akey=""):
@@ -7801,6 +7853,51 @@ async def test_alert_message_includes_machine_tool_service_and_reason(monkeypatc
     # the machine-name override wins when set
     monkeypatch.setattr(config, "INSTANCE_NAME", "prod-eu-1")
     assert alerts._machine(down) == "prod-eu-1"
+
+
+def test_backend_down_recovery_needs_stable_up_no_flap(monkeypatch):
+    """Anti-flap hysteresis: once latched DOWN, a SINGLE good poll must NOT clear it — that would
+    emit a recovery and let the next failure re-fire immediately, bypassing the cooldown and
+    spamming the channel (the down:litellm flood). Recovery only after ALERT_BACKEND_UP_AFTER
+    consecutive good polls; the message keeps the real reason during the up-grace window."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 2)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 3)
+    alerts.reset_down_streaks()
+    bad = {"collectors": {"litellm": {"available": False, "error": "TimeoutError"}}}
+    good = {"collectors": {"litellm": {"available": True}}}
+
+    def k(snap):
+        return [x for x, _ in alerts.evaluate(snap)]
+    assert k(bad) == []                    # 1 fail — quiet
+    assert k(bad) == ["down:litellm"]      # 2 fails — latched DOWN
+    assert k(good) == ["down:litellm"]     # 1 good — flap IGNORED, still down
+    assert k(bad) == ["down:litellm"]      # fails again — no recover/re-fire churn
+    assert k(good) == ["down:litellm"]     # up-streak 1
+    assert k(good) == ["down:litellm"]     # up-streak 2
+    assert k(good) == []                   # up-streak 3 — finally recovered
+    # reason survives the grace window (b['error'] is None on a good poll)
+    alerts.reset_down_streaks()
+    k(bad); k(bad)
+    assert "TimeoutError" in dict(alerts.evaluate(good))["down:litellm"]
+
+
+def test_delivery_card_collapses_consecutive_repeats(tmp_path, monkeypatch):
+    """A repeating alert must not fill the whole Recent-deliveries list. recent_webhook_sends
+    collapses consecutive-identical runs into one row (n=count), so distinct sends (a test click,
+    another alert) stay visible instead of being crowded off by 30× down:litellm."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wl.db"))
+    db.init()
+    t = 1000.0
+    for i in range(30):
+        db.record_webhook_send(t + i, "webhook", "down:litellm", 202, True, 5.0)
+    db.record_webhook_send(t + 30, "test", "test", 200, True, 4.0)
+    for i in range(5):
+        db.record_webhook_send(t + 31 + i, "webhook", "down:litellm", 202, True, 5.0)
+    got = db.recent_webhook_sends(10)
+    assert [g["akey"] for g in got] == ["down:litellm", "test", "down:litellm"]   # newest first
+    assert [g["n"] for g in got] == [5, 1, 30]        # runs collapsed with their counts
+    assert got[0]["ts"] == t + 35                       # newest ts of the run is shown
 
 
 async def test_real_alert_fanout_posts_teams_card_to_global_url(monkeypatch):
@@ -9911,6 +10008,8 @@ async def test_service_toggle_off_fires_no_down_alert(monkeypatch):
         "llamacpp": {"available": False, "error": "conn refused"},      # genuinely down
     }}
     monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 1)  # this test is about WHICH
+    alerts.reset_down_streaks()                                # backends alarm, not the streak
     keys = [k for k, _ in alerts.evaluate(snap)]
     assert "down:ollama" not in keys, "disabled backend must not alarm"
     assert "down:llamacpp" in keys, "a genuinely-down backend still alarms"
@@ -11694,10 +11793,12 @@ def test_webhook_log_never_raises_on_bad_input(tmp_path, monkeypatch):
     assert isinstance(db.recent_webhook_sends(5), list)
 
 
-async def test_post_json_records_delivery_outcome(tmp_path, monkeypatch):
-    """A real send writes ONE webhook_log row carrying the outcome the Channels card renders:
-    2xx -> ok + status, 5xx -> not ok + status, transport failure -> ok=False with NULL status
-    (that NULL is what distinguishes 'rejected' from 'never arrived')."""
+async def test_post_json_returns_outcome_and_fanout_batches_it(tmp_path, monkeypatch):
+    """_post_json RETURNS (akey, status, ok, ms) and does NOT write — the write happens once,
+    after the whole fan-out (a fan-out is 1+WEBHOOK_MAX_RECIPIENTS posts, and recording each
+    inline put sqlite work inside the notifier's time budget, where a cancellation would sail
+    past the recorder's `except Exception` and delay real alerts). 2xx -> ok+status,
+    5xx -> not ok, transport failure -> ok False with NULL status/ms ('never arrived')."""
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wl3.db"))
     db.init()
 
@@ -11714,15 +11815,52 @@ async def test_post_json_records_delivery_outcome(tmp_path, monkeypatch):
             return _Resp(self._st)
 
     n = alerts.Notifier()
-    await n._post_json(_Sess(204), "https://hook.example.com/x", {"text": "t"}, "cpu")
-    await n._post_json(_Sess(500), "https://hook.example.com/x", {"text": "t"}, "gpu")
-    await n._post_json(_Sess(boom=True), "https://hook.example.com/x", {"text": "t"}, "disk")
+    ok_out = await n._post_json(_Sess(204), "https://hook.example.com/x", {"text": "t"}, "cpu")
+    assert ok_out[0] == "cpu" and ok_out[1] == 204 and ok_out[2] is True and ok_out[3] is not None
+    bad_out = await n._post_json(_Sess(500), "https://hook.example.com/x", {"text": "t"}, "gpu")
+    assert bad_out[1] == 500 and bad_out[2] is False
+    dead_out = await n._post_json(_Sess(boom=True), "https://hook.example.com/x", {"t": 1}, "disk")
+    assert dead_out[1] is None and dead_out[2] is False and dead_out[3] is None
+    assert db.recent_webhook_sends(10) == [], "_post_json must not write; the fan-out batches"
+
+    # the fan-out performs the single batched write
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL", "https://hook.example.com/global")
+    await n._fanout(_Sess(204), "hello", [], "cpu_pct")
     rows = db.recent_webhook_sends(10)
-    by = {r["akey"]: r for r in rows}
+    assert len(rows) == 1 and rows[0]["akey"] == "cpu_pct" and rows[0]["channel"] == "webhook"
+    assert rows[0]["ok"] is True and rows[0]["status"] == 204
+
+
+def test_record_webhook_sends_batches_in_one_call(tmp_path, monkeypatch):
+    """The batch writer takes (ts,channel,akey,status,ok,ms) tuples, coerces defensively, and
+    never raises — one connection for a whole fan-out instead of one per recipient."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wlb.db"))
+    db.init()
+    now = 9_000_000.0
+    db.record_webhook_sends([(now, "webhook", "a", 204, True, 5.0),
+                             (now, "user", "a", None, False, None),
+                             (now, "user", "a", "bogus", True, "bogus")])
+    rows = db.recent_webhook_sends(10)
     assert len(rows) == 3
-    assert by["cpu"]["ok"] is True and by["cpu"]["status"] == 204 and by["cpu"]["ms"] is not None
-    assert by["gpu"]["ok"] is False and by["gpu"]["status"] == 500
-    assert by["disk"]["ok"] is False and by["disk"]["status"] is None and by["disk"]["ms"] is None
+    assert {r["channel"] for r in rows} == {"webhook", "user"}
+    db.record_webhook_sends([])          # no-op, must not raise
+
+
+async def test_deliveries_hide_per_user_rows_from_non_admins(tmp_path, monkeypatch):
+    """A fan-out writes one 'user' row per per-user recipient. Returning those to a viewer would
+    leak how many colleagues have a webhook configured and whether each is failing, so a non-admin
+    sees the operator-global scope only ('webhook'/'test')."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "wlscope.db"))
+    db.init()
+    now = 9_000_000.0
+    db.record_webhook_sends([(now, "webhook", "cpu", 204, True, 5.0),
+                            (now + 1, "user", "cpu", 204, True, 6.0),
+                            (now + 2, "user", "cpu", 500, False, 7.0),
+                            (now + 3, "test", "test", 200, True, 8.0)])
+    assert {r["channel"] for r in db.recent_webhook_sends(10)} == {"webhook", "user", "test"}
+    scoped = db.recent_webhook_sends(10, ("webhook", "test"))
+    assert {r["channel"] for r in scoped} == {"webhook", "test"}, "per-user rows must be excluded"
+    assert len(scoped) == 2
 
 
 async def test_alerts_endpoint_exposes_recent_deliveries(tmp_path, monkeypatch):
@@ -11740,3 +11878,119 @@ async def test_alerts_endpoint_exposes_recent_deliveries(tmp_path, monkeypatch):
     assert len(d["deliveries"]) == 10, "capped at 10"
     assert d["deliveries"][0]["akey"] == "k11", "newest first"
     assert "history" in d and isinstance(d["history"], list), "history must remain"
+
+
+def test_backend_down_never_alerts_on_the_startup_seed(monkeypatch):
+    """FIELD BUG: every monitor restart paged 'vLLM is DOWN — starting' + a recovery moments
+    later. `_backend_latest` is seeded {"available": False, "error": "starting"} at import, and
+    the main loop's first tick (pure /proc, sub-ms) beats the HTTP backends' first round-trip, so
+    evaluate() read the SEED. 'starting' means NOT YET CHECKED — absence of a measurement is not
+    evidence of an outage, and the monitor's own restart says nothing about the backend."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    snap = {"collectors": {
+        "vllm": {"available": False, "error": "starting"},
+        "litellm": {"available": False, "error": "starting"},
+        "ollama": {"available": False, "error": "unconfigured"},
+    }}
+    keys = [k for k, _ in alerts.evaluate(snap)]
+    assert keys == [], f"the startup seed must never alert; got {keys}"
+    # a REAL transport failure still alerts (once it has crossed the strike threshold)
+    real = {"collectors": {"vllm": {"available": False, "error": "ClientConnectorError"}}}
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 1)
+    assert [k for k, _ in alerts.evaluate(real)] == ["down:vllm"]
+
+
+def test_backend_down_requires_consecutive_failures(monkeypatch):
+    """One failed poll is not an outage — a TLS-handshake blip or a proxy reload produces it.
+    A backend must fail ALERT_BACKEND_DOWN_AFTER consecutive samples before it is called DOWN,
+    and one success resets the streak."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 1)   # isolate the DOWN streak (instant recovery)
+    alerts.reset_down_streaks()
+    bad = {"collectors": {"vllm": {"available": False, "error": "TimeoutError"}}}
+    good = {"collectors": {"vllm": {"available": True}}}
+    assert [k for k, _ in alerts.evaluate(bad)] == [], "1st failure must stay quiet"
+    assert [k for k, _ in alerts.evaluate(bad)] == [], "2nd failure must stay quiet"
+    assert [k for k, _ in alerts.evaluate(bad)] == ["down:vllm"], "3rd consecutive failure alerts"
+    assert [k for k, _ in alerts.evaluate(bad)] == ["down:vllm"], "stays down while failing"
+    assert [k for k, _ in alerts.evaluate(good)] == [], "recovery clears"
+    assert [k for k, _ in alerts.evaluate(bad)] == [], "streak reset by the success"
+
+
+def test_backend_down_streak_is_per_backend(monkeypatch):
+    """Each backend keeps its own streak — a flapping LiteLLM must not push vLLM toward DOWN."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 2)
+    alerts.reset_down_streaks()
+    both_bad = {"collectors": {"vllm": {"available": False, "error": "E"},
+                               "litellm": {"available": False, "error": "E"}}}
+    only_ll = {"collectors": {"vllm": {"available": True},
+                              "litellm": {"available": False, "error": "E"}}}
+    assert alerts.evaluate(both_bad) == []
+    keys = [k for k, _ in alerts.evaluate(only_ll)]
+    assert keys == ["down:litellm"], f"only litellm reached the threshold: {keys}"
+
+
+def test_maintenance_window_suppresses_down_alert(monkeypatch):
+    """A backend down INSIDE its configured maintenance window (a known, expected
+    outage — e.g. a daily vLLM model-reload restart) must never alert, no matter how
+    many consecutive failures accumulate. Once the window closes, it's a normal
+    backend again — a real outage past that point still pages, after the usual
+    N-consecutive-failures arm delay (the window boundary must not itself count)."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 2)
+    alerts.reset_down_streaks()
+    bad = {"collectors": {"vllm": {"available": False, "error": "connection refused"}}}
+
+    monkeypatch.setattr(config, "in_maintenance_window", lambda name, now_ts=None: name == "vllm")
+    assert alerts.evaluate(bad) == [], "1st failure inside the window: quiet"
+    assert alerts.evaluate(bad) == [], "2nd failure inside the window: still quiet (would have armed)"
+    assert alerts.evaluate(bad) == [], "stays quiet the whole window, however long it runs"
+
+    monkeypatch.setattr(config, "in_maintenance_window", lambda name, now_ts=None: False)
+    assert alerts.evaluate(bad) == [], "window just closed: 1st failure after, still not armed"
+    keys = [k for k, _ in alerts.evaluate(bad)]
+    assert keys == ["down:vllm"], f"2nd consecutive failure after the window must page: {keys}"
+
+
+def test_maintenance_window_does_not_suppress_other_backends(monkeypatch):
+    """A window scoped to vllm must not silence a genuine litellm outage."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 1)
+    monkeypatch.setattr(config, "in_maintenance_window", lambda name, now_ts=None: name == "vllm")
+    alerts.reset_down_streaks()
+    both_bad = {"collectors": {"vllm": {"available": False, "error": "reload"},
+                               "litellm": {"available": False, "error": "ClientConnectorError"}}}
+    keys = [k for k, _ in alerts.evaluate(both_bad)]
+    assert keys == ["down:litellm"], f"vllm suppressed, litellm still pages: {keys}"
+
+
+def test_machine_name_reads_the_real_collector_shape(monkeypatch):
+    """FIELD BUG: every webhook line read '[unknown-host]'. _machine() looked up
+    host['hostname'], but the host collector puts it at host['info']['hostname'] — one level
+    down — so the lookup ALWAYS missed and the fallback always won. The old unit test used a
+    hand-made top-level shape that production never emits, which is why it stayed green."""
+    monkeypatch.setattr(config, "INSTANCE_NAME", "")
+    real = {"collectors": {"host": {"available": True, "info": {"hostname": "gpu-box-01"}}}}
+    assert alerts._machine(real) == "gpu-box-01", "must read the REAL collector shape"
+    legacy = {"collectors": {"host": {"available": True, "hostname": "gpu-box-01"}}}
+    assert alerts._machine(legacy) == "gpu-box-01", "top-level shape still supported"
+    monkeypatch.setattr(config, "INSTANCE_NAME", "prod-eu-1")
+    assert alerts._machine(real) == "prod-eu-1", "operator override still wins"
+
+
+def test_alert_text_falls_back_to_the_tool_name_not_unknown_host(monkeypatch):
+    """When the hostname genuinely can't be resolved, the line must NOT say 'unknown-host' —
+    it names the tool instead. No empty '[]' and no '[AI Monitoring] AI-Monitoring' stutter."""
+    monkeypatch.setattr(config, "INSTANCE_NAME", "")
+    blind = {"collectors": {"host": {"available": False}}}
+    txt = alerts._alert_text(blind, "vLLM is DOWN — conn refused", fired=True)
+    assert "unknown-host" not in txt and "unknown host" not in txt, txt
+    assert "[]" not in txt, f"no empty bracket: {txt}"
+    assert txt.count("AI-Monitoring") == 1, f"tool name must not stutter: {txt}"
+    assert txt.startswith("🔴 AI-Monitoring — "), txt
+    assert "vLLM is DOWN — conn refused" in txt
+    # with a hostname the prefix is still there
+    named = {"collectors": {"host": {"info": {"hostname": "gpu-box-01"}}}}
+    assert alerts._alert_text(named, "x", fired=True).startswith("🔴 [gpu-box-01] AI-Monitoring — ")

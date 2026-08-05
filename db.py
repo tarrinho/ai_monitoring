@@ -359,6 +359,8 @@ CREATE TABLE IF NOT EXISTS spend_daily (
 
 # Retention for the per-(day,model,key) spend rollup — 1 year of daily buckets.
 SPEND_MU_RETENTION_DAYS = 366
+# webhook_log feeds a 10-row "Recent deliveries" list — days, not the 1-year history horizon.
+WEBHOOK_LOG_RETENTION_DAYS = 7
 # Retention for the per-day usage/cost history (Spend "over time"). Long by design —
 # the whole point is to outlast LiteLLM's 7-day window; default ~5 years.
 SPEND_DAILY_RETENTION_DAYS = 1826
@@ -1083,7 +1085,13 @@ def prune_key_series() -> None:
             # keep alert/anomaly history for the full hour-rollup horizon (1y)
             conn.execute("DELETE FROM anomalies WHERE ts < ?", (hour_cut,))
             conn.execute("DELETE FROM alert_log WHERE ts < ?", (hour_cut,))
-            conn.execute("DELETE FROM webhook_log WHERE ts < ?", (hour_cut,))
+            # webhook_log backs a 10-row UI list, so it gets a SHORT horizon of its own rather
+            # than alert_log's 1-year one. Recoveries are not debounced (unlike fires, which
+            # ALERT_REPEAT_MIN gates), so a flapping backend fans out every other tick — at a 5s
+            # sample interval that is thousands of rows/day, times each per-user recipient.
+            # A year of that is unbounded disk growth on the monitor's own SQLite file.
+            conn.execute("DELETE FROM webhook_log WHERE ts < ?",
+                         (now - WEBHOOK_LOG_RETENTION_DAYS * 86400,))
     except Exception as _e:
         _dberr(_e)
         pass
@@ -1536,15 +1544,75 @@ def record_webhook_send(ts: float, channel: str, akey: str | None,
         _dberr(_e)
 
 
-def recent_webhook_sends(limit: int = 10) -> list[dict[str, Any]]:
-    """The most recent webhook deliveries, NEWEST FIRST — the Channels card's list."""
+def record_webhook_sends(rows: list) -> None:
+    """Record a BATCH of delivery attempts in ONE connection (executemany).
+
+    One fan-out is 1 + WEBHOOK_MAX_RECIPIENTS posts; opening a connection per row inside the
+    notifier's time budget is what made bookkeeping able to delay alerting (see alerts._fanout).
+    `rows` are (ts, channel, akey, status, ok, ms) tuples. Best-effort like record_alert."""
+    if not rows:
+        return
+
+    def _int_or_none(v):
+        try:
+            return None if v is None else int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _float_or_none(v):
+        try:
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            return None
     try:
+        vals = []
+        for r in rows:
+            ts, channel, akey, status, ok, ms = r
+            vals.append((float(ts), str(channel)[:24], str(akey or "")[:80],
+                         _int_or_none(status), 1 if ok else 0, _float_or_none(ms)))
         with _connect() as conn:
-            rows = conn.execute(
-                "SELECT ts,channel,akey,status,ok,ms FROM webhook_log "
-                "ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
-        return [{"ts": t, "channel": c, "akey": k, "status": s,
-                 "ok": bool(o), "ms": m} for t, c, k, s, o, m in rows]
+            conn.executemany(
+                "INSERT INTO webhook_log(ts,channel,akey,status,ok,ms) VALUES (?,?,?,?,?,?)",
+                vals)
+    except Exception as _e:
+        _dberr(_e)
+
+
+def recent_webhook_sends(limit: int = 10,
+                         channels: tuple | None = None) -> list[dict[str, Any]]:
+    """The most recent webhook deliveries, NEWEST FIRST — the Channels card's list.
+
+    `channels` restricts which rows are returned. The caller passes the operator-global scope
+    only ('webhook','test') for a non-admin viewer: a fan-out writes one 'user' row per per-user
+    recipient, so returning those to everyone would let any viewer infer HOW MANY colleagues have
+    a webhook configured and whether each is failing. No URL or user id is stored either way —
+    this bounds the inference, not a direct leak."""
+    try:
+        sql = "SELECT ts,channel,akey,status,ok,ms FROM webhook_log"
+        args: list = []
+        if channels:
+            sql += " WHERE channel IN (" + ",".join("?" for _ in channels) + ")"
+            args.extend(channels)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        # Fetch a WIDER window than we display, then collapse consecutive-identical runs below.
+        # A flapping/repeating alert (down:litellm every cooldown) would otherwise fill the whole
+        # short list and crowd out the DISTINCT recent deliveries (test sends, other alerts).
+        args.append(max(1, int(limit)) * 40)
+        with _connect() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()   # noqa: S608 - fixed IN placeholders
+        groups: list[dict[str, Any]] = []
+        for t, c, k, s, o, m in rows:                    # newest first
+            o = bool(o)
+            last = groups[-1] if groups else None
+            if last and last["channel"] == c and last["akey"] == k \
+                    and last["ok"] == o and last["status"] == s:
+                last["n"] += 1                           # extend the run (keeps newest ts/ms)
+            else:
+                if len(groups) >= max(1, int(limit)):
+                    break                                # a new distinct group would overflow the list
+                groups.append({"ts": t, "channel": c, "akey": k, "status": s,
+                               "ok": o, "ms": m, "n": 1})
+        return groups
     except Exception as _e:
         _dberr(_e)
         return []

@@ -47,17 +47,31 @@ _METRIC = {"cpu": "CPU", "mem": "Memory", "disk": "Disk", "gpu": "GPU", "vram": 
 
 def _machine(snap: dict) -> str:
     """Name of the monitored machine for the alert prefix: the operator override
-    (MONITOR_INSTANCE_NAME) if set, else the host collector's own hostname."""
+    (MONITOR_INSTANCE_NAME) if set, else the host collector's own hostname. "" when it
+    genuinely cannot be resolved — the caller then omits the prefix entirely.
+
+    The hostname lives at host['info']['hostname'] (collectors/host.py fills `info` from
+    os.uname().nodename). This used to read host['hostname'], one level too high, so the
+    lookup missed EVERY time and every alert read '[unknown-host]' even though the name was
+    right there. The top-level key is still accepted so an older/flatter snapshot still works."""
     if config.INSTANCE_NAME:
         return config.INSTANCE_NAME
     host = (snap.get("collectors", {}) or {}).get("host", {}) or {}
-    return host.get("hostname") or "unknown-host"
+    info = host.get("info") or {}
+    return str(info.get("hostname") or host.get("hostname") or "")
 
 
 def _alert_text(snap: dict, body: str, fired: bool) -> str:
     """One consistent, polished line for every channel: which machine, which tool, then the
-    event — e.g. '🔴 [gpu-box-01] AI-Monitoring — vLLM is DOWN — connection refused'."""
-    return f"{'🔴' if fired else '🟢'} [{_machine(snap)}] AI-Monitoring — {body}"
+    event — e.g. '🔴 [gpu-box-01] AI-Monitoring — vLLM is DOWN — connection refused'.
+
+    When the machine name can't be resolved the bracket is DROPPED rather than filled with a
+    placeholder: '🔴 AI-Monitoring — vLLM is DOWN — …'. A line that reads '[unknown-host]' tells
+    the reader nothing and looks broken; the tool name alone is honest and already identifies
+    the sender. (Set MONITOR_INSTANCE_NAME to label a specific box.)"""
+    machine = _machine(snap)
+    prefix = f"[{machine}] " if machine else ""
+    return f"{'🔴' if fired else '🟢'} {prefix}AI-Monitoring — {body}"
 
 
 def _recover_msg(key: str) -> str:
@@ -240,6 +254,20 @@ async def send_test(session: aiohttp.ClientSession) -> dict:
     return {"webhook": res}
 
 
+async def _record_sends(rows: list) -> None:
+    """Persist a BATCH of delivery outcomes in one off-loop hop / one sqlite connection.
+
+    Called once per fan-out, after every POST has returned — see the comment in _fanout for why
+    per-POST recording inside the delivery path is unsafe. Swallows everything: bookkeeping about
+    a notification must never break the notification."""
+    if not rows:
+        return
+    try:
+        await asyncio.to_thread(db.record_webhook_sends, rows)
+    except Exception:
+        pass
+
+
 async def _record_send(channel: str, akey: str, status: int | None,
                        ok: bool, ms: float | None) -> None:
     """Persist ONE delivery outcome for the Channels card's recent-deliveries list.
@@ -268,11 +296,46 @@ def thresholds_status() -> dict:
         "disk_pct": config.ALERT_DISK_PCT, "gpu_pct": config.ALERT_GPU_PCT,
         "vram_pct": config.ALERT_VRAM_PCT, "llm_wait_ms": config.ALERT_LLM_WAIT_MS,
         "backlog": config.ALERT_BACKLOG, "backend_down": config.ALERT_ON_BACKEND_DOWN,
+        "backend_down_after": config.ALERT_BACKEND_DOWN_AFTER,
         "vllm_waiting": config.ALERT_VLLM_WAITING,
         "anomaly_factor": config.ANOMALY_FACTOR,
         "key_budget_hr": config.ANOMALY_KEY_BUDGET_HR,
         "repeat_min": config.ALERT_REPEAT_MIN,
+        "maintenance_windows": {n: r for n, r in config.MAINTENANCE_RAW.items() if r},
     }
+
+
+# Backend `error` values that are NOT an outage and must never page:
+#   None           — no error recorded
+#   'unconfigured' — the operator never set this backend up
+#   'starting'     — the seed in app._backend_latest, meaning "not checked YET". The main sampler
+#                    loop's first tick (pure /proc, sub-ms) beats every HTTP backend's first
+#                    network round-trip, so it reads this seed on EVERY restart. Absence of a
+#                    measurement is not evidence of failure, and a restart of the MONITOR says
+#                    nothing about the monitored backend — alerting here paged on our own boot
+#                    (plus a recovery moments later), which is how an alert channel gets ignored.
+_NOT_AN_OUTAGE = (None, "unconfigured", "starting")
+
+# Anti-flap hysteresis state per backend (evaluate() is otherwise a pure function of the snapshot;
+# reset_down_streaks() clears it for tests / a config change):
+#   _down_streak — consecutive failed polls, arms a DOWN alert at ALERT_BACKEND_DOWN_AFTER
+#   _up_streak   — consecutive good polls, disarms it at ALERT_BACKEND_UP_AFTER
+#   _firing      — backends currently LATCHED down: they keep alerting through a brief up-blip and
+#                  only recover after a STABLE up run, so a flap can't spam down/recover pairs
+#   _down_reason — last error seen while down, so the message keeps the real cause during the
+#                  up-grace window (when b['error'] is momentarily None)
+_down_streak: dict[str, int] = {}
+_up_streak: dict[str, int] = {}
+_firing: set[str] = set()
+_down_reason: dict[str, str] = {}
+
+
+def reset_down_streaks() -> None:
+    """Forget every backend's flap-hysteresis state."""
+    _down_streak.clear()
+    _up_streak.clear()
+    _firing.clear()
+    _down_reason.clear()
 
 
 def _pct(used, total) -> float | None:
@@ -324,11 +387,46 @@ def evaluate(snap: dict) -> list[tuple[str, str]]:
     if config.ALERT_ON_BACKEND_DOWN:
         for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
             b = c.get(name, {})
-            # "configured but down" = available False and not the unconfigured note
+            if config.in_maintenance_window(name):
+                # Known, expected outage (e.g. a daily model-reload restart) — the
+                # dashboard still shows it down (collector data is untouched), but no
+                # alert can arm or stay latched through the window. Streaks reset so
+                # the window boundary can't count toward DOWN_AFTER/UP_AFTER hysteresis
+                # on either side; if it's still down once the window closes, that's a
+                # real page again after the normal N-consecutive-failures arm delay.
+                _firing.discard(name)
+                _down_streak.pop(name, None)
+                _up_streak.pop(name, None)
+                _down_reason.pop(name, None)
+                continue
+            # "configured but down" = available False, and the error is a real failure — NOT
+            # 'unconfigured' (operator never set it up) and NOT 'starting' (see _NOT_AN_OUTAGE).
             if b and b.get("available") is False and \
-                    b.get("error") not in (None, "unconfigured"):
+                    b.get("error") not in _NOT_AN_OUTAGE:
+                # DOWN poll: arm after N consecutive failures (one blip is not an outage).
+                _down_streak[name] = _down_streak.get(name, 0) + 1
+                _up_streak.pop(name, None)
+                _down_reason[name] = str(b.get("error"))
+                if _down_streak[name] >= max(1, config.ALERT_BACKEND_DOWN_AFTER):
+                    _firing.add(name)
+            elif b and b.get("available") is True:
+                # GOOD poll: only DISARM after M consecutive good polls (hysteresis). Until then a
+                # latched backend stays DOWN — a single good poll can't emit a recovery + re-fire.
+                _up_streak[name] = _up_streak.get(name, 0) + 1
+                _down_streak.pop(name, None)
+                if _up_streak[name] >= max(1, config.ALERT_BACKEND_UP_AFTER):
+                    _firing.discard(name)
+                    _up_streak.pop(name, None)
+                    _down_reason.pop(name, None)
+            else:                                 # unconfigured / starting / missing → not an outage
+                _firing.discard(name)
+                _down_streak.pop(name, None)
+                _up_streak.pop(name, None)
+                _down_reason.pop(name, None)
+            if name in _firing:                   # latched (armed, not yet stably recovered)
                 out.append((f"down:{name}",
-                            f"{_SVC.get(name, name)} is DOWN — {b.get('error')}"))
+                            f"{_SVC.get(name, name)} is DOWN — "
+                            f"{_down_reason.get(name) or 'no response'}"))
     return out
 
 
@@ -409,18 +507,34 @@ class Notifier:
                       recipients: list[str], akey: str = "") -> None:
         # Build the body PER URL: a Teams URL and a Slack URL need different shapes,
         # and a fan-out can mix destinations (global vs per-user).
+        #
+        # Delivery bookkeeping is collected here and written ONCE, AFTER every POST has
+        # returned — never per-POST inside the fan-out. A fan-out can be 1 + WEBHOOK_MAX_RECIPIENTS
+        # posts; recording each one inline meant that many separate sqlite connections queued on
+        # the shared executor INSIDE the notifier's 15s budget. If they backed up behind a write
+        # lock the budget expired and `process()` was CANCELLED mid-loop — and CancelledError is a
+        # BaseException, so it sails straight through the recorder's `except Exception`, leaving
+        # later `due` keys unsent and `_active` un-updated. Alerting is a security control, so a
+        # LOGGING concern must never be able to delay it: batch after the sends, one hop, one
+        # connection. (Channel: 'webhook' = operator-global, 'user' = a per-user recipient.)
+        rows: list[tuple] = []
+        now = time.time()
         if config.ALERT_WEBHOOK_URL:                  # operator-set global (trusted)
-            await self._post_json(session, config.ALERT_WEBHOOK_URL,
-                                  _webhook_payload(text, config.ALERT_WEBHOOK_URL), akey)
+            out = await self._post_json(session, config.ALERT_WEBHOOK_URL,
+                                        _webhook_payload(text, config.ALERT_WEBHOOK_URL), akey)
+            if out:
+                rows.append((now, "webhook", *out))
         if recipients:                                 # per-user → SSRF-pinned sender
             wsess = _webhook_sender()                  # concurrent: each POST is
-            await asyncio.gather(*(self._post_json(wsess, url, _webhook_payload(text, url), akey)
-                                   for url in recipients))               # bounded
+            outs = await asyncio.gather(*(self._post_json(wsess, url, _webhook_payload(text, url), akey)
+                                          for url in recipients))         # bounded
+            rows.extend((now, "user", *o) for o in outs if o)
+        await _record_sends(rows)
 
-    async def _post_json(self, session, url, payload, akey: str = "") -> None:
-        # Timed so the Channels card can show round-trip latency; `status`/`ms` stay None when
-        # the POST never got a response, which is what distinguishes "rejected" from "never
-        # arrived" in the delivery list.
+    async def _post_json(self, session, url, payload, akey: str = "") -> tuple | None:
+        """POST one webhook. Returns (akey, status, ok, ms) for the caller to record in a batch —
+        deliberately NOT recorded here (see _fanout). `status`/`ms` stay None when the POST never
+        got a response, which is what distinguishes "rejected" from "never arrived" in the UI."""
         t0 = time.monotonic()
         status: int | None = None
         ok = False
@@ -437,15 +551,22 @@ class Notifier:
                     _LOG.warning("webhook rejected", extra={"url": _log_url(url), "status": r.status})
         except Exception as e:                        # transport/timeout — was silently swallowed
             _LOG.warning("webhook failed", extra={"url": _log_url(url), "error": type(e).__name__})
-        await _record_send("webhook", akey, status, ok,
-                           (time.monotonic() - t0) * 1000.0 if status is not None else None)
+        return (akey, status, ok,
+                (time.monotonic() - t0) * 1000.0 if status is not None else None)
 
     async def _try_post(self, session, url, payload) -> str:
+        # Test sends are recorded too (channel='test'): an admin who clicks "Send test alert" and
+        # then sees an EMPTY "Recent deliveries" list would read that as "delivery is broken" —
+        # the exact confusion this feature exists to remove. One row, off the request path.
+        t0 = time.monotonic()
+        status: int | None = None
+        ok = False
         try:
             async with session.post(
                     url, json=payload, allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)) as r:
-                if r.status < 400:
+                status, ok = r.status, r.status < 400
+                if ok:
                     _LOG.info("webhook test delivered",
                               extra={"url": _log_url(url), "status": r.status})
                     return "ok"
@@ -455,6 +576,9 @@ class Notifier:
         except Exception as e:
             _LOG.warning("webhook test failed", extra={"url": _log_url(url), "error": type(e).__name__})
             return type(e).__name__
+        finally:
+            await _record_send("test", "test", status, ok,
+                               (time.monotonic() - t0) * 1000.0 if status is not None else None)
 
 
 async def send_test_url(session: aiohttp.ClientSession, url: str) -> dict:

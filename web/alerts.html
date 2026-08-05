@@ -290,8 +290,11 @@ function render(d){
         const cls = x.ok ? "recover" : "fire";
         const ms = (x.ms==null) ? "" : (x.ms<1000 ? Math.round(x.ms)+"ms"
                                                   : (x.ms/1000).toFixed(1)+"s");
+        // a collapsed run of identical consecutive deliveries shows ×N (newest time), so one
+        // repeating alert takes ONE row instead of flooding the list off distinct deliveries.
+        const rep = (x.n && x.n>1) ? ` <span style="color:var(--muted)">×${escapeHtml(String(x.n))}</span>` : "";
         return `<tr><td>${escapeHtml(ago(x.ts))}</td>`
-          +`<td>${escapeHtml(x.akey||"—")}</td>`
+          +`<td>${escapeHtml(x.akey||"—")}${rep}</td>`
           +`<td class="${cls}">${escapeHtml(x.ok?"✓ ":"✗ ")}${escapeHtml(st)}</td>`
           +`<td style="color:var(--muted)">${escapeHtml(ms)}</td></tr>`;
       }).join("")+`</table>`

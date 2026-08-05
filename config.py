@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 VERSION = "AI-Monitoring_1.8.19"
 
@@ -385,6 +386,82 @@ ALERT_BACKLOG       = _float("ALERT_BACKLOG", 0.0)      # LiteLLM queue depth
 ALERT_VLLM_WAITING  = _float("ALERT_VLLM_WAITING", 0.0)
 ALERT_ON_BACKEND_DOWN = _str("ALERT_ON_BACKEND_DOWN", "1") not in ("0", "false", "")
 ALERT_REPEAT_MIN    = _float("ALERT_REPEAT_MIN", 30.0)  # re-notify cooldown
+# Consecutive failed samples before a backend is called DOWN. One failed poll is not an outage
+# (a TLS-handshake blip, a proxy reload, a backend GC pause all produce one), and paging on it
+# trains people to ignore the channel. 3 ≈ 15s at the default 5s interval — fast enough for a
+# real outage, immune to a single blip. 1 restores the old fire-on-first-failure behaviour.
+ALERT_BACKEND_DOWN_AFTER = _int("ALERT_BACKEND_DOWN_AFTER", 3)
+# The mirror of the above for RECOVERY: how many CONSECUTIVE good polls before a DOWN backend is
+# declared back UP. This is the anti-flap hysteresis — a backend that briefly answers one poll
+# then fails again (a flapping /health under load) stays latched DOWN instead of emitting a
+# recovery + an immediate re-fire (which would bypass ALERT_REPEAT_MIN and spam the channel).
+ALERT_BACKEND_UP_AFTER = _int("ALERT_BACKEND_UP_AFTER", 3)
+
+# --- maintenance windows: suppress DOWN/recovery alerts for a KNOWN, expected
+# outage (e.g. a daily vLLM model-reload restart) without touching the collector
+# data itself — the dashboard still shows the backend down during the window,
+# only the alert is silenced. Per-backend, comma-separated `HH:MM-HH:MM` (UTC,
+# 24h, daily-recurring); a window may cross midnight (e.g. "23:50-00:10"). Empty
+# = never suppressed (default, unchanged behaviour).
+_MAINTENANCE_BACKENDS = ("litellm", "ollama", "llamacpp", "vllm", "gpu")
+
+
+def _parse_hhmm(s: str) -> int | None:
+    """'HH:MM' -> minutes since midnight, or None if malformed."""
+    try:
+        h, m = s.strip().split(":")
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def _parse_maintenance_windows(raw: str) -> list[tuple[int, int]]:
+    """'HH:MM-HH:MM,HH:MM-HH:MM' -> [(start_min, end_min), ...]. Malformed entries
+    are skipped here (defensive at runtime); validate() reports them as fatal."""
+    out: list[tuple[int, int]] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split("-")
+        if len(bits) != 2:
+            continue
+        start, end = _parse_hhmm(bits[0]), _parse_hhmm(bits[1])
+        if start is not None and end is not None:
+            out.append((start, end))
+    return out
+
+
+MAINTENANCE_RAW: dict[str, str] = {
+    name: _str(f"MONITOR_MAINTENANCE_{name.upper()}", "") or ""
+    for name in _MAINTENANCE_BACKENDS
+}
+MAINTENANCE_WINDOWS: dict[str, list[tuple[int, int]]] = {
+    name: _parse_maintenance_windows(raw) for name, raw in MAINTENANCE_RAW.items()
+}
+
+
+def in_maintenance_window(name: str, now_ts: float | None = None) -> bool:
+    """True if `name` (litellm/ollama/llamacpp/vllm/gpu) is inside one of its
+    configured daily UTC maintenance windows right now. Handles a window that
+    wraps past midnight (start minute > end minute)."""
+    windows = MAINTENANCE_WINDOWS.get(name)
+    if not windows:
+        return False
+    t = time.gmtime(now_ts if now_ts is not None else time.time())
+    minute_of_day = t.tm_hour * 60 + t.tm_min
+    for start, end in windows:
+        if start <= end:
+            if start <= minute_of_day < end:
+                return True
+        else:                                   # wraps past midnight
+            if minute_of_day >= start or minute_of_day < end:
+                return True
+    return False
+
 
 # --- per-key anomaly / abuse detection (0 disables each) ---------------------
 # Spike: a key's recent request rate >= FACTOR × its own hourly baseline.
@@ -470,6 +547,17 @@ def validate(user_count: int = 0) -> list[str]:
                     "token, create a user (MONITOR_ADMIN_USER/PASSWORD/EMAIL), or "
                     "MONITOR_ALLOW_OPEN=1 to run open on purpose (loopback / behind "
                     "an authenticating proxy only).")
+    # A malformed MONITOR_MAINTENANCE_* window silently parses to "no window" at
+    # runtime (see _parse_maintenance_windows) — fail loud at boot instead, so a
+    # typo doesn't quietly leave a daily restart alerting exactly like before.
+    for _mb_name, _mb_raw in MAINTENANCE_RAW.items():
+        for _mb_part in (p.strip() for p in _mb_raw.split(",")):
+            if not _mb_part:
+                continue
+            if len(_parse_maintenance_windows(_mb_part)) != 1:
+                errs.append(
+                    f"MONITOR_MAINTENANCE_{_mb_name.upper()} has a malformed window "
+                    f"'{_mb_part}' — expected HH:MM-HH:MM (24h, UTC)")
     return errs
 
 
@@ -504,6 +592,7 @@ TUNABLES: dict[str, dict] = {
     "ALERT_LLM_WAIT_MS": {"t": "float", "def": ALERT_LLM_WAIT_MS, "min": 0, "max": 600000, "group": "Alerts", "label": "LLM wait (ms) ≥", "help": "LiteLLM avg response ≥ this"},
     "ALERT_BACKLOG":  {"t": "float", "def": ALERT_BACKLOG,  "min": 0, "max": 100000, "group": "Alerts", "label": "LLM backlog ≥", "help": "In-flight LiteLLM requests ≥ this"},
     "ALERT_REPEAT_MIN": {"t": "float", "def": ALERT_REPEAT_MIN, "min": 1, "max": 1440, "group": "Alerts", "label": "Re-notify after (min)", "help": "Cooldown before an alert re-fires"},
+    "ALERT_BACKEND_DOWN_AFTER": {"t": "int", "def": ALERT_BACKEND_DOWN_AFTER, "min": 1, "max": 60, "group": "Alerts", "label": "Backend DOWN after (samples)", "help": "Consecutive failed polls before a backend is called DOWN. 1 = alert on the first failure (noisy: a single handshake blip pages)"},
     # ── Phase 2: sampling / retention / LiteLLM tuning ──
     "SAMPLE_INTERVAL": {"t": "float", "def": SAMPLE_INTERVAL, "min": 1, "max": 3600, "group": "Sampling", "label": "Sample interval (s)", "help": "Seconds between backend samples"},
     "DB_RETENTION_HOURS": {"t": "int", "def": DB_RETENTION_HOURS, "min": 1, "max": 26280, "group": "Retention", "label": "Raw retention (h)", "help": "Hours of raw samples kept on disk"},

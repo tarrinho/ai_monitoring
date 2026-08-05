@@ -3710,10 +3710,15 @@ async def spend_model_user_series_handler(request: web.Request) -> web.Response:
 
 
 async def alerts_handler(request: web.Request) -> web.Response:
+    # A fan-out writes one 'user' row per per-user recipient, so returning those to a viewer
+    # would leak how many colleagues have a webhook configured (and whether each is failing).
+    # Non-admins see the operator-global scope only; no URL or user id is stored either way.
+    _, _role, _ = _auth_ctx(request)
+    chans = None if (not _auth_enabled() or _role == "admin") else ("webhook", "test")
     # Both SQLite reads in ONE off-loop hop (§6): `history` used to read on-loop, and the
     # Channels card's delivery list would have doubled that on every poll of every open tab.
     def _reads() -> tuple:
-        return db.recent_alerts(50), db.recent_webhook_sends(10)
+        return db.recent_alerts(50), db.recent_webhook_sends(10, chans)
     history, deliveries = await asyncio.to_thread(_reads)
     return web.json_response({
         "channels": alerts.channels_status(),

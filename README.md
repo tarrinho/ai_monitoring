@@ -409,6 +409,7 @@ endpoint returning `{"gpus":[{util,vram_used,vram_total,power,temp,…}]}`.
 | `ALERT_ON_BACKEND_DOWN` | `1` | a configured backend goes down |
 | `ALERT_REPEAT_MIN` | `30` | cooldown before a still-firing alert re-notifies |
 | `ALERT_WEBHOOK_URL` | *(empty)* | delivery target — `POST {source, text}` |
+| `MONITOR_MAINTENANCE_<BACKEND>` | *(empty)* | one per `LITELLM`/`OLLAMA`/`LLAMACPP`/`VLLM`/`GPU` — comma-separated `HH:MM-HH:MM` (UTC, daily, may cross midnight) during which that backend's DOWN/recovery alert is suppressed (dashboard still shows it down) |
 
 ### Per-key anomaly / abuse detection (`0` = off)
 | Var | Default | Meaning |
@@ -628,7 +629,7 @@ pip install -r requirements-dev.txt && pytest
 ## Development
 
 This project was built with AI assistance (Claude Code). All code is human-reviewed and
-gated by an extensive CI pipeline that runs on every push: 700+ tests, ruff / semgrep /
+gated by an extensive CI pipeline that runs on every push: 900+ tests, ruff / semgrep /
 bandit static analysis, gitleaks + trufflehog secret scanning, Trivy CVE scans
 (filesystem + image), and cosign image signing.
 
