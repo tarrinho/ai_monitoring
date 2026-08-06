@@ -381,7 +381,12 @@ def _majority_failing(name: str) -> bool:
     h = _down_hist.get(name) or []
     if not w or len(h) < w:
         return False
-    return sum(1 for ok in h if not ok) * 2 > len(h)
+    fails = sum(1 for ok in h if not ok)
+    # Must ALSO have seen at least ALERT_BACKEND_DOWN_AFTER failures. Without this the smaller
+    # of the two knobs silently wins: N consecutive failures always satisfy "more than half of
+    # the last N", so an operator who raised DOWN_AFTER above the window size had their setting
+    # quietly ignored and got paged after `window` failures instead.
+    return fails * 2 > len(h) and fails >= max(1, config.ALERT_BACKEND_DOWN_AFTER)
 
 
 def reset_down_streaks() -> None:
@@ -447,6 +452,18 @@ def evaluate(snap: dict) -> list[tuple[str, str]]:
             (ll.get("backlog") or 0) >= config.ALERT_BACKLOG:
         out.append(("backlog", f"LLM queue backlog {ll['backlog']} ≥ "
                               f"{config.ALERT_BACKLOG}"))
+    if not config.ALERT_ON_BACKEND_DOWN:
+        # Toggling backend-down alerting OFF must CLOSE any latched alert silently — the
+        # same "absence != recovery" rule as _cancelled. Skipping the block entirely left
+        # _firing populated and the keys simply vanished from the output, which Notifier
+        # read as "🟢 back UP" for backends that were still down.
+        for name in list(_firing):
+            _cancelled.add(f"down:{name}")
+        _firing.clear()
+        _down_streak.clear()
+        _up_streak.clear()
+        _down_hist.clear()
+        _down_reason.clear()
     if config.ALERT_ON_BACKEND_DOWN:
         for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
             b = c.get(name, {})
@@ -463,8 +480,21 @@ def evaluate(snap: dict) -> list[tuple[str, str]]:
                 # then re-paged when the window closed. Keeping the latch also means the window
                 # closing on a still-down backend emits nothing new (it never stopped firing).
                 _down_streak.pop(name, None)
-                _up_streak.pop(name, None)
                 _down_hist.pop(name, None)
+                # A GOOD poll inside the window still counts toward disarming. Skipping poll
+                # data entirely meant a backend that recovered DURING its maintenance window
+                # (the normal case — the restart is what fixes it) kept its latch, so the first
+                # tick after the window emitted "🔴 is DOWN" with the stale pre-window reason for
+                # a backend that had been healthy for the whole window. An always-open window
+                # (two adjacent entries) also stranded the key in the active set forever.
+                if b and b.get("available") is True:
+                    _up_streak[name] = _up_streak.get(name, 0) + 1
+                    if _up_streak[name] >= max(1, config.ALERT_BACKEND_UP_AFTER):
+                        _firing.discard(name)
+                        _up_streak.pop(name, None)
+                        _down_reason.pop(name, None)
+                else:
+                    _up_streak.pop(name, None)   # still failing → no progress toward recovery
                 if name in _firing:
                     _held.add(f"down:{name}")
                 continue
@@ -522,6 +552,11 @@ class Notifier:
     def __init__(self) -> None:
         self._last: dict[str, float] = {}   # key -> last-sent monotonic-ish ts
         self._active: set[str] = set()
+        # Keys whose FIRE we actually announced. Only these can produce a recovery: a breach
+        # that was debounced away never told anyone, so its "🟢 back UP" would be an all-clear
+        # for an alarm nobody heard — and that pairing is what let a flapping backend emit an
+        # unbounded fire/recover storm.
+        self._notified: set[str] = set()
 
     def _due(self, key: str, now: float) -> bool:
         last = self._last.get(key)
@@ -547,7 +582,18 @@ class Notifier:
         #   cancelled — no longer monitored: close the alert silently, drop it from active
         #   otherwise — genuinely recovered → send the 🟢
         held, cancelled = held_keys(), cancelled_keys()
-        recoveries = list(self._active - firing - held - cancelled)
+        # ALERT_REPEAT_MIN rate-limits STATE CHANGES, not just fires. A recovery used to send
+        # immediately AND clear the key's debounce, so the next failure counted as first-seen and
+        # fired with no cooldown: a flapping backend produced fire→recover→fire→recover forever
+        # (measured: 15 webhook posts in 5 minutes on defaults). A recovery that isn't due yet is
+        # DEFERRED — held in `_active` and emitted once the cooldown passes — never dropped, or
+        # the all-clear would be lost entirely.
+        pending = self._active - firing - held - cancelled
+        # Recover ONLY what we announced. A real fire still recovers immediately (an operator
+        # who was paged learns it is over at once); a debounced-away breach leaves silently.
+        # Combined with stamping `_last` on recovery, a flapping backend is bounded to one
+        # fire + one recovery per ALERT_REPEAT_MIN instead of a fire/recover storm.
+        recoveries = [k for k in pending if k in self._notified]
         # Resolve the per-user recipient list ONCE per tick (SSRF-validate once),
         # not per alert key — cheap + observer-effect friendly.
         recipients = await self._recipients() if (due or recoveries) else []
@@ -555,6 +601,7 @@ class Notifier:
         for key, msg in due:
             await self._fanout(session, _alert_text(snap, msg, fired=True), recipients, key)
             self._last[key] = now
+            self._notified.add(key)
             sent.append(msg)
             db.record_alert(now, key, "fire", msg)
             _LOG.warning("alert fired", extra={"key": key, "detail": msg,
@@ -562,17 +609,19 @@ class Notifier:
         for key in recoveries:
             rmsg = _recover_msg(key)
             await self._fanout(session, _alert_text(snap, rmsg, fired=False), recipients, key)
-            self._last.pop(key, None)
+            self._last[key] = now          # stamp, don't clear: a re-fire waits out the cooldown
+            self._notified.discard(key)
             sent.append(f"recovered:{key}")
             db.record_alert(now, key, "recover", rmsg)
             _LOG.info("alert recovered", extra={"key": key, "detail": rmsg,
                                                 "machine": _machine(snap)})
-        # HELD keys stay active so the window closing on a still-down backend emits nothing new;
-        # CANCELLED keys leave, and their debounce is cleared so a later REAL outage on a
-        # re-enabled backend pages immediately instead of waiting out ALERT_REPEAT_MIN.
-        for key in cancelled:
-            self._last.pop(key, None)
+        # HELD keys stay active so the window closing on a still-down backend emits nothing new.
+        # CANCELLED keys leave. Their debounce is deliberately NOT cleared: doing so was a
+        # REPEAT_MIN bypass reachable by any backend alternating between a real error and an
+        # 'unconfigured'/'starting' sample (a dying GPU driver does exactly that), which paged
+        # once per alternation instead of once per cooldown.
         self._active = (firing | (self._active & held)) - cancelled
+        self._notified -= cancelled
         return sent
 
     def active_keys(self) -> list[str]:

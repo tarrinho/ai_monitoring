@@ -12182,7 +12182,8 @@ def test_merge_key_budgets_dedups_a_key_seen_under_two_identities():
     masked key_name, the spend snapshot only by the full hash) used to be appended TWICE, double
     counting its spend across the totals, the key count and the table."""
     live = {"sk-...9f3c": {"spend": 100.0, "team": "", "budget": 0.0, "user": "", "user_name": "",
-                           "ids": ["sk-...9f3c", "FULLHASH123"]}}
+                           "ids": ["sk-...9f3c", "FULLHASH123"],
+                           "ids_strong": ["FULLHASH123"]}}   # hash-class subset (production shape)
     snapshot = [{"key": "FULLHASH123", "alias": "", "cost": 12.34}]
     rows = appmod.merge_key_budgets(live, snapshot, {})
     assert len(rows) == 1, f"same key under two identities must not duplicate: {rows}"
@@ -12203,3 +12204,125 @@ def test_budget_rows_expose_every_identity_for_the_cost_join():
     assert rows, "expected a budget row"
     ids = rows[0].get("ids") or []
     assert "sk-...9f3c" in ids and "FULLHASH123" in ids, f"both identities must ship: {ids}"
+
+
+async def test_flapping_backend_cannot_storm_past_repeat_min(monkeypatch, tmp_path):
+    """ALERT_REPEAT_MIN rate-limits STATE CHANGES. A recovery used to send immediately AND clear
+    the debounce, so the next failure counted as first-seen: fire→recover→fire→recover forever
+    (measured 15 webhook posts in ~5 min on defaults). A not-yet-due recovery is DEFERRED, never
+    dropped — the all-clear still arrives once the cooldown passes."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "storm.db")); db.init()
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_WINDOW", 0)
+    monkeypatch.setattr(config, "ALERT_REPEAT_MIN", 30.0)
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL", "")
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: False)
+    alerts.reset_down_streaks()
+    D = {"ts": 0, "collectors": {"vllm": {"available": False, "error": "e"}}}
+    U = {"ts": 0, "collectors": {"vllm": {"available": True}}}
+    posts = []
+
+    async def _fanout(self, session, text, recipients, akey=""):
+        posts.append(text)
+    monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
+    monkeypatch.setattr(alerts.Notifier, "_recipients", lambda self: _noop_recipients())
+    n = alerts.Notifier()
+    pattern = [U, U, D, U, U, D, D, D]
+    t = 1000.0
+    for _ in range(8):                      # 64 ticks at 5s ≈ 5.3 minutes
+        for s in pattern:
+            await n.process(None, s, t)
+            t += 5.0
+    assert len(posts) <= 2, f"flap storm: {len(posts)} posts in 5 min with REPEAT_MIN=30: {posts}"
+
+
+async def test_backend_recovering_inside_a_maintenance_window_does_not_false_page(monkeypatch, tmp_path):
+    """The normal maintenance case: an outage arms, the window opens, the restart FIXES it. The
+    window branch used to skip poll data entirely, so the latch survived and the first tick after
+    the window emitted '🔴 is DOWN' with the stale pre-window reason for a healthy backend."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mwrec.db")); db.init()
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_WINDOW", 0)
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL", "")
+    alerts.reset_down_streaks()
+    win = {"on": False}
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: win["on"])
+    posts = []
+
+    async def _fanout(self, session, text, recipients, akey=""):
+        posts.append(text)
+    monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
+    monkeypatch.setattr(alerts.Notifier, "_recipients", lambda self: _noop_recipients())
+    n = alerts.Notifier()
+    D = {"ts": 0, "collectors": {"vllm": {"available": False, "error": "conn refused"}}}
+    U = {"ts": 0, "collectors": {"vllm": {"available": True}}}
+    t = 1000.0
+    for _ in range(3):                      # arm + fire
+        await n.process(None, D, t); t += 5
+    assert any("is DOWN" in p for p in posts)
+    win["on"] = True
+    posts.clear()
+    for _ in range(8):                      # recovers INSIDE the window
+        await n.process(None, U, t); t += 5
+    win["on"] = False
+    for _ in range(3):                      # window closes, still healthy
+        await n.process(None, U, t); t += 5
+    assert not any("is DOWN" in p for p in posts), f"false page after window: {posts}"
+    # The genuine recovery IS announced — we paged for this outage, so the all-clear is owed and
+    # arrives as soon as the backend is stably up, window or not.
+    assert any("back UP" in p for p in posts), f"recovery must be delivered: {posts}"
+    assert n.active_keys() == [], f"alert must clear after the recovery: {n.active_keys()}"
+
+
+def test_backend_down_toggle_off_cancels_silently(monkeypatch):
+    """Turning ALERT_ON_BACKEND_DOWN off while a backend is latched must CANCEL the alert, not
+    let the key vanish (which Notifier reads as '🟢 back UP' for a still-down backend)."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 2)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_WINDOW", 0)
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: False)
+    alerts.reset_down_streaks()
+    D = {"collectors": {"vllm": {"available": False, "error": "e"}}}
+    alerts.evaluate(D)
+    assert [k for k, _ in alerts.evaluate(D)] == ["down:vllm"]
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", False)
+    assert alerts.evaluate(D) == []
+    assert "down:vllm" in alerts.cancelled_keys(), "toggle-off must CANCEL, not look like recovery"
+
+
+def test_down_window_does_not_silently_cap_down_after(monkeypatch):
+    """N consecutive failures always satisfy 'more than half of the last N', so the smaller knob
+    used to win: an operator raising ALERT_BACKEND_DOWN_AFTER above the window size was paged
+    after `window` failures instead. The majority arm now also requires DOWN_AFTER failures."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 10)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_WINDOW", 3)
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: False)
+    alerts.reset_down_streaks()
+    D = {"collectors": {"vllm": {"available": False, "error": "e"}}}
+    for i in range(9):
+        assert alerts.evaluate(D) == [], f"must not page before 10 failures (tick {i+1})"
+    assert [k for k, _ in alerts.evaluate(D)] == ["down:vllm"], "pages at the 10th, as configured"
+
+
+def test_merge_key_budgets_does_not_lose_a_key_to_an_alias_collision():
+    """The identity-set dedup must not collapse DISTINCT keys. Hash-class ids (key/api_key/token)
+    are unique and match across fields; alias-class ids (key_name `sk-…4chars`, reusable aliases)
+    match canonical-label to canonical-label only. Matching any-id-to-any-id made a real key's
+    spend vanish from the totals, the count, the table AND the chart."""
+    live = {"billing": {"spend": 10.0, "team": "", "budget": 0.0, "user": "", "user_name": "",
+                        "ids": ["billing", "sk-...4f2a", "hashL"],
+                        "key_name": "sk-...4f2a", "token": "hashL"}}
+    # a DIFFERENT (deleted) key whose alias equals the live key's masked name
+    rows = appmod.merge_key_budgets(live, [{"key": "hashD", "alias": "sk-...4f2a", "cost": 300.0}], {})
+    assert len(rows) == 2, f"distinct keys must both survive: {rows}"
+    assert round(sum(r.get("cost", 0) for r in rows), 2) == 310.0, "no money may vanish"
+    # the SAME key under two representations must still collapse (the original double-count bug)
+    live2 = {"sk-...9f3c": {"spend": 100.0, "ids": ["sk-...9f3c", "FULLHASH123"],
+                            "key_name": "sk-...9f3c", "token": "FULLHASH123"}}
+    rows2 = appmod.merge_key_budgets(live2, [{"key": "FULLHASH123", "alias": "", "cost": 12.34}], {})
+    assert len(rows2) == 1 and round(sum(r.get("cost", 0) for r in rows2), 2) == 100.0

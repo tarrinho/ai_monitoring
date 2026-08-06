@@ -332,7 +332,7 @@ function updateSeries(chart,labels,next){
         <button data-by="key">by key</button>
         <button data-by="team">by team</button>
       </span></h2>
-    <div class="hint" style="margin-top:2px">real-cash spend in the selected time window · <b>click a user to see the keys they used</b></div>
+    <div class="hint" id="cost-hint" style="margin-top:2px">real-cash spend in the selected time window · <b>click a user to see the keys they used</b></div>
     <div class="chart-wrap"><canvas id="cost-chart" role="img" aria-label="Cost by user"></canvas></div>
     <div id="cost-detail"></div>
   </section>
@@ -600,11 +600,37 @@ let SPWINCOST=null;   // {alias: windowed spend} — makes Cost-by-user/key/team
 // the masked `key_name` — matching only on `k.key` returned 0, and since the chart filters
 // spent>0 the user or team vanished from "Cost by user/key/team" while the table below still
 // listed their spend.
+// CLAIM-ONCE: two DISTINCT keys can legitimately share an alias-class id (LiteLLM's masked
+// `key_name` is `sk-…`+4 chars, and aliases can repeat), and both rows would then look up the
+// SAME cost entry — inflating the by-user and by-team bars by counting one payment twice. Each
+// map entry is owned by the first row that claims it; rebuilt whenever the key list changes.
+let SPWINCLAIM=null;
+function buildWinClaims(keys){
+  SPWINCLAIM = SPWINCOST ? {} : null;
+  if(!SPWINCOST) return;
+  (keys||[]).forEach(k=>{
+    const ids=(k.ids&&k.ids.length)?k.ids:[k.key];
+    for(const id of new Set(ids)){
+      if(SPWINCOST[id]!==undefined && SPWINCLAIM[id]===undefined) SPWINCLAIM[id]=k.key;
+    }
+  });
+}
 function winSpent(k){
   if(!SPWINCOST) return k.spent||0;
+  // SUM over the distinct ids, don't return the first hit. The rollup stores an alias per
+  // (day,model,key) from whatever /spend/logs reported that day, and LiteLLM populates it
+  // inconsistently — so ONE key routinely has two labels in a window (hash for the days before
+  // the alias appeared, alias after). First-match-wins silently dropped the other half of the
+  // money. `v!==undefined` also keeps a legitimate 0 from falling through to a foreign id.
   const ids=(k.ids&&k.ids.length)?k.ids:[k.key];
-  for(const id of ids){ const v=SPWINCOST[id]; if(v) return v; }
-  return 0;
+  let sum=0, hit=false;
+  for(const id of new Set(ids)){
+    const v=SPWINCOST[id];
+    if(v===undefined||v===null) continue;
+    if(SPWINCLAIM && SPWINCLAIM[id]!==k.key) continue;   // another row owns this entry
+    sum+=v; hit=true;
+  }
+  return hit?sum:0;
 }
 async function loadKeyCost(){
   const d=await api("/api/spend/keycost?window="+SPWIN);
@@ -613,6 +639,15 @@ async function loadKeyCost(){
   // "Cost by user/key/team" card (rows.length===0) while the summary above still showed real
   // money. Treat empty as absent so the fallback fires.
   SPWINCOST=(d && d.cost && Object.keys(d.cost).length) ? d.cost : null;
+  buildWinClaims(_lastKeys);   // cost map and key list load independently — rebuild on either
+  // An empty map is legitimate (fresh install before the rollup fills, a window past the
+  // rollup retention, or a ◀ pan into a quiet range). winSpent then falls back to LIFETIME
+  // spend — so relabel the card instead of presenting all-time money as window money.
+  (function(){ const el=document.getElementById("cost-hint"); if(!el) return;
+    el.textContent = SPWINCOST
+      ? "real-cash spend in the selected time window · click a user to see the keys they used"
+      : "windowed data unavailable for this range — showing ALL-TIME totals · click a user to see the keys they used";
+  })();
   renderCostChart(_lastKeys);
 }
 const KEYS_PER_PAGE=20;
@@ -1097,6 +1132,7 @@ async function tick(){
   renderTeams(d.keys);
   renderKeys(d.keys);
   _lastKeys=d.keys||[];
+  buildWinClaims(_lastKeys);   // claim-once ownership of each windowed-cost entry
   renderCostChart(_lastKeys);
   loadSpendSeries(); loadModelCostSeries(); loadModelUserCostSeries(); loadKeyCost();
 }

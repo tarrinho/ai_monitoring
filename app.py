@@ -2180,9 +2180,13 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
     def _alias(k):
         return litellm.key_label(k)          # D-1: one canonical join label
     keys: list = []
-    seen: set = set()
+    # Two identity classes (see the dedup comment below): hashes are unique, alias-class values
+    # are not, so a match only counts within the same class.
+    seen_strong: set = set()
+    seen_alias: set = set()
     if live:
         for alias, info in live.items():
+            info_row = info if isinstance(info, dict) else {}
             row = {"alias": alias, "cost": info.get("spend", 0.0),
                    "team": info.get("team", ""), "budget": info.get("budget", 0.0),
                    # carry the resolved owner through so the budget rows can show
@@ -2190,23 +2194,44 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
                    "user": info.get("user", ""), "user_name": info.get("user_name", "")}
             row["ids"] = list(info.get("ids") or []) or [alias]
             keys.append(row)
-            # Dedup on the id SET, not one label: /key/list may identify a key by its masked
-            # `key_name` while the spend snapshot only has the full `api_key` hash. Matching a
-            # single canonical label missed that case, so the SAME key was appended twice and
-            # its spend counted twice across the totals, the key count and the table.
-            seen.update(str(i) for i in row["ids"] if i)
-            seen.add(_alias(row))
+            # Dedup on identity, but keep the two CLASSES apart. A hash (key/api_key/token) is
+            # unique; an alias-class value (alias/key_alias/key_name) is not — `key_name` is
+            # `sk-…` + 4 chars, so distinct keys collide, and an alias can be reused. Matching
+            # any-id-against-any-id therefore DROPPED a real key whose masked name happened to
+            # equal another key's hash-adjacent field, silently losing its spend from the totals,
+            # the count, the table AND the chart — the inverse of the double-count it replaced.
+            # HASH class matches across every hash field — that is the new capability that
+            # catches "same key, described by key_name here and api_key there".
+            seen_strong.update(str(i) for i in (info_row.get("ids_strong") or []) if i)
+            seen_strong.update(str(v) for f in litellm.STRONG_ID_FIELDS if (v := info_row.get(f)))
+            # ALIAS class matches canonical-label to canonical-label ONLY (the original, safe
+            # behaviour). Putting every alias-class id into this set is what made a distinct key
+            # whose masked name equalled another key's alias-class value disappear.
+            seen_alias.add(_alias(row))
     for sk in (snapshot_keys or []):     # fold in snapshot spend keys not already present
-        sk_ids = litellm.key_ids(sk) or [_alias(sk)]
-        if any(str(i) in seen for i in sk_ids if i):
-            continue                     # already represented under one of its other identities
+        strong = {str(sk.get(f)) for f in litellm.STRONG_ID_FIELDS if sk.get(f)}
         a = _alias(sk)
-        if a:
+        if (strong & seen_strong) or (a and a != "?" and a in seen_alias):
+            continue                     # same key under one of its other identities
+        if a and a != "?":
             row = dict(sk)
-            row["ids"] = [str(i) for i in sk_ids if i] or [a]
+            row["ids"] = [str(i) for i in (litellm.key_ids(sk) or [a]) if i] or [a]
             keys.append(row)
-            seen.update(row["ids"])
-            seen.add(a)
+            seen_strong.update(strong)
+            seen_alias.add(a)
+        elif (sk.get("cost") or sk.get("spend") or 0):
+            # No identity at all, but it HAS spend. Every such row used to collapse onto the
+            # single label "?" and all but the first were dropped, silently losing real money.
+            # Keep each one, but give it a DISTINCT synthetic alias: callers rely on the merged
+            # list having unique display identities (asserted by the merge property test), and
+            # several rows all displaying as "" would break that. The label is deliberately
+            # obvious — it is genuinely all LiteLLM told us about this spend.
+            synthetic = f"unidentified-{sum(1 for r in keys if str(r.get('alias', '')).startswith('unidentified-')) + 1}"
+            row = dict(sk)
+            row["alias"] = synthetic
+            row["ids"] = [synthetic]
+            keys.append(row)
+            seen_alias.add(synthetic)
     for k in keys:                       # env override wins over LiteLLM max_budget
         if _alias(k) in env_map:
             k["budget"] = env_map[_alias(k)]
@@ -3624,7 +3649,10 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
     # already uses successfully in lite mode. Gated on spend_mode, not just "cost is
     # empty": in full mode that delta is REQUEST COUNTS, not dollars, and plotting it
     # here would silently mislabel units.
-    if not cost and (_backend_latest.get("litellm", {}) or {}).get("spend_mode") != "full":
+# .get(..., "full"): a timeout replaces the litellm sample wholesale, so `spend_mode` can be
+    # ABSENT for a tick. Treating absent as non-full dropped a full-mode deployment into the
+    # lite fallback, which plots per-bucket REQUEST COUNTS as USD.
+    if not cost and (_backend_latest.get("litellm", {}) or {}).get("spend_mode", "full") != "full":
         # require_known=False: a key with real windowed activity is a real key — keep the
         # billed-but-unconfirmed key (master / ephemeral virtual) instead of dropping it,
         # matching the full-mode key_cost_window path so the two spend modes agree.

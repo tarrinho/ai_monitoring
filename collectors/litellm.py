@@ -57,6 +57,10 @@ def _is_team_id(s) -> bool:
 # canonical JOIN key every producer must use so the labels line up. Prefers the human alias,
 # falls back to the raw key hash, never empty ("?" only when a row carries no identity at all).
 _KEY_ID_FIELDS = ("alias", "key_alias", "key_name", "key", "api_key", "token")
+# The identity fields that are UNIQUE per key (hash-class). The rest of _KEY_ID_FIELDS are
+# alias-class and can legitimately repeat across keys — `key_name` is `sk-…` + 4 chars, and an
+# alias can be reused — so a cross-class match must never be treated as "same key".
+STRONG_ID_FIELDS = ("key", "api_key", "token")
 
 
 def key_ids(k: dict) -> list[str]:
@@ -1558,6 +1562,9 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
             "user": uid,
             "user_name": uname,                            # user_id → email/alias for grouping
             "ids": ids,                                    # every identity, for a shape-proof join
+            # The HASH-class subset, kept separate: only these may match across fields when
+            # deduping (an alias-class value like the masked key_name repeats across keys).
+            "ids_strong": [str(k.get(f)) for f in STRONG_ID_FIELDS if k.get(f)],
         }
     _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])} "
          f"teamed={sum(1 for v in out.values() if v['team'])}")
