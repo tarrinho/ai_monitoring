@@ -218,7 +218,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.19</div>
+      <div id="sidebar-brand-ver">v1.8.20</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -1089,7 +1089,10 @@ function _wireWhyOther(cardId, d){
       ? " Per-model history is new (it only fills from recent samples), so this shrinks over time."
       : "";
     _showPop(ev,'<span class="x">✕</span><h4>Why the “Other” band?</h4>'
-      +'<div>In this window, <b>'+CUR+Number(oth).toFixed(2)+'</b> of '+CUR
+      // No currency prefix: this popover only ever serves the concurrency / backlog cards,
+      // whose quantities are in-flight REQUESTS, not money. "$1.20 of $3.40 of measured
+      // concurrent LLM work" read as a cost figure and invited exactly the wrong conclusion.
+      +'<div>In this window, <b>'+Number(oth).toFixed(2)+'</b> of '
       +Number(agg).toFixed(2)+' ('+pct+'%) of measured '+metric+' couldn’t be tied to a '
       +'specific '+noun+'.</div>'
       +'<div class="muted" style="margin-top:6px">The total is measured directly every '
@@ -1195,9 +1198,28 @@ function _foldSeriesByUser(series, owners){
   if(byUser["Other"]!==undefined) users.push("Other");   // residual stays last (grey band)
   return users.map(u=>({label:u, data:byUser[u]}));
 }
+// Fold the ATTRIBUTION block the same way as the series. `attribution` is computed server-side
+// per KEY, so on a "by user" card the why-Other popover was listing raw key ids (violating this
+// card's "a raw key id must never appear" invariant) and mixing units — "3 more users" when it
+// meant 3 more keys, "beyond the top 12" when only 4 user bands were drawn.
+function _foldAttributionByUser(a, owners, foldedSeries){
+  if(!a) return a;
+  const omap=owners||{};
+  const own=k=>{ const e=omap[k]; return e ? usernameOf(e) : userOf(k); };
+  // Names hidden in "Other", mapped key -> user and de-duplicated (many keys, one owner).
+  const others=[...new Set((a.other_labels||[]).map(own))].filter(u=>u&&u!=="Other");
+  // `shown` must be the number of USER bands actually drawn — take it from the folded series,
+  // the only place that knows. Counts and names then agree on the same unit.
+  const shown=(foldedSeries||[]).filter(s=>s.label!=="Other").length;
+  return Object.assign({},a,{other_labels:others,
+                             shown:shown, labels_total:shown+others.length});
+}
 async function loadConcByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=conc&window="+WIN);
-  if(d && d.series) d.series=_foldSeriesByUser(d.series, d.owners);   // title is "by user" → show users
+  if(d && d.series){                                   // title is "by user" → show users
+    d.series=_foldSeriesByUser(d.series, d.owners);
+    d.attribution=_foldAttributionByUser(d.attribution, d.owners, d.series);
+  }
   renderStackByKey(d, concByKeyChart, "card-conc-by-key", "conc-by-key-basis");
 }
 async function loadConcByModel(){
@@ -1207,7 +1229,10 @@ async function loadConcByModel(){
 }
 async function loadBacklogByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=backlog&window="+WIN);
-  if(d && d.series) d.series=_foldSeriesByUser(d.series, d.owners);   // title is "by user" → show users
+  if(d && d.series){                                   // title is "by user" → show users
+    d.series=_foldSeriesByUser(d.series, d.owners);
+    d.attribution=_foldAttributionByUser(d.attribution, d.owners, d.series);
+  }
   renderStackByKey(d, backlogByKeyChart, "card-backlog-by-key", "backlog-by-key-basis");
 }
 async function loadAnomalies(){
@@ -1699,7 +1724,10 @@ function utDrawSmall(){
 }
 function utRows(filter){ const q=String(filter||"").toLowerCase(), rows=document.getElementById("ut-rows"); if(!rows)return;
   setHtml(rows, utData.list.filter(o=>o.name.toLowerCase().includes(q)).map(o=>
-    "<label class='r'><input type='checkbox' data-u='"+encodeURIComponent(o.name)+"' "+(utSel.has(o.name)?"checked":"")+">"+
+    // encodeURIComponent does NOT escape an apostrophe, so a username like o'brien closed this
+    // single-quoted attribute early: dataset.u became "o", the checkbox never matched the series,
+    // and ticking that user silently did nothing. %27 it explicitly.
+    "<label class='r'><input type='checkbox' data-u='"+encodeURIComponent(o.name).replace(/'/g,"%27")+"' "+(utSel.has(o.name)?"checked":"")+">"+
     "<span class='sw' style='background:"+o.color+"'></span><span class='nm'>"+escapeHtml(o.name)+"</span><span class='tot'>"+utFmt(o.total)+"</span></label>").join("")
     || "<div class='sub'>no users</div>"); }
 (function(){

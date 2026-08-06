@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 
-VERSION = "AI-Monitoring_1.8.19"
+VERSION = "AI-Monitoring_1.8.20"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -396,6 +396,12 @@ ALERT_BACKEND_DOWN_AFTER = _int("ALERT_BACKEND_DOWN_AFTER", 3)
 # then fails again (a flapping /health under load) stays latched DOWN instead of emitting a
 # recovery + an immediate re-fire (which would bypass ALERT_REPEAT_MIN and spam the channel).
 ALERT_BACKEND_UP_AFTER = _int("ALERT_BACKEND_UP_AFTER", 3)
+# Sliding-window arm condition, alongside the consecutive one above. Consecutive-only means a
+# backend that fails MOST of its polls but never N times in a row can never page: at a 2-in-3
+# error rate (DOWN,DOWN,UP repeating) the streak resets forever, yet that is an outage by any
+# user's definition. If MORE THAN HALF of the last N samples failed, arm. A 50/50 alternation
+# deliberately does NOT arm — that is the flap the hysteresis exists to damp. 0 disables.
+ALERT_BACKEND_DOWN_WINDOW = _int("ALERT_BACKEND_DOWN_WINDOW", 10)
 
 # --- maintenance windows: suppress DOWN/recovery alerts for a KNOWN, expected
 # outage (e.g. a daily vLLM model-reload restart) without touching the collector
@@ -433,7 +439,11 @@ def _parse_maintenance_windows(raw: str) -> list[tuple[int, int]]:
         if len(bits) != 2:
             continue
         start, end = _parse_hhmm(bits[0]), _parse_hhmm(bits[1])
-        if start is not None and end is not None:
+        # start == end is a ZERO-LENGTH window: `start <= m < end` can never be true, so it
+        # parses clean and silently suppresses nothing. An operator writing "00:00-00:00" for
+        # "all day" would get no suppression at all and no error — exactly what validate() is
+        # meant to catch. Treated as malformed so validate() reports it.
+        if start is not None and end is not None and start != end:
             out.append((start, end))
     return out
 
@@ -596,6 +606,8 @@ TUNABLES: dict[str, dict] = {
     "ALERT_BACKLOG":  {"t": "float", "def": ALERT_BACKLOG,  "min": 0, "max": 100000, "group": "Alerts", "label": "LLM backlog ≥", "help": "In-flight LiteLLM requests ≥ this"},
     "ALERT_REPEAT_MIN": {"t": "float", "def": ALERT_REPEAT_MIN, "min": 1, "max": 1440, "group": "Alerts", "label": "Re-notify after (min)", "help": "Cooldown before an alert re-fires"},
     "ALERT_BACKEND_DOWN_AFTER": {"t": "int", "def": ALERT_BACKEND_DOWN_AFTER, "min": 1, "max": 60, "group": "Alerts", "label": "Backend DOWN after (samples)", "help": "Consecutive failed polls before a backend is called DOWN. 1 = alert on the first failure (noisy: a single handshake blip pages)"},
+    "ALERT_BACKEND_UP_AFTER": {"t": "int", "def": ALERT_BACKEND_UP_AFTER, "min": 1, "max": 60, "group": "Alerts", "label": "Backend UP after (samples)", "help": "Consecutive good polls before a DOWN alert clears (anti-flap hysteresis)."},
+    "ALERT_BACKEND_DOWN_WINDOW": {"t": "int", "def": ALERT_BACKEND_DOWN_WINDOW, "min": 0, "max": 200, "group": "Alerts", "label": "Backend DOWN window (samples)", "help": "Also call a backend DOWN when MORE THAN HALF of the last N samples failed, even without N consecutive failures. 0 disables."},
     # ── Phase 2: sampling / retention / LiteLLM tuning ──
     "SAMPLE_INTERVAL": {"t": "float", "def": SAMPLE_INTERVAL, "min": 1, "max": 3600, "group": "Sampling", "label": "Sample interval (s)", "help": "Seconds between backend samples"},
     "DB_RETENTION_HOURS": {"t": "int", "def": DB_RETENTION_HOURS, "min": 1, "max": 26280, "group": "Retention", "label": "Raw retention (h)", "help": "Hours of raw samples kept on disk"},

@@ -59,6 +59,27 @@ def _is_team_id(s) -> bool:
 _KEY_ID_FIELDS = ("alias", "key_alias", "key_name", "key", "api_key", "token")
 
 
+def key_ids(k: dict) -> list[str]:
+    """EVERY non-empty identity value on a key row, not just the canonical one.
+
+    `key_label` collapses a key to ONE label, but the two sources describe the same key with
+    different fields: /key/list often has `key_name` (masked `sk-...9f3c`) while the spend
+    snapshot falls back to the full `api_key` hash. Joining on a single label therefore missed,
+    which (a) let one key appear TWICE in the budget union — double-counting its spend — and
+    (b) stopped the windowed cost map joining budget rows for alias-less keys, so those users
+    vanished from the Cost chart. Matching on the id SET makes either representation join."""
+    if not isinstance(k, dict):
+        return []
+    out: list[str] = []
+    for f in _KEY_ID_FIELDS:
+        v = k.get(f)
+        if v:
+            s = str(v).strip()
+            if s and s not in out:
+                out.append(s)
+    return out
+
+
 def key_label(k: dict) -> str:
     """Canonical join label for a key dict from ANY LiteLLM shape (see note above)."""
     if not isinstance(k, dict):
@@ -1493,6 +1514,7 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         if not isinstance(k, dict):
             continue
         alias = key_label(k)                 # D-1: canonical join label (was a local chain)
+        ids = key_ids(k)                     # every identity, so the merge can join either shape
         if alias == "?":
             continue                         # a row with no identity at all — skip, as before
         # Owner user-id can live on ANY of several fields: `user_id` (owner), `created_by`
@@ -1535,6 +1557,7 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
             "team": team,
             "user": uid,
             "user_name": uname,                            # user_id → email/alias for grouping
+            "ids": ids,                                    # every identity, for a shape-proof join
         }
     _dbg(f"/key/list keys={len(out)} budgeted={sum(1 for v in out.values() if v['budget'])} "
          f"teamed={sum(1 for v in out.values() if v['team'])}")
@@ -1670,6 +1693,9 @@ def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[di
                       else "ok")
         rows.append({
             "key": str(alias), "role": k.get("role", "viewer"),
+            # every identity for this key, so the client's windowed-cost lookup can join
+            # whichever representation the cost map used (masked key_name vs full hash)
+            "ids": [str(i) for i in (k.get("ids") or key_ids(k)) if i] or [str(alias)],
             "team": k.get("team") or "",
             "email": k.get("user_name") or "",   # resolved owner email/alias
             "user": k.get("user") or "",         # LiteLLM user id (the "ID" in details)

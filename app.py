@@ -126,6 +126,16 @@ async def _backend_loop(name: str, sample_fn, session, bound: float) -> None:
         except asyncio.TimeoutError:
             _SLOG.warning(f"backend '{name}' exceeded {bound:.0f}s — skipped this tick",
                           extra={"backend": name})
+            # Record the timeout as a REAL failure instead of leaving the previous sample in
+            # place. A wedged backend would otherwise keep presenting its last {"available":
+            # True} forever: the panel shows it healthy, the up-streak climbs to
+            # ALERT_BACKEND_UP_AFTER and emits "back UP" for something that is hung, and no
+            # down: alert can ever arm. A timeout IS the signal — and "timeout …" is correctly
+            # outside alerts._NOT_AN_OUTAGE, so it arms the normal N-consecutive-failure path.
+            _backend_latest[name] = {"available": False,
+                                     # %g keeps a sub-second bound readable: a 0.3s bound
+                                     # rendered as "timeout >0s" in the alert text and UI.
+                                     "error": f"timeout >{bound:g}s"}
         except Exception as e:
             _backend_latest[name] = {"available": False, "error": f"{type(e).__name__}"}
         await asyncio.sleep(config.SAMPLE_INTERVAL)
@@ -2178,12 +2188,24 @@ def merge_key_budgets(live: dict | None, snapshot_keys: list, env_map: dict) -> 
                    # carry the resolved owner through so the budget rows can show
                    # email + user id (was dropped here → budgets card had no user).
                    "user": info.get("user", ""), "user_name": info.get("user_name", "")}
+            row["ids"] = list(info.get("ids") or []) or [alias]
             keys.append(row)
-            seen.add(_alias(row))        # dedup on the CANONICAL label (both paths agree — D-1)
+            # Dedup on the id SET, not one label: /key/list may identify a key by its masked
+            # `key_name` while the spend snapshot only has the full `api_key` hash. Matching a
+            # single canonical label missed that case, so the SAME key was appended twice and
+            # its spend counted twice across the totals, the key count and the table.
+            seen.update(str(i) for i in row["ids"] if i)
+            seen.add(_alias(row))
     for sk in (snapshot_keys or []):     # fold in snapshot spend keys not already present
+        sk_ids = litellm.key_ids(sk) or [_alias(sk)]
+        if any(str(i) in seen for i in sk_ids if i):
+            continue                     # already represented under one of its other identities
         a = _alias(sk)
-        if a and a not in seen:
-            keys.append(dict(sk))
+        if a:
+            row = dict(sk)
+            row["ids"] = [str(i) for i in sk_ids if i] or [a]
+            keys.append(row)
+            seen.update(row["ids"])
             seen.add(a)
     for k in keys:                       # env override wins over LiteLLM max_budget
         if _alias(k) in env_map:
@@ -3061,7 +3083,12 @@ def _owner_of(row: dict, omap: dict) -> str:
     the SAME way the /litellm by-user charts do (userOf → 'Unassigned', litellm.html). The two
     pages used to disagree: the same ownerless key showed as an alias band here and under
     'Unassigned' there, so per-user totals never reconciled across pages (F5)."""
-    alias = str(row.get("alias") or "")
+    # Fall back to the key hash when the row has no alias — every sibling reader joins on
+    # COALESCE(NULLIF(alias,''), key) (db.key_cost_window / key_cumulative), and
+    # _fold_model_user leaves `alias` empty for alias-less keys. Joining on "" made ovr/
+    # live/stored all miss, so a key the admin had EXPLICITLY reassigned still stacked
+    # under "Unassigned" here while "Cost by user" above it named the owner.
+    alias = str(row.get("alias") or "") or str(row.get("key") or "")
     ovr, live, stored = omap.get("ovr", {}), omap.get("live", {}), omap.get("stored", {})
     # Precedence: admin override > LiteLLM's LIVE owner > the PERSISTED last-known owner > Unassigned.
     # The stored layer is what keeps this chart warm when the live /key/list+/user/list poll blips

@@ -297,6 +297,7 @@ def thresholds_status() -> dict:
         "vram_pct": config.ALERT_VRAM_PCT, "llm_wait_ms": config.ALERT_LLM_WAIT_MS,
         "backlog": config.ALERT_BACKLOG, "backend_down": config.ALERT_ON_BACKEND_DOWN,
         "backend_down_after": config.ALERT_BACKEND_DOWN_AFTER,
+        "backend_up_after": config.ALERT_BACKEND_UP_AFTER,
         "vllm_waiting": config.ALERT_VLLM_WAITING,
         "anomaly_factor": config.ANOMALY_FACTOR,
         "key_budget_hr": config.ANOMALY_KEY_BUDGET_HR,
@@ -317,7 +318,9 @@ def thresholds_status() -> dict:
 _NOT_AN_OUTAGE = (None, "unconfigured", "starting")
 
 # Anti-flap hysteresis state per backend (evaluate() is otherwise a pure function of the snapshot;
-# reset_down_streaks() clears it for tests / a config change):
+# reset_down_streaks() clears it — used by tests; NOTE nothing in the app calls it on a live
+# config change, so a lowered threshold arms an in-flight streak immediately and a raised one
+# cannot un-latch a firing backend until it recovers normally):
 #   _down_streak — consecutive failed polls, arms a DOWN alert at ALERT_BACKEND_DOWN_AFTER
 #   _up_streak   — consecutive good polls, disarms it at ALERT_BACKEND_UP_AFTER
 #   _firing      — backends currently LATCHED down: they keep alerting through a brief up-blip and
@@ -328,6 +331,57 @@ _down_streak: dict[str, int] = {}
 _up_streak: dict[str, int] = {}
 _firing: set[str] = set()
 _down_reason: dict[str, str] = {}
+# Rolling pass/fail history per backend (newest last), for the ALERT_BACKEND_DOWN_WINDOW
+# majority-failure arm condition — the consecutive streak alone can never fire on a backend
+# that fails most polls without ever failing N times in a row.
+_down_hist: dict[str, list] = {}
+
+# Why a key is ABSENT from evaluate()'s output, for the ONE tick just evaluated. Notifier.process
+# infers recovery from `self._active - firing`, i.e. absence == recovered — true only when the
+# backend actually came back. Two paths drop a key while it is STILL DOWN, and without these sets
+# each emitted a triumphant "🟢 is back UP" for a backend that never recovered:
+#   _held      — suppressed by a maintenance window. Still an outage; the message is withheld, the
+#                latch is kept, and the key must stay ACTIVE so the window closing doesn't re-page.
+#   _cancelled — no longer monitored (backend toggled off / absent from the snapshot). The alert
+#                should CLOSE silently: not a recovery, and the key leaves the active set.
+_held: set[str] = set()
+_cancelled: set[str] = set()
+
+
+def held_keys() -> set[str]:
+    """Keys withheld this tick by a maintenance window (absence != recovery, still down)."""
+    return set(_held)
+
+
+def cancelled_keys() -> set[str]:
+    """Keys closed this tick because the backend stopped being monitored (absence != recovery)."""
+    return set(_cancelled)
+
+
+def _note_poll(name: str, ok: bool) -> None:
+    """Append one poll result to the backend's rolling history, capped at the window size."""
+    w = max(0, config.ALERT_BACKEND_DOWN_WINDOW)
+    if not w:
+        _down_hist.pop(name, None)
+        return
+    h = _down_hist.setdefault(name, [])
+    h.append(bool(ok))
+    del h[:-w]
+
+
+def _majority_failing(name: str) -> bool:
+    """True when MORE THAN HALF of the last ALERT_BACKEND_DOWN_WINDOW samples failed.
+
+    Consecutive-only arming can never fire on a backend that fails most of its polls without
+    ever failing N times in a row — at a 2-in-3 error rate the streak resets forever, yet that
+    is an outage by any user's definition. Strictly-more-than-half is deliberate: an exact 50/50
+    alternation is the flap the hysteresis exists to damp, and must NOT page. Needs a full
+    window before it can arm, so a couple of early failures can't trip it."""
+    w = max(0, config.ALERT_BACKEND_DOWN_WINDOW)
+    h = _down_hist.get(name) or []
+    if not w or len(h) < w:
+        return False
+    return sum(1 for ok in h if not ok) * 2 > len(h)
 
 
 def reset_down_streaks() -> None:
@@ -336,6 +390,9 @@ def reset_down_streaks() -> None:
     _up_streak.clear()
     _firing.clear()
     _down_reason.clear()
+    _down_hist.clear()
+    _held.clear()
+    _cancelled.clear()
 
 
 def _pct(used, total) -> float | None:
@@ -348,7 +405,13 @@ def _pct(used, total) -> float | None:
 
 
 def evaluate(snap: dict) -> list[tuple[str, str]]:
-    """Return list of (key, message) for every breaching condition."""
+    """Return list of (key, message) for every breaching condition.
+
+    Also refreshes the per-tick `held_keys()` / `cancelled_keys()` sets, which tell the caller
+    WHY a previously-firing key is absent from this result — absence alone must never be read
+    as recovery (see the _held/_cancelled comment above)."""
+    _held.clear()
+    _cancelled.clear()
     out: list[tuple[str, str]] = []
     c = snap.get("collectors", {})
     h, g = c.get("host", {}), c.get("gpu", {})
@@ -388,41 +451,64 @@ def evaluate(snap: dict) -> list[tuple[str, str]]:
         for name in ("litellm", "ollama", "llamacpp", "vllm", "gpu"):
             b = c.get(name, {})
             if config.in_maintenance_window(name):
-                # Known, expected outage (e.g. a daily model-reload restart) — the
-                # dashboard still shows it down (collector data is untouched), but no
-                # alert can arm or stay latched through the window. Streaks reset so
-                # the window boundary can't count toward DOWN_AFTER/UP_AFTER hysteresis
-                # on either side; if it's still down once the window closes, that's a
-                # real page again after the normal N-consecutive-failures arm delay.
-                _firing.discard(name)
+                # Known, expected outage (e.g. a daily model-reload restart) — the dashboard
+                # still shows it down (collector data is untouched) and no alert can ARM during
+                # the window. Streaks reset so the boundary can't count toward the
+                # DOWN_AFTER/UP_AFTER hysteresis on either side.
+                #
+                # An ALREADY-LATCHED backend keeps its latch and is reported as HELD, not
+                # dropped: suppression must be SILENT. Discarding the latch here made the key
+                # vanish from evaluate()'s output, which Notifier reads as "recovered" — so a
+                # window opening mid-outage sent "🟢 back UP" for a backend that was still down,
+                # then re-paged when the window closed. Keeping the latch also means the window
+                # closing on a still-down backend emits nothing new (it never stopped firing).
                 _down_streak.pop(name, None)
                 _up_streak.pop(name, None)
-                _down_reason.pop(name, None)
+                _down_hist.pop(name, None)
+                if name in _firing:
+                    _held.add(f"down:{name}")
                 continue
             # "configured but down" = available False, and the error is a real failure — NOT
             # 'unconfigured' (operator never set it up) and NOT 'starting' (see _NOT_AN_OUTAGE).
             if b and b.get("available") is False and \
                     b.get("error") not in _NOT_AN_OUTAGE:
                 # DOWN poll: arm after N consecutive failures (one blip is not an outage).
+                _note_poll(name, False)
                 _down_streak[name] = _down_streak.get(name, 0) + 1
-                _up_streak.pop(name, None)
+                # DECAY the up-streak instead of zeroing it. A hard reset meant that if the
+                # backend's blip period was shorter than ALERT_BACKEND_UP_AFTER ticks, the
+                # up-streak could NEVER reach the threshold — so a mostly-healthy backend (e.g.
+                # 85% good) stayed latched down forever and re-paged every ALERT_REPEAT_MIN.
+                # That inverted the very flap-storm the hysteresis exists to prevent, and it bit
+                # exactly the operator who RAISED the knob to damp flapping.
+                _up_streak[name] = max(0, _up_streak.get(name, 0) - 1)
                 _down_reason[name] = str(b.get("error"))
-                if _down_streak[name] >= max(1, config.ALERT_BACKEND_DOWN_AFTER):
+                if _down_streak[name] >= max(1, config.ALERT_BACKEND_DOWN_AFTER) \
+                        or _majority_failing(name):
                     _firing.add(name)
             elif b and b.get("available") is True:
                 # GOOD poll: only DISARM after M consecutive good polls (hysteresis). Until then a
                 # latched backend stays DOWN — a single good poll can't emit a recovery + re-fire.
+                _note_poll(name, True)
                 _up_streak[name] = _up_streak.get(name, 0) + 1
                 _down_streak.pop(name, None)
                 if _up_streak[name] >= max(1, config.ALERT_BACKEND_UP_AFTER):
                     _firing.discard(name)
                     _up_streak.pop(name, None)
                     _down_reason.pop(name, None)
+                    _down_hist.pop(name, None)
             else:                                 # unconfigured / starting / missing → not an outage
+                # A LATCHED backend that stops being monitored (toggled off in Settings, or gone
+                # from the snapshot) must have its alert CANCELLED, not "recovered": it did not
+                # come back, we simply stopped watching. Reported so Notifier closes the key
+                # silently instead of announcing "🟢 back UP" for a backend that is still down.
+                if name in _firing:
+                    _cancelled.add(f"down:{name}")
                 _firing.discard(name)
                 _down_streak.pop(name, None)
                 _up_streak.pop(name, None)
                 _down_reason.pop(name, None)
+                _down_hist.pop(name, None)
             if name in _firing:                   # latched (armed, not yet stably recovered)
                 out.append((f"down:{name}",
                             f"{_SVC.get(name, name)} is DOWN — "
@@ -456,7 +542,12 @@ class Notifier:
         sent: list[str] = []
 
         due = [(k, m) for k, m in breaches if self._due(k, now)]
-        recoveries = list(self._active - firing)
+        # A key can leave `firing` for three different reasons, and only ONE is a recovery:
+        #   held      — maintenance window: still down, message withheld → stay active, say nothing
+        #   cancelled — no longer monitored: close the alert silently, drop it from active
+        #   otherwise — genuinely recovered → send the 🟢
+        held, cancelled = held_keys(), cancelled_keys()
+        recoveries = list(self._active - firing - held - cancelled)
         # Resolve the per-user recipient list ONCE per tick (SSRF-validate once),
         # not per alert key — cheap + observer-effect friendly.
         recipients = await self._recipients() if (due or recoveries) else []
@@ -476,7 +567,12 @@ class Notifier:
             db.record_alert(now, key, "recover", rmsg)
             _LOG.info("alert recovered", extra={"key": key, "detail": rmsg,
                                                 "machine": _machine(snap)})
-        self._active = firing
+        # HELD keys stay active so the window closing on a still-down backend emits nothing new;
+        # CANCELLED keys leave, and their debounce is cleared so a later REAL outage on a
+        # re-enabled backend pages immediately instead of waiting out ALERT_REPEAT_MIN.
+        for key in cancelled:
+            self._last.pop(key, None)
+        self._active = (firing | (self._active & held)) - cancelled
         return sent
 
     def active_keys(self) -> list[str]:
@@ -517,18 +613,20 @@ class Notifier:
         # later `due` keys unsent and `_active` un-updated. Alerting is a security control, so a
         # LOGGING concern must never be able to delay it: batch after the sends, one hop, one
         # connection. (Channel: 'webhook' = operator-global, 'user' = a per-user recipient.)
+        # Each row is stamped when ITS post completes (not at fan-out start): sharing one
+        # timestamp made "Recent deliveries" ages off by up to HTTP_TIMEOUT per row, and
+        # tied timestamps left the newest-first ordering to rowid luck.
         rows: list[tuple] = []
-        now = time.time()
         if config.ALERT_WEBHOOK_URL:                  # operator-set global (trusted)
             out = await self._post_json(session, config.ALERT_WEBHOOK_URL,
                                         _webhook_payload(text, config.ALERT_WEBHOOK_URL), akey)
             if out:
-                rows.append((now, "webhook", *out))
+                rows.append((out[0], "webhook", *out[1:]))
         if recipients:                                 # per-user → SSRF-pinned sender
             wsess = _webhook_sender()                  # concurrent: each POST is
             outs = await asyncio.gather(*(self._post_json(wsess, url, _webhook_payload(text, url), akey)
                                           for url in recipients))         # bounded
-            rows.extend((now, "user", *o) for o in outs if o)
+            rows.extend((o[0], "user", *o[1:]) for o in outs if o)
         await _record_sends(rows)
 
     async def _post_json(self, session, url, payload, akey: str = "") -> tuple | None:
@@ -551,7 +649,7 @@ class Notifier:
                     _LOG.warning("webhook rejected", extra={"url": _log_url(url), "status": r.status})
         except Exception as e:                        # transport/timeout — was silently swallowed
             _LOG.warning("webhook failed", extra={"url": _log_url(url), "error": type(e).__name__})
-        return (akey, status, ok,
+        return (time.time(), akey, status, ok,
                 (time.monotonic() - t0) * 1000.0 if status is not None else None)
 
     async def _try_post(self, session, url, payload) -> str:

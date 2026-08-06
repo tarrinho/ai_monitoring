@@ -651,7 +651,7 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.19"
+    assert config.VERSION == "AI-Monitoring_1.8.20"
 
 
 def test_all_version_surfaces_match_config_version():

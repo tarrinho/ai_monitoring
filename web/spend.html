@@ -261,7 +261,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.19</div>
+      <div id="sidebar-brand-ver">v1.8.20</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -595,10 +595,24 @@ function renderYearCost(d, realCol, estCol){
 let COSTBY="user", _lastKeys=[], _costRows=[], _keysPage=0, _costOpen=null;
 let SPWINCOST=null;   // {alias: windowed spend} — makes Cost-by-user/key/team follow SPWIN
 // spend for the SELECTED window (falls back to LiteLLM all-time until the map loads)
-function winSpent(k){ return SPWINCOST?(SPWINCOST[k.key]||0):(k.spent||0); }
+// Try EVERY identity this key is known by. The windowed cost map is keyed by whatever label the
+// spend rollup stored (the full hash for an alias-less key), while the budget row's `key` may be
+// the masked `key_name` — matching only on `k.key` returned 0, and since the chart filters
+// spent>0 the user or team vanished from "Cost by user/key/team" while the table below still
+// listed their spend.
+function winSpent(k){
+  if(!SPWINCOST) return k.spent||0;
+  const ids=(k.ids&&k.ids.length)?k.ids:[k.key];
+  for(const id of ids){ const v=SPWINCOST[id]; if(v) return v; }
+  return 0;
+}
 async function loadKeyCost(){
   const d=await api("/api/spend/keycost?window="+SPWIN);
-  SPWINCOST=(d&&d.cost)||{};
+  // An EMPTY cost map means "no windowed data", not "everything cost zero". `{}` is truthy, so
+  // it defeated the all-time fallback below and scored every key 0 — which then hid the whole
+  // "Cost by user/key/team" card (rows.length===0) while the summary above still showed real
+  // money. Treat empty as absent so the fallback fires.
+  SPWINCOST=(d && d.cost && Object.keys(d.cost).length) ? d.cost : null;
   renderCostChart(_lastKeys);
 }
 const KEYS_PER_PAGE=20;

@@ -645,9 +645,14 @@ async def test_sample_once_not_stalled_by_slow_backend():
 
 
 async def test_backend_loop_bounds_a_hung_backend():
-    """A backend whose sample never returns (wedged nvidia-smi / dead proxy) must
-    be timed out by the loop's wait_for bound — the loop survives and keeps its
-    last good value instead of freezing forever (the wedged-loop bug)."""
+    """A backend whose sample never returns (wedged nvidia-smi / dead proxy) must be timed out by
+    the loop's wait_for bound — the loop SURVIVES and keeps ticking instead of freezing forever
+    (the wedged-loop bug; that anti-wedge guarantee is this test's subject).
+
+    The timeout is now recorded as a real FAILURE. This test used to assert the prior value was
+    preserved, which meant a hung backend kept presenting `available: True` indefinitely: the
+    panel showed it healthy, the recovery hysteresis could emit 'back UP' for something wedged,
+    and no down: alert could ever arm. A timeout IS the signal."""
     import app as appmod
     appmod._backend_latest["ollama"] = {"available": True, "_pre": 1}
 
@@ -656,13 +661,17 @@ async def test_backend_loop_bounds_a_hung_backend():
 
     task = asyncio.create_task(appmod._backend_loop("ollama", _hang, None, 0.3))
     await asyncio.sleep(0.8)          # > bound, so at least one tick timed out
+    alive_mid_run = not task.done()   # the anti-wedge guarantee: still looping, not crashed
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
-    # timed out -> prior value preserved, loop never wedged or crashed
-    assert appmod._backend_latest["ollama"] == {"available": True, "_pre": 1}
+    assert alive_mid_run, "the loop must survive a wedged backend, not die on the timeout"
+    got = appmod._backend_latest["ollama"]
+    assert got.get("available") is False, f"a timeout must be recorded as down, got {got}"
+    assert "timeout" in str(got.get("error", "")), got
+    assert got.get("_pre") is None, "the stale good sample must not survive a timeout"
 
 
 async def test_containers_collector_reads_docker_socket(tmp_path, monkeypatch):
@@ -11816,11 +11825,13 @@ async def test_post_json_returns_outcome_and_fanout_batches_it(tmp_path, monkeyp
 
     n = alerts.Notifier()
     ok_out = await n._post_json(_Sess(204), "https://hook.example.com/x", {"text": "t"}, "cpu")
-    assert ok_out[0] == "cpu" and ok_out[1] == 204 and ok_out[2] is True and ok_out[3] is not None
+    # (ts, akey, status, ok, ms) — ts is per-row so each delivery carries its own completion time
+    assert len(ok_out) == 5 and ok_out[0] > 0
+    assert ok_out[1] == "cpu" and ok_out[2] == 204 and ok_out[3] is True and ok_out[4] is not None
     bad_out = await n._post_json(_Sess(500), "https://hook.example.com/x", {"text": "t"}, "gpu")
-    assert bad_out[1] == 500 and bad_out[2] is False
+    assert bad_out[2] == 500 and bad_out[3] is False
     dead_out = await n._post_json(_Sess(boom=True), "https://hook.example.com/x", {"t": 1}, "disk")
-    assert dead_out[1] is None and dead_out[2] is False and dead_out[3] is None
+    assert dead_out[2] is None and dead_out[3] is False and dead_out[4] is None
     assert db.recent_webhook_sends(10) == [], "_post_json must not write; the fan-out batches"
 
     # the fan-out performs the single batched write
@@ -11994,3 +12005,201 @@ def test_alert_text_falls_back_to_the_tool_name_not_unknown_host(monkeypatch):
     # with a hostname the prefix is still there
     named = {"collectors": {"host": {"info": {"hostname": "gpu-box-01"}}}}
     assert alerts._alert_text(named, "x", fired=True).startswith("🔴 [gpu-box-01] AI-Monitoring — ")
+
+
+class _RecSess:
+    """Notifier fan-out stub: captures the messages that would be sent."""
+    def __init__(self): self.msgs = []
+
+
+async def _drive(n, snaps, monkeypatch, now0=1000.0, step=10.0):
+    """Drive Notifier.process over a tick sequence, returning the emitted texts per tick."""
+    out = []
+    sess = _RecSess()
+
+    async def _fanout(self, session, text, recipients, akey=""):
+        sess.msgs.append(text)
+    monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
+    monkeypatch.setattr(alerts.Notifier, "_recipients", lambda self: _noop_recipients())
+    for i, s in enumerate(snaps):
+        sess.msgs.clear()
+        await n.process(None, s, now0 + i * step)
+        out.append(list(sess.msgs))
+    return out
+
+
+async def _noop_recipients():
+    return []
+
+
+def _snap_backend(name, state, err="connection refused"):
+    if state == "down":
+        return {"ts": 0, "collectors": {name: {"available": False, "error": err}}}
+    if state == "up":
+        return {"ts": 0, "collectors": {name: {"available": True}}}
+    if state == "unconfigured":
+        return {"ts": 0, "collectors": {name: {"available": False, "error": "unconfigured"}}}
+    return {"ts": 0, "collectors": {}}                      # missing
+
+
+async def test_maintenance_window_never_sends_a_false_recovery(monkeypatch, tmp_path):
+    """CRITICAL: a maintenance window opening MID-OUTAGE used to emit '🟢 vLLM is back UP' for a
+    backend that never came up. evaluate() dropped the key to suppress it, but Notifier reads
+    `_active - firing` as RECOVERED — absence meant recovery. Suppression must be silent."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mw.db")); db.init()
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL", "")
+    alerts.reset_down_streaks()
+    win = {"vllm": False}
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: win.get(n, False))
+    n = alerts.Notifier()
+    down = _snap_backend("vllm", "down")
+    # t1..t3 arm and fire
+    msgs = await _drive(n, [down, down, down], monkeypatch)
+    assert msgs[0] == [] and msgs[1] == []
+    assert any("is DOWN" in m for m in msgs[2]), msgs[2]
+    # t4: window opens while STILL down — must be silent, never a recovery
+    win["vllm"] = True
+    m4 = (await _drive(n, [down], monkeypatch, now0=2000.0))[0]
+    assert not any("back UP" in m for m in m4), f"false recovery during maintenance: {m4}"
+    assert m4 == [], f"maintenance must be silent, got {m4}"
+    # t5-t6 inside the window: still silent
+    inside = await _drive(n, [down, down], monkeypatch, now0=3000.0)
+    assert inside == [[], []], inside
+    # window closes, still down: no NEW page (nothing changed) and no recovery
+    win["vllm"] = False
+    after = await _drive(n, [down, down], monkeypatch, now0=4000.0)
+    assert not any("back UP" in m for tick in after for m in tick), after
+
+
+async def test_disabling_a_backend_closes_the_alert_silently(monkeypatch, tmp_path):
+    """Toggling a backend OFF (collector -> 'unconfigured'), or it vanishing from the snapshot,
+    must CANCEL a latched DOWN silently — 'no longer monitored' is not 'recovered'."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mw2.db")); db.init()
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 2)
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL", "")
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: False)
+    for state in ("unconfigured", "missing"):
+        alerts.reset_down_streaks()
+        n = alerts.Notifier()
+        down = _snap_backend("vllm", "down")
+        msgs = await _drive(n, [down, down], monkeypatch)
+        assert any("is DOWN" in m for m in msgs[1]), (state, msgs)
+        off = (await _drive(n, [_snap_backend("vllm", state)], monkeypatch, now0=9000.0))[0]
+        assert off == [], f"{state}: must close silently, got {off}"
+        assert n.active_keys() == [], f"{state}: alert must be cleared, got {n.active_keys()}"
+
+
+def test_up_streak_decays_so_a_mostly_healthy_backend_recovers(monkeypatch):
+    """A hard up-streak reset meant that if the blip period was shorter than UP_AFTER ticks, the
+    up-streak could never reach the threshold — an 85%-healthy backend stayed latched DOWN
+    forever and re-paged every ALERT_REPEAT_MIN, inverting the flap-damping it was added for.
+    The streak now DECAYS by one per bad poll, so a mostly-good backend still recovers."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 10)
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: False)
+    alerts.reset_down_streaks()
+    down = {"collectors": {"vllm": {"available": False, "error": "conn refused"}}}
+    up = {"collectors": {"vllm": {"available": True}}}
+    for _ in range(3):
+        alerts.evaluate(down)
+    assert [k for k, _ in alerts.evaluate(down)] == ["down:vllm"], "must be latched"
+    # 7 good : 1 bad, repeated — 85% healthy. With a hard reset this NEVER clears.
+    fired = True
+    for _ in range(12):
+        for _ in range(7):
+            fired = bool([k for k, _ in alerts.evaluate(up)])
+        alerts.evaluate(down)
+    assert not fired, "a mostly-healthy backend must eventually clear, not latch forever"
+
+
+async def test_backend_timeout_is_recorded_as_a_failure_not_a_stale_good_sample(monkeypatch):
+    """A wedged backend used to keep its LAST sample on timeout, so it presented available:True
+    forever — the panel showed it healthy, the up-streak could emit 'back UP' for something hung,
+    and no down: alert could ever arm. A timeout is itself the failure signal."""
+    monkeypatch.setattr(appmod, "_backend_latest", dict(appmod._backend_latest))
+    appmod._backend_latest["vllm"] = {"available": True, "models": ["m"]}
+
+    async def _hang(session):
+        await asyncio.sleep(9999)
+
+    async def _one_tick():
+        task = asyncio.create_task(appmod._backend_loop("vllm", _hang, None, 0.05))
+        await asyncio.sleep(0.35)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    await _one_tick()
+    got = appmod._backend_latest["vllm"]
+    assert got.get("available") is False, f"timeout must mark the backend down: {got}"
+    assert "timeout" in str(got.get("error", "")), got
+    assert got.get("error") not in alerts._NOT_AN_OUTAGE, "a timeout must be able to arm an alert"
+
+
+def test_majority_failing_backend_arms_without_consecutive_failures(monkeypatch):
+    """Consecutive-only arming can never page a backend that fails MOST polls without ever
+    failing N in a row (2-in-3 error rate resets the streak forever). More-than-half of the last
+    window arms it. A strict 50/50 alternation must STAY quiet — that is the flap the hysteresis
+    exists to damp, and paging on it would undo the anti-flap work."""
+    monkeypatch.setattr(config, "ALERT_ON_BACKEND_DOWN", True)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_UP_AFTER", 3)
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_WINDOW", 10)
+    monkeypatch.setattr(config, "in_maintenance_window", lambda n: False)
+    D = {"collectors": {"vllm": {"available": False, "error": "e"}}}
+    U = {"collectors": {"vllm": {"available": True}}}
+
+    alerts.reset_down_streaks()
+    fired = []
+    for _ in range(12):                       # 66% failing, never 3 consecutive
+        for s in (D, D, U):
+            fired = [k for k, _ in alerts.evaluate(s)]
+    assert fired == ["down:vllm"], "a mostly-failing backend must page"
+
+    alerts.reset_down_streaks()
+    for _ in range(12):                       # exact 50/50 = flap
+        for s in (D, U):
+            fired = [k for k, _ in alerts.evaluate(s)]
+    assert fired == [], "a 50/50 flap must stay damped, not page"
+
+    # disabled by config → consecutive-only behaviour restored
+    monkeypatch.setattr(config, "ALERT_BACKEND_DOWN_WINDOW", 0)
+    alerts.reset_down_streaks()
+    for _ in range(12):
+        for s in (D, D, U):
+            fired = [k for k, _ in alerts.evaluate(s)]
+    assert fired == [], "window=0 disables the majority arm"
+
+
+def test_merge_key_budgets_dedups_a_key_seen_under_two_identities():
+    """One physical key described differently by the two sources (live /key/list knows it by the
+    masked key_name, the spend snapshot only by the full hash) used to be appended TWICE, double
+    counting its spend across the totals, the key count and the table."""
+    live = {"sk-...9f3c": {"spend": 100.0, "team": "", "budget": 0.0, "user": "", "user_name": "",
+                           "ids": ["sk-...9f3c", "FULLHASH123"]}}
+    snapshot = [{"key": "FULLHASH123", "alias": "", "cost": 12.34}]
+    rows = appmod.merge_key_budgets(live, snapshot, {})
+    assert len(rows) == 1, f"same key under two identities must not duplicate: {rows}"
+    assert rows[0]["cost"] == 100.0
+    # a genuinely different key is still unioned in
+    rows2 = appmod.merge_key_budgets(live, [{"key": "OTHERHASH", "alias": "", "cost": 5.0}], {})
+    assert len(rows2) == 2, rows2
+
+
+def test_budget_rows_expose_every_identity_for_the_cost_join():
+    """The windowed cost map is keyed by whatever label the rollup stored (the full hash for an
+    alias-less key) while the budget row's `key` may be the masked name — so the row must carry
+    ALL its identities or the client's winSpent() lookup misses and the user vanishes from the
+    Cost chart while the table still lists their spend."""
+    from collectors import litellm as L
+    rows = L.budget_rows([{"key_name": "sk-...9f3c", "token": "FULLHASH123", "spend": 5.0}],
+                         {}, 15, 30)
+    assert rows, "expected a budget row"
+    ids = rows[0].get("ids") or []
+    assert "sk-...9f3c" in ids and "FULLHASH123" in ids, f"both identities must ship: {ids}"

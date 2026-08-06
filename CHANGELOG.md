@@ -4,6 +4,11 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.20] — 2026-08-06
+
+### Changed
+- **Version bump for a clean, unambiguous redeploy.** The `1.8.19` string was reused across several code states during rapid iteration, so an early `1.8.19` image (missing the maintenance-window feature and the anti-flap hysteresis) was running in production while a later `1.8.19` on disk had both — a maintenance window configured via `MONITOR_MAINTENANCE_*` was silently ignored because the deployed binary predated it. No code change in this release: it re-tags the current tree (Teams webhook shaping, alert polish, aiohttp 3.14.3, backend-down flap hysteresis, delivery-card collapse, **maintenance windows**) as `1.8.20` so "what's deployed" is verifiable. Confirm after deploy via `/api/alerts` → `thresholds.maintenance_windows`.
+
 ## [1.8.19] — 2026-08-04
 
 ### Added
