@@ -3784,6 +3784,17 @@ async def test_spend_series_attaches_cost_models(monkeypatch):
         await c.close()
 
 
+# Two RECENT dates for the windowed spend-series tests. These used to be hardcoded
+# ("2026-07-07"/"2026-07-08") which made them TIME BOMBS: /api/spend/series?window=30d
+# correctly drops anything older than 30 days, so the fixtures silently fell out of the
+# window as the calendar advanced and the assertions started KeyError-ing on a date the
+# code was right to omit. Anchored to "now" they stay inside any window under test.
+def _recent_days(n=2):
+    import datetime as _dt
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    return [(today - _dt.timedelta(days=i)).isoformat() for i in range(n, 0, -1)]
+
+
 async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
     """When LiteLLM gives a per-day per-model breakdown, the series uses it (cost_basis
     'per-day') so an external model's cost lands ONLY on days it ran — Jul 07 (self-hosted
@@ -3792,9 +3803,11 @@ async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
 
+    D7, D8 = _recent_days()
+
     async def _daily(session, s, e):
-        return [{"date": "2026-07-07", "requests": 5, "tokens": 2000, "spend": 0.0},
-                {"date": "2026-07-08", "requests": 9, "tokens": 4000, "spend": 0.0}]
+        return [{"date": D7, "requests": 5, "tokens": 2000, "spend": 0.0},
+                {"date": D8, "requests": 9, "tokens": 4000, "spend": 0.0}]
 
     async def _prices(session):
         return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
@@ -3806,8 +3819,8 @@ async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
                  "internal": True, "cost_kind": "reference"}]
 
     async def _pmd(session, s, e, prices, ov=None):
-        return {"2026-07-07": {"real": 0.0, "est": 0.20},
-                "2026-07-08": {"real": 1.00, "est": 0.30}}
+        return {D7: {"real": 0.0, "est": 0.20},
+                D8: {"real": 1.00, "est": 0.30}}
     monkeypatch.setattr(litellm, "spend_activity", _daily)
     monkeypatch.setattr(litellm, "model_prices", _prices)
     monkeypatch.setattr(litellm, "per_model_range", _pm)
@@ -3818,8 +3831,8 @@ async def test_spend_series_uses_per_day_cost_when_available(monkeypatch):
         d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
         assert d.get("cost_basis") == "per-day"
         pts = {time.strftime("%Y-%m-%d", time.gmtime(p["t"])): p for p in d["points"]}
-        assert pts["2026-07-07"]["real_cost"] == 0.0      # external model didn't run → 0
-        assert pts["2026-07-08"]["real_cost"] == 1.00
+        assert pts[D7]["real_cost"] == 0.0      # external model didn't run → 0
+        assert pts[D8]["real_cost"] == 1.00
         assert d["real_cost_total"] == 1.00
     finally:
         await c.close()
@@ -3833,9 +3846,11 @@ async def test_spend_series_real_anchored_to_actual_cash(monkeypatch):
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
 
+    D7, D8 = _recent_days()
+
     async def _daily(session, s, e):   # actual cash: 2.00 + 2.43 = 4.43
-        return [{"date": "2026-07-07", "requests": 5, "tokens": 2000, "spend": 2.00},
-                {"date": "2026-07-08", "requests": 9, "tokens": 4000, "spend": 2.43}]
+        return [{"date": D7, "requests": 5, "tokens": 2000, "spend": 2.00},
+                {"date": D8, "requests": 9, "tokens": 4000, "spend": 2.43}]
 
     async def _prices(session):
         return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
@@ -3845,8 +3860,8 @@ async def test_spend_series_real_anchored_to_actual_cash(monkeypatch):
                 {"model": "ollama/qwen", "tokens": 5000, "cost_kind": "reference"}]
 
     async def _pmd(session, s, e, prices, ov=None):   # reconstruction real would be 9.99
-        return {"2026-07-07": {"real": 4.44, "est": 0.20},
-                "2026-07-08": {"real": 5.55, "est": 0.30}}
+        return {D7: {"real": 4.44, "est": 0.20},
+                D8: {"real": 5.55, "est": 0.30}}
     monkeypatch.setattr(litellm, "spend_activity", _daily)
     monkeypatch.setattr(litellm, "model_prices", _prices)
     monkeypatch.setattr(litellm, "per_model_range", _pm)
@@ -3857,12 +3872,12 @@ async def test_spend_series_real_anchored_to_actual_cash(monkeypatch):
         d = await (await c.get("/api/spend/series?window=30d", headers=hdr)).json()
         assert d.get("cost_basis") == "actual-real"
         pts = {time.strftime("%Y-%m-%d", time.gmtime(p["t"])): p for p in d["points"]}
-        assert pts["2026-07-07"]["real_cost"] == 2.00     # actual cash, not 4.44 rebuild
-        assert pts["2026-07-08"]["real_cost"] == 2.43
+        assert pts[D7]["real_cost"] == 2.00     # actual cash, not 4.44 rebuild
+        assert pts[D8]["real_cost"] == 2.43
         assert d["real_cost_total"] == 4.43               # == the real spend shown elsewhere
         assert d["real_cost_lifetime"] == 4.43            # all in 2026 → lifetime == window here
         # estimated (self-hosted) is still the reconstruction
-        assert pts["2026-07-07"]["est_cost"] == 0.20 and pts["2026-07-08"]["est_cost"] == 0.30
+        assert pts[D7]["est_cost"] == 0.20 and pts[D8]["est_cost"] == 0.30
     finally:
         await c.close()
 
@@ -3912,9 +3927,11 @@ async def test_spend_series_anchors_real_even_on_blended_fallback(monkeypatch):
     monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
     monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-x")
 
+    D7, D8 = _recent_days()
+
     async def _daily(session, s, e):     # actual cash 1.11 + 3.32 = 4.43
-        return [{"date": "2026-07-07", "requests": 5, "tokens": 2000, "spend": 1.11},
-                {"date": "2026-07-08", "requests": 9, "tokens": 4000, "spend": 3.32}]
+        return [{"date": D7, "requests": 5, "tokens": 2000, "spend": 1.11},
+                {"date": D8, "requests": 9, "tokens": 4000, "spend": 3.32}]
 
     async def _prices(session):
         return {"gpt-4o": 0.001, "ollama/qwen": 0.0001}
@@ -12326,3 +12343,33 @@ def test_merge_key_budgets_does_not_lose_a_key_to_an_alias_collision():
                             "key_name": "sk-...9f3c", "token": "FULLHASH123"}}
     rows2 = appmod.merge_key_budgets(live2, [{"key": "FULLHASH123", "alias": "", "cost": 12.34}], {})
     assert len(rows2) == 1 and round(sum(r.get("cost", 0) for r in rows2), 2) == 100.0
+
+
+def test_status_segments_never_draws_unobserved_time_as_up(tmp_path, monkeypatch):
+    """FIELD BUG: the status timeline drew confident GREEN for time the monitor never observed.
+    State before the first event defaulted to UP, so a backend whose first-ever event was a DOWN
+    3h ago rendered 21h of green and claimed 87.5% uptime. Unknown is its own state: it must be
+    reported as up=None (dashed 'no data' styling) and excluded from the uptime denominator."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "unk.db"))
+    db.init()
+    now = 1_000_000.0
+    db.record_event(now - 3 * 3600, "vllm", False, "conn refused")   # first-ever event, DOWN
+    out = db.status_segments("24h", ["vllm"], end=now)["vllm"]
+    kinds = [s["up"] for s in out["segments"]]
+    assert kinds[0] is None, f"time before the first observation must be UNKNOWN, got {kinds}"
+    assert kinds[-1] is False, f"the observed span is down, got {kinds}"
+    assert not any(s["up"] is True for s in out["segments"]), \
+        f"no fabricated UP run: {out['segments']}"
+    # uptime is over OBSERVED time only — 0 of the 3 known hours were up
+    assert out["uptime_pct"] == 0.0, f"unobserved time must not inflate uptime: {out}"
+
+
+def test_status_segments_uptime_is_over_observed_time_only(tmp_path, monkeypatch):
+    """A backend never sampled at all reported uptime_pct 100.0 — a perfect score for something
+    that was never observed. With nothing known, the percentage is 0 and no_data flags the lane."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "unk2.db"))
+    db.init()
+    out = db.status_segments("24h", ["ollama"], end=1_000_000.0)["ollama"]
+    assert out["no_data"] is True
+    assert out["uptime_pct"] == 0.0, f"never-sampled must not claim 100%: {out}"
+    assert all(s["up"] is None for s in out["segments"]), out["segments"]

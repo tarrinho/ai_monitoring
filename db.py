@@ -1759,24 +1759,39 @@ def status_segments(window: str, backends: list[str],
                     "SELECT ts,up FROM events WHERE backend=? AND ts>=? AND ts<=? "
                     "AND (kind='state' OR kind IS NULL) "
                     "ORDER BY ts", (b, start, now)).fetchall()
-                state = pre[0] if pre else 1
+                # UNKNOWN is its own state, not "up". Defaulting to up drew confident GREEN
+                # across time the monitor never observed — a backend whose first-ever event was
+                # a DOWN three hours ago rendered the preceding 21h as healthy and claimed 87.5%
+                # uptime. `None` here surfaces as up=None so the lane is drawn in the dashed
+                # "no data" style for that span instead of asserting something we never saw.
+                state = pre[0] if pre else None
                 segs: list[dict] = []
                 up_time = 0.0
+                known = 0.0            # observed seconds — the uptime denominator
                 cursor = start
                 for ts, up in evs:
                     if ts > cursor:
-                        segs.append({"from": cursor, "to": ts, "up": bool(state)})
-                        if state:
-                            up_time += ts - cursor
+                        segs.append({"from": cursor, "to": ts,
+                                     "up": None if state is None else bool(state)})
+                        if state is not None:
+                            known += ts - cursor
+                            if state:
+                                up_time += ts - cursor
                     state = up
                     cursor = ts
                 if now > cursor:
-                    segs.append({"from": cursor, "to": now, "up": bool(state)})
-                    if state:
-                        up_time += now - cursor
+                    segs.append({"from": cursor, "to": now,
+                                 "up": None if state is None else bool(state)})
+                    if state is not None:
+                        known += now - cursor
+                        if state:
+                            up_time += now - cursor
                 out[b] = {
                     "segments": segs,
-                    "uptime_pct": round(up_time / secs * 100, 2) if secs else 0.0,
+                    # Percentage of OBSERVED time that was up. Dividing by the whole window made
+                    # a never-sampled backend report 100% — a perfect score for something that
+                    # was never watched.
+                    "uptime_pct": round(up_time / known * 100, 2) if known else 0.0,
                     "no_data": pre is None and not evs,
                 }
         return out

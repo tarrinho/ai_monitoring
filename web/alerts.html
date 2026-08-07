@@ -484,9 +484,13 @@ function buildStatusChart(resp){
         data:[{x:0, y:base+_MID, up:null}, {x:secs, y:base+_MID, up:null}]};
     }
     const segs = s.segments || [];
-    const pts = segs.map(g => ({x: Math.max(0, g.from - start), y: base + (g.up?_UP:_DN), up: g.up}));
+    // up===null is UNKNOWN (before the monitor first observed this backend) — drawn on the
+    // MIDDLE line in muted dashes, never as up or down. `g.up?_UP:_DN` alone would have sunk
+    // it to the down level and painted it red, asserting an outage we never saw.
+    const lvl = u => u===null || u===undefined ? _MID : (u ? _UP : _DN);
+    const pts = segs.map(g => ({x: Math.max(0, g.from - start), y: base + lvl(g.up), up: g.up}));
     if(segs.length){ const last = segs[segs.length-1];
-      pts.push({x: secs, y: base + (last.up?_UP:_DN), up: last.up}); }
+      pts.push({x: secs, y: base + lvl(last.up), up: last.up}); }
     else { pts.push({x:0, y:base+_MID, up:null}, {x:secs, y:base+_MID, up:null}); }
     return {label:s.label, borderWidth:2.5, pointRadius:0, stepped:"after", tension:0,
       fill:false, borderColor:OK, data:pts,
@@ -495,8 +499,14 @@ function buildStatusChart(resp){
       // rendered height guarantees green always marks the high (up) run and red the low
       // (down) run — they can never disagree with what the eye sees.
       segment:{ borderColor: ctx => {
-        const y0 = ctx.p0.parsed.y;
-        return (y0 - Math.floor(y0)) > (_UP + _DN) / 2 ? OK : BAD; }}};
+        const f = ctx.p0.parsed.y - Math.floor(ctx.p0.parsed.y);
+        // the middle level is the UNKNOWN lane — muted, so it reads as "no data", not an outage
+        if(Math.abs(f - _MID) < 0.01) return MUT;
+        return f > (_UP + _DN) / 2 ? OK : BAD; },
+        // dash the unknown spans so they are unmistakable even in a screenshot
+        borderDash: ctx => {
+          const f = ctx.p0.parsed.y - Math.floor(ctx.p0.parsed.y);
+          return Math.abs(f - _MID) < 0.01 ? [5,4] : undefined; }}};
   });
   wrap.style.height = (n*40 + 44) + "px";
   if(statusChart) statusChart.destroy();
