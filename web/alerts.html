@@ -488,7 +488,12 @@ function buildStatusChart(resp){
     // MIDDLE line in muted dashes, never as up or down. `g.up?_UP:_DN` alone would have sunk
     // it to the down level and painted it red, asserting an outage we never saw.
     const lvl = u => u===null || u===undefined ? _MID : (u ? _UP : _DN);
-    const pts = segs.map(g => ({x: Math.max(0, g.from - start), y: base + lvl(g.up), up: g.up}));
+    // Clamp the lane to when this service was FIRST observed. Earlier time isn't "unknown
+    // pending more data" — the monitor didn't exist yet — so drawing a dash there invites a
+    // doubt that no amount of data can resolve. Start the line at first observation instead.
+    const since = (s.since!=null) ? Math.max(0, s.since - start) : 0;
+    const pts = segs.filter(g => (g.to - start) > since)
+                    .map(g => ({x: Math.max(since, g.from - start), y: base + lvl(g.up), up: g.up}));
     if(segs.length){ const last = segs[segs.length-1];
       pts.push({x: secs, y: base + lvl(last.up), up: last.up}); }
     else { pts.push({x:0, y:base+_MID, up:null}, {x:secs, y:base+_MID, up:null}); }

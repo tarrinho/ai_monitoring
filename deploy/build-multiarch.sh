@@ -14,7 +14,18 @@
 # build-args (the default builder uses the host daemon, which can pull/pull).
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.6}"
+# Single source of truth for the version = the string baked into the code (config.VERSION). The
+# old hardcoded default (1.0.6) let the tag drift from the code; and reusing one VERSION across
+# code states is exactly how a stale image shipped to prod (T-19). A caller may still override
+# VERSION, but if it disagrees with config.py we FAIL rather than mislabel the image.
+_CODE_VER="$(python3 -c 'import config; print(config.VERSION.split("_")[-1])')"
+VERSION="${VERSION:-$_CODE_VER}"
+if [ "$VERSION" != "$_CODE_VER" ]; then
+  echo "ERROR: VERSION=$VERSION disagrees with config.VERSION=$_CODE_VER — refusing to mislabel" >&2
+  exit 1
+fi
+# Stamp the source commit into every image so the running container is verifiable (see /healthz).
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 IMAGE="${IMAGE:-ai-monitoring}"
 # Trivy's DB download defaults to staging in $TMPDIR (/tmp), which on this host is a
 # small tmpfs (~4G) that's often already near-full — the download then dies with a
@@ -33,7 +44,7 @@ PROXY_ARGS=()
 build() {   # <platform> <tag-suffix> <run_tests>
   echo "── build $1 (RUN_TESTS=$3) ──"
   DOCKER_BUILDKIT=1 docker build --platform "$1" --target runtime \
-    --build-arg "RUN_TESTS=$3" "${PROXY_ARGS[@]}" \
+    --build-arg "RUN_TESTS=$3" --build-arg "GIT_SHA=$GIT_SHA" "${PROXY_ARGS[@]}" \
     -t "${IMAGE}:${VERSION}-$2" .
 }
 

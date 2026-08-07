@@ -68,6 +68,13 @@ RUN if [ "$RUN_TESTS" = "1" ]; then \
 # --- runtime stage: lean image, gated on the test stage passing --------------
 FROM base AS runtime
 
+# Build provenance (T-19): stamp the source commit into the image so the running container is
+# verifiable. Passed by deploy/build-multiarch.sh as `--build-arg GIT_SHA=$(git rev-parse --short)`.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA \
+      org.opencontainers.image.version=$GIT_SHA
+ENV BUILD_SHA=$GIT_SHA
+
 # app files only (no tests, no dev deps)
 COPY config.py db.py dbutil.py auth.py app.py alerts.py anomaly.py metrics_prom.py obslog.py ./
 COPY collectors/ ./collectors/

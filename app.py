@@ -14,6 +14,8 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import re
 import secrets
 import threading
@@ -47,6 +49,14 @@ _CLOG = obslog.get("collector")     # collector availability
 _notifier = alerts.Notifier()
 # last-known up/down state per backend, for transition (event) detection
 _backend_state: dict = {}
+# Last ts we wrote a 'state' row per backend. _track_events only records first-sight and
+# CHANGES, so a backend that never flaps writes ONE row and then nothing for months — and any
+# window starting after that row has no prior state to reconstruct from, so the whole lane
+# renders UNKNOWN even though the monitor was watching the entire time. Re-stamping the current
+# state once an hour bounds that gap to an hour. ~6 backends x 24 x 365 = ~52k rows/year in a
+# table that otherwise holds a handful.
+_backend_state_ts: dict = {}
+STATE_HEARTBEAT_S = 3600.0
 _TRACKED_BACKENDS = ("litellm", "ollama", "llamacpp", "vllm", "gpu")
 _matrix_logged = False              # one-shot: startup backend matrix (logged at first sample)
 # model load/unload tracking (None/False = baseline not yet established, so the
@@ -337,9 +347,15 @@ def _track_events(snap: dict) -> None:
         prev = _backend_state.get(name)
         if prev is None:
             _backend_state[name] = up
+            _backend_state_ts[name] = ts
+            db.record_event(ts, name, up, b.get("error") or "")
+        elif prev == up and ts - _backend_state_ts.get(name, 0.0) >= STATE_HEARTBEAT_S:
+            # unchanged, but re-stamp so the timeline always has a recent anchor (see above)
+            _backend_state_ts[name] = ts
             db.record_event(ts, name, up, b.get("error") or "")
         elif prev != up:
             _backend_state[name] = up
+            _backend_state_ts[name] = ts
             db.record_event(ts, name, up, b.get("error") or "")
             # Log the EDGE only (never per-poll) — a flap can't spam the log, and the
             # dedupe filter's extras-aware key keeps each backend on its own line.
@@ -1610,6 +1626,21 @@ def _redact_containers(snap: dict, role: str | None) -> dict:
     return {**snap, "collectors": {**cols, "containers": {**cont, "containers": reds}}}
 
 
+def _finite_json(obj):
+    """Recursively replace non-finite floats (NaN / Inf) with None. A single NaN/Inf reaching
+    web.json_response (json.dumps default allow_nan=True) serializes as a bare `NaN`/`Infinity`
+    token that the browser's JSON.parse REJECTS — which blanks the ENTIRE response (all panels +
+    history), not just the offending card (T-18). A compromised/misconfigured backend could return
+    such a value in any spend/cost field, so scrub the whole payload at the serialization boundary."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_finite_json(v) for v in obj]
+    return obj
+
+
 async def data_handler(request: web.Request) -> web.Response:
     try:
         n = int(request.query.get("history", "180"))
@@ -1618,12 +1649,12 @@ async def data_handler(request: web.Request) -> web.Response:
     n = max(1, min(n, config.RETENTION_SAMPLES))
     _, _role, _ = _auth_ctx(request)               # role gates container-name visibility (F-2)
     hist = [_redact_containers(h, _role) for h in list(_ring)[-n:]]
-    return web.json_response({
+    return web.json_response(_finite_json({
         "version": config.VERSION,
         "now": time.time(),
         "latest": _redact_containers(_snapshot_for_display(_latest), _role),
         "history": hist,
-    })
+    }))
 
 
 async def series_handler(request: web.Request) -> web.Response:
@@ -3847,8 +3878,8 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
                     break
                 _last_auth = _now
             _disp = _redact_containers(_snapshot_for_display(_latest), _role)
-            data = json.dumps({"ts": _disp.get("ts"),
-                               "collectors": _disp.get("collectors", {})})
+            data = json.dumps(_finite_json({"ts": _disp.get("ts"),
+                                            "collectors": _disp.get("collectors", {})}))
             await resp.write(b"data: " + data.encode() + b"\n\n")
             await asyncio.sleep(config.SAMPLE_INTERVAL)
     except (ConnectionResetError, asyncio.CancelledError):
@@ -3959,6 +3990,11 @@ async def healthz_handler(request: web.Request) -> web.Response:
     body: dict = {"status": "ok" if ok else "starting"}
     if _auth_ctx(request)[0]:
         body["version"] = config.VERSION
+        # Build provenance (T-19): the exact code the running container was built from. The VERSION
+        # string was reused across code states once, so a stale image ran in prod with a feature
+        # silently missing and nothing could prove which code was live. BUILD_SHA is baked by the
+        # Dockerfile (`ARG GIT_SHA`). Authed-only, same disclosure rule as version.
+        body["git_sha"] = os.environ.get("BUILD_SHA", "unknown")
         body["samples"] = len(_ring)
         # Swallowed-DB-error telemetry: nonzero means persistence is failing while the ring
         # still looks healthy. Authed-only (same disclosure rule as version).

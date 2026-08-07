@@ -1143,6 +1143,21 @@ def test_dockerfile_nonroot_and_healthcheck():
     assert "/healthz" in df
 
 
+def test_build_provenance_git_sha_and_single_source_version():
+    """T-19: the running container must be traceable to its source commit, and the image tag must
+    derive from config.VERSION — not a stale hardcoded default (which let a mislabelled image ship
+    to prod with a feature silently missing)."""
+    app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("BUILD_SHA"' in app_src and '"git_sha"' in app_src, \
+        "authed /healthz must report git_sha from the baked BUILD_SHA"
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG GIT_SHA" in df and "ENV BUILD_SHA=$GIT_SHA" in df, "Dockerfile must stamp GIT_SHA"
+    sh = (ROOT / "deploy" / "build-multiarch.sh").read_text(encoding="utf-8")
+    assert 'VERSION="${VERSION:-1.0.6}"' not in sh, "stale hardcoded VERSION default must be gone"
+    assert "config.VERSION" in sh, "VERSION must derive from config.py (single source)"
+    assert "GIT_SHA=$GIT_SHA" in sh, "build must pass the GIT_SHA build-arg"
+
+
 def test_dockerfile_alpine_multiarch_hardened():
     # Alpine base (0 HIGH/CRITICAL vs 11 on Debian slim) + multi-arch build knobs
     df = (ROOT / "Dockerfile").read_text(encoding="utf-8")

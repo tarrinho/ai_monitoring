@@ -2326,6 +2326,28 @@ def test_backend_up_down_gates_unconfigured():
     assert up == ["litellm"] and down == ["ollama"]        # vllm/gpu gated out
 
 
+def test_non_finite_values_never_break_api_json():
+    """T-18: a single NaN/Inf from a backend serialized as a bare `NaN`/`Infinity` token makes the
+    browser's JSON.parse reject the WHOLE /api/data (all panels + history blank). Two layers:
+    (1) LiteLLM parse coerces non-finite → clean (_fnum → 0.0, _num_or_none → None); (2) the serve
+    boundary scrubs any non-finite → None so json output is always JSON.parse-able."""
+    import json
+    import app as appmod
+    import collectors.litellm as L
+    # layer 1 — parse-time
+    assert L._fnum(float("nan")) == 0.0 and L._fnum(float("inf")) == 0.0
+    assert L._fnum("3.5") == 3.5 and L._fnum(None) == 0.0
+    assert L._num_or_none(float("nan")) is None and L._num_or_none("2") == 2.0
+    # layer 2 — serialization scrub over the exact /api/data shape (latest + history)
+    payload = {"latest": {"collectors": {"litellm": {"spend": float("nan"), "ok": 1.5}}},
+               "history": [{"cpu": float("inf")}, {"cpu": 2.0}]}
+    clean = appmod._finite_json(payload)
+    json.loads(json.dumps(clean))          # must not raise (no bare NaN/Infinity remains)
+    assert clean["latest"]["collectors"]["litellm"]["spend"] is None
+    assert clean["latest"]["collectors"]["litellm"]["ok"] == 1.5      # finite values untouched
+    assert clean["history"][0]["cpu"] is None and clean["history"][1]["cpu"] == 2.0
+
+
 async def test_alert_fire_recover_logs(monkeypatch, caplog):
     """#3 — Notifier logs a WARNING on fire and an INFO on recover, with the alert key."""
     import alerts
@@ -12373,3 +12395,178 @@ def test_status_segments_uptime_is_over_observed_time_only(tmp_path, monkeypatch
     assert out["no_data"] is True
     assert out["uptime_pct"] == 0.0, f"never-sampled must not claim 100%: {out}"
     assert all(s["up"] is None for s in out["segments"]), out["segments"]
+
+
+def test_state_heartbeat_bounds_the_unknown_gap(monkeypatch, tmp_path):
+    """A backend that never flaps wrote ONE event and then nothing, so any window starting after
+    it had no prior state and rendered entirely UNKNOWN. The state is now re-stamped hourly, so
+    a window can never be more than the heartbeat interval away from an anchor."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "hb.db"))
+    db.init()
+    monkeypatch.setattr(appmod, "_backend_state", {})
+    monkeypatch.setattr(appmod, "_backend_state_ts", {})
+    t0 = 1_000_000.0
+    up = {"available": True}
+    # 6 hours of a perfectly stable backend, sampled every 5 minutes
+    for i in range(6 * 12):
+        appmod._track_events({"ts": t0 + i * 300, "collectors": {"vllm": up}})
+    with db._connect() as c:
+        n = c.execute("SELECT COUNT(*) FROM events WHERE backend='vllm'").fetchone()[0]
+    assert 6 <= n <= 8, f"expected ~1 anchor per hour over 6h, got {n}"
+    # a window covering only the last 2h still resolves a prior state → no UNKNOWN
+    out = db.status_segments("1h", ["vllm"], end=t0 + 6 * 3600)["vllm"]
+    assert all(s["up"] is True for s in out["segments"]), out["segments"]
+    assert out["uptime_pct"] == 100.0
+
+
+def test_prune_keeps_the_last_state_row_per_backend(monkeypatch, tmp_path):
+    """Step reconstruction needs ONE prior state row to colour a window. A stable backend may
+    have only that row, and pruning it turned a fully-monitored year into UNKNOWN — so the
+    newest row per backend survives the retention cut regardless of age."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "pr.db"))
+    # pin retention: the deployed value varies (365 default, 730 on some boxes), and a fixture
+    # that isn't actually past the cut makes this test pass vacuously
+    monkeypatch.setattr(config, "ROLLUP_HOUR_DAYS", 30)
+    db.init()
+    now = time.time()
+    old = now - 400 * 86400                      # comfortably past the pinned cut
+    db.record_event(old, "vllm", True, "")
+    db.record_event(old + 60, "ollama", False, "down")
+    db.prune_metrics()          # prune() only touches `samples`; events live here
+    with db._connect() as c:
+        rows = c.execute("SELECT backend, up FROM events ORDER BY backend").fetchall()
+    got = {b: bool(u) for b, u in rows}
+    assert got == {"ollama": False, "vllm": True}, f"last row per backend must survive: {rows}"
+    # and the timeline can still colour a window from it
+    out = db.status_segments("24h", ["vllm"], end=now)["vllm"]
+    assert all(s["up"] is True for s in out["segments"]), out["segments"]
+
+
+def test_status_segments_reports_when_monitoring_began(tmp_path, monkeypatch):
+    """`since` lets the chart clamp a lane to first observation instead of dashing across
+    pre-history — time before the monitor existed is not a doubt more data can resolve."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "since.db"))
+    db.init()
+    now = 1_000_000.0
+    db.record_event(now - 3 * 3600, "vllm", True, "")
+    out = db.status_segments("24h", ["vllm", "ollama"], end=now)
+    assert out["vllm"]["since"] == now - 3 * 3600
+    assert out["ollama"]["since"] is None, "never observed → no start point"
+
+
+def test_status_segments_coalesces_heartbeat_runs(tmp_path, monkeypatch):
+    """OBSERVER-EFFECT (§6): the hourly state heartbeat re-stamps an unchanged backend, so a
+    stable service emits one event per hour with NO transition. Without coalescing, a 30d window
+    returned 720 identical runs (12mo ≈ 8.7k per backend) — a multi-MB payload and tens of
+    thousands of chart points for a flat line. Segment count must track real transitions."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "co.db"))
+    db.init()
+    now = 1_000_000.0
+    for i in range(30 * 24):                     # 30 days of hourly heartbeats, all UP
+        db.record_event(now - 30 * 86400 + i * 3600, "vllm", True, "")
+    db.record_event(now - 5 * 86400, "vllm", False, "conn refused")   # one real outage
+    db.record_event(now - 4 * 86400, "vllm", True, "")
+    out = db.status_segments("30d", ["vllm"], end=now)["vllm"]
+    assert len(out["segments"]) == 3, f"expected 3 real runs, got {len(out['segments'])}"
+    assert [s["up"] for s in out["segments"]] == [True, False, True]
+    assert 99.0 < out["uptime_pct"] < 100.0, out["uptime_pct"]
+    # coalescing must not distort the timeline: runs stay contiguous and cover the window
+    segs = out["segments"]
+    for a, b in zip(segs, segs[1:]):
+        assert a["to"] == b["from"], "coalesced runs must remain contiguous"
+    assert round(segs[-1]["to"] - segs[0]["from"]) == 30 * 86400
+
+
+def test_status_segments_coalescing_never_merges_across_a_state_change(tmp_path, monkeypatch):
+    """Coalescing joins only ADJACENT runs of the SAME state — a flap must stay visible."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "co2.db"))
+    db.init()
+    now = 1_000_000.0
+    st = True
+    for i in range(10):                          # alternate every hour
+        db.record_event(now - 10 * 3600 + i * 3600, "vllm", st, "")
+        st = not st
+    out = db.status_segments("24h", ["vllm"], end=now)["vllm"]
+    ups = [s["up"] for s in out["segments"]]
+    assert len(ups) >= 10, f"alternating states must not be merged away: {ups}"
+    for a, b in zip(ups, ups[1:]):
+        assert a != b or a is None, f"adjacent identical states left un-coalesced: {ups}"
+
+
+def test_state_heartbeat_does_not_fire_for_unconfigured_or_starting(monkeypatch, tmp_path):
+    """The heartbeat must respect the same gate as transition tracking: a backend that is
+    unconfigured, or still showing the boot 'starting' sentinel, records nothing at all —
+    otherwise every restart would stamp phantom history for services nobody enabled."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "hb2.db"))
+    db.init()
+    monkeypatch.setattr(appmod, "_backend_state", {})
+    monkeypatch.setattr(appmod, "_backend_state_ts", {})
+    t0 = 1_000_000.0
+    for i in range(30):
+        appmod._track_events({"ts": t0 + i * 3600, "collectors": {
+            "vllm": {"available": False, "error": "unconfigured"},
+            "ollama": {"available": False, "error": "starting"}}})
+    with db._connect() as c:
+        n = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert n == 0, f"unconfigured/starting must never be recorded, got {n} rows"
+
+
+def test_state_heartbeat_timer_resets_on_a_real_transition(monkeypatch, tmp_path):
+    """A transition is itself an anchor, so it must reset the heartbeat clock — otherwise a
+    backend that flaps just under the interval would write a redundant row every tick."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "hb3.db"))
+    db.init()
+    monkeypatch.setattr(appmod, "_backend_state", {})
+    monkeypatch.setattr(appmod, "_backend_state_ts", {})
+    t0 = 1_000_000.0
+    appmod._track_events({"ts": t0, "collectors": {"vllm": {"available": True}}})
+    # a transition 59 minutes later (before the heartbeat is due)
+    appmod._track_events({"ts": t0 + 3540, "collectors": {
+        "vllm": {"available": False, "error": "e"}}})
+    # 10 minutes later, unchanged — must NOT heartbeat (the transition reset the clock)
+    appmod._track_events({"ts": t0 + 4140, "collectors": {
+        "vllm": {"available": False, "error": "e"}}})
+    with db._connect() as c:
+        n = c.execute("SELECT COUNT(*) FROM events WHERE backend='vllm'").fetchone()[0]
+    assert n == 2, f"expected baseline + transition only, got {n}"
+
+
+def test_prune_keeps_last_row_per_backend_and_kind(tmp_path, monkeypatch):
+    """The prune guard is per (backend, kind): a 'model' event surviving must not stand in for
+    the 'state' anchor the timeline needs, and vice versa."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "pr2.db"))
+    monkeypatch.setattr(config, "ROLLUP_HOUR_DAYS", 30)   # see note in the sibling prune test
+    db.init()
+    now = time.time()
+    old = now - 400 * 86400
+    db.record_event(old, "vllm", True, "", kind="state")
+    db.record_event(old + 10, "vllm", True, "loaded m", kind="model")
+    db.record_event(old + 20, "vllm", True, "", kind="state")     # newest state
+    db.prune_metrics()          # prune() only touches `samples`; events live here
+    with db._connect() as c:
+        rows = c.execute("SELECT kind, ts FROM events WHERE backend='vllm' ORDER BY ts").fetchall()
+    kinds = sorted({k for k, _ in rows})
+    assert "state" in kinds, f"the state anchor must survive: {rows}"
+    # the surviving state row is the NEWEST one, so reconstruction uses current truth
+    st = [ts for k, ts in rows if k == "state"]
+    assert st == [old + 20], f"only the newest state row should remain: {rows}"
+
+
+async def test_status_timeline_endpoint_surfaces_unknown_and_since(tmp_path, monkeypatch):
+    """End-to-end: the endpoint carries `since` and up=None through to the client so the chart
+    can clamp the lane and draw unobserved time as dashed-unknown rather than fake green."""
+    from aiohttp.test_utils import make_mocked_request
+    import json as _json
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "ep.db"))
+    db.init()
+    now = time.time()
+    db.record_event(now - 2 * 3600, "vllm", False, "conn refused")   # first-ever, DOWN
+    monkeypatch.setattr(appmod, "_STATUS_SERVICES", [("vllm", "vLLM")])
+    monkeypatch.setattr(appmod, "_configured", lambda k, ok=True: True)
+    r = await appmod.status_timeline_handler(make_mocked_request("GET", "/api/status-timeline"))
+    d = _json.loads(r.text)
+    svc = next(s for s in d["services"] if s["key"] == "vllm")
+    assert svc["since"] is not None, "endpoint must expose when monitoring began"
+    assert any(s["up"] is None for s in svc["segments"]), "unobserved time must reach the client"
+    assert not any(s["up"] is True for s in svc["segments"]), "no fabricated up run"
+    assert svc["uptime_pct"] == 0.0

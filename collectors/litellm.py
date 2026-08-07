@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -545,7 +546,7 @@ async def _fetch_top_keys(session: aiohttp.ClientSession, base: str,
             "key": k.get("api_key", "?"),
             "alias": k.get("key_alias") or k.get("key_name") or "",
             "reqs": None, "tokens": None,
-            "cost": round(float(k.get("total_spend") or 0), 4),
+            "cost": round(_fnum(k.get("total_spend")), 4),
         } for k in ks
             if not _is_health_check_key(k.get("api_key"),
                                         k.get("key_alias") or k.get("key_name"))
@@ -1042,9 +1043,10 @@ def _num_or_none(raw) -> float | None:
     if raw is None or raw == "":
         return None
     try:
-        return float(raw)
+        v = float(raw)
     except (TypeError, ValueError):
         return None
+    return v if math.isfinite(v) else None    # NaN/Inf are not real cash — treat as "no value" (T-18)
 
 
 def _norm_date(raw) -> str:
@@ -1095,15 +1097,18 @@ def _norm_date(raw) -> str:
 
 
 def _fnum(v) -> float:
-    """Coerce a possibly-string/None/dict spend or count to a float — never raise."""
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
-        try:
-            return float(v.replace(",", "").strip() or 0)
-        except ValueError:
+    """Coerce a possibly-string/None/dict spend or count to a FINITE float — never raise.
+    A backend returning NaN/Inf must not poison a stored/served number (T-18): non-finite → 0.0."""
+    try:
+        if isinstance(v, (int, float)):
+            n = float(v)
+        elif isinstance(v, str):
+            n = float(v.replace(",", "").strip() or 0)
+        else:
             return 0.0
-    return 0.0
+    except ValueError:
+        return 0.0
+    return n if math.isfinite(n) else 0.0
 
 
 def _parse_daily(rows) -> tuple[list[dict], bool]:
@@ -1556,8 +1561,8 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         if _is_team_id(uname):                             # user_id-looking name → not a name
             uname = ""
         out[str(alias)] = {
-            "budget": float(k.get("max_budget") or 0),
-            "spend": float(k.get("spend") or 0),
+            "budget": _fnum(k.get("max_budget")),
+            "spend": _fnum(k.get("spend")),
             "team": team,
             "user": uid,
             "user_name": uname,                            # user_id → email/alias for grouping
@@ -1660,7 +1665,7 @@ def budget_rows(top_keys, budget_map, month_day: int, month_len: int) -> list[di
     day = max(1, int(month_day))
     for k in top_keys or []:
         alias = key_label(k)                 # D-1: canonical join label
-        total = float(k.get("cost") or k.get("total_spend") or k.get("spend") or 0)
+        total = _fnum(k.get("cost") or k.get("total_spend") or k.get("spend"))
         # Budgets cap REAL cash. A key can mix external (real) + self-hosted
         # (reference) usage; only the real portion counts against the budget.
         if "real" in k:

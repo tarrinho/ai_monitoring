@@ -1766,13 +1766,26 @@ def status_segments(window: str, backends: list[str],
                 # "no data" style for that span instead of asserting something we never saw.
                 state = pre[0] if pre else None
                 segs: list[dict] = []
+
+                def _emit(frm: float, to: float, up_val, _segs=segs) -> None:
+                    """Append a run, COALESCING with the previous one when the state is the same.
+
+                    The hourly state heartbeat re-stamps an unchanged backend, so a stable
+                    service generates one event per hour with no transition. Emitting a segment
+                    per event made a 30d window return 720 identical runs (a 12mo window would
+                    be ~8.7k per backend) — a multi-MB payload and tens of thousands of chart
+                    points for a line that never changes. Segment count now tracks real
+                    transitions, not sample cadence."""
+                    if _segs and _segs[-1]["up"] is up_val and _segs[-1]["to"] == frm:
+                        _segs[-1]["to"] = to
+                    else:
+                        _segs.append({"from": frm, "to": to, "up": up_val})
                 up_time = 0.0
                 known = 0.0            # observed seconds — the uptime denominator
                 cursor = start
                 for ts, up in evs:
                     if ts > cursor:
-                        segs.append({"from": cursor, "to": ts,
-                                     "up": None if state is None else bool(state)})
+                        _emit(cursor, ts, None if state is None else bool(state))
                         if state is not None:
                             known += ts - cursor
                             if state:
@@ -1780,13 +1793,20 @@ def status_segments(window: str, backends: list[str],
                     state = up
                     cursor = ts
                 if now > cursor:
-                    segs.append({"from": cursor, "to": now,
-                                 "up": None if state is None else bool(state)})
+                    _emit(cursor, now, None if state is None else bool(state))
                     if state is not None:
                         known += now - cursor
                         if state:
                             up_time += now - cursor
+                # When this backend was FIRST observed at all (any window). Time before it is
+                # not "unknown" in a way more data could fix — the monitor did not exist yet —
+                # so the UI clamps the lane to start here rather than drawing a doubt-inducing
+                # dash across pre-history.
+                first = conn.execute(
+                    "SELECT MIN(ts) FROM events WHERE backend=? "
+                    "AND (kind='state' OR kind IS NULL)", (b,)).fetchone()
                 out[b] = {
+                    "since": (first[0] if first and first[0] is not None else None),
                     "segments": segs,
                     # Percentage of OBSERVED time that was up. Dividing by the whole window made
                     # a never-sampled backend report 100% — a perfect score for something that
@@ -1960,7 +1980,12 @@ def prune_metrics() -> int:
             removed = cur.rowcount or 0
             conn.execute("DELETE FROM metrics_1m WHERE bucket < ?", (min_cut,))
             conn.execute("DELETE FROM metrics_1h WHERE bucket < ?", (hour_cut,))
-            conn.execute("DELETE FROM events WHERE ts < ?", (hour_cut,))
+            # Keep the NEWEST row per (backend, kind) regardless of age: step reconstruction
+            # needs one prior 'state' row to colour a window, and a stable backend may have only
+            # that one. Pruning it turned a fully-monitored year into UNKNOWN.
+            conn.execute(
+                "DELETE FROM events WHERE ts < ? AND rowid NOT IN "
+                "(SELECT MAX(rowid) FROM events GROUP BY backend, kind)", (hour_cut,))
     except Exception as _e:
         _dberr(_e)
         pass
