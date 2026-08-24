@@ -1195,7 +1195,10 @@ async def spend_report_probe(session: aiohttp.ClientSession,
         try:
             async with session.get(url, headers=_headers(), allow_redirects=False,
                                    timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT)) as r:
-                return f"HTTP {r.status}: {(await r.text())[:280]}"
+                # Byte-cap the error-body read (T-23): only ~4 KiB is needed for the 280-char
+                # diagnostic, so never pull a multi-GB 4xx body into memory before slicing.
+                snippet = (await r.content.read(4096)).decode("utf-8", "replace")
+                return f"HTTP {r.status}: {snippet[:280]}"
         except Exception as e:      # noqa: BLE001 — diagnostics must never raise
             return f"{type(e).__name__}"
 

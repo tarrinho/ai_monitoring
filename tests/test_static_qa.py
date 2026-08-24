@@ -1158,6 +1158,19 @@ def test_build_provenance_git_sha_and_single_source_version():
     assert "GIT_SHA=$GIT_SHA" in sh, "build must pass the GIT_SHA build-arg"
 
 
+def test_containers_collector_pins_redirects_and_caps_reads():
+    """T-24 + T-23: both Docker GETs refuse redirects (SSRF via a TCP socket-proxy), and neither the
+    list nor the inspect read pulls an uncapped body into memory."""
+    src = (ROOT / "collectors" / "containers.py").read_text(encoding="utf-8")
+    gets = [g for g in re.findall(r"s\.get\([\s\S]*?\)\s*as r", src) if "containers" in g]
+    assert len(gets) >= 2, "expected the list + inspect GETs"
+    for g in gets:
+        assert "allow_redirects=False" in g, f"unpinned redirect on: {g[:80]}"
+    assert '(await r.json()).get("State")' not in src, "inspect read must be byte-capped (T-23)"
+    ll = (ROOT / "collectors" / "litellm.py").read_text(encoding="utf-8")
+    assert "(await r.text())[:280]" not in ll, "litellm 4xx read must be byte-capped (T-23)"
+
+
 def test_dockerfile_alpine_multiarch_hardened():
     # Alpine base (0 HIGH/CRITICAL vs 11 on Debian slim) + multi-arch build knobs
     df = (ROOT / "Dockerfile").read_text(encoding="utf-8")

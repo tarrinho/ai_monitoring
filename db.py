@@ -391,6 +391,18 @@ _METRIC_COLS = ["cpu", "mem", "gpu", "vram_used", "vram_total",
 # Tables that carry the metric columns (raw + rollups).
 _METRIC_TABLES = ["metrics", "metrics_1m", "metrics_1h"]
 
+
+def _assert_safe_ident(name: str) -> str:
+    """Fail-closed PATTERN guard for the SQL identifier-interpolation sites (T-31): the many tiered
+    read paths interpolate a `{table}` name (metrics*, key_series, cpu_core_series, proc_series, …),
+    so an exhaustive allowlist is brittle. Instead require a bare identifier — a snake_case name is
+    fine; anything with whitespace, quotes, `;`, or parens (i.e. an injection payload) is rejected.
+    A no-op for every current internal-literal caller; a fail-closed tripwire for a future one that
+    wired user/backend input into a table name."""
+    if not (isinstance(name, str) and name.isidentifier()):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return name
+
 # Window math + the shared per-key hide predicate live in dbutil (review D-4): pure helpers
 # with no DB/state coupling. Re-exported so db.window_secs / db.norm_window / db.WINDOWS /
 # db.month_start / db._pos_step / db._label_hidden / … keep resolving from here unchanged.
@@ -569,6 +581,8 @@ def _pick_tier(secs: float, end: float, now: float,
     even though the coarser _1m (ROLLUP_MIN_DAYS, default 30d but operator-configurable — the
     live box runs 730) / _1h (ROLLUP_HOUR_DAYS, default 365d) tiers still hold that range.
     Returns (table, ts_column)."""
+    for _t in (raw_tbl, m1_tbl, h1_tbl):     # T-31: only a bare identifier may flow into the f-string
+        _assert_safe_ident(_t)
     oldest_age = now - (end - secs)
     if secs <= WINDOWS["1h"] and oldest_age <= config.ROLLUP_RAW_HOURS * 3600:
         return raw_tbl, "ts"

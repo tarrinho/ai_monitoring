@@ -551,6 +551,15 @@ def validate(user_count: int = 0) -> list[str]:
     if DASHBOARD_TOKEN and len(DASHBOARD_TOKEN) < 16:
         errs.append("MONITOR_DASHBOARD_TOKEN too short (<16 chars) — use a long, "
                     "random token (e.g. `openssl rand -base64 24`)")
+    # T-28: the same strength gate for the other boot credentials — a short scrape token or a
+    # weak/placeholder seed admin password must not pass validate(). CHANGE_ME placeholders (shipped
+    # in the k8s Secret example) are rejected outright so an unedited deploy fails loud at boot.
+    for _cn, _cv, _cmin in (("MONITOR_METRICS_TOKEN", METRICS_TOKEN, 16),
+                            ("MONITOR_ADMIN_PASSWORD", ADMIN_PASSWORD, 12)):
+        if _cv and "CHANGE_ME" in _cv:
+            errs.append(f"{_cn} is a CHANGE_ME placeholder — set a real value")
+        elif _cv and len(_cv) < _cmin:
+            errs.append(f"{_cn} too short (<{_cmin} chars)")
     # F2: refuse to boot fully open unless the operator opted in explicitly.
     # Auth is "configured" when a legacy token is set OR at least one user account
     # exists (username+password login). Neither → fatal unless MONITOR_ALLOW_OPEN=1.

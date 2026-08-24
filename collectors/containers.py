@@ -87,6 +87,7 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
         # discover every container on the host (running + stopped)
         try:
             async with s.get(f"{_base()}/containers/json?all=1",
+                             allow_redirects=False,          # SSRF guard (T-24): a TCP socket-proxy
                              timeout=aiohttp.ClientTimeout(total=4)) as r:
                 if r.status != 200:
                     return {"available": False, "error": f"list HTTP {r.status}"}
@@ -111,6 +112,7 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
                  "uptime_s": None, "down_s": None}
         try:
             async with s.get(f"{_base()}/containers/{quote(name, safe='')}/json",
+                             allow_redirects=False,          # SSRF guard (T-24): no 3xx bounce
                              timeout=aiohttp.ClientTimeout(total=4)) as r:
                 if r.status == 404:
                     # removed from Docker entirely — fall back to when WE last saw it
@@ -121,7 +123,16 @@ async def sample(_session: aiohttp.ClientSession | None = None) -> dict:
                 elif r.status != 200:
                     entry["status"] = f"HTTP {r.status}"
                 else:
-                    st = (await r.json()).get("State") or {}
+                    # Byte-cap the inspect read too (T-23): a hostile/compromised socket-proxy could
+                    # stream a huge inspect body — and this runs up to 50 concurrent. Accumulate to
+                    # the cap like the list path, then parse.
+                    ibuf = bytearray()
+                    async for chunk in r.content.iter_chunked(65536):
+                        ibuf += chunk
+                        if len(ibuf) > config.HTTP_MAX_BYTES:
+                            entry["status"] = "inspect too large"
+                            return entry
+                    st = json.loads(bytes(ibuf) or b"{}").get("State") or {}
                     _last_seen[name] = now          # observed (running or not)
                     entry["running"] = bool(st.get("Running"))
                     entry["status"] = st.get("Status")

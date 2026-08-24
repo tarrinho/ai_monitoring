@@ -92,11 +92,30 @@ def _log_url(url: str) -> str:
         return "?"
 
 
+def _egress_text(text: str) -> str:
+    """Sanitize alert text BEFORE it leaves the box on a webhook: (1) run the same secret redactor
+    the logs use (T-20 — the egress channel was previously un-scrubbed, so a secret/internal-host in
+    a backend error string would ship verbatim to Teams/Slack), and (2) neutralize chat-platform
+    markup so a backend-derived model/key string can't inject a Teams/Slack link (T-29). The emoji
+    and em-dash we send intentionally are preserved."""
+    try:
+        text = obslog._redactor(config.log_redaction_values())(text)
+    except Exception:            # redaction must never break delivery
+        pass
+    # Neutralize chat markup WITHOUT destroying our own format: a markdown/mrkdwn link needs the
+    # parentheses (`[label](url)`), so stripping `()` + the emphasis/code/pipe chars defangs an
+    # injected link while KEEPING the `[machine]` brackets and the em-dash we emit ourselves.
+    for ch in "()`*_~<>|":
+        text = text.replace(ch, " ")
+    return text
+
+
 def _webhook_payload(text: str, url: str) -> dict:
     """Shape the POST body for the destination (config.WEBHOOK_FORMAT; "auto" picks by URL):
       teams   -> Adaptive-Card message envelope the stock Teams flow renders with no flow edits
       slack   -> {"text": …}  (Slack incoming webhooks)
       generic -> {"source": "AI-Monitoring", "text": …}  (unchanged default for every other receiver)"""
+    text = _egress_text(text)    # T-20 secret-scrub + T-29 markup-neutralize before it leaves the box
     fmt = config.WEBHOOK_FORMAT
     if fmt == "auto":
         fmt = "teams" if _is_teams_url(url) else "generic"
@@ -122,6 +141,8 @@ _BLOCKED_MSG = "URL resolves to a private/loopback/reserved address (blocked)"
 # RFC 6598 carrier-grade-NAT / shared address space (100.64/10) is NOT flagged by
 # is_private in Python < 3.13, but must never be a webhook target either.
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
+# NAT64 well-known prefix (RFC 6052) — embeds an IPv4 target in the low 32 bits.
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 
 def _ip_blocked(ip_str: str) -> bool:
@@ -133,6 +154,11 @@ def _ip_blocked(ip_str: str) -> bool:
     # internal v4 can't slip past the range checks by being mapped into v6.
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
+    # NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 target in the low 32 bits (T-33): on a
+    # host with a NAT64 gateway this routes to that v4, and the address reads as global, so re-test
+    # the embedded v4 rather than trusting it.
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64:
+        return _ip_blocked(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
     return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
             or ip.is_multicast or ip.is_unspecified
             or (ip.version == 4 and ip in _CGNAT))

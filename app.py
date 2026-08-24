@@ -884,15 +884,17 @@ async def _auth_mw(request: web.Request, handler):
         if _is_alerts_path(request.path):
             return web.json_response(
                 {"error": "alerts require authentication"}, status=403)
-        # User management is meaningless in open (no-auth) mode and is a pure attack
-        # surface: without this, an anonymous caller could create/DELETE admin users
-        # (a backdoor that persists if auth is later enabled) since the admin handlers
-        # rely on the middleware gate that open mode otherwise skips. Deny it like alerts.
+        # SCR-01: the ENTIRE admin surface — not just user management — must be denied in open
+        # (no-auth) mode. The admin handlers rely on the auth-mode gate that this branch skips, so
+        # previously only /admin/users* was denied while POST /api/admin/settings, /api/admin/teams,
+        # /api/admin/audit, key-user, team-budget, model-cost, … fell through to the handler with no
+        # role/CSRF check — an anonymous config-tamper (silence alerts, shrink audit retention) and
+        # PII-read (emails, usernames+IPs) backdoor. Deny the whole admin set like alerts.
         _op = request.path
-        if _op == "/admin/users" or _op.startswith("/api/admin/users"):
+        if _op in _ADMIN_PAGES or _op.startswith(_ADMIN_API_PREFIX):
             if _op.startswith("/api/"):
                 return web.json_response(
-                    {"error": "user management requires authentication"}, status=403)
+                    {"error": "authentication required"}, status=403)
             return web.Response(text="403 — authentication required", status=403)
         return await handler(request)
     p = request.path
@@ -1626,6 +1628,34 @@ def _redact_containers(snap: dict, role: str | None) -> dict:
     return {**snap, "collectors": {**cols, "containers": {**cont, "containers": reds}}}
 
 
+def _is_cost_field(k) -> bool:
+    kl = str(k).lower()
+    return "cost" in kl or "spend" in kl or kl in ("cache_saved", "usd_1m", "usd_1h", "budget")
+
+
+def _redact_cost(snap: dict, role: str | None) -> dict:
+    """SCR-02 / T-21: when SPEND_REQUIRE_ADMIN is on, a non-admin must NOT receive per-key cost,
+    key aliases, or upstream error text. The dedicated /api/spend/* + attribution endpoints already
+    403 for viewers, but the IDENTICAL data ships inline in the LiteLLM collector snapshot served by
+    /api/data and streamed by /api/stream — this closes that bypass. Strips the per-key cards
+    (top_keys, recent_failures), any cost/spend/budget field at the collector top level, and the cost
+    field on each per_model row (model name + usage counts are kept — operators-see-all applies to
+    non-cost telemetry). No-op for admin or when the lock-down is off."""
+    if role == "admin" or not getattr(config, "SPEND_REQUIRE_ADMIN", False):
+        return snap
+    cols = snap.get("collectors") or {}
+    ll = cols.get("litellm")
+    if not isinstance(ll, dict):
+        return snap
+    red = {k: v for k, v in ll.items()
+           if k not in ("top_keys", "recent_failures") and not _is_cost_field(k)}
+    pm = red.get("per_model")
+    if isinstance(pm, list):
+        red["per_model"] = [{k: v for k, v in m.items() if not _is_cost_field(k)}
+                            if isinstance(m, dict) else m for m in pm]
+    return {**snap, "collectors": {**cols, "litellm": red}}
+
+
 def _finite_json(obj):
     """Recursively replace non-finite floats (NaN / Inf) with None. A single NaN/Inf reaching
     web.json_response (json.dumps default allow_nan=True) serializes as a bare `NaN`/`Infinity`
@@ -1648,13 +1678,21 @@ async def data_handler(request: web.Request) -> web.Response:
         n = 180
     n = max(1, min(n, config.RETENTION_SAMPLES))
     _, _role, _ = _auth_ctx(request)               # role gates container-name visibility (F-2)
-    hist = [_redact_containers(h, _role) for h in list(_ring)[-n:]]
+    hist = [_redact_cost(_redact_containers(h, _role), _role) for h in list(_ring)[-n:]]
     return web.json_response(_finite_json({
         "version": config.VERSION,
         "now": time.time(),
-        "latest": _redact_containers(_snapshot_for_display(_latest), _role),
+        "latest": _redact_cost(_redact_containers(_snapshot_for_display(_latest), _role), _role),
         "history": hist,
     }))
+
+
+def _strip_cost_series(points: list, role: str | None) -> list:
+    """SCR-03: the per-sample `costrate` column is aggregate $/hr — under SPEND_REQUIRE_ADMIN a
+    viewer must not see cost, so drop it from /api/series + /api/export for a non-admin."""
+    if role == "admin" or not getattr(config, "SPEND_REQUIRE_ADMIN", False):
+        return points
+    return [{k: v for k, v in p.items() if k != "costrate"} for p in points]
 
 
 async def series_handler(request: web.Request) -> web.Response:
@@ -1665,10 +1703,12 @@ async def series_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 300
     pts = max(30, min(pts, 1000))
+    _, _role, _ = _auth_ctx(request)
+    rows = await asyncio.to_thread(db.series, window, pts, end=_q_end(request))
     return web.json_response({
         "window": window,
         "windows": list(db.WINDOWS.keys()),
-        "points": await asyncio.to_thread(db.series, window, pts, end=_q_end(request)),
+        "points": _strip_cost_series(rows, _role),
     })
 
 
@@ -3878,6 +3918,7 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
                     break
                 _last_auth = _now
             _disp = _redact_containers(_snapshot_for_display(_latest), _role)
+            _disp = _redact_cost(_disp, _role)     # SCR-02: also strip cost/alias/errors for viewers
             data = json.dumps(_finite_json({"ts": _disp.get("ts"),
                                             "collectors": _disp.get("collectors", {})}))
             await resp.write(b"data: " + data.encode() + b"\n\n")
@@ -3964,8 +4005,12 @@ async def export_handler(request: web.Request) -> web.Response:
     fmt = request.query.get("format", "csv").lower()
     # honour the pan/zoom cursor: without it a zoomed or panned view silently exported a
     # same-duration window ending NOW, i.e. not the range the user was looking at
-    pts = await asyncio.to_thread(db.series, window, 1000, end=_q_end(request))
-    cols = ["t"] + db._METRIC_COLS
+    _, _role, _ = _auth_ctx(request)
+    pts = _strip_cost_series(
+        await asyncio.to_thread(db.series, window, 1000, end=_q_end(request)), _role)
+    # drop the cost column header too when it's been stripped for a non-admin (SCR-03)
+    _gated = _role != "admin" and getattr(config, "SPEND_REQUIRE_ADMIN", False)
+    cols = ["t"] + [c for c in db._METRIC_COLS if not (_gated and c == "costrate")]
     if fmt == "json":
         return web.json_response({"window": window, "points": pts})
     lines = [",".join(cols)]

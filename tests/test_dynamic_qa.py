@@ -2348,6 +2348,86 @@ def test_non_finite_values_never_break_api_json():
     assert clean["history"][0]["cpu"] is None and clean["history"][1]["cpu"] == 2.0
 
 
+def test_redact_cost_strips_litellm_snapshot_for_viewer(monkeypatch):
+    """SCR-02 / T-21: with SPEND_REQUIRE_ADMIN on, a non-admin's /api/data + SSE snapshot must NOT
+    carry per-key cost/alias, upstream error text, or aggregate cost — even though those ship inline
+    in the LiteLLM collector (the dedicated /api/spend/* endpoints were already gated, this closes the
+    inline bypass). Model name + usage counts stay (operators-see-all applies to non-cost telemetry)."""
+    import app as a
+    import config as cfg
+    monkeypatch.setattr(cfg, "SPEND_REQUIRE_ADMIN", True)
+    snap = {"collectors": {"litellm": {"available": True, "req_rate": 3.0,
+        "top_keys": [{"key": "abc", "alias": "user@example.com", "cost": 12.3}],
+        "recent_failures": [{"key": "abc", "error": "boom talking to a backend"}],
+        "per_model": [{"model": "gpt", "tokens": 100, "reqs": 5, "cost": 9.9, "cost_rate_hr": 1.1}],
+        "cost_rate_hr": 4.5, "cache_saved": 2.0}}}
+    ll = a._redact_cost(snap, "viewer")["collectors"]["litellm"]
+    assert "top_keys" not in ll and "recent_failures" not in ll        # per-key cards gone
+    assert "cost_rate_hr" not in ll and "cache_saved" not in ll         # aggregate cost gone
+    assert ll["available"] is True and ll["req_rate"] == 3.0            # non-cost telemetry kept
+    pm = ll["per_model"][0]
+    assert pm["model"] == "gpt" and pm["tokens"] == 100 and pm["reqs"] == 5
+    assert "cost" not in pm and "cost_rate_hr" not in pm                # per-model cost stripped
+    # admin sees everything
+    assert a._redact_cost(snap, "admin")["collectors"]["litellm"]["top_keys"][0]["cost"] == 12.3
+    # lock-down off → no-op
+    monkeypatch.setattr(cfg, "SPEND_REQUIRE_ADMIN", False)
+    assert a._redact_cost(snap, "viewer")["collectors"]["litellm"]["top_keys"]
+
+
+def test_ip_blocked_covers_nat64_embedded_v4():
+    """T-33: NAT64 64:ff9b::/96 embeds an IPv4 target — the embedded private v4 must be blocked,
+    a public one allowed."""
+    import alerts
+    assert alerts._ip_blocked("64:ff9b::7f00:1") is True    # 127.0.0.1 embedded
+    assert alerts._ip_blocked("64:ff9b::a00:1") is True     # 10.0.0.1 embedded
+    assert alerts._ip_blocked("64:ff9b::808:808") is False  # 8.8.8.8 → public
+
+
+def test_validate_flags_weak_metrics_token_and_placeholder(monkeypatch):
+    """T-28: validate() must flag a short METRICS_TOKEN / seed ADMIN_PASSWORD and reject CHANGE_ME."""
+    import config
+    monkeypatch.setattr(config, "METRICS_TOKEN", "short")
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "CHANGE_ME_ADMIN")
+    errs = " ".join(config.validate())
+    assert "MONITOR_METRICS_TOKEN" in errs and "CHANGE_ME" in errs
+
+
+def test_egress_text_scrubs_secret_and_neutralizes_markup(monkeypatch):
+    """T-20 + T-29: the webhook body is secret-scrubbed AND chat-markup-neutralized before it
+    leaves the box."""
+    import alerts
+    import config
+    monkeypatch.setattr(config, "log_redaction_values", lambda: ["supersecretvalue"])
+    out = alerts._egress_text("boom supersecretvalue Bearer abcdef123456 [x](http://evil)")
+    assert "supersecretvalue" not in out and "abcdef123456" not in out and "«redacted" in out
+    assert "[x](http://evil)" not in out and "(" not in out and ")" not in out   # link defanged; brackets kept
+
+
+def test_assert_safe_ident_fails_closed_on_injection():
+    """T-31: only a bare identifier may reach an f-string table interpolation; an injection payload
+    (space / `;` / quotes / parens) is rejected fail-closed."""
+    import db
+    assert db._assert_safe_ident("metrics") == "metrics"
+    assert db._assert_safe_ident("key_series") == "key_series"       # real tiered table
+    for bad in ("metrics; DROP TABLE users", "a b", "x'--", "t(1)"):
+        with pytest.raises(ValueError):
+            db._assert_safe_ident(bad)
+
+
+def test_strip_cost_series_gates_costrate_for_viewer(monkeypatch):
+    """SCR-03: the aggregate costrate column is dropped for a non-admin under SPEND_REQUIRE_ADMIN."""
+    import app as a
+    import config
+    rows = [{"t": 1, "cpu": 10.0, "costrate": 4.5}, {"t": 2, "cpu": 12.0, "costrate": 5.0}]
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    v = a._strip_cost_series(rows, "viewer")
+    assert all("costrate" not in p for p in v) and v[0]["cpu"] == 10.0     # cost gone, cpu kept
+    assert a._strip_cost_series(rows, "admin")[0]["costrate"] == 4.5       # admin keeps it
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", False)
+    assert a._strip_cost_series(rows, "viewer")[0]["costrate"] == 4.5      # off → no-op
+
+
 async def test_alert_fire_recover_logs(monkeypatch, caplog):
     """#3 — Notifier logs a WARNING on fire and an INFO on recover, with the alert key."""
     import alerts
@@ -3689,10 +3769,15 @@ async def test_spend_model_series_endpoint(monkeypatch):
     async def fake_prices(session):
         return {"gpt-5-mini": 2.25e-06}
 
+    # Dates must land INSIDE the 30d window bucket_model_series clamps to
+    # (cutoff = now-30d .. now), so use recent days relative to today rather
+    # than fixed calendar dates that drift out of the window over time.
+    _d0, _d1 = _recent_days(2)
+
     async def fake_series(session, start, end, prices, ov):
-        return {"dates": ["2026-07-15", "2026-07-16"], "models": [
+        return {"dates": [_d0, _d1], "models": [
             {"model": "gpt-5-mini", "kind": "real", "total": 30.0,
-             "daily": {"2026-07-15": 10.0, "2026-07-16": 20.0}}]}
+             "daily": {_d0: 10.0, _d1: 20.0}}]}
     monkeypatch.setattr(litellm, "model_prices", fake_prices)
     monkeypatch.setattr(litellm, "per_model_daily_series", fake_series)
     c2 = await _client()
@@ -5322,6 +5407,26 @@ async def test_open_mode_denies_alerts():
         assert (await c.get("/api/alerts")).status == 403    # API denied
         # a benign open endpoint is unaffected
         assert (await c.get("/healthz")).status == 200
+    finally:
+        await c.close()
+
+
+async def test_open_mode_denies_full_admin_surface():
+    """SCR-01: open (no-auth) mode must hard-deny the WHOLE admin surface, not just user
+    management — otherwise an anonymous caller could POST /api/admin/settings (silence every
+    alert, shrink AUDIT_RETENTION_DAYS = anti-forensics) or read /api/admin/{teams,audit,keys-diag}
+    (owner emails, usernames+IPs, key structure) with zero credential."""
+    c = await _client()
+    try:
+        assert (await c.post("/api/admin/settings",
+                             data={"name": "ALERT_CPU_PCT", "value": "0"})).status == 403
+        assert (await c.get("/api/admin/teams")).status == 403
+        assert (await c.get("/api/admin/audit")).status == 403
+        assert (await c.get("/api/admin/keys-diag")).status == 403
+        assert (await c.get("/settings")).status == 403            # admin page
+        assert (await c.get("/api/admin/users")).status == 403     # still covered
+        # a benign viewer data route stays open (operators-see-all in open mode)
+        assert (await c.get("/api/data")).status == 200
     finally:
         await c.close()
 
@@ -9183,7 +9288,7 @@ async def test_model_kinds_in_out_cache_survive_a_provider_prefix_mismatch(monke
     monkeypatch.setattr(litellm, "model_price_detail", _detail)
     monkeypatch.setattr(litellm, "per_model_range", _range)
     db.init()
-    c = await _client()
+    c, _csrf = await _admin_client(monkeypatch)   # /api/admin/* now requires admin (SCR-01)
     try:
         d = await (await c.get("/api/admin/model-kinds")).json()
         m = next(x for x in d["models"] if x["model"] == NAME)
@@ -9225,7 +9330,7 @@ async def test_cost_controls_no_double_end_to_end(monkeypatch):
     monkeypatch.setattr(litellm, "model_price_detail", _detail)
     monkeypatch.setattr(litellm, "per_model_range", _range)
     db.init()
-    c = await _client()
+    c, _csrf = await _admin_client(monkeypatch)   # /api/admin/* now requires admin (SCR-01)
     try:
         d = await (await c.get("/api/admin/model-kinds")).json()
         m = next(x for x in d["models"] if x["model"] == NAME)
@@ -9255,7 +9360,7 @@ async def test_cost_controls_override_pins_rate(monkeypatch):
     monkeypatch.setattr(litellm, "per_model_range", _range)
     db.init()
     db.model_cost_price_set(NAME, 0.30, time.time())    # pin €0.30/1M
-    c = await _client()
+    c, _csrf = await _admin_client(monkeypatch)          # /api/admin/* now requires admin (SCR-01)
     try:
         d = await (await c.get("/api/admin/model-kinds")).json()
         m = next(x for x in d["models"] if x["model"] == NAME)
