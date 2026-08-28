@@ -2164,7 +2164,7 @@ async def test_notifier_debounce_and_recovery(monkeypatch):
     monkeypatch.setattr(config, "ALERT_REPEAT_MIN", 9999)  # never repeat
     sent_log = []
 
-    async def fake_fanout(self, session, text, recipients=None, akey=""):
+    async def fake_fanout(self, session, text, recipients=None, akey="", public_text=None):
         sent_log.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", fake_fanout)
 
@@ -2434,7 +2434,7 @@ async def test_alert_fire_recover_logs(monkeypatch, caplog):
     import logging
     n = alerts.Notifier()
 
-    async def _fanout(self, session, text, recipients, akey=""):    # stub: no real webhook
+    async def _fanout(self, session, text, recipients, akey="", public_text=None):  # stub: no real webhook
         return None
 
     async def _no_recipients(self):
@@ -3096,7 +3096,8 @@ def test_anomaly_budget_detection(monkeypatch):
     monkeypatch.setattr(config, "ANOMALY_FACTOR", 0.0)          # spike off
     monkeypatch.setattr(config, "ANOMALY_KEY_BUDGET_HR", 1.0)   # $1/h cap
     # 15-min window; a key that spent $0.50 → $2/h → over the $1/h cap
-    snap = {"available": True, "spend_window_min": 15,
+    # spend_mode=full: cost is windowed, so the $/h rate is meaningful (R-01).
+    snap = {"available": True, "spend_window_min": 15, "spend_mode": "full",
             "top_keys": [{"key": "k1", "alias": "app-x", "cost": 0.5},
                          {"key": "k2", "cost": 0.10}]}   # $0.40/h → under
     msgs = dict(anomaly.detect(snap, {}))
@@ -4485,6 +4486,284 @@ async def test_key_budgets_owner_from_created_by_or_nested(monkeypatch):
     assert out["RodKey"]["user_name"] == "rod@example.com"       # created_by → /user/list join
     assert out["NestedKey"]["user_name"] == "leo@example.com"    # nested created_by_user email
     assert out["Orphan"]["user_name"] == ""                       # no owner anywhere → unassigned
+
+
+@pytest.mark.asyncio
+async def test_key_budgets_owner_beats_creator_when_admin_made_the_key(monkeypatch):
+    """Bug fix — a key that has a real owner (`user_id`) but was CREATED by someone else
+    (the nested `created_by_user` carries the creator's email) must resolve to the OWNER,
+    not the creator. Otherwise every key an admin provisions for a user shows the admin's
+    name on the 'Concurrent LLM work — by user' / 'Cost by user' charts."""
+    from collectors import litellm as _ll
+    monkeypatch.setattr(config, "LITELLM_BASE_URL", "http://litellm:4000")
+    monkeypatch.setattr(config, "LITELLM_MASTER_KEY", "sk-supersecretvalue")
+    async def _dir(_session, _base):            # /user/list directory: user_id UUID -> email
+        return ({}, {}, {"uid-owner": "owner@example.com"})
+    monkeypatch.setattr(_ll, "_team_directory", _dir)
+    rows = [
+        # real owner is uid-owner; admin (created_by_user) provisioned it
+        {"key_alias": "ProvisionedKey", "user_id": "uid-owner",
+         "created_by_user": {"user_email": "admin@example.com"},
+         "spend": 3.0, "max_budget": 0},
+    ]
+    async def _fj(_session, url, **_kw):
+        return ({"keys": rows, "total_count": len(rows)}, None) if "/key/list" in url else (None, "x")
+    monkeypatch.setattr(_ll, "fetch_json", _fj)
+    _ll._KEY_BUDGETS_CACHE = None
+    out = await _ll.key_budgets(None)
+    assert out["ProvisionedKey"]["user_name"] == "owner@example.com"   # owner, NOT the creator
+
+
+def test_q_end_rejects_out_of_range_finite_epoch():
+    """F-06: a huge FINITE ?end= (e.g. 1e18) passed float()/inf-nan checks and reached
+    time.gmtime() in the month handlers → uncaught OSError → HTTP 500. _q_end must clamp
+    out-of-range finite epochs to None (live), while sane values still pass through."""
+    from aiohttp.test_utils import make_mocked_request
+    import app as appmod
+    assert appmod._q_end(make_mocked_request("GET", "/x?end=1e18")) is None   # was 500
+    assert appmod._q_end(make_mocked_request("GET", "/x?end=1000000")) == 1000000.0
+    assert appmod._q_end(make_mocked_request("GET", "/x")) is None
+    # small negatives are gmtime-safe → still accepted (unchanged contract)
+    assert appmod._q_end(make_mocked_request("GET", "/x?end=-5")) == -5.0
+
+
+async def test_master_token_blocked_from_spend_api_when_require_admin(monkeypatch):
+    """F-02: the shared master/URL token maps to role=admin, so it sailed past the
+    SPEND_REQUIRE_ADMIN gate and could read per-key cost + user emails via /api/budgets.
+    When SPEND_REQUIRE_ADMIN is on, the master token must be treated as non-admin here."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "masterddtoken1234567")
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    c = await _client()
+    try:
+        assert (await c.get("/api/budgets?token=masterddtoken1234567")).status == 403
+        assert (await c.get("/api/keyseries?token=masterddtoken1234567")).status == 403
+        # a non-sensitive endpoint is still reachable with the master token
+        assert (await c.get("/api/data?token=masterddtoken1234567")).status == 200
+    finally:
+        await c.close()
+
+
+async def test_open_mode_denies_spend_api_when_require_admin(monkeypatch):
+    """F-03: in open mode the middleware returned before the SPEND gate, so the dedicated
+    sensitive spend endpoints (emails + per-key cost) were served anonymously even with
+    SPEND_REQUIRE_ADMIN=1, while /api/data stayed redacted — a false assurance."""
+    monkeypatch.setattr(config, "ALLOW_OPEN", True)
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", None)
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    c = await _client()
+    try:
+        assert (await c.get("/api/budgets")).status == 403
+        assert (await c.get("/api/userreqs")).status == 403
+        assert (await c.get("/api/data")).status == 200        # non-sensitive stays open
+    finally:
+        await c.close()
+
+
+async def test_login_rejects_cross_origin_post(monkeypatch):
+    """F-04: POST /login is CSRF-exempt (it mints the session) — a cross-site auto-submit
+    could force-log a victim into the attacker's account. Reject a POST whose Origin is a
+    different host; a same-origin post (no/matching Origin) still logs in."""
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    db.user_create("luser", "luser@x.io", auth.hash_password("luserpw12"), "admin", time.time())
+    c = await _client()
+    try:
+        r = await c.post("/login", data={"username": "luser", "password": "luserpw12"},
+                         headers={"Origin": "http://evil.example"}, allow_redirects=False)
+        assert r.status == 403
+        r2 = await c.post("/login", data={"username": "luser", "password": "luserpw12"},
+                          allow_redirects=False)                    # no Origin → same-origin
+        assert r2.status in (302, 303)
+    finally:
+        await c.close()
+
+
+async def test_password_reset_revokes_pats(monkeypatch):
+    """F-05: an admin password reset/force_reset must revoke the target's personal access
+    tokens — otherwise API access via a pre-existing PAT survives a credential reset."""
+    c, csrf = await _admin_client(monkeypatch)
+    try:
+        db.user_create("victim", "victim@x.io", auth.hash_password("victimpw1"),
+                       "viewer", time.time())
+        raw, tid, pfx = appmod._new_pat()
+        db.api_token_create(tid, "victim", "viewer", "l", appmod._hash_token(raw), pfx, time.time())
+        assert db.api_token_count("victim") == 1
+        r = await c.post("/api/admin/users/action",
+                         data={"username": "victim", "action": "reset", "password": "newpw1234"},
+                         headers={"X-CSRF-Token": csrf})
+        assert r.status == 200
+        assert db.api_token_count("victim") == 0            # PATs revoked on reset
+    finally:
+        await c.close()
+
+
+async def test_alert_fanout_redacts_cost_for_non_admin_recipients(monkeypatch):
+    """F-01: with SPEND_REQUIRE_ADMIN on, per-key spend/attribution in an anomaly alert must
+    NOT be fanned out verbatim to non-admin (viewer) webhooks — the same cost data /api/data
+    redacts for that user. Admin recipients still get the full detail."""
+    import json as _json
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    monkeypatch.setattr(config, "ALERT_WEBHOOK_URL", "")
+    async def _ok(_url):                       # accept any webhook URL (skip SSRF network)
+        return None
+    monkeypatch.setattr(alerts, "validate_webhook_url", _ok)
+    db.user_create("adm", "adm@x.io", auth.hash_password("admpw1234"), "admin", time.time())
+    db.user_create("vwr", "vwr@x.io", auth.hash_password("vwrpw1234"), "viewer", time.time())
+    db.user_set_webhook("adm", "http://admin.example/hook", True)
+    db.user_set_webhook("vwr", "http://viewer.example/hook", True)
+    n = alerts.Notifier()
+    captured: list[tuple] = []
+    async def _fake_post(session, url, payload, akey=""):
+        captured.append((url, _json.dumps(payload, ensure_ascii=False)))
+        return (akey, 200, True, 1.0)
+    monkeypatch.setattr(n, "_post_json", _fake_post)
+    snap = {"available": True}
+    breach = ("budget:mykey", "key mykey spend $50.00/h ≥ $10/h")
+    await n.process(None, snap, time.time(), extra_breaches=[breach])
+    byurl = {u: t for u, t in captured}
+    assert "http://viewer.example/hook" in byurl and "http://admin.example/hook" in byurl
+    assert "$50.00" not in byurl["http://viewer.example/hook"]
+    assert "mykey" not in byurl["http://viewer.example/hook"]
+    assert "$50.00" in byurl["http://admin.example/hook"]      # admin keeps full detail
+
+
+def test_sse_acquire_enforces_per_client_cap_and_releases(monkeypatch):
+    """F-07: the SSE connection accounting caps concurrent streams per client and frees the
+    slot on release, so one credential can't hold unbounded /api/stream connections."""
+    import app as appmod
+    monkeypatch.setattr(config, "SSE_MAX_PER_CLIENT", 2)
+    monkeypatch.setattr(config, "SSE_MAX_TOTAL", 100)
+    appmod._sse_active.clear()
+    monkeypatch.setattr(appmod, "_sse_total", 0)
+    cid = "u:alice"
+    assert appmod._sse_acquire(cid) is True
+    assert appmod._sse_acquire(cid) is True
+    assert appmod._sse_acquire(cid) is False       # 3rd exceeds per-client cap
+    appmod._sse_release(cid)
+    assert appmod._sse_acquire(cid) is True         # a freed slot is reusable
+    appmod._sse_release(cid); appmod._sse_release(cid)
+    assert appmod._sse_active.get(cid) is None       # fully released → key gone
+
+
+def test_sse_acquire_enforces_global_cap(monkeypatch):
+    """F-07: a global ceiling bounds total concurrent streams across all clients."""
+    import app as appmod
+    monkeypatch.setattr(config, "SSE_MAX_PER_CLIENT", 100)
+    monkeypatch.setattr(config, "SSE_MAX_TOTAL", 1)
+    appmod._sse_active.clear()
+    monkeypatch.setattr(appmod, "_sse_total", 0)
+    assert appmod._sse_acquire("ip:1.1.1.1") is True
+    assert appmod._sse_acquire("ip:2.2.2.2") is False    # global cap reached
+    appmod._sse_release("ip:1.1.1.1")
+
+
+async def test_sse_stream_rejected_with_429_when_capped(monkeypatch):
+    """F-07: over the cap, /api/stream returns 429 (before prepare) instead of opening
+    another unbounded event-stream."""
+    import app as appmod
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "ssetok1234567890")
+    monkeypatch.setattr(config, "SSE_MAX_TOTAL", 0)          # every connect is over the cap
+    appmod._sse_active.clear()
+    monkeypatch.setattr(appmod, "_sse_total", 0)
+    c = await _client()
+    try:
+        r = await c.get("/api/stream?token=ssetok1234567890")
+        assert r.status == 429
+    finally:
+        await c.close()
+
+
+async def test_sse_slot_released_when_prepare_fails(monkeypatch):
+    """F-07 regression: if resp.prepare() fails/cancels (client RSTs on connect), the acquired
+    SSE slot must still be released — otherwise leaks accumulate and pin the cap, 429-ing every
+    future stream (self-DoS). prepare() must run inside the try that releases in finally."""
+    import app as appmod
+    from aiohttp.test_utils import make_mocked_request
+    monkeypatch.setattr(config, "SSE_MAX_TOTAL", 100)
+    monkeypatch.setattr(config, "SSE_MAX_PER_CLIENT", 100)
+    appmod._sse_active.clear()
+    monkeypatch.setattr(appmod, "_sse_total", 0)
+    async def _boom(self, request):
+        raise ConnectionResetError("client gone during prepare")
+    monkeypatch.setattr(web.StreamResponse, "prepare", _boom)
+    for _ in range(5):
+        await appmod.stream_handler(make_mocked_request("GET", "/api/stream"))
+    assert appmod._sse_total == 0        # every acquired slot was released despite prepare failing
+    assert appmod._sse_active == {}
+
+
+def test_anomaly_budget_only_fires_in_full_spend_mode(monkeypatch):
+    """R-01: in lite/off mode top_keys[].cost is LIFETIME cumulative, so dividing it by the
+    window invents a huge $/h and false-pages. The budget branch must only run when the cost
+    basis is windowed (spend_mode == 'full')."""
+    monkeypatch.setattr(config, "ANOMALY_KEY_BUDGET_HR", 10.0)
+    monkeypatch.setattr(config, "ANOMALY_FACTOR", 0)      # isolate the budget branch
+    lite = {"available": True, "spend_mode": "lite", "spend_window_min": 15,
+            "top_keys": [{"alias": "k1", "cost": 100.0}]}          # $100 LIFETIME
+    assert anomaly.detect(lite, {}) == []                  # must NOT page on cumulative spend
+    full = {"available": True, "spend_mode": "full", "spend_window_min": 15,
+            "top_keys": [{"alias": "k1", "cost": 100.0}]}          # $100 in-window
+    out = anomaly.detect(full, {})
+    assert any(k.startswith("budget:") for k, _ in out)    # windowed cost → real breach
+
+
+def test_anomalies_redacted_for_non_admin(monkeypatch):
+    """R-02: /api/anomalies carries per-key $/h + aliases. Under SPEND_REQUIRE_ADMIN a
+    non-admin must get the breach existence but not the cost/attribution detail."""
+    import app as appmod, json as _json
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    active = [{"key": "budget:secretalias", "message": "key secretalias spend $50.00/h ≥ $10/h"}]
+    history = [{"ts": 1, "label": "secretalias", "kind": "budget",
+                "detail": "key secretalias spend $50.00/h ≥ $10/h"}]
+    ra, rh = appmod._redact_anomalies(active, history, "viewer")
+    blob = _json.dumps(ra) + _json.dumps(rh)
+    assert "secretalias" not in blob and "$50.00" not in blob
+    ra2, rh2 = appmod._redact_anomalies(active, history, "admin")   # admin unchanged
+    assert ra2 == active and rh2 == history
+
+
+async def test_anomalies_endpoint_redacts_for_viewer(monkeypatch):
+    """R-02 end-to-end: a logged-in viewer polling /api/anomalies gets 200 but no alias/cost
+    when SPEND_REQUIRE_ADMIN is on."""
+    import app as appmod
+    monkeypatch.setattr(config, "COOKIE_ALLOW_INSECURE", True)
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    db.user_create("anv", "anv@x.io", auth.hash_password("anvpw123"), "viewer", time.time())
+    monkeypatch.setattr(appmod, "_latest_anomalies",
+                        [{"key": "budget:aliassecret",
+                          "message": "key aliassecret spend $99.00/h ≥ $10/h"}])
+    c = await _client()
+    try:
+        await c.post("/login", data={"username": "anv", "password": "anvpw123"})
+        r = await c.get("/api/anomalies")
+        body = await r.text()
+        assert r.status == 200
+        assert "aliassecret" not in body and "$99.00" not in body
+    finally:
+        await c.close()
+
+
+async def test_metrics_redacts_containers_and_cost_for_non_admin(monkeypatch):
+    """R-03: /metrics must honour CONTAINERS_ADMIN_ONLY + SPEND_REQUIRE_ADMIN for a non-admin
+    caller (viewer session or the scrape-only METRICS_TOKEN)."""
+    import app as appmod
+    monkeypatch.setattr(config, "METRICS_ENABLED", True)
+    monkeypatch.setattr(config, "METRICS_TOKEN", "mtok1234567890xy")
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "dashtok1234567890")   # auth enabled
+    monkeypatch.setattr(config, "CONTAINERS_ADMIN_ONLY", True)
+    monkeypatch.setattr(config, "SPEND_REQUIRE_ADMIN", True)
+    monkeypatch.setattr(appmod, "_latest", {"ts": 1, "collectors": {
+        "containers": {"containers": [{"name": "secretbox", "running": True}]},
+        "litellm": {"available": True, "cost_rate_hr": 42.5}}})
+    c = await _client()
+    try:
+        r = await c.get("/metrics?token=mtok1234567890xy")
+        body = await r.text()
+        assert r.status == 200
+        assert "secretbox" not in body                      # container name hidden
+        assert "container-1" in body                          # replaced with placeholder
+        assert "aimon_litellm_cost_rate_hourly" not in body  # cost gauge stripped
+    finally:
+        await c.close()
 
 
 def test_budget_rows_split_real_vs_reference():
@@ -7479,8 +7758,8 @@ def test_unit_anomaly_ignores_low_volume(monkeypatch):
 
 def test_unit_anomaly_budget_breach(monkeypatch):
     monkeypatch.setattr(config, "ANOMALY_KEY_BUDGET_HR", 1.0)
-    snap = {"available": True, "spend_window_min": 60,
-            "top_keys": [{"alias": "spender", "cost": 5.0}]}   # $5/h >= $1/h
+    snap = {"available": True, "spend_window_min": 60, "spend_mode": "full",
+            "top_keys": [{"alias": "spender", "cost": 5.0}]}   # $5/h >= $1/h (windowed)
     assert any(k == "budget:spender" for k, _ in anomaly.detect(snap, {}))
 
 
@@ -7987,7 +8266,7 @@ async def test_alert_message_includes_machine_tool_service_and_reason(monkeypatc
     alerts.reset_down_streaks()                                # not the flap hysteresis
     sent = []
 
-    async def fake_fanout(self, session, text, recipients=None, akey=""):
+    async def fake_fanout(self, session, text, recipients=None, akey="", public_text=None):
         sent.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", fake_fanout)
     n = alerts.Notifier()
@@ -12161,7 +12440,7 @@ async def _drive(n, snaps, monkeypatch, now0=1000.0, step=10.0):
     out = []
     sess = _RecSess()
 
-    async def _fanout(self, session, text, recipients, akey=""):
+    async def _fanout(self, session, text, recipients, akey="", public_text=None):
         sess.msgs.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
     monkeypatch.setattr(alerts.Notifier, "_recipients", lambda self: _noop_recipients())
@@ -12368,7 +12647,7 @@ async def test_flapping_backend_cannot_storm_past_repeat_min(monkeypatch, tmp_pa
     U = {"ts": 0, "collectors": {"vllm": {"available": True}}}
     posts = []
 
-    async def _fanout(self, session, text, recipients, akey=""):
+    async def _fanout(self, session, text, recipients, akey="", public_text=None):
         posts.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
     monkeypatch.setattr(alerts.Notifier, "_recipients", lambda self: _noop_recipients())
@@ -12397,7 +12676,7 @@ async def test_backend_recovering_inside_a_maintenance_window_does_not_false_pag
     monkeypatch.setattr(config, "in_maintenance_window", lambda n: win["on"])
     posts = []
 
-    async def _fanout(self, session, text, recipients, akey=""):
+    async def _fanout(self, session, text, recipients, akey="", public_text=None):
         posts.append(text)
     monkeypatch.setattr(alerts.Notifier, "_fanout", _fanout)
     monkeypatch.setattr(alerts.Notifier, "_recipients", lambda self: _noop_recipients())

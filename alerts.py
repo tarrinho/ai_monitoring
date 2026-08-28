@@ -584,6 +584,22 @@ class Notifier:
         # unbounded fire/recover storm.
         self._notified: set[str] = set()
 
+    # Anomaly breach keys whose message carries per-key COST or attribution (alias/rates).
+    # These are the surfaces SPEND_REQUIRE_ADMIN hides from non-admins in the UI (F-01).
+    _COST_SENSITIVE_PREFIXES = ("budget:", "spike:")
+
+    def _public_text(self, snap: dict, key: str, fired: bool) -> str | None:
+        """Redacted alert line for NON-admin webhook recipients when SPEND_REQUIRE_ADMIN is on
+        and the breach exposes per-key cost/attribution. Returns None when no redaction is
+        needed (the fan-out then sends the full text to everyone)."""
+        if not config.SPEND_REQUIRE_ADMIN:
+            return None
+        if key.startswith(self._COST_SENSITIVE_PREFIXES):
+            body = ("a monitored key crossed an anomaly threshold"
+                    if fired else "a key anomaly cleared")
+            return _alert_text(snap, body, fired)
+        return None
+
     def _due(self, key: str, now: float) -> bool:
         last = self._last.get(key)
         if last is None:
@@ -625,7 +641,9 @@ class Notifier:
         recipients = await self._recipients() if (due or recoveries) else []
 
         for key, msg in due:
-            await self._fanout(session, _alert_text(snap, msg, fired=True), recipients, key)
+            ptext = self._public_text(snap, key, fired=True)
+            await self._fanout(session, _alert_text(snap, msg, fired=True), recipients, key,
+                               public_text=ptext)
             self._last[key] = now
             self._notified.add(key)
             sent.append(msg)
@@ -634,7 +652,9 @@ class Notifier:
                                                "machine": _machine(snap)})
         for key in recoveries:
             rmsg = _recover_msg(key)
-            await self._fanout(session, _alert_text(snap, rmsg, fired=False), recipients, key)
+            ptext = self._public_text(snap, key, fired=False)
+            await self._fanout(session, _alert_text(snap, rmsg, fired=False), recipients, key,
+                               public_text=ptext)
             self._last[key] = now          # stamp, don't clear: a re-fire waits out the cooldown
             self._notified.discard(key)
             sent.append(f"recovered:{key}")
@@ -653,29 +673,37 @@ class Notifier:
     def active_keys(self) -> list[str]:
         return sorted(self._active)
 
-    async def _recipients(self) -> list[str]:
-        """Validated per-user webhook URLs (enabled, non-disabled users). Bounded +
-        concurrent + time-boxed so one slow-resolving host can't stall the alert tick
-        (and, via the tick, the whole sampling loop): capped at WEBHOOK_MAX_RECIPIENTS
-        and each validation runs under HTTP_TIMEOUT."""
+    async def _recipients(self) -> list[dict]:
+        """Validated per-user webhook recipients — each a {"url","role"} dict (enabled,
+        non-disabled users). Bounded + concurrent + time-boxed so one slow-resolving host
+        can't stall the alert tick (and, via the tick, the whole sampling loop): capped at
+        WEBHOOK_MAX_RECIPIENTS and each validation runs under HTTP_TIMEOUT. The role rides
+        along so the fan-out can withhold cost/attribution detail from non-admins when
+        SPEND_REQUIRE_ADMIN is on (F-01)."""
         rows = list(db.user_webhooks_enabled())[:config.WEBHOOK_MAX_RECIPIENTS]
 
-        async def _ok(url: str | None) -> str | None:
+        async def _ok(row: dict) -> dict | None:
+            url = row.get("url")
             if not url:
                 return None
             try:
                 if await asyncio.wait_for(validate_webhook_url(url),
                                           config.HTTP_TIMEOUT) is None:
-                    return url
+                    return {"url": url, "role": row.get("role") or "viewer"}
             except Exception:                 # timeout / resolver error → drop it
                 return None
             return None
 
-        checked = await asyncio.gather(*(_ok(r.get("url")) for r in rows))
-        return [u for u in checked if u]
+        checked = await asyncio.gather(*(_ok(r) for r in rows))
+        return [r for r in checked if r]
 
     async def _fanout(self, session: aiohttp.ClientSession, text: str,
-                      recipients: list[str], akey: str = "") -> None:
+                      recipients: list[dict], akey: str = "",
+                      public_text: str | None = None) -> None:
+        # `public_text` is the cost/attribution-redacted variant sent to NON-admin recipients
+        # (F-01). None = no redaction needed → everyone gets `text`. The operator-global
+        # webhook is operator-trusted and always receives the full `text`.
+        public_text = text if public_text is None else public_text
         # Build the body PER URL: a Teams URL and a Slack URL need different shapes,
         # and a fan-out can mix destinations (global vs per-user).
         #
@@ -699,8 +727,12 @@ class Notifier:
                 rows.append((out[0], "webhook", *out[1:]))
         if recipients:                                 # per-user → SSRF-pinned sender
             wsess = _webhook_sender()                  # concurrent: each POST is
-            outs = await asyncio.gather(*(self._post_json(wsess, url, _webhook_payload(text, url), akey)
-                                          for url in recipients))         # bounded
+            # An admin recipient gets the full text; a non-admin gets the redacted variant.
+            def _rtext(r: dict) -> str:
+                return text if (r.get("role") == "admin") else public_text
+            outs = await asyncio.gather(
+                *(self._post_json(wsess, r["url"], _webhook_payload(_rtext(r), r["url"]), akey)
+                  for r in recipients))                                   # bounded
             rows.extend((o[0], "user", *o[1:]) for o in outs if o)
         await _record_sends(rows)
 

@@ -32,7 +32,13 @@ def detect(litellm_snap: dict, baselines: dict[str, dict]) -> list[tuple[str, st
                             f"baseline {base:.0f} ({fx})"))
 
     # --- per-key budget (snapshot only) -------------------------------------
-    if config.ANOMALY_KEY_BUDGET_HR and config.ANOMALY_KEY_BUDGET_HR > 0:
+    # R-01: `rate = cost / window_hours` is only meaningful when `cost` is spend WITHIN the
+    # window — true in FULL spend mode. In lite/off, top_keys[].cost is LIFETIME cumulative
+    # (from /global/spend/keys), so dividing it by a 15-min window invents a huge $/h and
+    # false-pages every key with any historical spend. Only evaluate the budget rule when the
+    # cost basis is windowed.
+    if (config.ANOMALY_KEY_BUDGET_HR and config.ANOMALY_KEY_BUDGET_HR > 0
+            and litellm_snap.get("spend_mode") == "full"):
         win_min = litellm_snap.get("spend_window_min") or \
             config.LITELLM_SPEND_WINDOW_MIN
         hours = max(win_min / 60.0, 1e-6)

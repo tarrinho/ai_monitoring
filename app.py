@@ -22,7 +22,7 @@ import threading
 import time
 from html import escape as _html_escape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -863,6 +863,32 @@ def _audit(request: web.Request, actor: str | None, action: str,
     db.audit_add(time.time(), actor, action, target, _client_ip(request), detail)
 
 
+def _cross_origin_post(request: web.Request) -> bool:
+    """True if this POST carries an Origin (or Referer) header whose host differs from the
+    request's own Host — i.e. a cross-site submission. Used to defend the CSRF-exempt
+    /login form against forced-login (login CSRF): the login handler mints a fresh session,
+    so SameSite=Strict on the existing cookie does not protect it. A same-origin browser
+    submit sends a matching Origin; a legitimate client with no Origin/Referer is allowed
+    (fail-open only when the header is absent — a cross-site form still sends Origin)."""
+    ref = request.headers.get("Origin") or request.headers.get("Referer")
+    if not ref:
+        return False
+    try:
+        netloc = urlsplit(ref).netloc
+    except Exception:
+        return True
+    if not netloc:
+        return True
+    # Accept either the request's own Host or the proxy-declared X-Forwarded-Host (a
+    # reverse proxy under a sub-path may rewrite Host to the backend, while the browser's
+    # Origin carries the PUBLIC host — matching only request.host would false-reject).
+    hosts = {request.host}
+    xfh = request.headers.get("X-Forwarded-Host", "").strip()
+    if xfh:
+        hosts.add(xfh.split(",")[0].strip())
+    return netloc not in hosts
+
+
 def _login_dest(request: web.Request, nxt: str) -> str:
     """Location for redirecting an unauthenticated page request to the login form,
     preserving where they were headed via a validated ?next=."""
@@ -895,6 +921,17 @@ async def _auth_mw(request: web.Request, handler):
             if _op.startswith("/api/"):
                 return web.json_response(
                     {"error": "authentication required"}, status=403)
+            return web.Response(text="403 — authentication required", status=403)
+        # F-03: the SPEND gate below the auth-enabled path is skipped in open mode, so the
+        # dedicated cost/PII endpoints (per-key spend + resolved user emails) would be served
+        # to anonymous callers even with SPEND_REQUIRE_ADMIN on — while /api/data stays redacted
+        # in-handler, giving a false sense the data is protected. Deny them outright here, like
+        # the admin/alerts surfaces (open mode has no credential that could satisfy an admin gate).
+        if config.SPEND_REQUIRE_ADMIN and (
+                _op == "/spend" or _op.startswith("/api/spend/") or _op == "/api/spend"
+                or _op in _SPEND_SENSITIVE_API):
+            if _op.startswith("/api/"):
+                return web.json_response({"error": "authentication required"}, status=403)
             return web.Response(text="403 — authentication required", status=403)
         return await handler(request)
     p = request.path
@@ -971,7 +1008,10 @@ async def _auth_mw(request: web.Request, handler):
     # sensitive. Off by default → viewers keep access (unchanged). Covers the /spend page,
     # /api/spend/*, AND the sibling per-key cost/email endpoints (_SPEND_SENSITIVE_API) that
     # feed the same data but sit outside the /api/spend/ prefix.
-    if (config.SPEND_REQUIRE_ADMIN and role != "admin"
+    # The master/URL token authenticates as role="admin", but it is a broad shareable
+    # secret (rides in the dashboard link) — so for the cost/PII surface it is treated as
+    # NON-admin here, exactly as it is withheld from Alerts/Settings/Users above (`master`).
+    if (config.SPEND_REQUIRE_ADMIN and (role != "admin" or master)
             and (p == "/spend" or p.startswith("/api/spend/") or p == "/api/spend"
                  or p in _SPEND_SENSITIVE_API)):
         if p.startswith("/api/"):
@@ -1184,6 +1224,12 @@ async def login_page_handler(request: web.Request) -> web.Response:
 
 
 async def login_submit_handler(request: web.Request) -> web.Response:
+    # F-04: login is CSRF-exempt (it mints the session), so a cross-site auto-submit could
+    # force a victim into the attacker's account. Reject a submission whose Origin/Referer
+    # host isn't ours before doing any work.
+    if _cross_origin_post(request):
+        _audit(request, None, "login.cross_origin")
+        return web.json_response({"error": "cross-origin login rejected"}, status=403)
     ip = _client_ip(request)
     now = time.time()
     locked = _auth_locked_until.get(ip, 0.0)
@@ -1519,11 +1565,13 @@ async def api_admin_users_action(request: web.Request) -> web.Response:
         db.user_set_password(name, auth.hash_password(pw))
         db.user_set_must_change(name, True)   # admin-set pw is temporary
         auth.sessions_drop_user(name)     # force re-login with the new password
+        db.api_tokens_revoke_all(name)    # F-05: a reset must also cut PAT (API) access
     elif action == "force_reset":
         # Require the user to choose a new password on next login WITHOUT the admin
         # setting one (keeps their current password working only to reach /account).
         db.user_set_must_change(name, True)
         auth.sessions_drop_user(name)     # end active sessions so the gate applies now
+        db.api_tokens_revoke_all(name)    # F-05: PAT auth bypasses the must-change gate — revoke
     elif action == "clear_reset":
         # Cancel a pending forced reset: the user keeps their current password and is no
         # longer gated to /account. Drop any gated session so the lift takes effect now
@@ -1656,6 +1704,38 @@ def _redact_cost(snap: dict, role: str | None) -> dict:
     return {**snap, "collectors": {**cols, "litellm": red}}
 
 
+_ANOM_COST_KINDS = ("budget", "spike")
+
+
+def _redact_anomalies(active: list, history: list, role: str | None) -> tuple[list, list]:
+    """R-02: anomaly messages embed per-key cost ($/h) + key aliases (the `budget:`/`spike:`
+    breaches). Under SPEND_REQUIRE_ADMIN a non-admin (or anonymous, in open mode) must keep the
+    breach's EXISTENCE + kind for the dashboard panel but not its cost/attribution detail —
+    mirroring the alert-fan-out redaction (`Notifier._public_text`). No-op for admin or when the
+    lock-down is off."""
+    if role == "admin" or not getattr(config, "SPEND_REQUIRE_ADMIN", False):
+        return active, history
+
+    def _sensitive_key(k: str) -> bool:
+        return str(k).split(":", 1)[0] in _ANOM_COST_KINDS
+
+    red_active = []
+    for a in active or []:
+        if isinstance(a, dict) and _sensitive_key(a.get("key", "")):
+            kind = str(a.get("key", "")).split(":", 1)[0]
+            red_active.append({"key": kind + ":", "message": "a monitored key crossed a threshold"})
+        else:
+            red_active.append(a)
+    red_history = []
+    for h in history or []:
+        if isinstance(h, dict) and str(h.get("kind", "")) in _ANOM_COST_KINDS:
+            red_history.append({"ts": h.get("ts"), "label": "(hidden)",
+                                "kind": h.get("kind"), "detail": "a monitored key crossed a threshold"})
+        else:
+            red_history.append(h)
+    return red_active, red_history
+
+
 def _finite_json(obj):
     """Recursively replace non-finite floats (NaN / Inf) with None. A single NaN/Inf reaching
     web.json_response (json.dumps default allow_nan=True) serializes as a bare `NaN`/`Infinity`
@@ -1724,6 +1804,13 @@ def _q_end(request: web.Request) -> float | None:
     # Reject non-finite (inf/-inf/nan, incl. overflow like 1e999): float() accepts them,
     # but they later blow up time.gmtime()/json in the pan handlers (uncaught 500). None = live.
     if f != f or f == float("inf") or f == float("-inf"):
+        return None
+    # Reject out-of-RANGE finite epochs too: a huge finite value (e.g. 1e18) passes the
+    # non-finite check above but still overflows time.gmtime() in the month handlers
+    # (OSError: value too large → uncaught 500). A pan cursor is always a past/near-now
+    # second, so cap it at now + 1yr; anything beyond is treated as live (None), same as an
+    # absent cursor. (No lower bound — small negatives are gmtime-safe and already accepted.)
+    if f > time.time() + 366 * 86400:
         return None
     return f
 
@@ -3871,10 +3958,14 @@ async def alerts_test_handler(request: web.Request) -> web.Response:
 
 
 async def anomalies_handler(request: web.Request) -> web.Response:
-    return web.json_response({
-        "active": _latest_anomalies,
-        "history": db.recent_anomalies(30),
-    })
+    # R-02: this endpoint sits outside _SPEND_SENSITIVE_API (viewers poll it live), but its
+    # messages carry per-key cost + aliases — redact them for non-admins under SPEND_REQUIRE_ADMIN.
+    _authed, _role, _ = _auth_ctx(request)
+    role = _role
+    if role == "admin" and _is_master_token_auth(request):
+        role = "viewer"        # the shared URL token is not a real admin for cost/PII
+    active, history = _redact_anomalies(_latest_anomalies, db.recent_anomalies(30), role)
+    return web.json_response({"active": active, "history": history})
 
 
 async def uptime_handler(request: web.Request) -> web.Response:
@@ -3885,6 +3976,51 @@ async def uptime_handler(request: web.Request) -> web.Response:
         "uptime": await asyncio.to_thread(db.uptime, window),
         "events": db.recent_events(30, kind="state"),
     })
+
+
+# F-07: bound concurrent SSE (/api/stream) connections. Each stream is a long-lived task
+# (up to 3600s) doing snapshot+redaction+serialization every SAMPLE_INTERVAL plus a DB read
+# per tick, so without a cap a single credential (or an anonymous client in open mode) could
+# open unbounded streams and exhaust memory/CPU/fds. `_sse_active` counts live streams per
+# CLIENT (login user / PAT owner, else source IP); `_sse_total` is the global count. The
+# check-then-increment is race-free under asyncio (no await between).
+_sse_active: dict[str, int] = {}
+_sse_total = 0
+
+
+def _stream_client_id(request: web.Request) -> str:
+    """Identity a stream's connection count is charged to: the login user, else the PAT
+    owner, else the source IP (covers the master token and open mode)."""
+    sess = _session_from_req(request)
+    if sess:
+        return "u:" + str(sess.get("user"))
+    pat = _pat_auth(request)
+    if pat:
+        return "u:" + str(pat[0])
+    return "ip:" + _client_ip(request)
+
+
+def _sse_acquire(cid: str) -> bool:
+    """Reserve one SSE slot for `cid` if under both the global and per-client caps."""
+    global _sse_total
+    if _sse_total >= config.SSE_MAX_TOTAL:
+        return False
+    if _sse_active.get(cid, 0) >= config.SSE_MAX_PER_CLIENT:
+        return False
+    _sse_active[cid] = _sse_active.get(cid, 0) + 1
+    _sse_total += 1
+    return True
+
+
+def _sse_release(cid: str) -> None:
+    """Release one SSE slot for `cid` (called from the handler's finally)."""
+    global _sse_total
+    n = _sse_active.get(cid, 0) - 1
+    if n > 0:
+        _sse_active[cid] = n
+    else:
+        _sse_active.pop(cid, None)
+    _sse_total = max(0, _sse_total - 1)
 
 
 async def stream_handler(request: web.Request) -> web.StreamResponse:
@@ -3901,9 +4037,18 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
     # /api/data (F-2). Without this, a non-admin viewer streaming here would receive full host
     # container names that MONITOR_CONTAINERS_ADMIN_ONLY hides on the polled endpoint.
     _authed, _role, _ = _auth_ctx(request)
-    await resp.prepare(request)
-    _started = _last_auth = time.time()
+    # F-07: refuse a new stream once this client (or the box) is at its concurrent-stream cap,
+    # BEFORE prepare() so the caller gets a clean 429 instead of another open event-stream.
+    _cid = _stream_client_id(request)
+    if not _sse_acquire(_cid):
+        return web.Response(status=429, text="too many concurrent streams",
+                            headers={"Retry-After": "30"})
+    # prepare() is INSIDE the try so a failure/cancel there (e.g. the client RSTs right after
+    # connecting) still hits the `finally` and releases the slot — otherwise the acquired slot
+    # would leak, and enough leaks would pin _sse_total at the cap and 429 every future stream.
     try:
+        await resp.prepare(request)
+        _started = _last_auth = time.time()
         while True:
             _now = time.time()
             # This is ONE long-lived request, so the per-request auth check doesn't re-run.
@@ -3927,6 +4072,8 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
         pass
     except Exception:
         pass
+    finally:
+        _sse_release(_cid)
     return resp
 
 
@@ -4097,7 +4244,16 @@ async def metrics_handler(request: web.Request) -> web.Response:
     extra = {"users": db.user_count(), "sessions": auth.session_count(),
              "alerts": len(_notifier.active_keys()),
              "db_errors": db.db_error_stats()["count"]}
-    body = metrics_prom.render(_latest, extra)
+    # R-03: /metrics must honour the same redaction as /api/data — otherwise a viewer session or
+    # the scrape-only METRICS_TOKEN recovers host container NAMES and the LiteLLM cost RATE that
+    # CONTAINERS_ADMIN_ONLY / SPEND_REQUIRE_ADMIN hide. Resolve role; a METRICS_TOKEN-only scrape
+    # has no session/PAT (role=None → non-admin), and the shared URL token is not a real admin.
+    _authed, _role, _ = _auth_ctx(request)
+    _mrole = _role
+    if _mrole == "admin" and _is_master_token_auth(request):
+        _mrole = "viewer"
+    _msnap = _redact_cost(_redact_containers(_latest, _mrole), _mrole)
+    body = metrics_prom.render(_msnap, extra)
     resp = web.Response(text=body)
     resp.headers["Content-Type"] = metrics_prom.CONTENT_TYPE
     return resp

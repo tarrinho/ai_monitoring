@@ -19,6 +19,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Patch openssl to the fixed build without unpinning the base digest (§9a keeps the
+# base pinned by @sha256; the pinned base lags fresh Alpine security bumps). Pulls the
+# CVE-2026-14456 fix (libcrypto3/libssl3 >= 3.5.8-r0) so the Trivy §10 gate stays green
+# between Dependabot base-digest bumps.
+RUN apk upgrade --no-cache libcrypto3 libssl3
+
 # openssh-client: agentless remote-GPU mode runs nvidia-smi over SSH.
 RUN apk add --no-cache openssh-client
 

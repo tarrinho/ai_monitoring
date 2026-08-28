@@ -1554,9 +1554,15 @@ async def key_budgets(session: aiohttp.ClientSession) -> dict | None:
         # object) or the /user/list directory keyed by ANY candidate id. Prefer an email.
         _km = k.get("metadata")
         meta = _km if isinstance(_km, dict) else {}
+        # OWNER precedence: the key's own user_email fields, then the directory-resolved email
+        # for its owner id (user_id first in id_cands), and ONLY THEN the creator's email
+        # (nested created_by_user). A key an admin provisions FOR a user carries the admin on
+        # created_by_user — ranking it above the owner mislabelled every such key with the
+        # creator's name on the by-user charts. It stays a fallback for the user_id-NULL case.
         uname = _pick_email(k.get("user_email"), k.get("litellm_user_email"),
-                            meta.get("user_email"), cbu.get("user_email"),
+                            meta.get("user_email"),
                             *(by_user_name.get(c, "") for c in id_cands),
+                            cbu.get("user_email"),
                             k.get("created_by"), k.get("user"))
         if not uname:                                      # no email → any readable name
             uname = str(by_user_name.get(uid, "") or cbu.get("user_alias")

@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 
-VERSION = "AI-Monitoring_1.8.20"
+VERSION = "AI-Monitoring_1.8.21"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -92,6 +92,11 @@ SESSION_TTL_S  = _float("MONITOR_SESSION_TTL_S", 7 * 24 * 3600.0)
 # Hard ceiling on concurrent server-side sessions (login + legacy-token), so the
 # in-memory session stores can't grow without bound. Oldest-expiring are evicted.
 SESSION_MAX    = _int("MONITOR_SESSION_MAX", 2000)
+# Concurrent Server-Sent-Events (/api/stream) connection caps, so a single credential
+# (or anonymous client in open mode) can't open unbounded long-lived streams and exhaust
+# memory/CPU/fds (F-07). Per-client = per login user / PAT owner, else per source IP.
+SSE_MAX_TOTAL      = _int("MONITOR_SSE_MAX_TOTAL", 200)
+SSE_MAX_PER_CLIENT = _int("MONITOR_SSE_MAX_PER_CLIENT", 12)
 # How long the access/admin audit trail is kept (days; admins review it in the UI).
 AUDIT_RETENTION_DAYS = _int("MONITOR_AUDIT_RETENTION_DAYS", 90)
 

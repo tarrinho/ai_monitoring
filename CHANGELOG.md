@@ -4,6 +4,52 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.21] — 2026-08-24
+
+### Security
+- **Route-scoped secure code review (OWASP) — two High access-control gaps closed that the STRIDE
+  pass missed, plus the folded Tier-A hardening set.** A whole-app review on top of the 2026-08-06
+  threat model found the cost/PII lock-down and open-mode enforcement were **incomplete on two
+  inline paths**:
+  - **SCR-01 (High) — open-mode admin surface was anonymously reachable.** With
+    `MONITOR_ALLOW_OPEN=1`, `_auth_mw` denied only `/admin/users*` and the alerts pages but **fell
+    through to the handler** for the rest of `/api/admin/*` and `/settings` — so an unauthenticated
+    caller could tamper config (disable alerts, shrink `AUDIT_RETENTION` for anti-forensics) and read
+    PII (owner emails, client IPs). The open-mode branch now denies the **full**
+    `_ADMIN_PAGES` + `_ADMIN_API_PREFIX` set (`/api/data` still serves). Covered by
+    `test_open_mode_denies_full_admin_surface`.
+  - **SCR-02 (High) — viewers read per-key cost / alias / key-id / upstream errors via `/api/data`
+    + `/api/stream`.** The `SPEND_REQUIRE_ADMIN` lock-down only covered the dedicated `/api/spend/*`
+    endpoints; the inline LiteLLM snapshot shipped on `/api/data` (latest **and** history) and
+    continuously over SSE with no role gate — the exact surface that flag exists to hide. New
+    `_redact_cost(snap, role)` strips `top_keys`, `recent_failures`, every top-level cost/spend/budget
+    field, and per-`per_model` cost fields (keeping model + usage counts) when
+    `SPEND_REQUIRE_ADMIN and role != "admin"`, applied at the same boundary for the snapshot, its
+    history, and the SSE write. This completes the T-21 plan (Task 9), which had covered only the
+    dedicated endpoints. Covered by `test_redact_cost_strips_litellm_snapshot_for_viewer`.
+- **Folded Tier-A hardening (from the same review):**
+  - **SCR-03 (Medium)** — `_strip_cost_series` gates the `costrate` column out of `/api/series` and
+    `/api/export` for non-admins under `SPEND_REQUIRE_ADMIN` (`test_strip_cost_series_gates_costrate_for_viewer`).
+  - **SCR-04 / SCR-13 (T-20 / T-29)** — `alerts._egress_text` secret-scrubs the webhook body and
+    neutralizes chat markup before egress (keeps our own `[machine]` bracket format, breaks link/mention
+    injection). Covered by `test_egress_text_scrubs_secret_and_neutralizes_markup`.
+  - **SCR-10 (T-23)** — byte-caps the containers-inspect and LiteLLM 4xx reads; **SCR-11 (T-24)** —
+    `allow_redirects=False` on both Docker socket GETs (`test_containers_collector_pins_redirects_and_caps_reads`).
+  - **SCR-12 (T-28)** — `config.validate()` now rejects a weak/placeholder `METRICS_TOKEN` /
+    `ADMIN_PASSWORD` / `CHANGE_ME` at boot (`test_validate_flags_weak_metrics_token_and_placeholder`).
+  - **T-31** — `db._assert_safe_ident` (identifier-pattern, fail-closed) at the `_pick_tier` table
+    chokepoint (`test_assert_safe_ident_fails_closed_on_injection`); **T-33** — NAT64 `64:ff9b::/96`
+    embedded-v4 addresses re-tested in the SSRF `_ip_blocked` guard (`test_ip_blocked_covers_nat64_embedded_v4`).
+- **Deferred (tracked, not in this release):** SCR-05 (T-22 per-user webhook scope), SCR-06 (T-25 PII
+  retention), SCR-07 (admin-deny audit), SCR-08 (PAT expiry), SCR-09 (webhook-test relay), SCR-14/15/16
+  (T-26 digest-pin / T-27 netpol egress / T-32 pid:host), SCR-17 latent (T-30 default-allow, T-34 GPU reap).
+
+### Changed
+- **Version bump to ship the secure-code-review remediations.** `1.8.20` was a no-code re-tag; the
+  SCR fixes above landed on disk afterward, so the built `1.8.20` image is stale (has SCR-01 but **not**
+  SCR-02). `1.8.21` is the first tag carrying the full Fix-approved set — rebuilt across all three
+  arches so "what's deployed" matches source. Report: `security-reports/2026-08-07-secure-code-review-ai-monitoring.md`.
+
 ## [1.8.20] — 2026-08-06
 
 ### Changed

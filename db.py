@@ -2957,6 +2957,19 @@ def api_token_revoke(tid: str, owner: str) -> bool:
         return False
 
 
+def api_tokens_revoke_all(owner: str) -> int:
+    """Delete EVERY personal access token for a user. Used on a password reset/force-reset so
+    a credential reset also cuts API access via any pre-existing PAT (delete/disable already
+    cascade; reset did not). Returns the number of tokens removed."""
+    try:
+        with _connect() as conn:
+            cur = conn.execute("DELETE FROM api_tokens WHERE owner = ?", (owner,))
+        return cur.rowcount or 0
+    except Exception as _e:
+        _dberr(_e)
+        return 0
+
+
 def api_token_touch(tid: str, ts: float) -> None:
     """Best-effort last-used stamp (throttled by the caller)."""
     try:
@@ -3013,10 +3026,10 @@ def user_webhooks_enabled() -> list[dict[str, Any]]:
     try:
         with _connect() as conn:
             rows = conn.execute(
-                "SELECT name, webhook_url FROM users WHERE webhook_enabled = 1 "
+                "SELECT name, webhook_url, role FROM users WHERE webhook_enabled = 1 "
                 "AND webhook_url IS NOT NULL AND webhook_url <> '' "
                 "AND disabled = 0 ORDER BY name").fetchall()
-        return [{"user": r[0], "url": r[1]} for r in rows]
+        return [{"user": r[0], "url": r[1], "role": r[2]} for r in rows]
     except Exception as _e:
         _dberr(_e)
         return []
