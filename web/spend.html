@@ -261,7 +261,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.23</div>
+      <div id="sidebar-brand-ver">v1.8.24</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -986,8 +986,8 @@ function renderTeams(keys){
     const tail=t.nb>0?`<span style="color:var(--warn)">${t.nb} unbudgeted</span>`
       :(t.reference>0?`<span style="color:var(--muted)">+ ${money(t.reference)} ref</span>`
                      :`<span>${t.n} key${t.n>1?"s":""}</span>`);
-    return `<div class="teamcard s-${t.st}">`
-      +`<div class="tt"><b>${escapeHtml(t.name)}</b><span class="pct c-${t.st}"`
+    return `<div class="teamcard s-${escapeHtml(t.st)}">`
+      +`<div class="tt"><b>${escapeHtml(t.name)}</b><span class="pct c-${escapeHtml(t.st)}"`
       +(t.mixed?' title="No team % shown: this team mixes keys whose spend resets with'
               +' keys whose spend is all-time, so their totals cannot be added and scored'
               +' against one cap."':'')
@@ -1059,7 +1059,7 @@ function renderKeys(keys){
       +`<td class="r" style="color:var(--muted)">${ref}</td>`
       +`<td class="r">${r.burn==null?'<span style="color:var(--muted)">—</span>':money(r.burn)}</td>`
       +`<td class="r ${dcls}">${dc}</td>`
-      +`<td class="r"><span class="bpill c-${r.status}"`
+      +`<td class="r"><span class="bpill c-${escapeHtml(r.status)}"`
       +(lifeCap?` title="${capTitle}"`:'')
       +`>${SLBL[r.status]}</span></td></tr>`
       +detail;

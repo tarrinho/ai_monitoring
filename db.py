@@ -785,18 +785,22 @@ def _upsert_known_with_owners(conn: Any, owners: dict[str, str], ts: float,
         rows)
 
 
-def hidden_unassigned() -> set[str]:
+def hidden_unassigned(conn: Any = None) -> set[str]:
     """Labels the per-key charts must drop because the "Unassigned" group is hidden
     (Settings → Keys → Hide unassigned keys). Empty — a pure no-op — while the toggle
     is off, so the default costs nothing and changes nothing. Read through
     `config.HIDE_UNASSIGNED_KEYS` at CALL time, not import time, because the tunable is
-    live-editable and `config._apply()` rebinds the module constant."""
+    live-editable and `config._apply()` rebinds the module constant.
+
+    `conn` (L7): reuse a caller's open connection for the reads instead of opening a fresh
+    one — the by-key chart reads call this + known_keys_set() before their own query, so
+    threading one connection through drops the per-read connection fan-out. None = open own."""
     if not getattr(config, "HIDE_UNASSIGNED_KEYS", False):
         return set()
-    return unassigned_labels()
+    return unassigned_labels(conn)
 
 
-def unassigned_labels() -> set[str]:
+def unassigned_labels(conn: Any = None) -> set[str]:
     """Labels LiteLLM reports NO owner for and that carry no admin user override — the
     keys the Settings board groups under "Unassigned". Mirrors that grouping exactly
     (settings.html: `k.user_grp || k.user || "__unassigned__"`), so hiding the group in
@@ -811,9 +815,12 @@ def unassigned_labels() -> set[str]:
     Treat it as a no-op until at least one owner is known — only then is empty-owner a
     trustworthy signal that LiteLLM genuinely names no owner."""
     try:
-        ovr = key_user_overrides()
-        with _connect() as conn:
+        ovr = key_user_overrides(conn)
+        if conn is not None:                 # L7: reuse the caller's connection when given
             rows = conn.execute("SELECT label, owner FROM known_keys").fetchall()
+        else:
+            with _connect() as c:
+                rows = c.execute("SELECT label, owner FROM known_keys").fetchall()
         if not any((o or "") for _, o in rows):
             return set()                     # owner never resolved → hide is a no-op
         return {lab for lab, o in rows if not (o or "") and not ovr.get(lab)}
@@ -822,12 +829,14 @@ def unassigned_labels() -> set[str]:
         return set()
 
 
-def known_keys_set() -> set[str]:
+def known_keys_set(conn: Any = None) -> set[str]:
     """All labels LiteLLM's /key/list has EVER confirmed valid (empty until the first
     successful key_budgets() poll — callers must treat 'empty' as 'no baseline yet',
     NOT as 'nothing is valid', or every by-key chart would blank out before the first
-    poll completes)."""
+    poll completes). `conn` (L7): reuse a caller's open connection; None = open own."""
     try:
+        if conn is not None:
+            return {r[0] for r in conn.execute("SELECT label FROM known_keys")}
         with _connect() as conn:
             return {r[0] for r in conn.execute("SELECT label FROM known_keys")}
     except Exception as _e:
@@ -871,9 +880,9 @@ def key_series(window: str, max_points: int = 300,
     # tier by window: raw ≤1h, 1-min ≤24h, 1-hour beyond (1-year history)
     table, tc = _pick_tier(secs, end, time.time(), "key_series", "key_series_1m", "key_series_1h")
     try:
-        known = known_keys_set()
-        hidden = hidden_unassigned()
         with _connect() as conn:
+            known = known_keys_set(conn)        # L7: share one connection for the lookups
+            hidden = hidden_unassigned(conn)
             # over-fetch, then drop excluded labels (the monitor's own key etc.) AND labels
             # LiteLLM's own /key/list has never confirmed as a real key (an unexpanded
             # '${ENV_VAR}' string, a made-up/revoked hash — a real but INVALID auth attempt)
@@ -983,9 +992,9 @@ def key_series_window_delta(window: str, top_n: int = 10,
     start = end - secs
     table, tc = _pick_tier(secs, end, time.time(), "key_series", "key_series_1m", "key_series_1h")
     try:
-        known = known_keys_set()
-        hidden = hidden_unassigned()
         with _connect() as conn:
+            known = known_keys_set(conn)        # L7: share one connection for the lookups
+            hidden = hidden_unassigned(conn)
             rows = conn.execute(
                 f"SELECT label, {tc}, reqs FROM {table} "
                 f"WHERE {tc} >= ? AND {tc} <= ? ORDER BY label, {tc}",
@@ -1723,24 +1732,34 @@ def uptime(window: str) -> dict[str, dict]:
                     "SELECT up FROM events WHERE backend=? AND ts<? "
                     "AND (kind='state' OR kind IS NULL) "
                     "ORDER BY ts DESC LIMIT 1", (b, start)).fetchone()
-                state = pre[0] if pre else 1
+                # L6: pre-window state is UNKNOWN, not assumed-up — and the denominator is the
+                # OBSERVED time, not the whole window. Defaulting to up + dividing by `secs` (the
+                # old behaviour) reported a backend whose first-ever event was a DOWN 3h into a 24h
+                # window as ~87.5% up — a healthy score for 21h the monitor never watched. Mirrors
+                # status_segments(), which fixed exactly this for the timeline lane.
+                state = pre[0] if pre else None
                 evs = conn.execute(
                     "SELECT ts,up FROM events WHERE backend=? AND ts>=? "
                     "AND (kind='state' OR kind IS NULL) "
                     "ORDER BY ts", (b, start)).fetchall()
                 up_time = 0.0
+                known = 0.0        # observed seconds — the uptime denominator
                 cursor = start
                 down_count = 0
                 for ts, up in evs:
-                    if state:
-                        up_time += ts - cursor
+                    if state is not None:
+                        known += ts - cursor
+                        if state:
+                            up_time += ts - cursor
                     if up == 0:
                         down_count += 1
                     state = up
                     cursor = ts
-                if state:
-                    up_time += now - cursor
-                out[b] = {"uptime_pct": round(up_time / secs * 100, 2),
+                if state is not None:
+                    known += now - cursor
+                    if state:
+                        up_time += now - cursor
+                out[b] = {"uptime_pct": round(up_time / known * 100, 2) if known else 0.0,
                           "outages": down_count}
             return out
     except Exception as _e:
@@ -2325,6 +2344,8 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
                 f"SELECT day, COALESCE(NULLIF(alias,''), key) AS label, SUM({col}) v "
                 f"FROM spend_model_user_daily WHERE day >= ? AND day <= ?{model_clause} "
                 "GROUP BY day, label ORDER BY day", tuple(params)).fetchall()
+            known = known_keys_set(conn)        # L7: share the connection for the lookups
+            hidden = hidden_unassigned(conn)
         if not rows:
             return {"labels": [], "metric": metric, "points": []}
         # rank keys by total over the span; keep the top-N
@@ -2340,8 +2361,6 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
         # drop excluded / unconfirmed / hidden-unassigned labels from top-N candidacy, same
         # as the sibling over-time chart (key_series) — this rollup-backed chart used to skip
         # the filter and surface them as their own lines.
-        known = known_keys_set()
-        hidden = hidden_unassigned()
         # require_known=False: a spend-rollup label is self-evidence of a real key (it billed a
         # completed request), so don't fold real spend into a vanished top-N slot just because
         # /key/list doesn't currently list it (master key / ephemeral virtual key). See _label_hidden.
@@ -2390,12 +2409,12 @@ def key_cost_window(days_back: int, end: float | None = None,
                 "SELECT COALESCE(NULLIF(alias,''), key) AS label, SUM(cost) c "
                 f"FROM spend_model_user_daily WHERE day >= ? AND day <= ?{model_clause} GROUP BY label",
                 tuple(params)).fetchall()
+            known = known_keys_set(conn)        # L7: share the connection for the lookups
+            hidden = hidden_unassigned(conn)
         # Fold excluded / unconfirmed / hidden-unassigned keys into "Other" rather than showing
         # them as named bands (this rollup-backed chart used to skip the filter entirely). Cost
         # is FOLDED, not dropped, so the window's total spend is preserved — a hidden key's
         # money stays visible in aggregate, it just loses its own labelled band.
-        known = known_keys_set()
-        hidden = hidden_unassigned()
         out: dict[str, float] = {}
         other = 0.0
         for label, c in rows:
@@ -2566,12 +2585,16 @@ def ui_layout_set(name: str, value, now: float) -> bool:
         return False
 
 
-def key_user_overrides() -> dict[str, str]:
-    """Admin-assigned per-key user/email overrides as {key: user_name}."""
+def key_user_overrides(conn: Any = None) -> dict[str, str]:
+    """Admin-assigned per-key user/email overrides as {key: user_name}. `conn` (L7): reuse a
+    caller's open connection; None = open own."""
     try:
-        with _connect() as conn:
+        if conn is not None:
             return {r[0]: r[1] for r in
                     conn.execute("SELECT key, user_name FROM key_user_ovr").fetchall()}
+        with _connect() as c:
+            return {r[0]: r[1] for r in
+                    c.execute("SELECT key, user_name FROM key_user_ovr").fetchall()}
     except Exception as _e:
         _dberr(_e)
         return {}

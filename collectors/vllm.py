@@ -242,8 +242,20 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, *,
                                allow_redirects=False) as resp:
             if resp.status >= 300:
                 return None, f"http {resp.status}"
-            raw = await resp.content.read(config.HTTP_MAX_BYTES)
-            return raw.decode("utf-8", "replace"), None
+            # M4: accumulate with iter_chunked, NOT a single read(n). read(n) returns only the
+            # currently-buffered bytes, so a multi-chunk /metrics (vLLM's exposition is routinely
+            # >64 KB) truncated → parse_prom silently folded PARTIAL text, dropping series like
+            # num_requests_waiting / kv_cache_usage_perc with no error. Drain the full body up to
+            # the cap; error (don't parse partial) if it somehow exceeds it.
+            cap = config.HTTP_MAX_BYTES
+            if resp.content_length is not None and resp.content_length > cap:
+                return None, f"body too large ({resp.content_length}B > {cap}B)"
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(65536):
+                buf += chunk
+                if len(buf) > cap:
+                    return None, f"body too large (>{cap}B)"
+            return bytes(buf).decode("utf-8", "replace"), None
     except aiohttp.ClientError as e:
         return None, f"conn: {type(e).__name__}"
     except Exception as e:                      # never let a backend kill the loop

@@ -101,7 +101,7 @@ async def sample(session: aiohttp.ClientSession) -> dict:
         "n_threads_batch": None,
     }
 
-    if perr is None and props:
+    if perr is None and isinstance(props, dict):   # L9: non-dict /props safe (list/scalar body)
         dm = props.get("default_generation_settings", {}) or {}
         pr = props.get("params") or {}          # some builds nest the run params here
         dp = dm.get("params") or {}             # newer builds: nested under gen-settings

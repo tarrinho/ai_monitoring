@@ -4,6 +4,62 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.24] — 2026-08-29
+
+### Security
+- **H1 (High) — the shared master/dashboard token no longer bypasses `SPEND_REQUIRE_ADMIN` /
+  `CONTAINERS_ADMIN_ONLY` redaction on the inline read endpoints.** `_auth_ctx` returns a nominal
+  `admin` role for the shared URL token, and the redactors no-op for admin — so `/api/data`,
+  `/api/stream`, `/api/series` and `/api/export` served per-key cost, owner aliases, upstream
+  errors and host container names to that token even with the lock-down on (the dedicated
+  `/api/spend/*` routes already 403'd it). `/metrics` and `/api/anomalies` had compensated inline;
+  the four busiest paths had not. New `_effective_role(request)` downgrades the master token to
+  `viewer` for redaction and is now the single resolver for all six paths (can't drift again).
+  Covered by `test_effective_role_downgrades_master_token`, `test_inline_read_handlers_use_effective_role`.
+- **M1 (Med)** — `config.validate()` now rejects a `CHANGE_ME` placeholder `MONITOR_DASHBOARD_TOKEN`
+  (the shipped k8s example was 25 chars, so it passed the length gate and booted with a
+  publicly-known token). `test_validate_rejects_change_me_dashboard_token`.
+- **M6 (Med)** — the LiteLLM `_parse_spend` hot loop + `_fold_model_user` / `_fold_model_token_types`
+  now guard `isinstance(row, dict)` and coerce cost/tokens with `_fnum` (never raises), so a
+  malformed / compromised / MITM'd `/spend/logs` body can't raise out of `sample()` and falsely mark
+  LiteLLM DOWN (dropping the tick's data). `test_parse_spend_survives_hostile_body`.
+- **L5** — the webhook SSRF guard `_ip_blocked` now decodes 6to4 (`2002::/16`) embedded IPv4, like
+  NAT64. `test_ip_blocked_covers_6to4_embedded_v4`.
+
+### Fixed
+- **M4** — vLLM `fetch_text` and **M5** — the shared `fetch_json` now drain the response body with
+  `iter_chunked` instead of a single `StreamReader.read(n)` (which returns only the buffered bytes):
+  a multi-chunk vLLM `/metrics` was silently truncated → wrong queue/KV/throughput numbers, and a
+  large-but-under-cap chunked JSON failed to refresh its panel. `test_collectors_read_bodies_with_iter_chunked_not_single_read`.
+- **M2** — `Notifier.process` writes `alert_log` via `asyncio.to_thread` (was a synchronous SQLite
+  write on the event loop in the alert hot path). **M3** — `Notifier._last` is now pruned (it was
+  stamped per fire/recover and never cleared → slow memory growth with rotating key aliases).
+- **L1** — `_q_end` rejects a pan cursor `time.gmtime()` can't represent (e.g. `-1e18` → `OSError`
+  → uncaught 500 on the month/pan handlers), via a direct gmtime probe that still accepts every
+  legitimate historical epoch. `test_q_end_rejects_large_negative_cursor`.
+- **L6** — `db.uptime()` divides by OBSERVED time with an unknown pre-window state (was assumed-up ÷
+  full window → a backend first seen DOWN 1h into a 24h window reported ~95% up), matching
+  `status_segments()`. `test_uptime_uses_observed_time_not_full_window`.
+- **L2** — `/metrics` strikes the brute-force lockout only on a presented token, not a stale session
+  cookie (matches the main middleware — avoids locking out an auto-polling dashboard).
+- **L3** — `ALERT_ON_BACKEND_DOWN` honours the `off`/`no`/`false` disable vocabulary; **L4** —
+  `ALERT_REPEAT_MIN` is floored at 1 so an env `0` can't defeat the debounce.
+  `test_config_backend_down_vocab_and_repeat_min_floor`.
+- **L8** — the anomalies / uptime-events / events reads run off the event loop (`asyncio.to_thread`).
+- **L9** — the Ollama (`/api/ps`, `/api/tags`, `/api/version`) and llama.cpp (`/props`) collectors
+  guard a non-dict body instead of raising (which would falsely mark the backend DOWN).
+- **L10** — the Spend status-pill class tokens and the LiteLLM usage-mix bar widths are escaped /
+  numeric-coerced before interpolation (defense-in-depth; already DOMPurify-mitigated).
+
+### Deferred (documented, not fixed)
+- **L7** (per-read SQLite connection fan-out on the by-key chart reads) — perf-only Low; the fix
+  threads pre-fetched sets through four correctness-sensitive read paths, disproportionate refactor
+  risk for a bounded per-request cost.
+- **L11** (nav / alert-dot cosmetic pollers swallow transient errors) — surfacing them adds UI noise
+  on every poll blip; the primary data path already surfaces errors.
+
+Full review report: `security-reports/2026-08-29-full-review-1.8.23.md`.
+
 ## [1.8.23] — 2026-08-28
 
 ### Added

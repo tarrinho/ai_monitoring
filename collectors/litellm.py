@@ -464,8 +464,8 @@ def _fold_model_token_types(logs: list, start_epoch: float,
         if config.key_excluded(kid, alias):
             continue
         model = str(row.get("model") or row.get("model_name") or "?")
-        pt = int(row.get("prompt_tokens", 0) or 0)
-        ct = int(row.get("completion_tokens", 0) or 0)
+        pt = int(_fnum(row.get("prompt_tokens", 0)))       # M6: _fnum never raises on a bad value
+        ct = int(_fnum(row.get("completion_tokens", 0)))
         cached = min(pt, _row_cached_tokens(row))   # cached is a subset of prompt
         e = out.setdefault(model, {"input": 0, "cached": 0, "output": 0, "total": 0})
         e["input"] += max(0, pt - cached)
@@ -1860,9 +1860,9 @@ def _fold_model_user(logs: list) -> list[dict]:
         if not kid or kid == "?" or _is_health_check_key(kid):
             continue
         model = str(row.get("model") or row.get("model_name") or "?")
-        spend = float(row.get("response_cost",
-                      row.get("spend", row.get("cost", 0))) or 0)
-        tok = int(row.get("total_tokens", 0) or 0)
+        spend = _fnum(row.get("response_cost",                # M6: safe coercion, never raises
+                      row.get("spend", row.get("cost", 0))))
+        tok = int(_fnum(row.get("total_tokens", 0)))
         day = datetime.fromtimestamp(st, tz=timezone.utc).strftime("%Y-%m-%d")
         alias = str(row.get("key_alias") or row.get("api_key_alias")
                     or meta.get("user_api_key_alias") or "")
@@ -2018,7 +2018,8 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
     if total > max_rows:
         logs = sorted(
             logs,
-            key=lambda r: _parse_ts(r.get("startTime") or r.get("start_time")) or 0.0
+            key=lambda r: (_parse_ts(r.get("startTime") or r.get("start_time"))
+                           if isinstance(r, dict) else None) or 0.0    # M6: non-dict-safe sort key
         )[-max_rows:]
     _kept = 0
     if logs:
@@ -2033,6 +2034,12 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
         per: dict[str, dict] = {}
         per_key: dict[str, dict] = {}
         for row in logs:
+            # M6: a malformed / compromised / MITM'd /spend/logs may carry non-dict elements
+            # (e.g. `[1, null]`) — `.get` on those raises out of sample() and the backend loop
+            # then falsely marks LiteLLM DOWN and drops the whole tick. Skip anything not a dict,
+            # like every other parser in this file.
+            if not isinstance(row, dict):
+                continue
             st = _parse_ts(row.get("startTime") or row.get("start_time"))
             en = _parse_ts(row.get("endTime") or row.get("end_time"))
             if st is None or en is None or en < window_start:
@@ -2043,12 +2050,13 @@ def _parse_spend(logs: list, window_start: float, max_rows: int) -> tuple[dict, 
             _kept += 1
             waits.append(dur_ms)
             model = row.get("model") or row.get("model_name") or "?"
-            # response_cost is the canonical StandardLoggingPayload field
-            spend = float(row.get("response_cost",
-                          row.get("spend", row.get("cost", 0))) or 0)
-            tok = int(row.get("total_tokens", 0) or 0)
-            pt = int(row.get("prompt_tokens", 0) or 0)
-            ct = int(row.get("completion_tokens", 0) or 0)
+            # response_cost is the canonical StandardLoggingPayload field. _fnum never raises on a
+            # bad/non-numeric value (returns 0.0), unlike the raw float()/int() this used to use.
+            spend = _fnum(row.get("response_cost",
+                          row.get("spend", row.get("cost", 0))))
+            tok = int(_fnum(row.get("total_tokens", 0)))
+            pt = int(_fnum(row.get("prompt_tokens", 0)))
+            ct = int(_fnum(row.get("completion_tokens", 0)))
             status = str(row.get("status", "")).lower()
             is_err = bool(row.get("exception")) or status in ("failure", "error")
             # TTFT: completionStartTime - startTime (streaming requests only)

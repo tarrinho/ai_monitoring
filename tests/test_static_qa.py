@@ -640,6 +640,33 @@ def test_litellm_load_controls_present_and_documented():
         assert var in readme, f"README missing {var}"
 
 
+def test_env_example_documents_every_config_var():
+    """rules.md §15 parity, now ENFORCED: `.env.example` must list EVERY env var config.py reads
+    (via `_str`/`_int`/`_float`/`_bool`/`_json("NAME", …)`). A new config knob without a documented
+    default fails here instead of silently drifting (this was a standing manual-only check)."""
+    cfg = (ROOT / "config.py").read_text(encoding="utf-8")
+    env = (ROOT / ".env.example").read_text(encoding="utf-8")
+    read_vars = sorted(set(re.findall(
+        r'_(?:str|int|float|bool|json)\("([A-Z][A-Z0-9_]+)"', cfg)))
+    missing = [v for v in read_vars if v not in env]
+    assert not missing, f".env.example is missing config vars: {missing}"
+
+
+def test_readme_test_count_not_overstated():
+    """rules.md §15: the README's '<N>+ tests' figure must never OVERSTATE the suite — N must not
+    exceed the number of test functions defined under tests/ (a conservative lower bound on the
+    collected count; round DOWN, never up)."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    m = re.search(r'(\d+)\+\s*tests', readme)
+    assert m, "README must state an approximate suite size ('N+ tests')"
+    claimed = int(m.group(1))
+    defined = sum(
+        len(re.findall(r'^\s*(?:async\s+def|def)\s+test_', p.read_text(encoding="utf-8"), re.M))
+        for p in (ROOT / "tests").glob("test_*.py"))
+    assert claimed <= defined, \
+        f"README claims {claimed}+ tests but only {defined} test functions are defined"
+
+
 def test_litellm_heavy_parse_runs_off_event_loop():
     """The /spend/logs aggregation must be dispatched to a thread (asyncio.to_thread)
     so a big log pull never blocks the event loop (F2)."""
@@ -651,7 +678,17 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.23"
+    assert config.VERSION == "AI-Monitoring_1.8.24"
+
+
+def test_collectors_read_bodies_with_iter_chunked_not_single_read():
+    """M4/M5: fetch_json + vllm.fetch_text must drain the body with iter_chunked (a single
+    StreamReader.read(n) short-reads a multi-chunk body → truncated JSON / silently-wrong vLLM
+    metrics). Guards against regressing back to the single-read pattern."""
+    fj = (ROOT / "collectors" / "__init__.py").read_text(encoding="utf-8")
+    assert "iter_chunked(" in fj and "content.read(cap + 1)" not in fj
+    vt = (ROOT / "collectors" / "vllm.py").read_text(encoding="utf-8")
+    assert "iter_chunked(" in vt and "content.read(config.HTTP_MAX_BYTES)" not in vt
 
 
 def test_litellm_per_model_filter_phase2_wiring():

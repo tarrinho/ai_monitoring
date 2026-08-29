@@ -781,6 +781,21 @@ def _is_master_token_auth(request: web.Request) -> bool:
     return _token_ok(_request_token(request)) or _token_cookie_valid(request)
 
 
+def _effective_role(request: web.Request) -> tuple[bool, str | None, dict | None]:
+    """Like `_auth_ctx`, but downgrades the shared master/dashboard token from its nominal
+    'admin' to 'viewer' FOR COST/PII REDACTION (H1). The master token is a broad, shareable
+    secret that rides in the dashboard URL, so under SPEND_REQUIRE_ADMIN / CONTAINERS_ADMIN_ONLY
+    it must NOT read per-key cost, owner aliases, or host container names — the same rule
+    `/metrics` and `/api/anomalies` already applied inline. Every cost/PII-redacting read path
+    (`/api/data`, `/api/stream`, `/api/series`, `/api/export`, `/metrics`, `/api/anomalies`)
+    resolves its role through THIS helper so the four inline paths can't silently drift back to
+    the un-downgraded `_auth_ctx` role again."""
+    authed, role, sess = _auth_ctx(request)
+    if role == "admin" and _is_master_token_auth(request):
+        role = "viewer"
+    return authed, role, sess
+
+
 # HTML pages that require auth (static assets + /healthz + /login stay open).
 _PAGES = ("/", "/spend", "/litellm", "/gpu", "/ollama", "/llamacpp", "/vllm",
           "/network", "/alerts", "/admin/users", "/account", "/settings")
@@ -1757,7 +1772,7 @@ async def data_handler(request: web.Request) -> web.Response:
     except ValueError:
         n = 180
     n = max(1, min(n, config.RETENTION_SAMPLES))
-    _, _role, _ = _auth_ctx(request)               # role gates container-name visibility (F-2)
+    _, _role, _ = _effective_role(request)         # role gates container-name visibility (F-2) + master-token downgrade (H1)
     hist = [_redact_cost(_redact_containers(h, _role), _role) for h in list(_ring)[-n:]]
     return web.json_response(_finite_json({
         "version": config.VERSION,
@@ -1783,7 +1798,7 @@ async def series_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 300
     pts = max(30, min(pts, 1000))
-    _, _role, _ = _auth_ctx(request)
+    _, _role, _ = _effective_role(request)         # master-token downgrade (H1)
     rows = await asyncio.to_thread(db.series, window, pts, end=_q_end(request))
     return web.json_response({
         "window": window,
@@ -1809,8 +1824,16 @@ def _q_end(request: web.Request) -> float | None:
     # non-finite check above but still overflows time.gmtime() in the month handlers
     # (OSError: value too large → uncaught 500). A pan cursor is always a past/near-now
     # second, so cap it at now + 1yr; anything beyond is treated as live (None), same as an
-    # absent cursor. (No lower bound — small negatives are gmtime-safe and already accepted.)
+    # absent cursor.
     if f > time.time() + 366 * 86400:
+        return None
+    # (L1) A large-magnitude NEGATIVE like -1e18 is finite and ≤ now+1yr, but time.gmtime(-1e18)
+    # raises OSError [Errno 75] → uncaught 500 in the month/pan handlers. Small negatives are
+    # legitimately gmtime-safe (and the spend pages pan years back), so don't guess a numeric
+    # floor: probe gmtime directly and reject only what it genuinely can't represent.
+    try:
+        time.gmtime(f)
+    except (OSError, ValueError, OverflowError):
         return None
     return f
 
@@ -3986,11 +4009,9 @@ async def alerts_test_handler(request: web.Request) -> web.Response:
 async def anomalies_handler(request: web.Request) -> web.Response:
     # R-02: this endpoint sits outside _SPEND_SENSITIVE_API (viewers poll it live), but its
     # messages carry per-key cost + aliases — redact them for non-admins under SPEND_REQUIRE_ADMIN.
-    _authed, _role, _ = _auth_ctx(request)
-    role = _role
-    if role == "admin" and _is_master_token_auth(request):
-        role = "viewer"        # the shared URL token is not a real admin for cost/PII
-    active, history = _redact_anomalies(_latest_anomalies, db.recent_anomalies(30), role)
+    _authed, role, _ = _effective_role(request)    # master-token downgrade (H1) — shared helper
+    _recent = await asyncio.to_thread(db.recent_anomalies, 30)   # L8: off the event loop
+    active, history = _redact_anomalies(_latest_anomalies, _recent, role)
     return web.json_response({"active": active, "history": history})
 
 
@@ -4000,7 +4021,7 @@ async def uptime_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "window": window,
         "uptime": await asyncio.to_thread(db.uptime, window),
-        "events": db.recent_events(30, kind="state"),
+        "events": await asyncio.to_thread(db.recent_events, 30, kind="state"),   # L8: off-loop
     })
 
 
@@ -4062,7 +4083,7 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
     # Resolve role at connect so the SSE feed honours the same container-name redaction as
     # /api/data (F-2). Without this, a non-admin viewer streaming here would receive full host
     # container names that MONITOR_CONTAINERS_ADMIN_ONLY hides on the polled endpoint.
-    _authed, _role, _ = _auth_ctx(request)
+    _authed, _role, _ = _effective_role(request)   # master-token downgrade (H1)
     # F-07: refuse a new stream once this client (or the box) is at its concurrent-stream cap,
     # BEFORE prepare() so the caller gets a clean 429 instead of another open event-stream.
     _cid = _stream_client_id(request)
@@ -4084,7 +4105,7 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
             if _now - _started > 3600:
                 break
             if _now - _last_auth > 30:
-                _authed, _role, _ = _auth_ctx(request)
+                _authed, _role, _ = _effective_role(request)   # master-token downgrade (H1)
                 if not _authed:
                     break
                 _last_auth = _now
@@ -4112,10 +4133,9 @@ async def events_handler(request: web.Request) -> web.Response:
         limit = max(1, min(int(request.query.get("limit", "40")), 200))
     except ValueError:
         limit = 40
-    return web.json_response({
-        "kind": kind,
-        "events": db.recent_events(limit, kind=None if kind == "all" else kind),
-    })
+    _evs = await asyncio.to_thread(db.recent_events, limit,   # L8: off the event loop
+                                   kind=None if kind == "all" else kind)
+    return web.json_response({"kind": kind, "events": _evs})
 
 
 # Services shown on the Alerts status timeline, in lane order. The monitoring
@@ -4178,7 +4198,7 @@ async def export_handler(request: web.Request) -> web.Response:
     fmt = request.query.get("format", "csv").lower()
     # honour the pan/zoom cursor: without it a zoomed or panned view silently exported a
     # same-duration window ending NOW, i.e. not the range the user was looking at
-    _, _role, _ = _auth_ctx(request)
+    _, _role, _ = _effective_role(request)         # master-token downgrade (H1)
     pts = _strip_cost_series(
         await asyncio.to_thread(db.series, window, 1000, end=_q_end(request)), _role)
     # drop the cost column header too when it's been stripped for a non-admin (SCR-03)
@@ -4262,7 +4282,10 @@ async def metrics_handler(request: web.Request) -> web.Response:
             return web.json_response({"error": "too many attempts"}, status=429,
                                      headers={"Retry-After": str(int(rem))})
         if not _metrics_authed(request):
-            if _request_token(request) or request.cookies.get(_USER_COOKIE):
+            # L2: strike only on a presented TOKEN, never a stale session cookie — mirrors the
+            # main middleware, which deliberately avoids locking out an operator whose expired
+            # aimon_user cookie is replayed by an auto-polling dashboard (or a spoofed IP).
+            if _request_token(request):
                 _record_strike(ip, now)
             return web.Response(text="unauthorized\n", status=401)
         _auth_fails.pop(ip, None)
@@ -4274,10 +4297,7 @@ async def metrics_handler(request: web.Request) -> web.Response:
     # the scrape-only METRICS_TOKEN recovers host container NAMES and the LiteLLM cost RATE that
     # CONTAINERS_ADMIN_ONLY / SPEND_REQUIRE_ADMIN hide. Resolve role; a METRICS_TOKEN-only scrape
     # has no session/PAT (role=None → non-admin), and the shared URL token is not a real admin.
-    _authed, _role, _ = _auth_ctx(request)
-    _mrole = _role
-    if _mrole == "admin" and _is_master_token_auth(request):
-        _mrole = "viewer"
+    _authed, _mrole, _ = _effective_role(request)  # master-token downgrade (H1) — shared helper
     _msnap = _redact_cost(_redact_containers(_latest, _mrole), _mrole)
     body = metrics_prom.render(_msnap, extra)
     resp = web.Response(text=body)

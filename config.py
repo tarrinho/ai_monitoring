@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 
-VERSION = "AI-Monitoring_1.8.23"
+VERSION = "AI-Monitoring_1.8.24"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:
@@ -389,8 +389,13 @@ ALERT_BACKLOG       = _float("ALERT_BACKLOG", 0.0)      # LiteLLM queue depth
 # vLLM queue depth: `running` means busy, but `waiting` means requests are QUEUED —
 # the saturation signal. 0 disables, like every other threshold here.
 ALERT_VLLM_WAITING  = _float("ALERT_VLLM_WAITING", 0.0)
-ALERT_ON_BACKEND_DOWN = _str("ALERT_ON_BACKEND_DOWN", "1") not in ("0", "false", "")
-ALERT_REPEAT_MIN    = _float("ALERT_REPEAT_MIN", 30.0)  # re-notify cooldown
+# L3: accept the same disable vocabulary as every other bool here — a bare "off"/"no"/"False"
+# meant to silence backend-down paging must actually disable it, not read as truthy.
+ALERT_ON_BACKEND_DOWN = (_str("ALERT_ON_BACKEND_DOWN", "1") or "").strip().lower() not in (
+    "0", "false", "no", "off", "")
+# L4: floor at 1 minute so an env ALERT_REPEAT_MIN=0 can't defeat the debounce (a flapping/
+# persistently-firing alert would post every sample tick). Mirrors the Settings-UI `min: 1`.
+ALERT_REPEAT_MIN    = max(1.0, _float("ALERT_REPEAT_MIN", 30.0))  # re-notify cooldown
 # Consecutive failed samples before a backend is called DOWN. One failed poll is not an outage
 # (a TLS-handshake blip, a proxy reload, a backend GC pause all produce one), and paging on it
 # trains people to ignore the channel. 3 ≈ 15s at the default 5s interval — fast enough for a
@@ -553,7 +558,13 @@ def validate(user_count: int = 0) -> list[str]:
                     "(/spend and /health need the master key)")
     # A too-short shared token is brute-forceable; refuse to boot with one so it
     # can't silently protect the dashboard with ~nothing. Use a long random token.
-    if DASHBOARD_TOKEN and len(DASHBOARD_TOKEN) < 16:
+    if DASHBOARD_TOKEN and "CHANGE_ME" in DASHBOARD_TOKEN:
+        # M1: the shipped k8s Secret example uses CHANGE_ME_DASHBOARD_TOKEN (25 chars), which
+        # passed the length gate below — booting with a publicly-known token is a silent auth
+        # bypass. Reject the placeholder outright, same as METRICS_TOKEN / ADMIN_PASSWORD.
+        errs.append("MONITOR_DASHBOARD_TOKEN is a CHANGE_ME placeholder — set a real, "
+                    "random value (e.g. `openssl rand -base64 24`)")
+    elif DASHBOARD_TOKEN and len(DASHBOARD_TOKEN) < 16:
         errs.append("MONITOR_DASHBOARD_TOKEN too short (<16 chars) — use a long, "
                     "random token (e.g. `openssl rand -base64 24`)")
     # T-28: the same strength gate for the other boot credentials — a short scrape token or a

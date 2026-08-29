@@ -143,6 +143,9 @@ _BLOCKED_MSG = "URL resolves to a private/loopback/reserved address (blocked)"
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # NAT64 well-known prefix (RFC 6052) — embeds an IPv4 target in the low 32 bits.
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
+# 6to4 (RFC 3056) — 2002:V4::/16 carries a routable IPv4 in bits 16-47; on a host with a 6to4
+# relay it routes to that v4, so the embedded address must be re-checked like NAT64 (L5).
+_6TO4 = ipaddress.ip_network("2002::/16")
 
 
 def _ip_blocked(ip_str: str) -> bool:
@@ -159,6 +162,9 @@ def _ip_blocked(ip_str: str) -> bool:
     # the embedded v4 rather than trusting it.
     if isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64:
         return _ip_blocked(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
+    # 6to4 (2002:V4::/16): the embedded v4 sits in bits 16-47 — extract and re-test it (L5).
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _6TO4:
+        return _ip_blocked(str(ipaddress.IPv4Address((int(ip) >> 80) & 0xFFFFFFFF)))
     return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
             or ip.is_multicast or ip.is_unspecified
             or (ip.version == 4 and ip in _CGNAT))
@@ -647,7 +653,7 @@ class Notifier:
             self._last[key] = now
             self._notified.add(key)
             sent.append(msg)
-            db.record_alert(now, key, "fire", msg)
+            await asyncio.to_thread(db.record_alert, now, key, "fire", msg)   # M2: off the event loop
             _LOG.warning("alert fired", extra={"key": key, "detail": msg,
                                                "machine": _machine(snap)})
         for key in recoveries:
@@ -658,7 +664,7 @@ class Notifier:
             self._last[key] = now          # stamp, don't clear: a re-fire waits out the cooldown
             self._notified.discard(key)
             sent.append(f"recovered:{key}")
-            db.record_alert(now, key, "recover", rmsg)
+            await asyncio.to_thread(db.record_alert, now, key, "recover", rmsg)   # M2: off the event loop
             _LOG.info("alert recovered", extra={"key": key, "detail": rmsg,
                                                 "machine": _machine(snap)})
         # HELD keys stay active so the window closing on a still-down backend emits nothing new.
@@ -667,6 +673,16 @@ class Notifier:
         # 'unconfigured'/'starting' sample (a dying GPU driver does exactly that), which paged
         # once per alternation instead of once per cooldown.
         self._active = (firing | (self._active & held)) - cancelled
+        # M3: bound `_last`. It is stamped for every fire/recover and (unlike `_active`/`_notified`)
+        # was never pruned, so an unbounded anomaly-key space (spike:/budget:<rotating-alias>) grew
+        # it forever on a months-long process. Once it exceeds a small ceiling, drop stamps for keys
+        # that are no longer active and whose cooldown has elapsed (a still-relevant key keeps its
+        # stamp so the debounce is unaffected).
+        if len(self._last) > 512:
+            _cut = now - config.ALERT_REPEAT_MIN * 60
+            for _k in [k for k, t in self._last.items()
+                       if k not in self._active and t < _cut]:
+                self._last.pop(_k, None)
         self._notified -= cancelled
         return sent
 

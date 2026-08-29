@@ -42,7 +42,9 @@ async def sample(session: aiohttp.ClientSession) -> dict:
 
     running = []
     ram_total = vram_total = 0
-    for m in (ps or {}).get("models", []) or []:
+    for m in ((ps if isinstance(ps, dict) else {}).get("models", []) or []):   # L9: non-dict /api/ps safe
+        if not isinstance(m, dict):
+            continue
         size = int(m.get("size", 0) or 0)
         vram = int(m.get("size_vram", 0) or 0)
         det = m.get("details") or {}
@@ -59,8 +61,8 @@ async def sample(session: aiohttp.ClientSession) -> dict:
             "expires_at": m.get("expires_at"),
         })
 
-    installed = len(tags.get("models", []) or []) if (terr is None and tags) else 0
-    version = ver.get("version") if (verr is None and ver) else None
+    installed = len(tags.get("models", []) or []) if (terr is None and isinstance(tags, dict)) else 0
+    version = ver.get("version") if (verr is None and isinstance(ver, dict)) else None
 
     # overall GPU-resident share across all running models
     gpu_pct = round(vram_total / ram_total * 100, 1) if ram_total else 0.0

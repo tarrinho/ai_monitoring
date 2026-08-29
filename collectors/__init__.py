@@ -44,9 +44,17 @@ async def fetch_json(
             cap = config.HTTP_MAX_BYTES
             if resp.content_length is not None and resp.content_length > cap:
                 return None, f"body too large ({resp.content_length}B > {cap}B)"
-            raw = await resp.content.read(cap + 1)
-            if len(raw) > cap:
-                return None, f"body too large (>{cap}B)"
+            # M5: accumulate with iter_chunked, NOT a single read(n). A StreamReader.read(n)
+            # returns only what is currently buffered (up to n), so on a multi-chunk body it
+            # truncates — a large-but-under-cap chunked JSON (LiteLLM /key/list pages,
+            # /model/info, /global/activity/model) would then fail json.loads and blank the
+            # panel. iter_chunked drains the whole body (same pattern as containers/_fetch_spend_raw).
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(65536):
+                buf += chunk
+                if len(buf) > cap:
+                    return None, f"body too large (>{cap}B)"
+            raw = bytes(buf)
             return (json.loads(raw) if raw else None), None
     except aiohttp.ClientError as e:
         return None, f"conn: {type(e).__name__}"

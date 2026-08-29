@@ -232,7 +232,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.23</div>
+      <div id="sidebar-brand-ver">v1.8.24</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -710,8 +710,8 @@ async function loadModels(){
     const unk=(u.unknown&&u.unknown.reqs)||0;
     mix=`<div style="display:flex;height:8px;border-radius:5px;overflow:hidden;`
       +`box-shadow:inset 0 0 0 1px var(--line);margin:2px 0 8px">`
-      +`<span style="width:${refPct}%;background:var(--ok)"></span>`
-      +`<span style="width:${realPct}%;background:var(--accent)"></span>`
+      +`<span style="width:${+refPct||0}%;background:var(--ok)"></span>`
+      +`<span style="width:${+realPct||0}%;background:var(--accent)"></span>`
       +`<span style="flex:1;background:var(--panel2)"></span></div>`
       +`<div class="unavail" style="margin:0 0 8px">`
       +`<b style="color:var(--ok)">${refPct}% of tokens self-hosted</b> (reference cost) · `

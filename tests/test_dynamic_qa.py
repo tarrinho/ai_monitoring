@@ -9539,7 +9539,9 @@ def test_stream_handler_redacts_containers_for_non_admin():
     body = src.split("async def stream_handler", 1)[1].split("\nasync def ", 1)[0]
     assert "_redact_containers(_snapshot_for_display(_latest)" in body, \
         "stream_handler must redact the snapshot with the role"
-    assert "_auth_ctx(request)" in body, "stream_handler must resolve the role at connect"
+    # H1: role is resolved via _effective_role (which downgrades the shared master token to
+    # viewer for redaction), not the raw _auth_ctx that treats the master token as admin.
+    assert "_effective_role(request)" in body, "stream_handler must resolve role via _effective_role"
 
 
 async def test_open_mode_denies_user_management(monkeypatch):
@@ -13002,3 +13004,115 @@ async def test_status_timeline_endpoint_surfaces_unknown_and_since(tmp_path, mon
     assert any(s["up"] is None for s in svc["segments"]), "unobserved time must reach the client"
     assert not any(s["up"] is True for s in svc["segments"]), "no fabricated up run"
     assert svc["uptime_pct"] == 0.0
+
+
+# ---------- 2026-08-29 full-review fix regressions ----------
+
+def test_effective_role_downgrades_master_token(monkeypatch):
+    """H1: the shared master/dashboard token is nominally admin but must resolve to VIEWER for
+    cost/PII redaction on every inline read path."""
+    from aiohttp.test_utils import make_mocked_request
+    tok = "H1tokenABCDEFGHIJ123456"
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", tok)
+    req = make_mocked_request("GET", "/api/data?token=" + tok)
+    assert appmod._auth_ctx(req)[1] == "admin"          # nominal role
+    assert appmod._effective_role(req)[1] == "viewer"   # downgraded for redaction
+
+
+def test_inline_read_handlers_use_effective_role():
+    """H1: the four inline read handlers resolve role via _effective_role (not _auth_ctx), so the
+    master token can't skip SPEND_REQUIRE_ADMIN / CONTAINERS_ADMIN_ONLY redaction."""
+    import inspect
+    for fn in (appmod.data_handler, appmod.series_handler,
+               appmod.export_handler, appmod.stream_handler):
+        assert "_effective_role" in inspect.getsource(fn), \
+            f"{fn.__name__} must resolve role via _effective_role"
+
+
+def test_validate_rejects_change_me_dashboard_token(monkeypatch):
+    """M1: a CHANGE_ME placeholder dashboard token (the shipped k8s Secret example) must fail
+    validate() outright, not just the <16 length gate."""
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "CHANGE_ME_DASHBOARD_TOKEN")
+    assert any("MONITOR_DASHBOARD_TOKEN" in e and "CHANGE_ME" in e for e in config.validate())
+
+
+def test_parse_spend_survives_hostile_body():
+    """M6: a malformed/compromised /spend/logs (non-dict rows, non-numeric cost/tokens) must NOT
+    raise out of the parser — else the backend loop falsely marks LiteLLM DOWN and drops the tick."""
+    now = time.time()
+    rows = [
+        {"startTime": now - 5, "endTime": now, "model": "m",
+         "response_cost": "abc", "total_tokens": "xx"},   # non-numeric
+        [1, 2, 3], None, "junk",                          # non-dict rows
+        {"startTime": now - 4, "endTime": now, "model": "m",
+         "response_cost": 0.5, "total_tokens": 10},
+    ]
+    res, kept, total = litellm._parse_spend(rows, now - 3600, 20000)   # must not raise
+    assert isinstance(res, dict) and kept >= 1
+
+
+def test_q_end_rejects_large_negative_cursor():
+    """L1: a large-magnitude negative ?end= must read as live (None), never reach time.gmtime()."""
+    from aiohttp.test_utils import make_mocked_request
+    assert appmod._q_end(make_mocked_request("GET", "/x?end=-1e18")) is None
+    ok = time.time() - 3600
+    assert appmod._q_end(make_mocked_request("GET", f"/x?end={ok:.0f}")) is not None
+
+
+def test_ip_blocked_covers_6to4_embedded_v4():
+    """L5: 6to4 (2002::/16) embeds a routable v4 in bits 16-47 — re-check it like NAT64."""
+    assert alerts._ip_blocked("2002:7f00:0001::") is True   # embeds 127.0.0.1 (loopback)
+    assert alerts._ip_blocked("2002:0a00:0001::") is True   # embeds 10.0.0.1 (private)
+    assert alerts._ip_blocked("2002:0808:0808::") is False  # embeds 8.8.8.8 (public → allowed)
+
+
+def test_uptime_uses_observed_time_not_full_window(tmp_path, monkeypatch):
+    """L6: a backend whose first-ever event is a DOWN partway into the window must not credit the
+    unobserved pre-window span as up (was ~95% for a 1h-in DOWN over 24h)."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "up.db"))
+    db.init()
+    now = time.time()
+    db.record_event(now - 3600, "litellm", False, kind="state")   # first-ever: DOWN, 1h ago
+    pct = db.uptime("24h")["litellm"]["uptime_pct"]
+    assert pct < 5.0, f"observed-time uptime should be ~0, got {pct}"
+
+
+def test_config_backend_down_vocab_and_repeat_min_floor(monkeypatch):
+    """L3: ALERT_ON_BACKEND_DOWN honours off/no/false. L4: ALERT_REPEAT_MIN is floored at 1."""
+    import importlib
+    monkeypatch.setenv("ALERT_ON_BACKEND_DOWN", "off")
+    monkeypatch.setenv("ALERT_REPEAT_MIN", "0")
+    try:
+        importlib.reload(config)
+        assert config.ALERT_ON_BACKEND_DOWN is False    # 'off' disables (L3)
+        assert config.ALERT_REPEAT_MIN >= 1.0           # 0 floored to 1 (L4)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_backup_restore_drill(tmp_path, monkeypatch):
+    """rules.md §5a gap (now covered): a FILE-LEVEL backup of the /data SQLite must restore into a
+    fresh instance and still serve windowed reads. Persistence + in-process reload were tested;
+    a copy-the-file-and-reopen restore was not."""
+    import shutil
+    src = tmp_path / "orig.db"
+    monkeypatch.setattr(config, "DB_PATH", str(src))
+    db.init()
+    now = time.time()
+    db.insert_metrics(now - 60, {"cpu": 11.0, "mem": 22.0})
+    db.insert_metrics(now - 30, {"cpu": 33.0, "mem": 44.0})
+    db.spend_model_user_upsert([{"day": time.strftime("%Y-%m-%d", time.gmtime(now)),
+                                 "model": "m", "key": "k", "alias": "team-a",
+                                 "cost": 2.0, "tokens": 100, "reqs": 5}], now)
+    # file-level backup: copy the db AND any -wal/-shm sidecars (WAL mode). No connection is open
+    # between ops (each is its own `with _connect()`), so the on-disk set is consistent.
+    dst = tmp_path / "restored.db"
+    for p in tmp_path.glob("orig.db*"):
+        shutil.copy2(p, str(dst) + p.name[len("orig.db"):])
+    # restore: a fresh instance pointed at the copy must serve the data
+    monkeypatch.setattr(config, "DB_PATH", str(dst))
+    db.init()
+    rows = db.series("1h", 300, end=now)
+    assert any(p.get("cpu") for p in rows), "restored metrics must be queryable after a file restore"
+    assert db.key_cost_window(2, end=now).get("team-a") == 2.0, "restored per-key spend must survive"
