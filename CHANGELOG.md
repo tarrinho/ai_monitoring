@@ -4,6 +4,83 @@ All notable changes to AI-Monitoring are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
 Versioning: [SemVer](https://semver.org/).
 
+## [1.8.23] — 2026-08-28
+
+### Added
+- **LiteLLM page — per-model filter, phase 2 (page-wide reach).** Pinning a model in the
+  **Per-model** card now also scopes the **per-key / per-user** cards and the KPI headline
+  to that model, not just failures + by-model concurrency (phase 1). The
+  per-(day,model,key) rollup (`spend_model_user_daily`) already carries the model dimension,
+  so this is a read-layer change — **no new schema, rollup, prune, or collector work**:
+  `db.key_cumulative` and `db.key_cost_window` gain an optional `model=` (one extra
+  `AND model = ?`), and `/api/keyrequests`, `/api/keyseries`, `/api/keydelta`,
+  `/api/spend/keycost`, `/api/userreqs` accept `?model=` (unset ⇒ byte-for-byte current
+  behavior). `keyseries`/`keydelta` route to the daily rollup when a model is set (they read
+  the model-less `key_series` table otherwise). The KPI card prepends a live "Selected
+  model" strip (reqs · tokens · p95 · wait · cost · SLO) from the snapshot's `per_model`
+  row. **Honest limit:** per-key-by-model is **day-granular** (the source table's grain), so
+  15m/1h windows collapse to "today" — the same trade-off `keyseries`/`userreqs` already
+  make. Left stack-wide on purpose (no per-model dimension in the store), stated in the
+  filter chip: the aggregate "metrics over time" chart, concurrency-vs-p95, load-vs-impact,
+  concurrency-by-key / backlog-by-key, and key anomalies. Design:
+  `docs/superpowers/specs/2026-08-28-litellm-per-model-filter-phase2-design.md`. Covered by
+  `test_key_cumulative_and_cost_window_filter_by_model`,
+  `test_keyrequests_handler_honors_model_query`, `test_litellm_per_model_filter_phase2_wiring`.
+
+## [1.8.22] — 2026-08-28
+
+### Added
+- **LiteLLM page — per-model filter (phase 1).** Click any row in the **Per-model** card to
+  pin that model; a filter chip appears at the top of the page and the cards whose fetched
+  data already carries a model dimension narrow to it: **Recent failed requests** (snapshot
+  failure rows are `.model`-tagged) and **Concurrent LLM work — by model** (its series are
+  labelled per model). Clicking the pinned row again, or the chip's **✕ clear**, resets it.
+  Client-side only — no backend, DB, or API change. Cards whose stored time-series collapsed
+  the model dimension at flatten time (latency/throughput history, per-key / per-user cards)
+  are intentionally left unfiltered in this phase, and the chip says so. Row wiring is
+  delegated on `document`, so the anti-blink table rebuilds never drop the handler. Covered
+  by `test_litellm_per_model_filter_phase1_present`.
+
+### Security
+- **Secure-code-review remediations (route-scoped review of the whole app).** Closed the
+  `SPEND_REQUIRE_ADMIN` cost/PII egress gaps and hardened the auth surface:
+  - **F-01** — the alert-webhook fan-out shipped per-key spend/aliases to *any* enabled user's
+    webhook, bypassing the cost redaction. Non-admin recipients now receive a redacted body for
+    the cost-sensitive `budget:`/`spike:` breaches (`alerts.Notifier._public_text`; the recipient
+    role rides through `db.user_webhooks_enabled` → `_recipients` → `_fanout`); the operator-global
+    webhook still gets full detail.
+  - **F-02** — the shared master/URL token authenticated as `admin` and sailed past the spend gate;
+    it is now treated as non-admin for `/spend`, `/api/spend/*`, and the `_SPEND_SENSITIVE_API` set.
+  - **F-03** — in open mode the sensitive spend endpoints (`/api/budgets`, `/api/keyseries`,
+    `/api/userreqs`, …) were served anonymously regardless of `SPEND_REQUIRE_ADMIN`; the open-mode
+    branch now denies them, matching the alerts/admin deny.
+  - **F-04** — `POST /login` (CSRF-exempt, mints a fresh session) accepted cross-site submits
+    (login-CSRF / forced-login); it now rejects a request whose `Origin`/`Referer` host isn't ours
+    (`_cross_origin_post`, honouring `X-Forwarded-Host`).
+  - **F-05** — a password `reset`/`force_reset` did not revoke the user's personal access tokens and
+    the `must_change` gate was session-only, so API access via a prior PAT survived a reset. Reset
+    and force-reset now call `db.api_tokens_revoke_all`.
+  - **F-06** — a huge finite `?end=` epoch overflowed `time.gmtime()` in the month handlers
+    (uncaught 500); `_q_end` now clamps out-of-range epochs to live.
+  - **F-07** — `/api/stream` (SSE) had no concurrency cap, so one credential could exhaust
+    memory/CPU/fds. Added per-client + global caps (`MONITOR_SSE_MAX_PER_CLIENT`=12,
+    `MONITOR_SSE_MAX_TOTAL`=200) with a 429 over the cap, released in the handler's `finally`.
+  - **R-02 / R-03** — `/api/anomalies` and `/metrics` shipped the same per-key cost / container
+    names outside the redaction; both now honour the caller's role (`_redact_anomalies`, and
+    `_redact_containers`/`_redact_cost` on the metrics snapshot).
+- **Base image openssl bump** — `libcrypto3`/`libssl3` upgraded to `3.5.8-r0` in the Dockerfile base
+  stage, clearing CVE-2026-14456 (Trivy §10 back to 0 HIGH / 0 CRITICAL on all three arches).
+- **Pinned Actions bumped** — checkout v7.0.1, trufflehog v3.97.1, setup-python v7.0.0,
+  setup-buildx v4.3.0, login-action v4.6.0, scorecard v2.4.4 (all re-pinned to their target SHAs).
+
+### Fixed
+- **R-01 — false per-key "budget" anomaly alerts in lite/off spend mode.** The budget rule divided a
+  key's *lifetime* cumulative spend by the window (only in-window spend is meaningful there), paging on
+  idle keys. It now runs only when the cost basis is windowed (`spend_mode == "full"`).
+- **By-user attribution named the key's creator instead of its owner.** `key_budgets` ranked the nested
+  `created_by_user` email above the directory-resolved owner (`user_id`), so an admin-provisioned key
+  showed the admin on every "by user" chart. Owner ids now outrank the creator in `_pick_email`.
+
 ## [1.8.21] — 2026-08-24
 
 ### Security

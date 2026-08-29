@@ -80,6 +80,20 @@ function updateSeries(chart,labels,next){
      couldn't be told apart from its neighbour's — the dividers tie each value to its header. */
   #ll-models table th,#ll-models table td{border-left:1px solid var(--line)}
   #ll-models table th:first-child,#ll-models table td:first-child{border-left:none}
+  /* Phase-1 per-model filter: click a per-model row to pin it; the chip bar shows the
+     active filter. Only cards whose fetched data already carries a model dimension
+     (Recent failed requests, Concurrent-by-model) honour it — see the note in the bar. */
+  #ll-models tr.pm-row{cursor:pointer}
+  #ll-models tr.pm-row:hover td{background:var(--panel2)}
+  #ll-models tr.pm-row.pm-sel td{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
+  #model-filter-bar{display:none;align-items:center;gap:10px;margin:0 0 4px;padding:8px 12px;
+    border:1px solid var(--accent);border-radius:9px;background:var(--panel2);font-size:13px}
+  #model-filter-bar.on{display:flex}
+  #model-filter-bar .mf-name{font-weight:600}
+  #model-filter-bar .mf-note{color:var(--muted);font-size:11.5px}
+  #model-filter-bar .mf-clear{margin-left:auto;cursor:pointer;background:var(--panel);
+    border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:3px 10px;font-size:12px}
+  #model-filter-bar .mf-clear:hover{border-color:var(--accent);color:var(--accent)}
   .badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--panel2)}
   .badge.ok{color:var(--ok)} .badge.bad{color:var(--bad)}
   .info{color:var(--muted);cursor:help;font-size:11px;margin-left:4px}
@@ -218,7 +232,7 @@ function updateSeries(chart,labels,next){
   <div id="sidebar-brand">
     <div>
       <div id="sidebar-brand-name">AI-Monitoring</div>
-      <div id="sidebar-brand-ver">v1.8.21</div>
+      <div id="sidebar-brand-ver">v1.8.23</div>
     </div>
     <button id="sidebar-toggle" title="Hide menu" aria-label="Hide menu">‹</button>
   </div>
@@ -257,6 +271,11 @@ function updateSeries(chart,labels,next){
     style="cursor:pointer;border:0;background:var(--panel2);color:var(--fg)">🌙</button>
 </header>
 <main>
+  <div id="model-filter-bar" class="span-full" role="status" aria-live="polite">
+    <span>Filtering by model: <span class="mf-name" id="mf-name"></span></span>
+    <span class="mf-note">— KPIs, the per-key / per-user &amp; spend cards, failures and by-model concurrency follow it (per-key views are day-granular); the aggregate time-series, concurrency-by-key and anomalies stay stack-wide.</span>
+    <button class="mf-clear" id="mf-clear" type="button" title="clear model filter">✕ clear</button>
+  </div>
   <section class="card span-2" id="card-kpi">
     <h2>Live <span class="badge" id="ll-badge"></span></h2>
     <div class="kpis" id="ll-kpis"></div>
@@ -599,6 +618,24 @@ function renderKpis(l){
   add("TTFT", l.ttft_avg_ms, " ms");
   add("Cache hit", l.cache_hit_pct, "%");
   add("Cache saved", l.cache_saved!=null?(CUR+l.cache_saved):null, "");
+  // Phase-2: when a model is pinned, prepend a live "selected model" strip from the
+  // snapshot's per_model row (reqs · tokens · p95 · wait · cost · SLO — the fields that
+  // endpoint reports). The global tiles above stay, so per-model and stack-wide never mix.
+  if(MODEL_FILTER){
+    const pm=(l.per_model||[]).find(m=>m&&m.model===MODEL_FILTER);
+    let strip;
+    if(pm){
+      strip=[kpi("Model reqs", pm.reqs||0),
+        kpi("Model tokens", compact(pm.tokens)||"—"),
+        pm.p95_ms!=null?kpi("Model p95", Math.round(pm.p95_ms)+" ms"):"",
+        pm.wait_avg_ms!=null?kpi("Model wait", Math.round(pm.wait_avg_ms)+" ms"):"",
+        pm.cost!=null?kpi("Model cost", CUR+(Math.round(pm.cost*10000)/10000)):"",
+        pm.slo_pct!=null?kpi("Model SLO", pm.slo_pct+"%", sloCls):""].join("");
+    } else {
+      strip=`<div class="unavail" style="grid-column:1/-1">no live data for ${escapeHtml(MODEL_FILTER)} in this window</div>`;
+    }
+    t.unshift(`<div style="grid-column:1/-1;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Selected model — ${escapeHtml(MODEL_FILTER)}</div>`+strip);
+  }
   setHtml(document.getElementById("ll-kpis"), t.join(""));
   // The Per-model table is rendered separately by loadModels() so it can honor
   // the time-window selector (queries LiteLLM's aggregated per-model endpoint for
@@ -658,7 +695,7 @@ async function loadModels(){
     const svc=svcProc(sb);   // serving-process CPU%/RSS (from procs collector) — live
     const [kl,kc]=kind(m);
     const ps=paramSize(m.model);
-    return `<tr><td>${escapeHtml(m.model||"(unnamed)")}`
+    return `<tr class="pm-row" data-mdl="${escapeHtml(m.model||"")}"><td>${escapeHtml(m.model||"(unnamed)")}`
       +(sb?`<span class="srv">${escapeHtml(sb)}</span>`:"")
       +` <span class="srv" style="color:${kc};border-color:${kc}">${kl}</span></td>`
       +`<td class="num">${ps?escapeHtml(ps):'—'}</td>`
@@ -692,6 +729,7 @@ async function loadModels(){
     +`<th class="num" title="Serving-process CPU — live CPU% (share of one core) of the LOCAL process serving this model (llama-server / ollama / vLLM / SGLang / TGI), read from /proc. '—' for external providers (no local process to measure) or when the monitor can't see host processes (run it with pid:host).">svc CPU</th>`
     +`<th class="num" title="Serving-process RAM — resident memory (RSS) of that same local serving process. '—' for external providers or when the process isn't visible (needs pid:host).">svc RAM</th>`
     +`</tr>${rows}</table>`);
+  _pmHighlight();   // re-apply the pinned-row highlight after a rebuild
   _pmHas=true;   // a real table is now shown → later transient misses keep it (no blink)
 }
 
@@ -817,7 +855,7 @@ const userWinSpendChart = _mkSpendBar("userkeys-winspend-chart", "#3fb950");
 async function loadWinSpend(){
   const kwl=document.getElementById("keys-winspend-win"); if(kwl) kwl.textContent=wlabel(WIN);
   const uwl=document.getElementById("userkeys-winspend-win"); if(uwl) uwl.textContent=wlabel(WIN);
-  const d=await api("/api/spend/keycost?window="+WIN);
+  const d=await api(withModel("/api/spend/keycost?window="+WIN));
   const cost=(d&&d.cost)||{};
   const r4=v=>Math.round(v*10000)/10000;
   // per key
@@ -922,7 +960,7 @@ const keyDeltaChart = new Chart(document.getElementById("keydelta-chart"), {
 });
 wireLegendFullName(keyDeltaChart, item=>{ const ds=keyDeltaChart.data.datasets[item.datasetIndex]; return ds&&ds._k; });
 async function loadKeyDelta(){
-  const d=await api("/api/keydelta?window="+WIN);
+  const d=await api(withModel("/api/keydelta?window="+WIN));
   const w=document.getElementById("keydelta-win"); if(w) w.textContent=wlabel(WIN);
   if(!d) return;
   const pts=d.points||[]; const labels=d.labels||[];
@@ -959,7 +997,7 @@ const userDeltaChart = new Chart(document.getElementById("userdelta-chart"), {
 });
 wireLegendFullName(userDeltaChart, item=>{ const ds=userDeltaChart.data.datasets[item.datasetIndex]; return ds&&ds._k; });
 async function loadUserDelta(){
-  const d=await api("/api/keydelta?window="+WIN);
+  const d=await api(withModel("/api/keydelta?window="+WIN));
   const w=document.getElementById("userdelta-win"); if(w) w.textContent=wlabel(WIN);
   if(!d) return;
   const pts=d.points||[]; const labels=d.labels||[];
@@ -1232,7 +1270,11 @@ async function loadConcByKey(){
 async function loadConcByModel(){
   // Same aggregate as loadConcByKey, split by MODEL (by=model) instead of key.
   const d=await api("/api/litellm/concurrency-by-key?metric=conc&by=model&window="+WIN);
-  renderStackByKey(d, concByModelChart, "card-conc-by-model", "conc-by-model-basis");
+  let dd=d;
+  if(d && MODEL_FILTER && Array.isArray(d.series)){   // isolate the pinned model's band
+    dd=Object.assign({},d,{series:d.series.filter(s=>s&&s.label===MODEL_FILTER)});
+  }
+  renderStackByKey(dd, concByModelChart, "card-conc-by-model", "conc-by-model-basis");
 }
 async function loadBacklogByKey(){
   const d=await api("/api/litellm/concurrency-by-key?metric=backlog&window="+WIN);
@@ -1383,7 +1425,7 @@ async function loadKeyTime(){
   // independent of the page's short window selector. Requests when the proxy exposes
   // per-key request counts (full spend mode); otherwise cumulative SPEND (off/lite modes
   // only expose per-key spend). The "requests in window" chart below is the per-window view.
-  const d=await api("/api/keyrequests");
+  const d=await api(withModel("/api/keyrequests"));
   _keytimeMetric=(d&&d.metric==="spend")?"spend":"reqs";
   const spend=_keytimeMetric==="spend";
   const km=document.getElementById("keytime-metric");
@@ -1409,7 +1451,7 @@ async function loadKeyTimeWin(){
   // Same per-key over-time lines as the all-time chart above, but for the SELECTED window
   // (/api/keyseries follows WIN). Per-key REQUEST counts need full spend mode; lite/off
   // store per-key SPEND, so label off _spendMode (same rule the delta cards use).
-  const d=await api("/api/keyseries?window="+WIN);
+  const d=await api(withModel("/api/keyseries?window="+WIN));
   const spend=_spendMode!=="full"; _keytimewinMetric=spend?"spend":"reqs";
   const m=document.getElementById("keytimewin-metric");
   if(m) m.textContent=spend?"cumulative spend":"cumulative requests";
@@ -1429,12 +1471,59 @@ async function loadKeyTimeWin(){
     borderWidth:1.5,pointRadius:0,tension:.25,fill:false,spanGaps:true})));
 }
 
+// ===== Phase-1 per-model filter (client-side, no backend change) =====
+// Clicking a row in the Per-model table pins MODEL_FILTER. Cards that already carry a
+// per-model dimension in the data they fetch — Recent failed requests (snapshot rows
+// have .model) and Concurrent LLM work by model (series labelled by model) — then show
+// only that model. Cards whose stored data collapsed the model dimension at flatten time
+// (latency/throughput history, per-key/per-user cards) are intentionally left unfiltered.
+let MODEL_FILTER=null;   // selected model name, or null
+let _lastLite=null;      // last litellm snapshot, so a click re-renders without waiting a tick
+function setModelFilter(m){
+  MODEL_FILTER=(m && m===MODEL_FILTER)?null:(m||null);   // clicking the pinned row again clears it
+  const bar=document.getElementById("model-filter-bar");
+  const nm=document.getElementById("mf-name");
+  if(bar) bar.classList.toggle("on", !!MODEL_FILTER);
+  if(nm) nm.textContent=MODEL_FILTER||"";
+  _pmHighlight();
+  modelFilteredReload();
+}
+// Append the active model filter to a loader URL (phase 2). The per-key/user cards read the
+// per-(day,model,key) rollup server-side, so `&model=` narrows them to the pinned model.
+function withModel(url){
+  if(!MODEL_FILTER) return url;
+  return url+(url.indexOf("?")>=0?"&":"?")+"model="+encodeURIComponent(MODEL_FILTER);
+}
+// Re-run every card that honours the model filter, from cached snapshot + fresh fetches.
+function modelFilteredReload(){
+  if(_lastLite){ renderKpis(_lastLite); renderFailures(_lastLite); }
+  loadConcByModel();                       // phase 1
+  loadKeyTime(); loadKeyTimeWin();         // top-10 keys/users over time
+  loadKeyDelta(); loadUserDelta();         // requests-in-window
+  loadWinSpend();                          // spend-in-window
+  loadUserTokens();                        // usage-by-user
+}
+function _pmHighlight(){
+  document.querySelectorAll('#ll-models tr.pm-row').forEach(function(tr){
+    tr.classList.toggle('pm-sel', MODEL_FILTER!=null && tr.dataset.mdl===MODEL_FILTER);
+  });
+}
+// Delegated once on document, so table rebuilds (loadModels) never lose the handler.
+document.addEventListener("click",function(ev){
+  if(!ev.target.closest) return;
+  if(ev.target.closest("#mf-clear")){ setModelFilter(null); return; }
+  const tr=ev.target.closest("#ll-models tr.pm-row");
+  if(tr && tr.dataset.mdl) setModelFilter(tr.dataset.mdl);
+});
+
 function renderFailures(l){
   const b=document.getElementById("fail-badge");
   const body=document.getElementById("fail-body");
-  const f=(l&&l.recent_failures)||[];
+  let f=(l&&l.recent_failures)||[];
+  if(MODEL_FILTER) f=f.filter(x=>x&&x.model===MODEL_FILTER);
   if(!f.length){ b.className="badge ok"; b.textContent="0";
-    setHtml(body,`<div class="unavail">no failed requests in window</div>`); return; }
+    setHtml(body,`<div class="unavail">no failed requests`
+      +(MODEL_FILTER?` for ${escapeHtml(MODEL_FILTER)}`:``)+` in window</div>`); return; }
   b.className="badge bad"; b.textContent=f.length;
   let rows=f.map(x=>`<tr><td>${escapeHtml(new Date(x.t*1000).toLocaleTimeString())}</td>`
     +`<td>${escapeHtml(x.model)}</td><td>${escapeHtml(x.key)}</td>`
@@ -1567,6 +1656,7 @@ async function tick(){
     _hostMemTotal = (c.host && c.host.mem_total) || 0;
     _spendMode = (c.litellm && c.litellm.spend_mode) || "full";
     _spendWinMin = (c.litellm && c.litellm.spend_window_min) || null;
+    _lastLite=c.litellm||null;
     renderKpis(c.litellm);
     renderKeys(c.litellm);
     renderUserKeys(c.litellm);
@@ -1611,7 +1701,7 @@ async function loadUserTokens(){
   // follow the page time-window (+ pan cursor) so the chart matches the 15m/1h/24h/30d/12mo
   // selector instead of always showing all-time; rangedReload() re-fires this on window change.
   const uw=document.getElementById("ut-win"); if(uw) uw.textContent=wlabel(WIN);
-  const d=await api("/api/userreqs?window="+encodeURIComponent(WIN)+(TIMEEND?("&end="+Math.round(TIMEEND)):""));
+  const d=await api(withModel("/api/userreqs?window="+encodeURIComponent(WIN)+(TIMEEND?("&end="+Math.round(TIMEEND)):"")));
   if(!d) return;                                    // fetch blip → keep last render (no blink)
   const mb=document.getElementById("ut-metric"); if(mb&&d.metric) mb.textContent=d.metric;
   const labels=d.labels||[], pts=d.points||[];

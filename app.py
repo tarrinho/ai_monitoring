@@ -1848,11 +1848,21 @@ async def keyseries_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 200
     pts = max(30, min(pts, 1000))
-    # monotonic: the windowed 'Top 10 API keys over time' card is an "only rises"
-    # cumulative view, but the raw stored value re-bases DOWN on key re-issue / budget
-    # roll — so plot a running total of positive steps instead (see db.key_series).
-    data = await asyncio.to_thread(db.key_series, window, pts,
-                                   end=_q_end(request), monotonic=True)
+    # LiteLLM-page per-model filter (phase 2): `?model=` restricts this card to one model.
+    # key_series has no model dimension, so route to the per-(day,model,key) rollup instead
+    # (day-granular cumulative — same {labels, points} shape). Unset ⇒ current key_series path.
+    model = request.query.get("model") or None
+    if model:
+        days_back = max(1, int((db.window_secs(window) + 86399) // 86400))
+        data = await asyncio.to_thread(db.key_cumulative, metric="reqs",
+                                       days_back=days_back, top_n=10,
+                                       end=_q_end(request), model=model)
+    else:
+        # monotonic: the windowed 'Top 10 API keys over time' card is an "only rises"
+        # cumulative view, but the raw stored value re-bases DOWN on key re-issue / budget
+        # roll — so plot a running total of positive steps instead (see db.key_series).
+        data = await asyncio.to_thread(db.key_series, window, pts,
+                                       end=_q_end(request), monotonic=True)
     return web.json_response({"window": window, **data})
 
 
@@ -1875,9 +1885,11 @@ async def userreqs_handler(request: web.Request) -> web.Response:
     # window duration -> day span for the day-granular rollup (ceil, min 1 day)
     days_back = max(1, int((db.window_secs(window) + 86399) // 86400))
     metric = "requests"
+    # LiteLLM-page per-model filter (phase 2): `?model=` restricts to one model's rows.
+    model = request.query.get("model") or None
     data = await asyncio.to_thread(db.key_cumulative, metric="reqs",
-                                   days_back=days_back, top_n=200, end=end)
-    if not data.get("points"):     # lite/off: no per-key request counts → cumulative SPEND instead
+                                   days_back=days_back, top_n=200, end=end, model=model)
+    if not model and not data.get("points"):     # lite/off: no per-key request counts → cumulative SPEND instead
         ks = await asyncio.to_thread(db.key_delta_series, window, 400, 200, end)
         if ks.get("points"):
             data = {"labels": ks.get("labels", []), "points": ks["points"]}
@@ -1915,8 +1927,10 @@ async def keyrequests_handler(request: web.Request) -> web.Response:
         top_n = 10
     metric = "cost" if request.query.get("metric") == "cost" else "reqs"
     end = _q_end(request)
-    data = await asyncio.to_thread(db.key_cumulative, metric=metric, top_n=top_n, end=end)
-    if metric == "reqs" and not data.get("points"):
+    # LiteLLM-page per-model filter (phase 2): `?model=` restricts to one model's rows.
+    model = request.query.get("model") or None
+    data = await asyncio.to_thread(db.key_cumulative, metric=metric, top_n=top_n, end=end, model=model)
+    if metric == "reqs" and not model and not data.get("points"):
         # off/lite spend mode has NO per-key request counts (only /spend/logs does). Fall
         # back to the per-key cumulative SPEND recorded in key_series — top_keys stores
         # LiteLLM's per-key total_spend there.
@@ -2000,7 +2014,17 @@ async def keydelta_handler(request: web.Request) -> web.Response:
     except ValueError:
         pts = 200
     pts = max(30, min(pts, 1000))
-    data = await asyncio.to_thread(db.key_delta_series, window, pts, end=_q_end(request))
+    # LiteLLM-page per-model filter (phase 2): `?model=` restricts this card to one model.
+    # key_series (which key_delta_series reads) has no model dimension, so route to the
+    # per-(day,model,key) rollup (day-granular cumulative, same {labels, points} shape).
+    model = request.query.get("model") or None
+    if model:
+        days_back = max(1, int((db.window_secs(window) + 86399) // 86400))
+        data = await asyncio.to_thread(db.key_cumulative, metric="reqs",
+                                       days_back=days_back, top_n=10,
+                                       end=_q_end(request), model=model)
+    else:
+        data = await asyncio.to_thread(db.key_delta_series, window, pts, end=_q_end(request))
     # Server-resolved owner map so the 'by user' delta chart attributes owned keys on first
     # paint instead of an oversized 'Unassigned' band (see _owner_map_for_labels).
     owners = await _owner_map_for_labels(data.get("labels") or [])
@@ -3799,7 +3823,9 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
     end = _q_end(request) or time.time()
     secs = (end - db.month_start(end)) if window == "month" else db.window_secs(window)
     days = int(secs // 86400) + 1
-    cost = await asyncio.to_thread(db.key_cost_window, days, end=end)
+    # LiteLLM-page per-model filter (phase 2): `?model=` restricts to one model's rows.
+    model = request.query.get("model") or None
+    cost = await asyncio.to_thread(db.key_cost_window, days, end=end, model=model)
     # The day-granular rollup this reads is fed only from /spend/logs (full mode) — in
     # lite/off mode it never gets a single row, so the LiteLLM page's "spend in window"
     # cards were permanently empty even with real, active spend (observed live). Fall
@@ -3810,7 +3836,7 @@ async def spend_keycost_handler(request: web.Request) -> web.Response:
 # .get(..., "full"): a timeout replaces the litellm sample wholesale, so `spend_mode` can be
     # ABSENT for a tick. Treating absent as non-full dropped a full-mode deployment into the
     # lite fallback, which plots per-bucket REQUEST COUNTS as USD.
-    if not cost and (_backend_latest.get("litellm", {}) or {}).get("spend_mode", "full") != "full":
+    if not model and not cost and (_backend_latest.get("litellm", {}) or {}).get("spend_mode", "full") != "full":
         # require_known=False: a key with real windowed activity is a real key — keep the
         # billed-but-unconfirmed key (master / ephemeral virtual) instead of dropping it,
         # matching the full-mode key_cost_window path so the two spend modes agree.

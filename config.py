@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 
-VERSION = "AI-Monitoring_1.8.21"
+VERSION = "AI-Monitoring_1.8.23"
 
 # --- optional local .env support (dev convenience; no-op if absent) ----------
 try:

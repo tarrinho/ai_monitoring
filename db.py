@@ -2292,7 +2292,7 @@ def spend_model_user_rows(days_back: int, end: float | None = None) -> list[dict
 
 
 def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
-                   end: float | None = None) -> dict[str, Any]:
+                   end: float | None = None, model: str | None = None) -> dict[str, Any]:
     """CUMULATIVE per-key metric over time, from the persisted per-(day,model,key) rollup.
 
     `metric` is "reqs" (request count, the default — drives 'Top 10 API keys over time')
@@ -2300,6 +2300,10 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
     RISES (never the rolling-window decay of the live request-rate view). Keys are labelled
     by alias (falling back to the key hash) and ranked by their total over the span; the
     top-N are returned. Day-granular; reads the local rollup only (no /spend/logs pull).
+
+    `model` (LiteLLM-page per-model filter, phase 2): when set, restrict to that model's
+    rows — the (day,model,key) grain already carries the model, so this is one extra WHERE
+    clause with no new storage. Unset ⇒ across all models (unchanged behavior).
 
     Returns {"labels": [...top-N...], "metric": <metric>, "points": [{t, <label>: cum, ...}]}
     with `t` the UTC epoch of each day. Empty on error / unknown metric / no data."""
@@ -2310,12 +2314,17 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
     end = end or time.time()
     start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
     end_day = time.strftime("%Y-%m-%d", time.gmtime(end))   # bound the TOP edge too (a panned/historical `end` must not pull days after the window)
+    params: list[Any] = [start_day, end_day]
+    model_clause = ""
+    if model:
+        model_clause = " AND model = ?"
+        params.append(model)
     try:
         with _connect() as conn:
             rows = conn.execute(
                 f"SELECT day, COALESCE(NULLIF(alias,''), key) AS label, SUM({col}) v "
-                "FROM spend_model_user_daily WHERE day >= ? AND day <= ? "
-                "GROUP BY day, label ORDER BY day", (start_day, end_day)).fetchall()
+                f"FROM spend_model_user_daily WHERE day >= ? AND day <= ?{model_clause} "
+                "GROUP BY day, label ORDER BY day", tuple(params)).fetchall()
         if not rows:
             return {"labels": [], "metric": metric, "points": []}
         # rank keys by total over the span; keep the top-N
@@ -2358,19 +2367,29 @@ def key_cumulative(metric: str = "reqs", days_back: int = 366, top_n: int = 10,
         return {"labels": [], "metric": metric, "points": []}
 
 
-def key_cost_window(days_back: int, end: float | None = None) -> dict[str, float]:
+def key_cost_window(days_back: int, end: float | None = None,
+                    model: str | None = None) -> dict[str, float]:
     """Total spend per key WITHIN the window (last `days_back` days), from the persisted
     per-(day,model,key) rollup. Keyed by alias (falling back to the key hash) to match the
     /api/budgets key rows. Powers the windowed 'Cost by user/key/team' chart so it follows
-    the page time-window instead of showing LiteLLM's all-time per-key total. Empty on error."""
+    the page time-window instead of showing LiteLLM's all-time per-key total. Empty on error.
+
+    `model` (LiteLLM-page per-model filter, phase 2): when set, restrict to that model's
+    rows — one extra WHERE clause on the existing (day,model,key) grain. Unset ⇒ all models."""
     end = end or time.time()
     start_day = time.strftime("%Y-%m-%d", time.gmtime(end - max(0, days_back) * 86400))
     end_day = time.strftime("%Y-%m-%d", time.gmtime(end))   # bound the TOP edge too (a panned/historical `end` must not pull days after the window)
+    params: list[Any] = [start_day, end_day]
+    model_clause = ""
+    if model:
+        model_clause = " AND model = ?"
+        params.append(model)
     try:
         with _connect() as conn:
             rows = conn.execute(
                 "SELECT COALESCE(NULLIF(alias,''), key) AS label, SUM(cost) c "
-                "FROM spend_model_user_daily WHERE day >= ? AND day <= ? GROUP BY label", (start_day, end_day)).fetchall()
+                f"FROM spend_model_user_daily WHERE day >= ? AND day <= ?{model_clause} GROUP BY label",
+                tuple(params)).fetchall()
         # Fold excluded / unconfirmed / hidden-unassigned keys into "Other" rather than showing
         # them as named bands (this rollup-backed chart used to skip the filter entirely). Cost
         # is FOLDED, not dropped, so the window's total spend is preserved — a hidden key's

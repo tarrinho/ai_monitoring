@@ -651,7 +651,38 @@ def test_litellm_heavy_parse_runs_off_event_loop():
 
 
 def test_version_is_current():
-    assert config.VERSION == "AI-Monitoring_1.8.21"
+    assert config.VERSION == "AI-Monitoring_1.8.23"
+
+
+def test_litellm_per_model_filter_phase2_wiring():
+    """Phase-2 per-model filter: the per-key/user loaders pass the pinned model to the
+    backend (via withModel), the KPI card gets a live per-model strip, and setModelFilter
+    re-fires the honouring cards."""
+    ll = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    assert "function withModel(" in ll and "function modelFilteredReload(" in ll
+    # every model-scoped loader URL is wrapped
+    for url in ('withModel("/api/keyrequests")',
+                'withModel("/api/keyseries?window="+WIN)',
+                'withModel("/api/keydelta?window="+WIN)',
+                'withModel("/api/spend/keycost?window="+WIN)',
+                'withModel("/api/userreqs?window="'):
+        assert url in ll, f"loader not wrapped with withModel: {url}"
+    assert "Selected model — " in ll and "l.per_model||[]).find(m=>m&&m.model===MODEL_FILTER)" in ll
+
+
+def test_litellm_per_model_filter_phase1_present():
+    """Phase-1 per-model filter on the LiteLLM page: clicking a Per-model row pins a
+    model and the two cards whose fetched data carries a model dimension (Recent failed
+    requests, Concurrent-by-model) filter to it. Client-side only — no backend change."""
+    ll = (ROOT / "web" / "litellm.html").read_text(encoding="utf-8")
+    # state + selector affordance
+    assert "let MODEL_FILTER=null;" in ll
+    assert 'id="model-filter-bar"' in ll and 'id="mf-clear"' in ll
+    assert 'class="pm-row" data-mdl=' in ll          # per-model rows are clickable + tagged
+    assert "function setModelFilter(" in ll and "function _pmHighlight(" in ll
+    # the two honouring cards actually consult MODEL_FILTER
+    assert "f=f.filter(x=>x&&x.model===MODEL_FILTER)" in ll          # Recent failed requests
+    assert "d.series.filter(s=>s&&s.label===MODEL_FILTER)" in ll     # Concurrent-by-model
 
 
 def test_all_version_surfaces_match_config_version():
@@ -4011,12 +4042,13 @@ def test_litellm_windowed_keys_over_time_card():
     assert order[-4] == "card-keytime", f"keytime must sit near the end, order tail={order[-4:]}"
     # windowed loader follows the selector (WIN) via the per-window key series endpoint,
     # and is TDZ-safe (its metric var declared before its chart)
-    assert 'api("/api/keyseries?window="+WIN)' in html, "windowed card must follow WIN"
+    # (wrapped in withModel() for the phase-2 per-model filter; still WIN-parametrized)
+    assert 'api(withModel("/api/keyseries?window="+WIN))' in html, "windowed card must follow WIN"
     assert html.index("let _keytimewinMetric") < html.index("keyTimeWinChart = new Chart")
     # refreshed on every reload path the other windowed charts use
     assert html.count("loadKeyTimeWin()") >= 3, "must run on rangedReload + window change + init"
     # the all-time card still uses the all-time endpoint (unchanged), so the two differ
-    assert 'api("/api/keyrequests")' in html, "all-time card keeps the all-time source"
+    assert 'api(withModel("/api/keyrequests"))' in html, "all-time card keeps the all-time source"
 
 
 def test_litellm_concurrency_by_model_card():

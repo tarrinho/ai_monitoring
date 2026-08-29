@@ -4945,6 +4945,53 @@ def test_key_cumulative_is_monotonic(tmp_path, monkeypatch):
     assert db.key_cumulative(metric="bogus", end=end)["labels"] == []   # unknown metric → empty
 
 
+def test_key_cumulative_and_cost_window_filter_by_model(tmp_path, monkeypatch):
+    """Phase-2 per-model filter: `model=` restricts key_cumulative / key_cost_window to one
+    model's rows (the (day,model,key) grain already carries it), while unset stays all-model."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "mf.db"))
+    db.init()
+    import calendar as _cal
+    end = _cal.timegm(time.strptime("2026-07-03", "%Y-%m-%d"))
+    db.spend_model_user_upsert([
+        {"day": "2026-07-01", "model": "gpt-4o", "key": "hA", "alias": "alice", "cost": 2.0, "tokens": 1, "reqs": 10},
+        {"day": "2026-07-01", "model": "qwen",   "key": "hA", "alias": "alice", "cost": 1.0, "tokens": 1, "reqs": 4},
+        {"day": "2026-07-01", "model": "gpt-4o", "key": "hB", "alias": "bob",   "cost": 5.0, "tokens": 1, "reqs": 7},
+    ], time.time())
+    # requests: filtered to qwen → only alice's 4; unset → alice 14 + bob 7
+    only_qwen = db.key_cumulative(metric="reqs", days_back=3650, top_n=10, end=end, model="qwen")
+    assert only_qwen["labels"] == ["alice"]
+    assert int(only_qwen["points"][-1]["alice"]) == 4
+    allm = db.key_cumulative(metric="reqs", days_back=3650, top_n=10, end=end)
+    assert set(allm["labels"]) == {"alice", "bob"}
+    assert int(allm["points"][-1]["alice"]) == 14
+    # cost window: filtered to gpt-4o excludes alice's qwen dollar
+    assert db.key_cost_window(30, end=end, model="gpt-4o") == {"alice": 2.0, "bob": 5.0}
+    assert db.key_cost_window(30, end=end)["alice"] == 3.0          # unset folds both models
+
+
+def test_keyrequests_handler_honors_model_query(tmp_path, monkeypatch):
+    """The `?model=` query on /api/keyrequests reaches the db filter: with it, only the
+    pinned model's keys are returned; without it, all models fold together."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "krmf.db"))
+    db.init()
+    import calendar as _cal
+    now = _cal.timegm(time.strptime("2026-07-02", "%Y-%m-%d"))
+    db.spend_model_user_upsert([
+        {"day": "2026-07-01", "model": "gpt-4o", "key": "hA", "alias": "alice", "cost": 1.0, "tokens": 1, "reqs": 9},
+        {"day": "2026-07-01", "model": "qwen",   "key": "hB", "alias": "bob",   "cost": 1.0, "tokens": 1, "reqs": 3},
+    ], time.time())
+    import asyncio, json as _json
+
+    class _Req:
+        def __init__(self, q): self.query = q
+    import app as _app
+    monkeypatch.setattr(_app, "_q_end", lambda r: now)
+    filtered = _json.loads(asyncio.run(_app.keyrequests_handler(_Req({"model": "qwen"}))).body.decode())
+    assert filtered["labels"] == ["bob"] and "alice" not in filtered["labels"]
+    allm = _json.loads(asyncio.run(_app.keyrequests_handler(_Req({}))).body.decode())
+    assert set(allm["labels"]) == {"alice", "bob"}
+
+
 async def test_spend_keycost_endpoint_windowed(tmp_path, monkeypatch):
     """/api/spend/keycost returns per-key spend WITHIN the window (alias→cost) so the
     Cost-by-user/key/team chart follows the page selector. db.key_cost_window excludes
@@ -11558,9 +11605,10 @@ async def test_userreqs_follows_window_and_end(monkeypatch):
     from aiohttp.test_utils import make_mocked_request
     seen = {}
 
-    def fake_cum(metric="reqs", days_back=366, top_n=10, end=None):
+    def fake_cum(metric="reqs", days_back=366, top_n=10, end=None, model=None):
         seen["days_back"] = days_back
         seen["end"] = end
+        seen["model"] = model
         return {"labels": ["k1"], "points": [{"t": 1, "k1": 5}]}
 
     monkeypatch.setattr(db, "key_cumulative", fake_cum)
