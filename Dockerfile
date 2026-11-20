@@ -11,7 +11,7 @@
 # Pinned-Dependencies). The tag is kept in the comment for readability; Dependabot
 # (docker ecosystem) bumps the digest. Re-pin with:
 #   docker buildx imagetools inspect python:3.14-alpine   # top-level Digest
-FROM python:3.14-alpine@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS base
+FROM python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
