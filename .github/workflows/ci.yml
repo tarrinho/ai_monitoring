@@ -31,7 +31,7 @@ jobs:
           fetch-depth: 0          # full history so both scanners see past commits
       - name: TruffleHog
         # Was @main (mutable branch — supply-chain risk).
-        uses: trufflesecurity/trufflehog@3bd2b5887eb0efb8fa18bfd1d296032924e4ffdc # v3.99.9
+        uses: trufflesecurity/trufflehog@4ef51f69ca6347aaa76a5e64a87eac9c0c909f71 # v3.100.1
         with:
           path: ./
           extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude
@@ -166,7 +166,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Dependency review (block vulnerable / strong-copyleft deps in PRs)
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
         with:
           fail-on-severity: high
           deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-3.0, SSPL-1.0
